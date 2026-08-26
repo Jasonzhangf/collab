@@ -53,10 +53,6 @@ pub fn gen_msg_id() -> String {
     format!("m{}-{}", now_ms(), n)
 }
 
-fn knock_text(from: &str, mtype: &str, msg_id: &str) -> String {
-    format!("[MAIL] from={} type={} id={}", from, mtype, msg_id)
-}
-
 const LONG_BODY_THRESHOLD_CHARS: usize = 500;
 
 fn message_doc_path(root: &Path, msg_id: &str) -> PathBuf {
@@ -86,7 +82,10 @@ fn delivery_text(
     body: &str,
 ) -> Result<String, String> {
     let prefix = format!("[MAIL] from={} type={} id={}:", from, mtype, msg_id);
-    let next = "next=\"Read mailbox body; collaborate, defer, or reject with reason; reply if requested.\"";
+    let next = format!(
+        "next=\"Process this collab input now: read the mailbox body, decide collaborate/defer/reject with reason, reply if requested, ack id={}, then immediately continue the current run's next step.\"",
+        msg_id
+    );
     if body.chars().count() <= LONG_BODY_THRESHOLD_CHARS {
         return Ok(format!("{prefix} {} | {next}", one_line(body)));
     }
@@ -97,17 +96,32 @@ fn delivery_text(
         .map_err(|e| format!("cannot make message reference relative: {e}"))?;
     Ok(format!(
         "{prefix} body-ref={} {next}",
-        relative.display()
+        relative.display(),
+        next = next,
     ))
+}
+
+pub(super) fn queue_system_knock(server: &Server, pane: &str, msg_id: &str, body: &str) {
+    match delivery_text(&server.root, "collab-server", "system", msg_id, body) {
+        Ok(text) => knock_or_log(&server.log_path(), pane, &text),
+        Err(error) => append_log(
+            &server.log_path(),
+            &format!("system delivery prompt failed id={} err={}", msg_id, error),
+        ),
+    }
+}
+
+fn timeout_prompt(kind: &str, worker_id: &str, timeout_ms: u64) -> String {
+    format!(
+        "Blocking collab {} returned without a message for worker {} after {}ms. Continue the current run from its notes/actor next step; do not idle or wait for another request.",
+        kind, worker_id, timeout_ms
+    )
 }
 
 fn notify_wait_timeout(server: &Server, kind: &str, worker_id: &str, timeout_ms: u64) {
     if let Some(pane) = server.state.lock().unwrap().worker_pane(worker_id) {
-        knock_or_log(
-            &server.log_path(),
-            &pane,
-            &format!("[MAIL] {kind}-timeout worker={} timeout_ms={timeout_ms}", worker_id),
-        );
+        let id = gen_msg_id();
+        queue_system_knock(server, &pane, &id, &timeout_prompt(kind, worker_id, timeout_ms));
     }
 }
 
@@ -263,7 +277,7 @@ fn handle_claim_acquire(
     let snap: Option<ClaimRec> = server.state.lock().unwrap().claims.get(&claim_id).cloned();
 
     let mut evs: Vec<Event> = Vec::new();
-    let mut knocks: Vec<(String, String)> = Vec::new();
+    let mut knocks: Vec<(String, String, String)> = Vec::new();
 
     let result = match snap {
         None => {
@@ -297,11 +311,11 @@ fn handle_claim_acquire(
                     let sid = gen_msg_id();
                     evs.push(Event::Sent { msg: Message {
                         id: sid.clone(), from: "collab-server".into(), to: old.clone(),
-                        mtype: "system".into(), body, in_reply_to: None,
+                        mtype: "system".into(), body: body.clone(), in_reply_to: None,
                         created_ms: now, state: "pending".into(), nudge_count: 0, last_nudge_ms: 0,
                     }});
                     if let Some(p) = pane {
-                        knocks.push((p, knock_text("collab-server", "system", &sid)));
+                        knocks.push((p, sid, body));
                     }
                     Ok(json!({"claim": claim_id, "status": "takeover", "previous_owner": old}))
                 } else {
@@ -331,8 +345,8 @@ fn handle_claim_acquire(
 
     if !evs.is_empty() {
         server.commit(&evs);
-        for (pane, text) in knocks {
-            knock_or_log(&server.log_path(), &pane, &text);
+        for (pane, msg_id, body) in knocks {
+            queue_system_knock(server, &pane, &msg_id, &body);
         }
     }
     match result {
@@ -355,7 +369,7 @@ fn handle_claim_release(server: &Server, worker_id: String, claim_id: String) ->
     // wake the next waiter with a direct notice
     if let Some(head) = reserved_for {
         let mut evs = Vec::new();
-        let mut knocks = Vec::new();
+        let mut knocks: Vec<(String, String, String)> = Vec::new();
         let pane = server.state.lock().unwrap().worker_pane(&head);
         let sid = gen_msg_id();
         evs.push(Event::Sent { msg: Message {
@@ -365,11 +379,11 @@ fn handle_claim_release(server: &Server, worker_id: String, claim_id: String) ->
             in_reply_to: None, created_ms: now_ms(), state: "pending".into(), nudge_count: 0, last_nudge_ms: 0,
         }});
         if let Some(p) = pane {
-            knocks.push((p, knock_text("collab-server", "system", &sid)));
+            knocks.push((p, sid, format!("RELEASED: claim '{}' is free; you are first in queue — acquire it now, then continue your current run.", claim_id)));
         }
         server.commit(&evs);
-        for (pane, text) in knocks {
-            knock_or_log(&server.log_path(), &pane, &text);
+        for (pane, msg_id, body) in knocks {
+            queue_system_knock(server, &pane, &msg_id, &body);
         }
     }
     Resp::data(json!({"claim": claim_id, "status": "released"}))
@@ -797,8 +811,10 @@ mod tests {
         let text = delivery_text(&root, "sender", "notify", "m1", &body).unwrap();
         assert!(text.starts_with("[MAIL] from=sender type=notify id=m1: "));
         assert!(text.contains(&body));
-        assert!(text.contains("Read mailbox body"));
-        assert!(text.chars().count() <= 700);
+        assert!(text.contains("Process this collab input now"));
+        assert!(text.contains("ack id=m1"));
+        assert!(text.contains("continue the current run's next step"));
+        assert!(text.chars().count() <= 850);
         assert!(!text.contains('\n'));
         assert!(!message_doc_path(&root, "m1").exists());
         std::fs::remove_dir_all(root).ok();
@@ -809,13 +825,33 @@ mod tests {
         let root = std::env::temp_dir().join("collab-delivery-long-test");
         let body = "long message\n".repeat(100);
         let text = delivery_text(&root, "sender", "notify", "m2", &body).unwrap();
-        assert!(text.chars().count() <= 200);
+        assert!(text.chars().count() <= 300);
         assert!(text.contains("body-ref=.agent-collab/messages/m2.md"));
-        assert!(text.contains("collaborate, defer, or reject"));
+        assert!(text.contains("Process this collab input now"));
+        assert!(text.contains("ack id=m2"));
         assert_eq!(
             std::fs::read_to_string(message_doc_path(&root, "m2")).unwrap(),
             body
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn system_delivery_uses_same_reasoning_prompt() {
+        let (_, root) = test_server();
+        let text = delivery_text(
+            &root,
+            "collab-server",
+            "system",
+            "system-1",
+            "NUDGE: request needs a substantive response",
+        )
+        .unwrap();
+        assert!(text.contains("from=collab-server type=system id=system-1"));
+        assert!(text.contains("NUDGE: request needs a substantive response"));
+        assert!(text.contains("decide collaborate/defer/reject with reason"));
+        assert!(text.contains("reply if requested, ack id=system-1"));
+        assert!(text.contains("immediately continue the current run's next step"));
         std::fs::remove_dir_all(root).ok();
     }
 }

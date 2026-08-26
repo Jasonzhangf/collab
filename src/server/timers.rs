@@ -10,7 +10,7 @@ const MAX_NUDGES: u32 = 3;
 pub fn tick(server: &Arc<Server>) {
     let now = now_ms();
     let mut evs: Vec<Event> = Vec::new();
-    let mut knocks: Vec<(String, String)> = Vec::new();
+    let mut knocks: Vec<(String, String, String)> = Vec::new();
 
     {
         let st = server.state.lock().unwrap();
@@ -29,10 +29,11 @@ pub fn tick(server: &Arc<Server>) {
                 let mut targets: Vec<String> = vec![c.owner.clone().unwrap()];
                 targets.extend(c.queue.iter().map(|q| q.worker_id.clone()));
                 for t in targets {
+                    let (event, msg_id, message_body) = sent_system(&t, body.clone());
+                    evs.push(event);
                     if let Some(pane) = st.worker_pane(&t) {
-                        knocks.push((pane, "[MAIL] lease-expired".into()));
+                        knocks.push((pane, msg_id, message_body));
                     }
-                    evs.push(sent_system(&t, body.clone()));
                 }
             }
         }
@@ -51,17 +52,22 @@ pub fn tick(server: &Arc<Server>) {
             // The recipient gets exactly one knock per request; later ticks do
             // not repeat the same wake-up while the request remains pending.
             if k == 1 {
+                let (event, msg_id, message_body) = sent_system(&m.to, nudge_body(&m.id, &m.from));
+                evs.push(event);
                 if let Some(pane) = st.worker_pane(&m.to) {
-                    knocks.push((pane, knock_line(&m.id, &m.from)));
+                    knocks.push((pane, msg_id, message_body));
                 }
-                evs.push(sent_system(&m.to, nudge_body(&m.id, &m.from)));
             }
             if k >= MAX_NUDGES {
                 let sender_body = format!(
                     "ESCALATE: request '{}' to {} has no reply after {} nudges; stop waiting and escalate per protocol",
                     m.id, m.to, MAX_NUDGES
                 );
-                evs.push(sent_system(&m.from, sender_body));
+                let (event, msg_id, message_body) = sent_system(&m.from, sender_body);
+                evs.push(event);
+                if let Some(pane) = st.worker_pane(&m.from) {
+                    knocks.push((pane, msg_id, message_body));
+                }
             }
             evs.push(Event::Nudged { msg_id: m.id.clone() });
         }
@@ -71,31 +77,31 @@ pub fn tick(server: &Arc<Server>) {
         return;
     }
     server.commit(&evs);
-    let log = server.log_path();
-    for (pane, text) in knocks {
-        crate::server::knock::knock_or_log(&log, &pane, &text);
+    for (pane, msg_id, body) in knocks {
+        super::queue_system_knock(server, &pane, &msg_id, &body);
     }
 }
 
-fn sent_system(to: &str, body: String) -> Event {
-    Event::Sent {
-        msg: Message {
-            id: super::gen_msg_id(),
+fn sent_system(to: &str, body: String) -> (Event, String, String) {
+    let id = super::gen_msg_id();
+    (
+        Event::Sent {
+            msg: Message {
+            id: id.clone(),
             from: "collab-server".into(),
             to: to.into(),
             mtype: "system".into(),
-            body,
+            body: body.clone(),
             in_reply_to: None,
             created_ms: now_ms(),
             state: "pending".into(),
             nudge_count: 0,
             last_nudge_ms: 0,
+            },
         },
-    }
-}
-
-fn knock_line(msg_id: &str, from: &str) -> String {
-    format!("[MAIL] NUDGE pending-request id={} from={}", msg_id, from)
+        id,
+        body,
+    )
 }
 
 fn nudge_body(msg_id: &str, from: &str) -> String {

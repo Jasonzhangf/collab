@@ -77,18 +77,29 @@ Outside tmux you can pass `--worker <id>` to act as a specific identity.
   sender receives an escalation notice after 15 minutes. If multiple replies
   are sent, earlier ones are marked `superseded` and only the newest is
   delivered.
-- Every send commits to the mailbox, then submits a tmux notification with
-  Enter. Short content (up to 500 characters) is sent once inline. Longer
+- Every send commits to the mailbox, then submits a tmux notification with one
+  Codex TUI carriage return (`tmux send-keys -t <pane> C-m`). Short content (up to 500 characters) is sent once inline. Longer
   content is stored under `.agent-collab/messages/<message-id>.md`, while tmux
   receives only a short `body-ref=<path>` reference. A timed-out blocking `recv` or
   `claim wait` also produces one submitted timeout reminder. Knock failures are
   logged when panes no longer exist; mailbox state remains authoritative.
 - A tmux delivery is a reasoning prompt carrying `from`, the full short body or
-  actionable long-body reference, and next action. Bare ACK/mailbox-ID prompts
-  are invalid for real messages.
+  actionable long-body reference, and a continuation anchor. Bare ACK/mailbox-
+  ID prompts are invalid for real messages. System notices, nudges, and
+  wait-timeout reminders use the same full prompt path.
 - On `[MAIL]`, read the referenced mailbox body first, decide whether to
   collaborate, defer, or reject, send one substantive result/evidence/next-step
-  reply when required, ack processed IDs, then resume its own task.
+  reply when required, ack processed IDs, then execute the current run's next
+  product/verification step. A reply is work input, not a reason to idle; if no
+  next step is recorded, derive one from the active claim/task and execute it.
+- Receive state machine: `MAIL_RECEIVED -> READ_BODY -> DECIDE ->
+  REPLY_IF_REQUESTED -> ACK -> RESUME_OWN_TASK -> REPORT`. `ACK` is not a
+  terminal state. "Received", "unread 0", "monitor", and "await next request"
+  are not substantive completion reports. If the pane is busy, consume the
+  pending prompt at the next turn before unrelated work.
+- Blocking waits are bounded at five minutes for foreground work. On timeout,
+  inspect the current run/claim next step and continue immediately if a safe
+  action exists; report blocked with evidence only if no safe action remains.
 
 ## Out of scope (explicit)
 

@@ -1,8 +1,14 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Best-effort tmux knock. Never fails the caller's operation: delivery truth
-/// lives in the mailbox, the knock is only a wake-up signal.
+/// Live tmux prompt for the recipient pane. Mailbox truth remains the
+/// authoritative delivery record; this knock only wakes the recipient with
+/// the reasoning prompt. Text + carriage return are two distinct `tmux
+/// send-keys` calls. Codex TUI consumes `C-m` as the submit key; the tmux
+/// `Enter` key name can leave text in the editor instead of submitting it.
+/// Live verification is done by a consumer harness in tests, not by
+/// `capture-pane`, because terminal word-wrap makes visual line capture
+/// unreliable for long prompts.
 pub fn pane_alive(pane: &str) -> bool {
     Command::new("tmux")
         .args(["display-message", "-p", "-t", pane, "-F", "#{pane_id}"])
@@ -22,10 +28,10 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
         anyhow::bail!("tmux text delivery failed for pane {}", pane);
     }
     let submitted = Command::new("tmux")
-        .args(["send-keys", "-t", pane, "Enter"])
+        .args(["send-keys", "-t", pane, "C-m"])
         .status()?;
     if !submitted.success() {
-        anyhow::bail!("tmux Enter delivery failed for pane {}", pane);
+        anyhow::bail!("tmux carriage-return delivery failed for pane {}", pane);
     }
     Ok(())
 }
