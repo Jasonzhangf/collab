@@ -24,8 +24,8 @@ agents. `collab` gives them:
 ## Install
 
 ```sh
-cargo build --release
-install -m 755 target/release/collab ~/.local/bin/collab
+cargo install --path . --force
+which collab
 ```
 
 ## Usage

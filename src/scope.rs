@@ -38,7 +38,7 @@ pub const COLLAB_DOC: &str = r#"# collab workflow
 
 This project uses the local `collab` daemon for multi-agent coordination.
 The binary lives in `~/code/collab`; the installed command is
-`~/.local/bin/collab`.
+`~/.cargo/bin/collab`.
 
 ## Roles
 
