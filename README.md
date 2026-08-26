@@ -175,7 +175,8 @@ Outside tmux you can pass `--worker <id>` to act as a specific identity.
   sender receives an escalation notice after 15 minutes. If multiple replies
   are sent, earlier ones are marked `superseded` and only the newest is
   delivered.
-- Every send commits to the mailbox, then submits a tmux notification using the
+- Every send, including the five-minute wait-timeout continuation reminder,
+  commits to the mailbox, then submits a tmux notification using the
   verified zterm v1 sequence: literal text first
   (`tmux send-keys -t <pane> -l -- <text>`), then exactly one tmux Enter key
   (`tmux send-keys -t <pane> Enter`). Short content (up to 500 characters) is

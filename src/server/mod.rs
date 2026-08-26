@@ -172,14 +172,24 @@ fn timeout_prompt(kind: &str, worker_id: &str, timeout_ms: u64) -> String {
 }
 
 fn notify_wait_timeout(server: &Server, kind: &str, worker_id: &str, timeout_ms: u64) {
-    if let Some(pane) = server.state.lock().unwrap().worker_pane(worker_id) {
-        let id = gen_msg_id();
-        queue_system_knock(
-            server,
-            &pane,
-            &id,
-            &timeout_prompt(kind, worker_id, timeout_ms),
-        );
+    let body = timeout_prompt(kind, worker_id, timeout_ms);
+    let id = gen_msg_id();
+    let msg = Message {
+        id: id.clone(),
+        from: "collab-server".into(),
+        to: worker_id.into(),
+        mtype: "system".into(),
+        body: body.clone(),
+        in_reply_to: None,
+        created_ms: now_ms(),
+        state: "pending".into(),
+        nudge_count: 0,
+        last_nudge_ms: 0,
+    };
+    let pane = server.state.lock().unwrap().worker_pane(worker_id);
+    server.commit(&[Event::Sent { msg }]);
+    if let Some(pane) = pane {
+        queue_system_knock(server, &pane, &id, &body);
     }
 }
 
@@ -1494,6 +1504,18 @@ mod tests {
 
         let response = handle_poll(&server, "receiver".into(), 0);
         assert_eq!(response.data["timeout"], json!(true));
+        let (message_id, message_type) = {
+            let state = server.state.lock().unwrap();
+            let inbox = state.inbox_of("receiver");
+            assert_eq!(inbox.len(), 1);
+            (inbox[0].id.clone(), inbox[0].mtype.clone())
+        };
+        assert_eq!(message_type, "system");
+        let backup = root
+            .join(".agent-collab")
+            .join("mailbox")
+            .join(format!("{}.json", message_id));
+        assert!(backup.exists());
         assert!(std::fs::read_to_string(server.log_path())
             .unwrap()
             .contains("knock failed pane=%collab-test-missing-pane"));

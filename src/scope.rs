@@ -20,6 +20,8 @@ pub fn init(root: &Path) -> std::io::Result<PathBuf> {
         "handoff",
         "merge-queue",
         "panes",
+        "mailbox",
+        "messages",
         "mailboxes",
         "server",
     ] {
