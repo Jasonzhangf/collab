@@ -12,10 +12,18 @@ use std::time::Duration;
 /// `capture-pane`, because terminal word-wrap makes visual line capture
 /// unreliable for long prompts.
 pub fn pane_alive(pane: &str) -> bool {
+    // `tmux display-message -t <pane>` exits 0 even when the pane does not
+    // exist, so enumerate all panes and compare pane ids exactly.
     Command::new("tmux")
-        .args(["display-message", "-p", "-t", pane, "-F", "#{pane_id}"])
+        .args(["list-panes", "-a", "-F", "#{pane_id}"])
         .output()
-        .map(|o| o.status.success())
+        .ok()
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|id| id.trim() == pane)
+        })
         .unwrap_or(false)
 }
 

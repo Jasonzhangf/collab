@@ -4,7 +4,7 @@ pub mod timers;
 
 use crate::proto::{Req, Resp, MSG_TYPES};
 use crate::scope::Scope;
-use crate::server::knock::{append_log, knock_or_log};
+use crate::server::knock::{append_log, knock_or_log, pane_alive};
 use serde_json::json;
 use state::{
     default_role, now_ms, task_heartbeat_active, task_resource_active, Event, Message, State,
@@ -44,6 +44,7 @@ pub struct Server {
     pub root: PathBuf,
     pub state: Mutex<State>,
     pub journal: Mutex<std::fs::File>,
+    pub pane_alive_check: fn(&str) -> bool,
 }
 
 impl Server {
@@ -435,7 +436,8 @@ fn handle_task_dispatch(server: &Server, worker_id: String, token: String) -> Re
     if master.role != "master" {
         return Resp::err("only master may dispatch available tasks");
     }
-    let (dispatch_events, dispatch_knocks, dispatched) = dispatch_available_to_idle(&mut st);
+    let (dispatch_events, dispatch_knocks, dispatched) =
+        dispatch_available_to_idle(&mut st, &server.pane_alive_check);
     if !dispatch_events.is_empty() {
         server.commit_locked(&mut st, &dispatch_events);
     }
@@ -586,6 +588,7 @@ fn idle_worker_ids(st: &State) -> Vec<String> {
         .values()
         .filter(|w| {
             w.role == "worker"
+                && w.pane.is_some()
                 && !st
                     .tasks
                     .values()
@@ -617,6 +620,7 @@ fn assignment_body(task: &TaskRec, master_id: Option<&str>) -> String {
 
 fn dispatch_available_to_idle(
     st: &mut State,
+    is_reachable: &dyn Fn(&str) -> bool,
 ) -> (
     Vec<Event>,
     Vec<(String, String, String)>,
@@ -639,7 +643,14 @@ fn dispatch_available_to_idle(
     let mut events = Vec::new();
     let mut knocks = Vec::new();
     let mut assignments = Vec::new();
-    let mut idle = idle_worker_ids(st);
+    let mut idle: Vec<String> = idle_worker_ids(st)
+        .into_iter()
+        .filter(|worker_id| {
+            st.worker_pane(worker_id)
+                .as_deref()
+                .is_some_and(|pane| is_reachable(pane))
+        })
+        .collect();
     let master = st.master_id();
 
     for mut task in available {
@@ -647,13 +658,16 @@ fn dispatch_available_to_idle(
             break;
         }
         let worker_id = idle.remove(0);
+        let Some(pane) = st.worker_pane(&worker_id) else {
+            continue;
+        };
+        let body = assignment_body(&task, master.as_deref());
+        let mid = gen_msg_id();
         task.owner = worker_id.clone();
         task.status = "working".to_string();
         task.updated_ms = now_ms();
         task.last_heartbeat_sent_ms = now_ms();
 
-        let body = assignment_body(&task, master.as_deref());
-        let mid = gen_msg_id();
         let message = Message {
             id: mid.clone(),
             from: "collab-server".into(),
@@ -674,9 +688,7 @@ fn dispatch_available_to_idle(
             "status": task.status,
             "message": mid,
         }));
-        if let Some(pane) = st.worker_pane(&worker_id) {
-            knocks.push((pane, mid, body));
-        }
+        knocks.push((pane, mid, body));
     }
     (events, knocks, assignments)
 }
@@ -904,7 +916,8 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
     // Merge closure frees the feature/worktree resource. Reconcile the board
     // immediately so an already-published task reaches an idle worker without
     // another master approval round.
-    let (dispatch_events, dispatch_knocks, dispatched) = dispatch_available_to_idle(&mut st);
+    let (dispatch_events, dispatch_knocks, dispatched) =
+        dispatch_available_to_idle(&mut st, &server.pane_alive_check);
     if !dispatch_events.is_empty() {
         server.commit_locked(&mut st, &dispatch_events);
     }
@@ -1282,6 +1295,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         root: scope.root.clone(),
         state: Mutex::new(state),
         journal: Mutex::new(journal_file),
+        pane_alive_check: pane_alive,
     });
     let listener = UnixListener::bind(&sock_path)?;
 
@@ -1328,6 +1342,7 @@ mod tests {
             root: root.clone(),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
+            pane_alive_check: |_| true,
         };
         (server, root)
     }
@@ -1341,7 +1356,7 @@ mod tests {
             worker: WorkerRec {
                 id: id.into(),
                 token: format!("token-{id}"),
-                pane: None,
+                pane: (role == "worker").then(|| format!("%test-{id}")),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
                 role: role.into(),
@@ -1357,7 +1372,7 @@ mod tests {
                 pane: pane.map(str::to_string),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
-                role: default_role(),
+                role: default_role(), // empty role means worker is invisible to idle_worker_ids
             },
         }]);
     }
@@ -2221,6 +2236,105 @@ mod tests {
         let st = server.state.lock().unwrap();
         assert_eq!(st.tasks["dispatch-high"].status, "working");
         assert_eq!(st.tasks["dispatch-low"].owner, "worker-b");
+        drop(st);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dispatch_skips_registered_workers_without_a_live_pane() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: "worker-no-pane".into(),
+                token: "token-worker-no-pane".into(),
+                pane: None,
+                cwd: "/tmp".into(),
+                registered_ms: now_ms(),
+                role: "worker".into(),
+            },
+        }]);
+
+        let created = handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "dispatch-unreachable".into(),
+            None,
+            Some("feature-dispatch-unreachable".into()),
+            None,
+            None,
+            None,
+            default_priority(),
+        );
+        assert!(created.ok);
+
+        let mut st = server.state.lock().unwrap();
+        assert!(
+            idle_worker_ids(&st).is_empty(),
+            "worker with pane=None must not appear in idle list"
+        );
+        let (events, knocks, dispatched) = dispatch_available_to_idle(&mut st, &|_| true);
+        assert!(events.is_empty());
+        assert!(knocks.is_empty());
+        assert!(dispatched.is_empty());
+
+        assert_eq!(
+            st.tasks["dispatch-unreachable"].owner, "master",
+            "task must stay with master when no idle pane workers exist"
+        );
+        assert_eq!(
+            st.tasks["dispatch-unreachable"].status, "available",
+            "task must stay available"
+        );
+        drop(st);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dispatch_assigns_only_to_registered_workers_with_live_panes() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_with_pane(&server, "worker-live-pane", Some("%5"));
+
+        let created = handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "dispatch-reachable".into(),
+            None,
+            Some("feature-dispatch-reachable".into()),
+            None,
+            None,
+            None,
+            default_priority(),
+        );
+        assert!(created.ok);
+
+        let mut st = server.state.lock().unwrap();
+        assert_eq!(
+            idle_worker_ids(&st),
+            vec!["worker-live-pane"],
+            "idle list must contain exactly worker-live-pane"
+        );
+        let (events, knocks, dispatched) = dispatch_available_to_idle(&mut st, &|_| true);
+        for event in &events {
+            st.apply(event);
+        }
+        assert_eq!(events.len(), 2, "assignment message + task update");
+        assert_eq!(knocks.len(), 1);
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(
+            dispatched[0]["owner"], "worker-live-pane",
+            "task must be assigned to worker-live-pane"
+        );
+        assert_eq!(dispatched[0]["status"], "working");
+
+        assert_eq!(
+            st.tasks["dispatch-reachable"].owner, "worker-live-pane",
+            "task owner must be worker-live-pane after dispatch"
+        );
+        assert_eq!(st.tasks["dispatch-reachable"].status, "working");
         drop(st);
         std::fs::remove_dir_all(root).ok();
     }

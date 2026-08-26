@@ -183,6 +183,7 @@ mod tests {
                 root: root.clone(),
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
+                pane_alive_check: |_| true,
             }),
             root,
         )
