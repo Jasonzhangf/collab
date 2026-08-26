@@ -148,12 +148,49 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Init => {
             let cwd = std::env::current_dir()?;
-            if scope::find_root(&cwd).is_some() && cwd.join(".agent-collab").is_dir() {
-                out(&json!({"ok": true, "root": cwd, "note": "already initialized"}));
-                return Ok(());
+            if scope::find_root(&cwd).is_none() || !cwd.join(".agent-collab").is_dir() {
+                let _base = scope::init(&cwd)?;
             }
-            let base = scope::init(&cwd)?;
-            out(&json!({"ok": true, "created": base}));
+            let scope = Scope::resolve()?;
+            let sock = scope.sock_path();
+            let mut started = false;
+            if !client::alive(&sock) {
+                let exe = std::env::current_exe()?;
+                use std::os::unix::process::CommandExt;
+                let log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(scope.server_dir().join("log.txt"))?;
+                let err = log.try_clone()?;
+                std::process::Command::new(exe)
+                    .arg("serve")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(log)
+                    .stderr(err)
+                    .process_group(0)
+                    .spawn()?;
+                for _ in 0..40 {
+                    if client::alive(&sock) {
+                        started = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            let ident = me(&scope, None)?;
+            let role_resp: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::Role {
+                    worker_id: ident.worker_id.clone(),
+                },
+            )?;
+            out(&json!({
+                "ok": true,
+                "root": cwd,
+                "worker_id": ident.worker_id,
+                "role": role_resp["role"],
+                "daemon_started": started
+            }));
             Ok(())
         }
         Cmd::Serve => {

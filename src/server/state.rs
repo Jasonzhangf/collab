@@ -102,13 +102,15 @@ impl State {
     pub fn apply(&mut self, ev: &Event) {
         match ev {
             Event::Registered { worker } => {
-                let worker = if self.workers.is_empty() && worker.role != "master" {
-                    WorkerRec {
-                        role: "master".into(),
-                        ..worker.clone()
-                    }
-                } else {
-                    worker.clone()
+                let existing = self.workers.get(&worker.id);
+                let role = match existing {
+                    Some(prev) => prev.role.clone(),
+                    None if self.workers.is_empty() => "master".to_string(),
+                    None => worker.role.clone(),
+                };
+                let worker = WorkerRec {
+                    role: role.clone(),
+                    ..worker.clone()
                 };
                 self.workers.insert(worker.id.clone(), worker);
             }
