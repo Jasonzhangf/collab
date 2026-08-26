@@ -48,21 +48,21 @@ pub fn tick(server: &Arc<Server>) {
                 continue;
             }
             let k = m.nudge_count + 1;
-            // receiver reminder
-            if let Some(pane) = st.worker_pane(&m.to) {
-                knocks.push((pane, knock_line(&m.id, &m.from)));
+            // The recipient gets exactly one knock per request; later ticks do
+            // not repeat the same wake-up while the request remains pending.
+            if k == 1 {
+                if let Some(pane) = st.worker_pane(&m.to) {
+                    knocks.push((pane, knock_line(&m.id, &m.from)));
+                }
+                evs.push(sent_system(&m.to, nudge_body(&m.id, &m.from)));
             }
-            evs.push(sent_system(&m.to, nudge_body(&m.id, &m.from)));
-            // sender progress / escalation
-            let sender_body = if k >= MAX_NUDGES {
-                format!(
+            if k >= MAX_NUDGES {
+                let sender_body = format!(
                     "ESCALATE: request '{}' to {} has no reply after {} nudges; stop waiting and escalate per protocol",
                     m.id, m.to, MAX_NUDGES
-                )
-            } else {
-                format!("request '{}' to {} still unanswered (nudge {}/{})", m.id, m.to, k, MAX_NUDGES)
-            };
-            evs.push(sent_system(&m.from, sender_body));
+                );
+                evs.push(sent_system(&m.from, sender_body));
+            }
             evs.push(Event::Nudged { msg_id: m.id.clone() });
         }
     }

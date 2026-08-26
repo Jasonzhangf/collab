@@ -24,11 +24,13 @@ pub struct Message {
     pub body: String,
     pub in_reply_to: Option<String>,
     pub created_ms: i64,
-    /// pending -> delivered -> read
+    /// pending -> delivered -> read; replies may also become superseded.
     pub state: String,
     pub nudge_count: u32,
     pub last_nudge_ms: i64,
 }
+
+pub const REQUEST_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueEntry {
@@ -70,6 +72,7 @@ pub enum Event {
     ClaimExpiredNotified { id: String },
     ClaimQueued { id: String, worker_id: String },
     Nudged { msg_id: String },
+    Superseded { ids: Vec<String> },
 }
 
 #[derive(Default)]
@@ -101,6 +104,13 @@ impl State {
                 for id in ids {
                     if let Some(m) = self.msgs.get_mut(id) {
                         m.state = "read".into();
+                    }
+                }
+            }
+            Event::Superseded { ids } => {
+                for id in ids {
+                    if let Some(m) = self.msgs.get_mut(id) {
+                        m.state = "superseded".into();
                     }
                 }
             }
@@ -165,7 +175,9 @@ impl State {
         let mut v: Vec<&Message> = self
             .msgs
             .values()
-            .filter(|m| m.to == worker_id && m.state != "read")
+            .filter(|m| {
+                m.to == worker_id && m.state != "read" && m.state != "superseded"
+            })
             .collect();
         v.sort_by_key(|m| m.created_ms);
         v
@@ -174,6 +186,47 @@ impl State {
     /// True when some other message is a reply to `msg`.
     pub fn answered(&self, msg_id: &str) -> bool {
         self.msgs.values().any(|m| m.in_reply_to.as_deref() == Some(msg_id))
+    }
+
+    /// One live request per direction during the cooldown window.
+    pub fn recent_live_request(
+        &self,
+        from: &str,
+        to: &str,
+        now_ms: i64,
+    ) -> Option<(&String, &Message)> {
+        self.msgs.iter().find(|(_, m)| {
+            m.from == from
+                && m.to == to
+                && m.mtype == "request"
+                && m.state != "read"
+                && !self.answered(&m.id)
+                && now_ms - m.created_ms < REQUEST_COOLDOWN_MS
+        })
+    }
+
+    /// Earlier replies remain journaled, but only the newest one is active.
+    pub fn superseded_replies(&self, request_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .msgs
+            .values()
+            .filter(|m| {
+                m.mtype == "reply"
+                    && m.in_reply_to.as_deref() == Some(request_id)
+                    && m.state != "superseded"
+            })
+            .map(|m| m.id.clone())
+            .collect();
+        ids.sort_by(|a, b| {
+            let rank = |id: &str| {
+                self.msgs
+                    .get(id)
+                    .map(|m| (m.created_ms, m.id.clone()))
+                    .unwrap_or_default()
+            };
+            rank(a).cmp(&rank(b))
+        });
+        ids
     }
 
     pub fn worker_pane(&self, worker_id: &str) -> Option<String> {
@@ -225,6 +278,53 @@ mod tests {
         st.apply(&Event::Sent { msg: reply });
         assert!(st.answered("m1"));
         assert!(!st.answered("m2"));
+    }
+
+    #[test]
+    fn request_cooldown_uses_only_recent_live_request() {
+        let mut st = State::default();
+        let mut request = msg("request", "w2", "request");
+        request.from = "w1".into();
+        request.created_ms = 500;
+        st.apply(&Event::Sent { msg: request });
+
+        let (id, _) = st
+            .recent_live_request("w1", "w2", 500 + REQUEST_COOLDOWN_MS - 1)
+            .expect("recent live request blocks a new send");
+        assert_eq!(id, "request");
+        assert!(st
+            .recent_live_request("w1", "w2", 500 + REQUEST_COOLDOWN_MS)
+            .is_none());
+    }
+
+    #[test]
+    fn latest_reply_supersedes_previous_replies() {
+        let mut st = State::default();
+        st.apply(&Event::Sent { msg: msg("request", "w1", "request") });
+
+        let mut first = msg("reply-1", "w1", "reply");
+        first.in_reply_to = Some("request".into());
+        first.created_ms = 2;
+        st.apply(&Event::Sent { msg: first });
+        let stale_replies = st.superseded_replies("request");
+
+        let mut latest = msg("reply-2", "w1", "reply");
+        latest.in_reply_to = Some("request".into());
+        latest.created_ms = 3;
+        st.apply(&Event::Sent { msg: latest });
+        st.apply(&Event::Superseded { ids: stale_replies });
+
+        assert!(st.answered("request"));
+        assert_eq!(st.msgs["reply-1"].state, "superseded");
+        assert_eq!(st.msgs["reply-2"].state, "pending");
+        assert_eq!(
+            st.inbox_of("w1")
+                .iter()
+                .filter(|m| m.mtype == "reply")
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reply-2"]
+        );
     }
 
     #[test]

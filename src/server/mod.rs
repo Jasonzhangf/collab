@@ -31,6 +31,10 @@ impl Server {
     /// Apply events to memory and persist them atomically-ordered in the journal.
     fn commit(&self, evs: &[Event]) {
         let mut st = self.state.lock().unwrap();
+        self.commit_locked(&mut st, evs);
+    }
+
+    fn commit_locked(&self, st: &mut State, evs: &[Event]) {
         let mut j = self.journal.lock().unwrap();
         use std::io::Write;
         for ev in evs {
@@ -51,6 +55,60 @@ pub fn gen_msg_id() -> String {
 
 fn knock_text(from: &str, mtype: &str, msg_id: &str) -> String {
     format!("[MAIL] from={} type={} id={}", from, mtype, msg_id)
+}
+
+const LONG_BODY_THRESHOLD_CHARS: usize = 500;
+
+fn message_doc_path(root: &Path, msg_id: &str) -> PathBuf {
+    root.join(".agent-collab").join("messages").join(format!("{msg_id}.md"))
+}
+
+fn write_message_doc(root: &Path, msg_id: &str, body: &str) -> anyhow::Result<PathBuf> {
+    let path = message_doc_path(root, msg_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+fn one_line(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+fn delivery_text(
+    root: &Path,
+    from: &str,
+    mtype: &str,
+    msg_id: &str,
+    body: &str,
+) -> Result<String, String> {
+    let prefix = format!("[MAIL] from={} type={} id={}:", from, mtype, msg_id);
+    let next = "next=\"Read mailbox body; collaborate, defer, or reject with reason; reply if requested.\"";
+    if body.chars().count() <= LONG_BODY_THRESHOLD_CHARS {
+        return Ok(format!("{prefix} {} | {next}", one_line(body)));
+    }
+    let path = write_message_doc(root, msg_id, body)
+        .map_err(|e| format!("cannot store long message {}: {e}", msg_id))?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|e| format!("cannot make message reference relative: {e}"))?;
+    Ok(format!(
+        "{prefix} body-ref={} {next}",
+        relative.display()
+    ))
+}
+
+fn notify_wait_timeout(server: &Server, kind: &str, worker_id: &str, timeout_ms: u64) {
+    if let Some(pane) = server.state.lock().unwrap().worker_pane(worker_id) {
+        knock_or_log(
+            &server.log_path(),
+            &pane,
+            &format!("[MAIL] {kind}-timeout worker={} timeout_ms={timeout_ms}", worker_id),
+        );
+    }
 }
 
 fn iso(ms: i64) -> String {
@@ -104,7 +162,7 @@ fn handle_send(
     if !MSG_TYPES.contains(&mtype.as_str()) {
         return Resp::err(format!("invalid type {}; must be one of {:?}", mtype, MSG_TYPES));
     }
-    let st = server.state.lock().unwrap();
+    let mut st = server.state.lock().unwrap();
     if !st.workers.contains_key(&to) {
         return Resp::err(format!("recipient {} not registered", to));
     }
@@ -113,11 +171,23 @@ fn handle_send(
             return Resp::err(format!("in_reply_to message {} not found", rid));
         }
     }
-    let pane = st.worker_pane(&to);
+    if mtype == "request" {
+        if let Some((existing_id, existing)) = st.recent_live_request(&from, &to, now_ms()) {
+            let retry_at = iso(existing.created_ms + state::REQUEST_COOLDOWN_MS);
+            return Resp::err(format!(
+                "request cooldown active: existing_request_id={}, retry_at={}",
+                existing_id, retry_at
+            ));
+        }
+    }
+    let superseded_ids = match (mtype.as_str(), in_reply_to.as_deref()) {
+        ("reply", Some(request_id)) => st.superseded_replies(request_id),
+        _ => Vec::new(),
+    };
     let msg = Message {
         id: gen_msg_id(),
         from: from.clone(),
-        to,
+        to: to.clone(),
         mtype: mtype.clone(),
         body,
         in_reply_to,
@@ -127,10 +197,20 @@ fn handle_send(
         last_nudge_ms: 0,
     };
     let mid = msg.id.clone();
+    let delivery = delivery_text(&server.root, &from, &mtype, &mid, &msg.body);
+    let delivery = match delivery {
+        Ok(text) => text,
+        Err(e) => return Resp::err(e),
+    };
+    let mut events = vec![Event::Sent { msg }];
+    if !superseded_ids.is_empty() {
+        events.push(Event::Superseded { ids: superseded_ids });
+    }
+    let pane = st.worker_pane(&to);
+    server.commit_locked(&mut st, &events);
     drop(st);
-    server.commit(&[Event::Sent { msg }]);
     if let Some(p) = pane {
-        knock_or_log(&server.log_path(), &p, &knock_text(&from, &mtype, &mid));
+        knock_or_log(&server.log_path(), &p, &delivery);
     }
     Resp::data(json!({"msg_id": mid}))
 }
@@ -161,6 +241,7 @@ fn handle_poll(server: &Server, worker_id: String, timeout_ms: u64) -> Resp {
             }));
         }
         if Instant::now() >= deadline {
+            notify_wait_timeout(server, "wait", &worker_id, timeout_ms);
             return Resp::data(json!({"messages": [], "count": 0, "timeout": true}));
         }
         std::thread::sleep(Duration::from_millis(POLL_TICK_MS));
@@ -350,6 +431,7 @@ fn handle_claim_wait(server: &Arc<Server>, worker_id: String, claim_id: String, 
             }
         }
         if Instant::now() >= deadline {
+            notify_wait_timeout(server, "claim-wait", &worker_id, timeout_ms);
             return Resp::data(json!({"claim": claim_id, "wait_status": "timeout"}));
         }
         std::thread::sleep(Duration::from_millis(POLL_TICK_MS));
@@ -536,5 +618,204 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
             }
             Err(e) => append_log(&server_dir.join("log.txt"), &format!("accept error: {}", e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_server() -> (Server, PathBuf) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("collab-send-filter-{}-{n}", std::process::id()));
+        let server_dir = root.join(".agent-collab/server");
+        std::fs::create_dir_all(&server_dir).unwrap();
+        let journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(server_dir.join("journal.jsonl"))
+            .unwrap();
+        let server = Server {
+            root: root.clone(),
+            state: Mutex::new(State::default()),
+            journal: Mutex::new(journal),
+        };
+        (server, root)
+    }
+
+    fn register(server: &Server, id: &str) {
+        register_with_pane(server, id, None);
+    }
+
+    fn register_with_pane(server: &Server, id: &str, pane: Option<&str>) {
+        server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: id.into(),
+                token: format!("token-{id}"),
+                pane: pane.map(str::to_string),
+                cwd: "/tmp".into(),
+                registered_ms: now_ms(),
+            },
+        }]);
+    }
+
+    fn send(
+        server: &Server,
+        from: &str,
+        to: &str,
+        mtype: &str,
+        body: &str,
+        in_reply_to: Option<String>,
+    ) -> Resp {
+        handle_send(
+            server,
+            from.into(),
+            to.into(),
+            mtype.into(),
+            body.into(),
+            in_reply_to,
+        )
+    }
+
+    #[test]
+    fn duplicate_direction_request_is_rate_limited() {
+        let (server, root) = test_server();
+        register(&server, "sender");
+        register(&server, "receiver");
+
+        let first = send(&server, "sender", "receiver", "request", "first", None);
+        assert!(first.ok);
+        let first_id = first.data["msg_id"].as_str().unwrap().to_string();
+
+        let second = send(&server, "sender", "receiver", "request", "second", None);
+        assert!(!second.ok);
+        assert!(second.error.unwrap().contains(&format!(
+            "existing_request_id={first_id}"
+        )));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn repeated_replies_deliver_only_latest() {
+        let (server, root) = test_server();
+        register(&server, "asker");
+        register(&server, "answerer");
+
+        let request = send(&server, "asker", "answerer", "request", "question", None);
+        let request_id = request.data["msg_id"].as_str().unwrap().to_string();
+        send(&server, "answerer", "asker", "reply", "old", Some(request_id.clone()));
+        let latest = send(
+            &server,
+            "answerer",
+            "asker",
+            "reply",
+            "latest",
+            Some(request_id),
+        );
+        let latest_id = latest.data["msg_id"].as_str().unwrap().to_string();
+
+        let st = server.state.lock().unwrap();
+        assert_eq!(
+            st.inbox_of("asker").iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![latest_id.as_str()]
+        );
+        drop(st);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn concurrent_requests_cannot_bypass_cooldown() {
+        let (server, root) = test_server();
+        register(&server, "sender");
+        register(&server, "receiver");
+        let server = Arc::new(server);
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let server = server.clone();
+                std::thread::spawn(move || {
+                    send(&server, "sender", "receiver", "request", &format!("r{i}"), None)
+                })
+            })
+            .collect();
+        let accepted = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .filter(|resp| resp.ok)
+            .count();
+
+        assert_eq!(accepted, 1);
+        assert_eq!(server.state.lock().unwrap().msgs.len(), 1);
+        drop(server);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn recv_timeout_logs_submitted_tmux_reminder() {
+        let (server, root) = test_server();
+        register_with_pane(&server, "receiver", Some("%collab-test-missing-pane"));
+
+        let response = handle_poll(&server, "receiver".into(), 0);
+        assert_eq!(response.data["timeout"], json!(true));
+        assert!(std::fs::read_to_string(server.log_path())
+            .unwrap()
+            .contains("knock failed pane=%collab-test-missing-pane"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claim_wait_timeout_logs_submitted_tmux_reminder() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        register_with_pane(&server, "waiter", Some("%collab-test-missing-pane"));
+        server.commit(&[Event::ClaimAcquired {
+            id: "build".into(),
+            owner: "owner".into(),
+            intent: None,
+            lease_until_ms: i64::MAX / 2,
+            at_ms: now_ms(),
+        }]);
+
+        let server = Arc::new(server);
+        let response = handle_claim_wait(&server, "waiter".into(), "build".into(), 0);
+        assert_eq!(response.data["wait_status"], json!("timeout"));
+        assert!(std::fs::read_to_string(server.log_path())
+            .unwrap()
+            .contains("knock failed pane=%collab-test-missing-pane"));
+        drop(server);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn short_delivery_is_single_line_and_bounded() {
+        let (_, root) = test_server();
+        let body = "x".repeat(500);
+        let text = delivery_text(&root, "sender", "notify", "m1", &body).unwrap();
+        assert!(text.starts_with("[MAIL] from=sender type=notify id=m1: "));
+        assert!(text.contains(&body));
+        assert!(text.contains("Read mailbox body"));
+        assert!(text.chars().count() <= 700);
+        assert!(!text.contains('\n'));
+        assert!(!message_doc_path(&root, "m1").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn long_delivery_stores_body_and_sends_reference() {
+        let root = std::env::temp_dir().join("collab-delivery-long-test");
+        let body = "long message\n".repeat(100);
+        let text = delivery_text(&root, "sender", "notify", "m2", &body).unwrap();
+        assert!(text.chars().count() <= 200);
+        assert!(text.contains("body-ref=.agent-collab/messages/m2.md"));
+        assert!(text.contains("collaborate, defer, or reject"));
+        assert_eq!(
+            std::fs::read_to_string(message_doc_path(&root, "m2")).unwrap(),
+            body
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 }

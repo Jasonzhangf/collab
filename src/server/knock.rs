@@ -15,10 +15,18 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if !pane_alive(pane) {
         anyhow::bail!("pane {} not alive", pane);
     }
-    Command::new("tmux")
+    let sent = Command::new("tmux")
         .args(["send-keys", "-t", pane, "-l", text])
         .status()?;
-    Command::new("tmux").args(["send-keys", "-t", pane, "Enter"]).status()?;
+    if !sent.success() {
+        anyhow::bail!("tmux text delivery failed for pane {}", pane);
+    }
+    let submitted = Command::new("tmux")
+        .args(["send-keys", "-t", pane, "Enter"])
+        .status()?;
+    if !submitted.success() {
+        anyhow::bail!("tmux Enter delivery failed for pane {}", pane);
+    }
     Ok(())
 }
 

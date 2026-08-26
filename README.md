@@ -14,8 +14,11 @@ agents. `collab` gives them:
 - resource claims with leases and FIFO waiting queues
 - tmux knock: when a message lands, the server types `[MAIL] ...` into the
   target worker's tmux pane, waking the agent immediately
-- server-side timers: lease expiry watch, unanswered-request nudges (5 min,
-  escalate after 3), all journaled
+- server-side timers: lease expiry watch, unanswered-request nudges (one
+  recipient reminder after 5 min, sender escalation after 15 min), all journaled
+- request filtering: one live request per sender/recipient direction during a
+  5-minute cooldown; duplicate replies are superseded so only the newest one is
+  delivered
 
 ## Install
 
@@ -68,10 +71,24 @@ Outside tmux you can pass `--worker <id>` to act as a specific identity.
 - FIFO: waiters are queued on first `claim wait` / failed acquire; on release
   the claim is reserved for the longest-waiter.
 - Messaging: `notify` (no reply), `request` (exactly one reply expected),
-  `reply` (`--in-reply-to`). Unanswered requests get a nudge every 5 minutes;
-  after 3 nudges the sender receives an escalation notice.
-- tmux knock is a wake-up signal only — the mailbox is the source of truth.
-  Knocks are skipped for panes that no longer exist.
+  `reply` (`--in-reply-to`). New requests from the same sender to the same
+  recipient are rejected during a 5-minute cooldown while an earlier request is
+  still unanswered. The recipient receives one nudge after 5 minutes; the
+  sender receives an escalation notice after 15 minutes. If multiple replies
+  are sent, earlier ones are marked `superseded` and only the newest is
+  delivered.
+- Every send commits to the mailbox, then submits a tmux notification with
+  Enter. Short content (up to 500 characters) is sent once inline. Longer
+  content is stored under `.agent-collab/messages/<message-id>.md`, while tmux
+  receives only a short `body-ref=<path>` reference. A timed-out blocking `recv` or
+  `claim wait` also produces one submitted timeout reminder. Knock failures are
+  logged when panes no longer exist; mailbox state remains authoritative.
+- A tmux delivery is a reasoning prompt carrying `from`, the full short body or
+  actionable long-body reference, and next action. Bare ACK/mailbox-ID prompts
+  are invalid for real messages.
+- On `[MAIL]`, read the referenced mailbox body first, decide whether to
+  collaborate, defer, or reject, send one substantive result/evidence/next-step
+  reply when required, ack processed IDs, then resume its own task.
 
 ## Out of scope (explicit)
 
