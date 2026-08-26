@@ -25,8 +25,67 @@ pub fn init(root: &Path) -> std::io::Result<PathBuf> {
     ] {
         std::fs::create_dir_all(base.join(sub))?;
     }
+    let docs = root.join("docs");
+    std::fs::create_dir_all(&docs)?;
+    let collab_doc = docs.join("collab.md");
+    if !collab_doc.exists() {
+        std::fs::write(&collab_doc, COLLAB_DOC)?;
+    }
     Ok(base)
 }
+
+pub const COLLAB_DOC: &str = r#"# collab workflow
+
+This project uses the local `collab` daemon for multi-agent coordination.
+The binary lives in `~/code/collab`; the installed command is
+`~/.local/bin/collab`.
+
+## Roles
+
+- First registered pane becomes `master`; every later pane becomes `worker`.
+- Master creates tasks, reviews deliveries, merges, closes tasks, and cleans
+  declared worktrees after merge.
+- Workers claim `available` tasks and work independently. They do not request
+  claim approval and do not register tasks.
+- Check identity with `collab role`, `collab who`, or `collab master`.
+
+## Task lifecycle
+
+```
+available -> working -> verifying -> reviewed -> delivered
+          -> master merge -> close/cleanup -> closed
+          -> rework -> working
+```
+
+Task records use a fixed shape:
+`id / owner / feature_id / worktree_path / branch / base_commit / priority /
+status`. Valid statuses are `available`, `working`, `verifying`, `reviewed`,
+`delivered`, `rework`, `merged`, `closed`, and `cancelled`.
+
+## Common commands
+
+```sh
+collab config                     # show .agent-collab/collab.json
+collab config --heartbeat-minutes 45
+collab who                        # workers + active task status
+collab task status [task-id]      # board or one task
+collab task register <id> --feature <feature-id> --worktree <path> \
+  --branch <branch> --base-commit <sha> --priority p2
+collab task claim <id>            # worker self-service
+collab task deliver <id> --evidence "commit=<sha>; gates=pass"
+collab task update <id> --status merged
+collab task close <id>            # master; verifies merged/clean then cleans
+```
+
+## Heartbeat and dispatch
+
+Only workers with an active claim receive heartbeats. `collab who` exposes
+`active_task` and `active_status` for every worker, so master can dispatch to
+idle workers without messaging busy ones.
+
+`.agent-collab/collab.json` configures the heartbeat interval. The daemon
+reloads it without a restart; invalid values fail closed to the default.
+"#;
 
 /// Scope guard used by every command except init.
 pub struct Scope {
@@ -49,5 +108,32 @@ impl Scope {
     }
     pub fn sock_path(&self) -> PathBuf {
         self.server_dir().join("server.sock")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_releases_collab_doc_only_once() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-scope-init-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        init(&root).unwrap();
+        let path = root.join("docs/collab.md");
+        assert!(path.exists());
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("# collab workflow"));
+
+        init(&root).unwrap();
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first, second);
+        std::fs::remove_dir_all(root).ok();
     }
 }

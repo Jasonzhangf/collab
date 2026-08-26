@@ -1,10 +1,17 @@
+use crate::config;
 use crate::server::state::{now_ms, task_heartbeat_active, Event, Message, TaskRec};
 use crate::server::Server;
+use crate::server::ROOT;
 use std::sync::Arc;
 
-const HEARTBEAT_INTERVAL_MS: i64 = 15 * 60 * 1000;
 const NUDGE_INTERVAL_MS: i64 = 5 * 60 * 1000;
 const MAX_NUDGES: u32 = 3;
+
+fn heartbeat_interval_ms(_server: &Server) -> i64 {
+    config::load_or_default(&ROOT.with(|root| root.borrow().clone()))
+        .heartbeat_minutes
+        .saturating_mul(60 * 1000)
+}
 
 fn heartbeat_body(
     task_id: &str,
@@ -15,12 +22,13 @@ fn heartbeat_body(
     pane: Option<&str>,
 ) -> String {
     format!(
-        "[COLLAB HEARTBEAT] from=collab-server master={} task={} owner={} status={} pane={} next={} | Process this task heartbeat now: read the task mailbox and current run notes; report to master only for a state change, blocker, ETA change, decision, verification, or handoff; otherwise continue the task next step immediately. Do not wait for another message.",
+        "[COLLAB HEARTBEAT] from=collab-server master={} task={} owner={} status={} pane={} next={} | You have an active claim. Run collab role and collab task status {}; report to master only for a state change, blocker, ETA change, decision, verification, or handoff; otherwise continue the task next step immediately. Do not wait for another message.",
         master.unwrap_or("unassigned"),
         task_id,
         owner,
         status,
         pane.unwrap_or("unknown"),
+        task_id,
         next_step.unwrap_or("inspect task state; continue the next safe step")
     )
 }
@@ -40,7 +48,7 @@ pub fn tick(server: &Arc<Server>) {
             if !task_heartbeat_active(&task.status) || task.heartbeat_pending {
                 continue;
             }
-            if now - task.last_heartbeat_sent_ms < HEARTBEAT_INTERVAL_MS {
+            if now - task.last_heartbeat_sent_ms < heartbeat_interval_ms(server) {
                 continue;
             }
             let pane = st.worker_pane(&task.owner);
@@ -205,6 +213,7 @@ mod tests {
                 worktree_path: Some("/tmp/wt".into()),
                 branch: None,
                 base_commit: None,
+                priority: "p2".into(),
                 status: status.into(),
                 next_step: Some("continue".into()),
                 created_ms: now,
@@ -227,7 +236,7 @@ mod tests {
             "t1",
             "owner",
             "working",
-            now_ms() - HEARTBEAT_INTERVAL_MS - 1000,
+            now_ms() - heartbeat_interval_ms(&server) - 1000,
         );
 
         tick(&server);

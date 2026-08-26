@@ -13,6 +13,10 @@ pub fn default_task_status() -> String {
     "working".into()
 }
 
+pub fn default_priority() -> String {
+    "p2".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRec {
     pub id: String,
@@ -55,6 +59,8 @@ pub struct TaskRec {
     pub branch: Option<String>,
     #[serde(default)]
     pub base_commit: Option<String>,
+    #[serde(default = "default_priority")]
+    pub priority: String,
     #[serde(default = "default_task_status")]
     pub status: String,
     #[serde(default)]
@@ -69,7 +75,10 @@ pub struct TaskRec {
 }
 
 pub fn task_heartbeat_active(status: &str) -> bool {
-    !matches!(status, "available" | "delivered" | "merged" | "closed" | "cancelled")
+    !matches!(
+        status,
+        "available" | "delivered" | "merged" | "closed" | "cancelled"
+    )
 }
 
 pub fn task_resource_active(status: &str) -> bool {
@@ -107,6 +116,16 @@ impl State {
                     Some(prev) => prev.role.clone(),
                     None if self.workers.is_empty() => "master".to_string(),
                     None => worker.role.clone(),
+                };
+                let role = if role == "master"
+                    && self
+                        .workers
+                        .values()
+                        .any(|w| w.id != worker.id && w.role == "master")
+                {
+                    "worker".to_string()
+                } else {
+                    role
                 };
                 let worker = WorkerRec {
                     role: role.clone(),
@@ -266,6 +285,32 @@ mod tests {
         });
         assert_eq!(st.msgs["m1"].state, "read");
         assert!(st.inbox_of("w2").is_empty());
+    }
+
+    #[test]
+    fn first_master_survives_duplicate_master_registration() {
+        let mut st = State::default();
+        let first = WorkerRec {
+            id: "first".into(),
+            token: "t1".into(),
+            pane: None,
+            cwd: "/tmp".into(),
+            registered_ms: 1,
+            role: "master".into(),
+        };
+        let second = WorkerRec {
+            id: "second".into(),
+            token: "t2".into(),
+            pane: None,
+            cwd: "/tmp".into(),
+            registered_ms: 2,
+            role: "master".into(),
+        };
+        st.apply(&Event::Registered { worker: first });
+        st.apply(&Event::Registered { worker: second });
+
+        assert_eq!(st.workers["first"].role, "master");
+        assert_eq!(st.workers["second"].role, "worker");
     }
 
     #[test]

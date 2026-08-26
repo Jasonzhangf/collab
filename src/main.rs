@@ -1,4 +1,5 @@
 mod client;
+mod config;
 mod identity;
 mod proto;
 mod scope;
@@ -34,6 +35,10 @@ enum Cmd {
     Status,
     /// Show your current role (master if first registered, otherwise worker)
     Role,
+    /// List all registered workers with roles; shows who is master
+    Who,
+    /// Show the current master worker id
+    Master,
     /// Get or create your worker identity and announce your tmux pane
     Whoami {
         #[arg(long)]
@@ -78,6 +83,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// Show or update project-local .agent-collab/collab.json
+    Config {
+        /// New heartbeat interval in minutes
+        #[arg(long)]
+        heartbeat_minutes: Option<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -95,6 +106,12 @@ enum TaskCmd {
         branch: Option<String>,
         #[arg(long)]
         base_commit: Option<String>,
+        /// Dispatch priority: p0 (highest) through p4
+        #[arg(long)]
+        priority: Option<String>,
+        /// Next step hint for the assigned worker
+        #[arg(long)]
+        next: Option<String>,
     },
     /// Update task status/next step by the task owner or master
     Update {
@@ -104,8 +121,18 @@ enum TaskCmd {
         #[arg(long)]
         next: Option<String>,
     },
-    /// Claim an available task (transitions it to working with you as owner)
+    /// Claim an available task (transfers ownership and starts work)
     Claim { id: String },
+    /// Complete a claim atomically, notify master, and return available tasks
+    Deliver {
+        id: String,
+        #[arg(long)]
+        evidence: Option<String>,
+    },
+    /// Close a merged task and clean up its declared worktree/branch
+    Close { id: String },
+    /// Dispatch available tasks to idle workers in priority order (master only)
+    Dispatch,
     /// Show task registry
     Status { id: Option<String> },
 }
@@ -246,6 +273,18 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&v);
             Ok(())
         }
+        Cmd::Who => {
+            let scope = Scope::resolve()?;
+            let v: serde_json::Value = client::call(&scope.sock_path(), &Req::Workers)?;
+            out(&v);
+            Ok(())
+        }
+        Cmd::Master => {
+            let scope = Scope::resolve()?;
+            let v: serde_json::Value = client::call(&scope.sock_path(), &Req::MasterId)?;
+            out(&v);
+            Ok(())
+        }
         Cmd::Whoami { worker, pane } => {
             let scope = Scope::resolve()?;
             let ident = identity::load_or_create(&scope, worker, pane)?;
@@ -340,6 +379,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     worktree,
                     branch,
                     base_commit,
+                    priority,
+                    next,
                 } => Req::TaskRegister {
                     worker_id: ident.worker_id,
                     token: ident.token,
@@ -349,6 +390,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     worktree_path: worktree,
                     branch,
                     base_commit,
+                    priority: priority.unwrap_or_else(crate::server::state::default_priority),
+                    next_step: next,
                 },
                 TaskCmd::Update { id, status, next } => Req::TaskUpdate {
                     worker_id: ident.worker_id,
@@ -362,10 +405,38 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     token: ident.token,
                     task_id: id,
                 },
+                TaskCmd::Deliver { id, evidence } => Req::TaskDeliver {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    task_id: id,
+                    evidence,
+                },
+                TaskCmd::Close { id } => Req::TaskClose {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    task_id: id,
+                },
+                TaskCmd::Dispatch => Req::TaskDispatch {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                },
                 TaskCmd::Status { id } => Req::TaskStatus { task_id: id },
             };
             let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
             out(&v);
+            Ok(())
+        }
+        Cmd::Config { heartbeat_minutes } => {
+            let scope = Scope::resolve()?;
+            let mut config = config::load(&scope.root)?;
+            if let Some(minutes) = heartbeat_minutes {
+                config.heartbeat_minutes = minutes;
+                config::save(&scope.root, &config)?;
+            }
+            out(&json!({
+                "path": scope.root.join(".agent-collab").join("collab.json"),
+                "config": config,
+            }));
             Ok(())
         }
     }

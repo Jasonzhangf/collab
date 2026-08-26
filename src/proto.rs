@@ -44,6 +44,9 @@ pub enum Req {
         worktree_path: Option<String>,
         branch: Option<String>,
         base_commit: Option<String>,
+        #[serde(default = "crate::server::state::default_priority")]
+        priority: String,
+        next_step: Option<String>,
     },
     TaskUpdate {
         worker_id: String,
@@ -57,6 +60,21 @@ pub enum Req {
         token: String,
         task_id: String,
     },
+    TaskDeliver {
+        worker_id: String,
+        token: String,
+        task_id: String,
+        evidence: Option<String>,
+    },
+    TaskClose {
+        worker_id: String,
+        token: String,
+        task_id: String,
+    },
+    TaskDispatch {
+        worker_id: String,
+        token: String,
+    },
     TaskStatus {
         task_id: Option<String>,
     },
@@ -67,6 +85,8 @@ pub enum Req {
     Role {
         worker_id: String,
     },
+    Workers,
+    MasterId,
     Ping,
 }
 
