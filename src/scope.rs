@@ -48,6 +48,8 @@ The binary lives in `~/code/collab`; the installed command is
 - Workers claim `available` tasks and work independently. They do not request
   claim approval and do not register tasks.
 - Check identity with `collab role`, `collab who`, or `collab master`.
+- If a message names a different role or owner, confirm identity first and
+  return the owner contact; do not act outside your role.
 
 ## Task lifecycle
 
@@ -77,6 +79,17 @@ collab task update <id> --status merged
 collab task close <id>            # master; verifies merged/clean then cleans
 ```
 
+## Message handling
+
+On `[MAIL]`, read the body or `body-ref` first, confirm identity and task
+ownership, decide collaborate/defer/reject/continue, reply only when there is
+meaningful evidence or a required ownership redirect, then acknowledge and
+resume the current task. A notify does not require a reply. A request requires
+one substantive reply. A reply from a peer is work input, not a stop signal.
+
+`collab inbox` and `collab msg <id>` query the durable local mailbox after a
+tmux pane disappears; mailbox state remains authoritative.
+
 ## Heartbeat and dispatch
 
 Only workers with an active claim receive heartbeats. `collab who` exposes
@@ -84,7 +97,12 @@ Only workers with an active claim receive heartbeats. `collab who` exposes
 idle workers without messaging busy ones.
 
 `.agent-collab/collab.json` configures the heartbeat interval. The daemon
-reloads it without a restart; invalid values fail closed to the default.
+reloads it without a restart; invalid values fail closed to the default. Only
+workers with an active claim receive heartbeat prompts. When working, ignore a
+heartbeat and continue. When intentionally waiting at a safe breakpoint, use
+`collab recv --timeout 300`; on timeout inspect the task next step and continue
+without waiting. The tmux heartbeat uses literal text, waits two seconds, then
+sends an explicit Enter.
 "#;
 
 /// Scope guard used by every command except init.

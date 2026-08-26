@@ -1,14 +1,13 @@
 use crate::config;
 use crate::server::state::{now_ms, task_heartbeat_active, Event, Message, TaskRec};
 use crate::server::Server;
-use crate::server::ROOT;
 use std::sync::Arc;
 
 const NUDGE_INTERVAL_MS: i64 = 5 * 60 * 1000;
 const MAX_NUDGES: u32 = 3;
 
-fn heartbeat_interval_ms(_server: &Server) -> i64 {
-    config::load_or_default(&ROOT.with(|root| root.borrow().clone()))
+fn heartbeat_interval_ms(server: &Server) -> i64 {
+    config::load_or_default(&server.root)
         .heartbeat_minutes
         .saturating_mul(60 * 1000)
 }
@@ -266,6 +265,21 @@ mod tests {
         tick(&server);
         let st = server.state.lock().unwrap();
         assert!(st.msgs.is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn heartbeat_reads_project_config_from_server_root() {
+        let (server, root) = test_server();
+        config::save(
+            &root,
+            &config::Config {
+                heartbeat_minutes: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(heartbeat_interval_ms(&server), 2 * 60 * 1000);
         std::fs::remove_dir_all(root).ok();
     }
 }

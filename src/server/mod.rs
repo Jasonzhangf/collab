@@ -46,14 +46,6 @@ pub struct Server {
     pub journal: Mutex<std::fs::File>,
 }
 
-thread_local! {
-    pub static ROOT: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
-}
-
-pub fn set_root(root: PathBuf) {
-    ROOT.with(|cell| *cell.borrow_mut() = root);
-}
-
 impl Server {
     pub fn log_path(&self) -> PathBuf {
         self.root
@@ -1291,8 +1283,6 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         state: Mutex::new(state),
         journal: Mutex::new(journal_file),
     });
-    set_root(scope.root.clone());
-
     let listener = UnixListener::bind(&sock_path)?;
 
     // background scheduler: task heartbeats + request escalation
