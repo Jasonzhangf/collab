@@ -1,5 +1,7 @@
 use std::path::Path;
 use std::process::Command;
+use std::thread::sleep;
+use std::time::Duration;
 
 /// Live tmux prompt for the recipient pane. Mailbox truth remains the
 /// authoritative delivery record; this knock only wakes the recipient with
@@ -29,12 +31,15 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if !pane_alive(pane) {
         anyhow::bail!("pane {} not alive", pane);
     }
+    // Wait for the TUI to finish processing literal text before submitting.
+    const SUBMIT_DELAY_MS: u64 = 2_000;
     let sent = Command::new("tmux")
         .args(literal_args(pane, text))
         .status()?;
     if !sent.success() {
         anyhow::bail!("tmux text delivery failed for pane {}", pane);
     }
+    sleep(Duration::from_millis(SUBMIT_DELAY_MS));
     let submitted = Command::new("tmux").args(submit_args(pane)).status()?;
     if !submitted.success() {
         anyhow::bail!("tmux Enter delivery failed for pane {}", pane);
