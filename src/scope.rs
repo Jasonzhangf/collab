@@ -79,6 +79,16 @@ collab task update <id> --status merged
 collab task close <id>            # master; verifies merged/clean then cleans
 ```
 
+Master owns the fixed task contract and the project board. After merging a
+delivered worker branch, run `collab task close <id>` to verify the merge,
+remove the clean declared `./playground/` worktree, remove the merged branch,
+and dispatch registered available tasks to idle workers. Then register the
+next decomposed tasks from the new main commit and run `collab task dispatch`.
+Workers never share worktrees: claim one task, work in its declared clean
+worktree, test, commit, and deliver; after delivery they inspect the returned
+available board and claim the next independent task without approval. A
+worker remains registered after task closure.
+
 ## Message handling
 
 On `[MAIL]`, read the body or `body-ref` first, confirm identity and task
