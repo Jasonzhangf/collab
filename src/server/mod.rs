@@ -540,9 +540,9 @@ fn handle_task_update(
                 "only master may close; use collab task close after merge and cleanup",
             );
         }
-        if new_status == "rework" {
+        if new_status == "rework" && task.owner != worker_id && worker.role != "master" {
             return Resp::err(
-                "rework must be requested by master message; use working after receiving it",
+                "rework must be requested by master or set by task owner; use working after receiving it",
             );
         }
         task.status = new_status;
@@ -1749,6 +1749,64 @@ mod tests {
         );
         assert!(!denied.ok);
         assert!(denied.error.unwrap().contains("only master"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_and_owner_can_put_delivered_task_into_rework() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_role(&server, "worker", "worker");
+        handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-rework".into(),
+            Some("worker".into()),
+            Some("feature-rework".into()),
+            None,
+            None,
+            None,
+            default_priority(),
+        );
+
+        let delivered = handle_task_update(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-rework".into(),
+            Some("delivered".into()),
+            None,
+        );
+        assert!(delivered.ok);
+
+        let reworked = handle_task_update(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-rework".into(),
+            Some("rework".into()),
+            Some("fix findings and redeliver".into()),
+        );
+        assert!(reworked.ok);
+        assert_eq!(
+            server.state.lock().unwrap().tasks["task-rework"].status,
+            "rework"
+        );
+
+        let resumed = handle_task_update(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-rework".into(),
+            Some("working".into()),
+            None,
+        );
+        assert!(resumed.ok);
+        assert_eq!(
+            server.state.lock().unwrap().tasks["task-rework"].status,
+            "working"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
