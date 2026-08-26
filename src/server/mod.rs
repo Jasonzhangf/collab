@@ -45,8 +45,34 @@ impl Server {
             st.apply(ev);
             let line = serde_json::to_string(ev).expect("serialize event");
             let _ = writeln!(j, "{}", line);
+            if let Event::Sent { msg } = ev {
+                self.backup_message(msg);
+            }
+            if let Event::Delivered { ids } = ev {
+                for id in ids {
+                    if let Some(msg) = st.msgs.get(id) {
+                        self.backup_message(msg);
+                    }
+                }
+            }
+            if let Event::Acked { ids } = ev {
+                for id in ids {
+                    if let Some(msg) = st.msgs.get(id) {
+                        self.backup_message(msg);
+                    }
+                }
+            }
         }
         let _ = j.flush();
+    }
+
+    fn backup_message(&self, msg: &Message) {
+        let dir = self.root.join(".agent-collab").join("mailbox");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{}.json", msg.id));
+        if let Ok(data) = serde_json::to_string_pretty(msg) {
+            let _ = std::fs::write(&path, data);
+        }
     }
 }
 
@@ -296,6 +322,7 @@ fn handle_task_register(
     if st.tasks.contains_key(&task_id) {
         return Resp::err(format!("task {} already registered", task_id));
     }
+    let is_available = owner.is_none() && worker.role == "master";
     let task_owner = owner.unwrap_or_else(|| worker_id.clone());
     if task_owner != worker_id && worker.role != "master" {
         return Resp::err("only master may register a task for another owner");
@@ -319,7 +346,11 @@ fn handle_task_register(
         worktree_path,
         branch,
         base_commit,
-        status: "working".into(),
+        status: if is_available {
+            "available".to_string()
+        } else {
+            "working".to_string()
+        },
         next_step: None,
         created_ms: now,
         updated_ms: now,
@@ -332,6 +363,52 @@ fn handle_task_register(
     Resp::data(
         json!({"task": task.id, "owner": task.owner, "status": task.status, "heartbeat": "active"}),
     )
+}
+
+fn handle_task_claim(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    task_id: String,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    let Some(worker) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if worker.token != token {
+        return Resp::err("token mismatch: identity does not own this worker_id");
+    }
+    let Some(mut task) = st.tasks.get(&task_id).cloned() else {
+        return Resp::err(format!("task {} not found", task_id));
+    };
+    if task.status != "available" {
+        return Resp::err(format!(
+            "task {} is not available (current status: {})",
+            task_id, task.status
+        ));
+    }
+    if let Some(existing) = st.tasks.values().find(|t| {
+        t.id != task.id
+            && task_resource_active(&t.status)
+            && t.owner == worker_id
+            && (task.feature_id.is_some() && t.feature_id == task.feature_id
+                || task.worktree_path.is_some() && t.worktree_path == task.worktree_path)
+    }) {
+        return Resp::err(format!(
+            "resource conflict with your active task {}",
+            existing.id
+        ));
+    }
+    task.owner = worker_id;
+    task.status = "working".to_string();
+    task.updated_ms = now_ms();
+    task.last_heartbeat_sent_ms = now_ms();
+    server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
+    Resp::data(json!({
+        "task": task.id,
+        "owner": task.owner,
+        "status": task.status
+    }))
 }
 
 fn handle_task_update(
@@ -577,6 +654,11 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             status,
             next_step,
         } => handle_task_update(server, worker_id, token, task_id, status, next_step),
+        Req::TaskClaim {
+            worker_id,
+            token,
+            task_id,
+        } => handle_task_claim(server, worker_id, token, task_id),
         Req::TaskStatus { task_id } => {
             let st = server.state.lock().unwrap();
             match task_id {
@@ -1175,6 +1257,68 @@ mod tests {
             None,
         );
         assert!(acquired.ok);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_creates_available_and_worker_claims() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_role(&server, "worker", "worker");
+
+        let created = handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-avail".into(),
+            None,
+            Some("feature-claim".into()),
+            None,
+            None,
+            None,
+        );
+        assert!(created.ok);
+        assert_eq!(created.data["status"], "available");
+
+        let claimed = handle_task_claim(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-avail".into(),
+        );
+        assert!(claimed.ok);
+        assert_eq!(claimed.data["owner"], "worker");
+        assert_eq!(claimed.data["status"], "working");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claim_fails_on_non_available_task() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_role(&server, "worker", "worker");
+
+        handle_task_register(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-working".into(),
+            None,
+            Some("feature-x".into()),
+            None,
+            None,
+            None,
+        );
+        let denied = handle_task_claim(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-working".into(),
+        );
+        assert!(!denied.ok);
+        assert!(denied.error.unwrap().contains("not available"));
+
         std::fs::remove_dir_all(root).ok();
     }
 }

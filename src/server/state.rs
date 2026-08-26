@@ -69,7 +69,7 @@ pub struct TaskRec {
 }
 
 pub fn task_heartbeat_active(status: &str) -> bool {
-    !matches!(status, "delivered" | "merged" | "closed" | "cancelled")
+    !matches!(status, "available" | "delivered" | "merged" | "closed" | "cancelled")
 }
 
 pub fn task_resource_active(status: &str) -> bool {

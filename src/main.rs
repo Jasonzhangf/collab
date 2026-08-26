@@ -104,6 +104,8 @@ enum TaskCmd {
         #[arg(long)]
         next: Option<String>,
     },
+    /// Claim an available task (transitions it to working with you as owner)
+    Claim { id: String },
     /// Show task registry
     Status { id: Option<String> },
 }
@@ -317,6 +319,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     task_id: id,
                     status,
                     next_step: next,
+                },
+                TaskCmd::Claim { id } => Req::TaskClaim {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    task_id: id,
                 },
                 TaskCmd::Status { id } => Req::TaskStatus { task_id: id },
             };

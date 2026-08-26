@@ -52,6 +52,11 @@ pub enum Req {
         status: Option<String>,
         next_step: Option<String>,
     },
+    TaskClaim {
+        worker_id: String,
+        token: String,
+        task_id: String,
+    },
     TaskStatus {
         task_id: Option<String>,
     },
