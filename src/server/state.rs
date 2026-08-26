@@ -5,6 +5,14 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+pub fn default_role() -> String {
+    "worker".into()
+}
+
+pub fn default_task_status() -> String {
+    "working".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRec {
     pub id: String,
@@ -12,6 +20,8 @@ pub struct WorkerRec {
     pub pane: Option<String>,
     pub cwd: String,
     pub registered_ms: i64,
+    #[serde(default = "default_role")]
+    pub role: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,28 +43,37 @@ pub struct Message {
 pub const REQUEST_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueEntry {
-    pub worker_id: String,
-    pub since_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaimRec {
+pub struct TaskRec {
     pub id: String,
-    pub owner: Option<String>,
-    pub intent: Option<String>,
-    pub acquired_ms: i64,
-    pub lease_until_ms: i64,
-    pub expired_notified: bool,
-    /// FIFO fairness: after release the claim is reserved for the longest-waiting requester.
-    pub reserved_for: Option<String>,
-    pub queue: Vec<QueueEntry>,
+    pub owner: String,
+    pub created_by: String,
+    #[serde(default)]
+    pub feature_id: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub base_commit: Option<String>,
+    #[serde(default = "default_task_status")]
+    pub status: String,
+    #[serde(default)]
+    pub next_step: Option<String>,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+    pub last_heartbeat_sent_ms: i64,
+    pub heartbeat_pending: bool,
+    #[serde(default)]
+    pub heartbeat_message_id: Option<String>,
+    pub heartbeat_stale_notified: bool,
 }
 
-impl ClaimRec {
-    pub fn lease_expired(&self, now: i64) -> bool {
-        self.owner.is_some() && self.lease_until_ms < now
-    }
+pub fn task_heartbeat_active(status: &str) -> bool {
+    !matches!(status, "delivered" | "merged" | "closed" | "cancelled")
+}
+
+pub fn task_resource_active(status: &str) -> bool {
+    !matches!(status, "merged" | "closed" | "cancelled")
 }
 
 /// Journal events. Every mutation is an event: live path applies + appends,
@@ -66,27 +85,32 @@ pub enum Event {
     Sent { msg: Message },
     Delivered { ids: Vec<String> },
     Acked { ids: Vec<String> },
-    ClaimAcquired { id: String, owner: String, intent: Option<String>, lease_until_ms: i64, at_ms: i64 },
-    ClaimReleased { id: String, by: String, reserved_for: Option<String> },
-    ClaimRenewed { id: String, lease_until_ms: i64 },
-    ClaimExpiredNotified { id: String },
-    ClaimQueued { id: String, worker_id: String },
     Nudged { msg_id: String },
     Superseded { ids: Vec<String> },
+    TaskCreated { task: TaskRec },
+    TaskUpdated { task: TaskRec },
 }
 
 #[derive(Default)]
 pub struct State {
     pub workers: HashMap<String, WorkerRec>,
     pub msgs: HashMap<String, Message>,
-    pub claims: HashMap<String, ClaimRec>,
+    pub tasks: HashMap<String, TaskRec>,
 }
 
 impl State {
     pub fn apply(&mut self, ev: &Event) {
         match ev {
             Event::Registered { worker } => {
-                self.workers.insert(worker.id.clone(), worker.clone());
+                let worker = if self.workers.is_empty() && worker.role != "master" {
+                    WorkerRec {
+                        role: "master".into(),
+                        ..worker.clone()
+                    }
+                } else {
+                    worker.clone()
+                };
+                self.workers.insert(worker.id.clone(), worker);
             }
             Event::Sent { msg } => {
                 self.msgs.insert(msg.id.clone(), msg.clone());
@@ -114,60 +138,27 @@ impl State {
                     }
                 }
             }
-            Event::ClaimAcquired { id, owner, intent, lease_until_ms, at_ms } => {
-                let rec = self.claims.entry(id.clone()).or_insert_with(|| ClaimRec {
-                    id: id.clone(),
-                    owner: None,
-                    intent: None,
-                    acquired_ms: *at_ms,
-                    lease_until_ms: 0,
-                    expired_notified: false,
-                    reserved_for: None,
-                    queue: Vec::new(),
-                });
-                rec.owner = Some(owner.clone());
-                rec.intent = intent.clone();
-                rec.acquired_ms = *at_ms;
-                rec.lease_until_ms = *lease_until_ms;
-                rec.expired_notified = false;
-                // consume the FIFO reservation if it was ours
-                if rec.reserved_for.as_deref() == Some(owner.as_str()) {
-                    rec.reserved_for = None;
-                }
-            }
-            Event::ClaimReleased { id, reserved_for, .. } => {
-                if let Some(c) = self.claims.get_mut(id) {
-                    c.owner = None;
-                    c.intent = None;
-                    c.expired_notified = false;
-                    c.reserved_for = reserved_for.clone();
-                }
-            }
-            Event::ClaimRenewed { id, lease_until_ms } => {
-                if let Some(c) = self.claims.get_mut(id) {
-                    c.lease_until_ms = *lease_until_ms;
-                    c.expired_notified = false;
-                }
-            }
-            Event::ClaimExpiredNotified { id } => {
-                if let Some(c) = self.claims.get_mut(id) {
-                    c.expired_notified = true;
-                }
-            }
-            Event::ClaimQueued { id, worker_id } => {
-                if let Some(c) = self.claims.get_mut(id) {
-                    if !c.queue.iter().any(|q| q.worker_id == *worker_id) {
-                        c.queue.push(QueueEntry { worker_id: worker_id.clone(), since_ms: now_ms() });
-                    }
-                }
-            }
             Event::Nudged { msg_id } => {
                 if let Some(m) = self.msgs.get_mut(msg_id) {
                     m.nudge_count += 1;
                     m.last_nudge_ms = now_ms();
                 }
             }
+            Event::TaskCreated { task } | Event::TaskUpdated { task } => {
+                self.tasks.insert(task.id.clone(), task.clone());
+            }
         }
+    }
+
+    pub fn has_master(&self) -> bool {
+        self.workers.values().any(|w| w.role == "master")
+    }
+
+    pub fn master_id(&self) -> Option<String> {
+        self.workers
+            .values()
+            .find(|w| w.role == "master")
+            .map(|w| w.id.clone())
     }
 
     /// Unread (not yet acked) inbox of a worker, oldest first.
@@ -175,9 +166,7 @@ impl State {
         let mut v: Vec<&Message> = self
             .msgs
             .values()
-            .filter(|m| {
-                m.to == worker_id && m.state != "read" && m.state != "superseded"
-            })
+            .filter(|m| m.to == worker_id && m.state != "read" && m.state != "superseded")
             .collect();
         v.sort_by_key(|m| m.created_ms);
         v
@@ -185,7 +174,9 @@ impl State {
 
     /// True when some other message is a reply to `msg`.
     pub fn answered(&self, msg_id: &str) -> bool {
-        self.msgs.values().any(|m| m.in_reply_to.as_deref() == Some(msg_id))
+        self.msgs
+            .values()
+            .any(|m| m.in_reply_to.as_deref() == Some(msg_id))
     }
 
     /// One live request per direction during the cooldown window.
@@ -256,15 +247,21 @@ mod tests {
     #[test]
     fn message_lifecycle() {
         let mut st = State::default();
-        st.apply(&Event::Sent { msg: msg("m1", "w2", "request") });
+        st.apply(&Event::Sent {
+            msg: msg("m1", "w2", "request"),
+        });
         assert_eq!(st.inbox_of("w2").len(), 1);
         assert!(st.inbox_of("w1").is_empty());
 
-        st.apply(&Event::Delivered { ids: vec!["m1".into()] });
+        st.apply(&Event::Delivered {
+            ids: vec!["m1".into()],
+        });
         assert_eq!(st.msgs["m1"].state, "delivered");
         assert_eq!(st.inbox_of("w2").len(), 1);
 
-        st.apply(&Event::Acked { ids: vec!["m1".into()] });
+        st.apply(&Event::Acked {
+            ids: vec!["m1".into()],
+        });
         assert_eq!(st.msgs["m1"].state, "read");
         assert!(st.inbox_of("w2").is_empty());
     }
@@ -272,7 +269,9 @@ mod tests {
     #[test]
     fn answered_detection() {
         let mut st = State::default();
-        st.apply(&Event::Sent { msg: msg("m1", "w2", "request") });
+        st.apply(&Event::Sent {
+            msg: msg("m1", "w2", "request"),
+        });
         let mut reply = msg("m2", "w1", "reply");
         reply.in_reply_to = Some("m1".into());
         st.apply(&Event::Sent { msg: reply });
@@ -300,7 +299,9 @@ mod tests {
     #[test]
     fn latest_reply_supersedes_previous_replies() {
         let mut st = State::default();
-        st.apply(&Event::Sent { msg: msg("request", "w1", "request") });
+        st.apply(&Event::Sent {
+            msg: msg("request", "w1", "request"),
+        });
 
         let mut first = msg("reply-1", "w1", "reply");
         first.in_reply_to = Some("request".into());
@@ -325,31 +326,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["reply-2"]
         );
-    }
-
-    #[test]
-    fn claim_lease_expiry() {
-        let mut st = State::default();
-        st.apply(&Event::ClaimAcquired { id: "build".into(), owner: "w1".into(), intent: Some("x".into()), lease_until_ms: 100, at_ms: 50 });
-        assert!(st.claims["build"].lease_expired(101));
-        assert!(!st.claims["build"].lease_expired(99));
-        st.apply(&Event::ClaimRenewed { id: "build".into(), lease_until_ms: 500 });
-        assert!(!st.claims["build"].lease_expired(101));
-    }
-
-    #[test]
-    fn claim_release_reserves_fifo_head() {
-        let mut st = State::default();
-        st.apply(&Event::ClaimAcquired { id: "build".into(), owner: "w1".into(), intent: None, lease_until_ms: 1_000_000, at_ms: 1 });
-        st.apply(&Event::ClaimQueued { id: "build".into(), worker_id: "w2".into() });
-        st.apply(&Event::ClaimQueued { id: "build".into(), worker_id: "w3".into() });
-        st.apply(&Event::ClaimReleased { id: "build".into(), by: "w1".into(), reserved_for: Some("w2".into()) });
-        let c = &st.claims["build"];
-        assert_eq!(c.reserved_for.as_deref(), Some("w2"));
-        assert_eq!(c.queue.len(), 2);
-        // acquiring by the non-reserved worker must be blocked by the handler;
-        // state-level: reservation persists until the reserved owner acquires
-        st.apply(&Event::ClaimAcquired { id: "build".into(), owner: "w2".into(), intent: None, lease_until_ms: 1_000_000, at_ms: 2 });
-        assert!(st.claims["build"].reserved_for.is_none());
     }
 }

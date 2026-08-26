@@ -35,40 +35,38 @@ pub enum Req {
     MsgStatus {
         msg_id: String,
     },
-    ClaimAcquire {
+    TaskRegister {
         worker_id: String,
-        claim_id: String,
-        intent: Option<String>,
-        lease_ms: Option<u64>,
-        #[serde(default)]
-        force: bool,
+        token: String,
+        task_id: String,
+        owner: Option<String>,
+        feature_id: Option<String>,
+        worktree_path: Option<String>,
+        branch: Option<String>,
+        base_commit: Option<String>,
     },
-    ClaimRelease {
+    TaskUpdate {
         worker_id: String,
-        claim_id: String,
+        token: String,
+        task_id: String,
+        status: Option<String>,
+        next_step: Option<String>,
     },
-    ClaimRenew {
+    TaskStatus {
+        task_id: Option<String>,
+    },
+    TaskConflicts {
+        feature_id: Option<String>,
+        worktree_path: Option<String>,
+    },
+    Role {
         worker_id: String,
-        claim_id: String,
-        lease_ms: Option<u64>,
-    },
-    ClaimStatus {
-        claim_id: Option<String>,
-    },
-    ClaimWait {
-        worker_id: String,
-        claim_id: String,
-        #[serde(default = "default_wait_timeout")]
-        timeout_ms: u64,
     },
     Ping,
 }
 
 fn default_poll_timeout() -> u64 {
     600_000
-}
-fn default_wait_timeout() -> u64 {
-    1_800_000
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,12 +80,20 @@ pub struct Resp {
 
 impl Resp {
     pub fn data(v: serde_json::Value) -> Self {
-        Resp { ok: true, error: None, data: v }
+        Resp {
+            ok: true,
+            error: None,
+            data: v,
+        }
     }
     pub fn err(msg: impl Into<String>) -> Self {
         let m = msg.into();
         eprintln!("collab: error: {}", m);
-        Resp { ok: false, error: Some(m), data: serde_json::Value::Null }
+        Resp {
+            ok: false,
+            error: Some(m),
+            data: serde_json::Value::Null,
+        }
     }
 }
 

@@ -29,11 +29,19 @@ pub fn gen_worker_id() -> String {
         .take(6)
         .map(|c| c as char)
         .collect();
-    format!("{}-{}-{}-{}", now_compact(), host(), std::process::id(), rnd.to_lowercase())
+    format!(
+        "{}-{}-{}-{}",
+        now_compact(),
+        host(),
+        std::process::id(),
+        rnd.to_lowercase()
+    )
 }
 
 fn hex(n: usize) -> String {
-    (0..n).map(|_| format!("{:02x}", rand::thread_rng().gen::<u8>())).collect()
+    (0..n)
+        .map(|_| format!("{:02x}", rand::thread_rng().gen::<u8>()))
+        .collect()
 }
 
 fn identity_path(scope: &Scope, worker_id: &str) -> PathBuf {
@@ -48,8 +56,14 @@ fn identity_path(scope: &Scope, worker_id: &str) -> PathBuf {
 /// Load existing identity or create one. Identity is keyed to the tmux pane
 /// when available (same pane = same worker across invocations), otherwise to
 /// the given worker_id; without either, a fresh identity is created each time.
-pub fn load_or_create(scope: &Scope, worker_id: Option<String>, pane_override: Option<String>) -> anyhow::Result<Identity> {
-    let pane = pane_override.clone().or_else(|| std::env::var("TMUX_PANE").ok());
+pub fn load_or_create(
+    scope: &Scope,
+    worker_id: Option<String>,
+    pane_override: Option<String>,
+) -> anyhow::Result<Identity> {
+    let pane = pane_override
+        .clone()
+        .or_else(|| std::env::var("TMUX_PANE").ok());
 
     let (id, path) = match worker_id {
         Some(w) => {
@@ -78,7 +92,10 @@ pub fn load_or_create(scope: &Scope, worker_id: Option<String>, pane_override: O
     if path.exists() {
         let ident: Identity = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
         if let Some(p) = pane_override.as_ref() {
-            return Ok(Identity { pane: Some(p.clone()), ..ident });
+            return Ok(Identity {
+                pane: Some(p.clone()),
+                ..ident
+            });
         }
         return Ok(ident);
     }
@@ -90,7 +107,11 @@ pub fn load_or_create(scope: &Scope, worker_id: Option<String>, pane_override: O
     } else {
         id
     };
-    let ident = Identity { worker_id: id, token: hex(16), pane };
+    let ident = Identity {
+        worker_id: id,
+        token: hex(16),
+        pane,
+    };
     let dir = path.parent().unwrap();
     std::fs::create_dir_all(dir)?;
     // atomic-ish write: temp + rename

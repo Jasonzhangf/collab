@@ -17,7 +17,6 @@ pub fn init(root: &Path) -> std::io::Result<PathBuf> {
     let base = root.join(".agent-collab");
     for sub in [
         "runs",
-        "claims",
         "handoff",
         "merge-queue",
         "panes",

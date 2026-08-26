@@ -2,19 +2,20 @@ pub mod knock;
 pub mod state;
 pub mod timers;
 
-use state::{now_ms, ClaimRec, Event, Message, State, WorkerRec};
 use crate::proto::{Req, Resp, MSG_TYPES};
 use crate::scope::Scope;
 use crate::server::knock::{append_log, knock_or_log};
 use serde_json::json;
+use state::{
+    default_role, now_ms, task_heartbeat_active, task_resource_active, Event, Message, State,
+    TaskRec, WorkerRec,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 
-const DEFAULT_LEASE_MS: i64 = 30 * 60 * 1000;
 const MAX_POLL_MS: u64 = 3_600_000;
-const MAX_WAIT_MS: u64 = 7_200_000;
 const POLL_TICK_MS: u64 = 250;
 
 pub struct Server {
@@ -25,7 +26,10 @@ pub struct Server {
 
 impl Server {
     pub fn log_path(&self) -> PathBuf {
-        self.root.join(".agent-collab").join("server").join("log.txt")
+        self.root
+            .join(".agent-collab")
+            .join("server")
+            .join("log.txt")
     }
 
     /// Apply events to memory and persist them atomically-ordered in the journal.
@@ -56,7 +60,9 @@ pub fn gen_msg_id() -> String {
 const LONG_BODY_THRESHOLD_CHARS: usize = 500;
 
 fn message_doc_path(root: &Path, msg_id: &str) -> PathBuf {
-    root.join(".agent-collab").join("messages").join(format!("{msg_id}.md"))
+    root.join(".agent-collab")
+        .join("messages")
+        .join(format!("{msg_id}.md"))
 }
 
 fn write_message_doc(root: &Path, msg_id: &str, body: &str) -> anyhow::Result<PathBuf> {
@@ -69,9 +75,7 @@ fn write_message_doc(root: &Path, msg_id: &str, body: &str) -> anyhow::Result<Pa
 }
 
 fn one_line(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .collect()
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 fn delivery_text(
@@ -121,7 +125,12 @@ fn timeout_prompt(kind: &str, worker_id: &str, timeout_ms: u64) -> String {
 fn notify_wait_timeout(server: &Server, kind: &str, worker_id: &str, timeout_ms: u64) {
     if let Some(pane) = server.state.lock().unwrap().worker_pane(worker_id) {
         let id = gen_msg_id();
-        queue_system_knock(server, &pane, &id, &timeout_prompt(kind, worker_id, timeout_ms));
+        queue_system_knock(
+            server,
+            &pane,
+            &id,
+            &timeout_prompt(kind, worker_id, timeout_ms),
+        );
     }
 }
 
@@ -136,33 +145,65 @@ fn iso(ms: i64) -> String {
 fn verify(state: &State, worker_id: &str, token: &str) -> Result<WorkerRec, Resp> {
     match state.workers.get(worker_id) {
         Some(w) if w.token == token => Ok(w.clone()),
-        Some(_) => Err(Resp::err("token mismatch: identity does not own this worker_id")),
+        Some(_) => Err(Resp::err(
+            "token mismatch: identity does not own this worker_id",
+        )),
         None => Err(Resp::err(format!("worker {} not registered", worker_id))),
     }
 }
 
-fn handle_register(server: &Server, worker_id: String, token: String, pane: Option<String>, cwd: String) -> Resp {
-    {
-        let st = server.state.lock().unwrap();
-        if let Some(existing) = st.workers.get(&worker_id) {
-            if existing.token != token {
-                return Resp::err(format!("worker_id {} already registered by another token", worker_id));
-            }
-            let refreshed = WorkerRec {
-                id: worker_id.clone(),
-                token: existing.token.clone(),
-                pane: pane.or_else(|| existing.pane.clone()),
-                cwd,
-                registered_ms: existing.registered_ms,
-            };
-            drop(st);
-            server.commit(&[Event::Registered { worker: refreshed }]);
-            return Resp::data(json!({"worker_id": worker_id, "reused": true}));
+fn handle_register(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    pane: Option<String>,
+    cwd: String,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    if let Some(existing) = st.workers.get(&worker_id).cloned() {
+        if existing.token != token {
+            return Resp::err(format!(
+                "worker_id {} already registered by another token",
+                worker_id
+            ));
         }
+        let role = existing.role.clone();
+        let refreshed = WorkerRec {
+            id: worker_id.clone(),
+            token: existing.token.clone(),
+            pane: pane.or_else(|| existing.pane.clone()),
+            cwd,
+            registered_ms: existing.registered_ms,
+            role: role.clone(),
+        };
+        server.commit_locked(&mut st, &[Event::Registered { worker: refreshed }]);
+        return Resp::data(json!({"worker_id": worker_id, "role": role, "reused": true}));
     }
-    let rec = WorkerRec { id: worker_id.clone(), token, pane, cwd, registered_ms: now_ms() };
-    server.commit(&[Event::Registered { worker: rec.clone() }]);
-    Resp::data(json!({"worker_id": worker_id, "registered_at": iso(rec.registered_ms)}))
+    let role = if st.has_master() {
+        default_role()
+    } else {
+        "master".into()
+    };
+    let rec = WorkerRec {
+        id: worker_id.clone(),
+        token,
+        pane,
+        cwd,
+        registered_ms: now_ms(),
+        role,
+    };
+    server.commit_locked(
+        &mut st,
+        &[Event::Registered {
+            worker: rec.clone(),
+        }],
+    );
+    Resp::data(json!({
+        "worker_id": worker_id,
+        "role": rec.role,
+        "registered_at": iso(rec.registered_ms),
+        "role_decision": if rec.role == "master" { "first-registered-worker-default-master" } else { "master-exists-default-worker" }
+    }))
 }
 
 fn handle_send(
@@ -174,7 +215,10 @@ fn handle_send(
     in_reply_to: Option<String>,
 ) -> Resp {
     if !MSG_TYPES.contains(&mtype.as_str()) {
-        return Resp::err(format!("invalid type {}; must be one of {:?}", mtype, MSG_TYPES));
+        return Resp::err(format!(
+            "invalid type {}; must be one of {:?}",
+            mtype, MSG_TYPES
+        ));
     }
     let mut st = server.state.lock().unwrap();
     if !st.workers.contains_key(&to) {
@@ -218,7 +262,9 @@ fn handle_send(
     };
     let mut events = vec![Event::Sent { msg }];
     if !superseded_ids.is_empty() {
-        events.push(Event::Superseded { ids: superseded_ids });
+        events.push(Event::Superseded {
+            ids: superseded_ids,
+        });
     }
     let pane = st.worker_pane(&to);
     server.commit_locked(&mut st, &events);
@@ -227,6 +273,130 @@ fn handle_send(
         knock_or_log(&server.log_path(), &p, &delivery);
     }
     Resp::data(json!({"msg_id": mid}))
+}
+
+fn handle_task_register(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    task_id: String,
+    owner: Option<String>,
+    feature_id: Option<String>,
+    worktree_path: Option<String>,
+    branch: Option<String>,
+    base_commit: Option<String>,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    let Some(worker) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if worker.token != token {
+        return Resp::err("token mismatch: identity does not own this worker_id");
+    }
+    if st.tasks.contains_key(&task_id) {
+        return Resp::err(format!("task {} already registered", task_id));
+    }
+    let task_owner = owner.unwrap_or_else(|| worker_id.clone());
+    if task_owner != worker_id && worker.role != "master" {
+        return Resp::err("only master may register a task for another owner");
+    }
+    if !st.workers.contains_key(&task_owner) {
+        return Resp::err(format!("task owner {} not registered", task_owner));
+    }
+    if let Some(existing) = st.tasks.values().find(|task| {
+        task_resource_active(&task.status)
+            && (feature_id.is_some() && task.feature_id == feature_id
+                || worktree_path.is_some() && task.worktree_path == worktree_path)
+    }) {
+        return Resp::err(format!("task resource conflict with {}", existing.id));
+    }
+    let now = now_ms();
+    let task = TaskRec {
+        id: task_id.clone(),
+        owner: task_owner,
+        created_by: worker_id,
+        feature_id,
+        worktree_path,
+        branch,
+        base_commit,
+        status: "working".into(),
+        next_step: None,
+        created_ms: now,
+        updated_ms: now,
+        last_heartbeat_sent_ms: now,
+        heartbeat_pending: false,
+        heartbeat_message_id: None,
+        heartbeat_stale_notified: false,
+    };
+    server.commit_locked(&mut st, &[Event::TaskCreated { task: task.clone() }]);
+    Resp::data(
+        json!({"task": task.id, "owner": task.owner, "status": task.status, "heartbeat": "active"}),
+    )
+}
+
+fn handle_task_update(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    task_id: String,
+    status: Option<String>,
+    next_step: Option<String>,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    let Some(worker) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if worker.token != token {
+        return Resp::err("token mismatch: identity does not own this worker_id");
+    }
+    let Some(mut task) = st.tasks.get(&task_id).cloned() else {
+        return Resp::err(format!("task {} not found", task_id));
+    };
+    if task.owner != worker_id && worker.role != "master" {
+        return Resp::err("only task owner or master may update this task");
+    }
+    if let Some(new_status) = status {
+        if matches!(new_status.as_str(), "merged" | "cancelled") && worker.role != "master" {
+            return Resp::err("only master may merge or cancel a task");
+        }
+        if new_status == "rework" {
+            return Resp::err(
+                "rework must be requested by master message; use working after receiving it",
+            );
+        }
+        task.status = new_status;
+    }
+    if next_step.is_some() {
+        task.next_step = next_step;
+    }
+    task.heartbeat_pending = false;
+    task.heartbeat_message_id = None;
+    task.updated_ms = now_ms();
+    if task_heartbeat_active(&task.status) {
+        task.heartbeat_stale_notified = false;
+    } else {
+        task.heartbeat_pending = false;
+    }
+    server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
+    Resp::data(
+        json!({"task": task.id, "status": task.status, "heartbeat": if task_heartbeat_active(&task.status) { "active" } else { "unregistered" }}),
+    )
+}
+
+fn task_view(task: &TaskRec) -> serde_json::Value {
+    json!({
+        "id": task.id,
+        "owner": task.owner,
+        "created_by": task.created_by,
+        "feature_id": task.feature_id,
+        "worktree": task.worktree_path,
+        "branch": task.branch,
+        "base_commit": task.base_commit,
+        "status": task.status,
+        "next_step": task.next_step,
+        "heartbeat": if task_heartbeat_active(&task.status) { "active" } else { "unregistered" },
+        "updated_at": iso(task.updated_ms),
+    })
 }
 
 fn handle_poll(server: &Server, worker_id: String, timeout_ms: u64) -> Resp {
@@ -262,203 +432,47 @@ fn handle_poll(server: &Server, worker_id: String, timeout_ms: u64) -> Resp {
     }
 }
 
-fn handle_claim_acquire(
+fn task_conflicts(
     server: &Server,
-    worker_id: String,
-    claim_id: String,
-    intent: Option<String>,
-    lease_ms: Option<u64>,
-    force: bool,
+    feature_id: Option<String>,
+    worktree_path: Option<String>,
 ) -> Resp {
-    const LEASE: i64 = DEFAULT_LEASE_MS;
-    let now = now_ms();
-    let lease_until = now + lease_ms.map(|m| m as i64).unwrap_or(LEASE);
-
-    let snap: Option<ClaimRec> = server.state.lock().unwrap().claims.get(&claim_id).cloned();
-
-    let mut evs: Vec<Event> = Vec::new();
-    let mut knocks: Vec<(String, String, String)> = Vec::new();
-
-    let result = match snap {
-        None => {
-            evs.push(Event::ClaimAcquired { id: claim_id.clone(), owner: worker_id.clone(), intent, lease_until_ms: lease_until, at_ms: now });
-            Ok(json!({"claim": claim_id, "status": "acquired"}))
-        }
-        Some(c) => {
-            if c.owner.as_deref() == Some(worker_id.as_str()) {
-                Ok(json!({"claim": claim_id, "status": "already-owner", "lease_until": iso(c.lease_until_ms)}))
-            } else if c.owner.is_none() {
-                match c.reserved_for.as_deref() {
-                    Some(r) if r != worker_id => Ok(json!({
-                        "claim": claim_id, "status": "reserved",
-                        "reserved_for": r,
-                        "hint": "FIFO reservation held by another worker"
-                    })),
-                    _ => {
-                        evs.push(Event::ClaimAcquired { id: claim_id.clone(), owner: worker_id.clone(), intent, lease_until_ms: lease_until, at_ms: now });
-                        Ok(json!({"claim": claim_id, "status": "acquired"}))
-                    }
-                }
-            } else if c.lease_expired(now) {
-                if force {
-                    let old = c.owner.clone().unwrap();
-                    evs.push(Event::ClaimAcquired { id: claim_id.clone(), owner: worker_id.clone(), intent: intent.clone(), lease_until_ms: lease_until, at_ms: now });
-                    let body = format!(
-                        "TAKEOVER: your claim '{}' was taken over by {} (lease expired since {})",
-                        claim_id, worker_id, iso(c.lease_until_ms)
-                    );
-                    let pane = server.state.lock().unwrap().worker_pane(&old);
-                    let sid = gen_msg_id();
-                    evs.push(Event::Sent { msg: Message {
-                        id: sid.clone(), from: "collab-server".into(), to: old.clone(),
-                        mtype: "system".into(), body: body.clone(), in_reply_to: None,
-                        created_ms: now, state: "pending".into(), nudge_count: 0, last_nudge_ms: 0,
-                    }});
-                    if let Some(p) = pane {
-                        knocks.push((p, sid, body));
-                    }
-                    Ok(json!({"claim": claim_id, "status": "takeover", "previous_owner": old}))
-                } else {
-                    Ok(json!({
-                        "claim": claim_id, "status": "expired",
-                        "owner": c.owner, "lease_until": iso(c.lease_until_ms),
-                        "hint": "lease expired; re-run with --force to take over"
-                    }))
-                }
-            } else {
-                // healthy contention: FIFO enqueue + report position
-                let already = c.queue.iter().any(|q| q.worker_id == worker_id);
-                if !already {
-                    evs.push(Event::ClaimQueued { id: claim_id.clone(), worker_id: worker_id.clone() });
-                }
-                let pos = c.queue.iter().position(|q| q.worker_id == worker_id).map(|i| i + 1)
-                    .unwrap_or(c.queue.len() + 1);
-                Ok(json!({
-                    "claim": claim_id, "status": "queued",
-                    "owner": c.owner, "lease_until": iso(c.lease_until_ms),
-                    "queue_position": pos,
-                    "hint": "use `collab claim wait` to block until release"
-                }))
-            }
-        }
-    };
-
-    if !evs.is_empty() {
-        server.commit(&evs);
-        for (pane, msg_id, body) in knocks {
-            queue_system_knock(server, &pane, &msg_id, &body);
-        }
-    }
-    match result {
-        Ok(v) => Resp::data(v),
-        Err(r) => r,
-    }
-}
-
-fn handle_claim_release(server: &Server, worker_id: String, claim_id: String) -> Resp {
-    let snap: Option<ClaimRec> = server.state.lock().unwrap().claims.get(&claim_id).cloned();
-    let Some(c) = snap else {
-        return Resp::err(format!("claim {} not found", claim_id));
-    };
-    if c.owner.as_deref() != Some(worker_id.as_str()) {
-        return Resp::err(format!("claim {} is not owned by {}", claim_id, worker_id));
-    }
-    let reserved_for = c.queue.first().map(|q| q.worker_id.clone());
-    server.commit(&[Event::ClaimReleased { id: claim_id.clone(), by: worker_id, reserved_for: reserved_for.clone() }]);
-
-    // wake the next waiter with a direct notice
-    if let Some(head) = reserved_for {
-        let mut evs = Vec::new();
-        let mut knocks: Vec<(String, String, String)> = Vec::new();
-        let pane = server.state.lock().unwrap().worker_pane(&head);
-        let sid = gen_msg_id();
-        evs.push(Event::Sent { msg: Message {
-            id: sid.clone(), from: "collab-server".into(), to: head.clone(),
-            mtype: "system".into(),
-            body: format!("RELEASED: claim '{}' is free; you are first in queue — acquire it now", claim_id),
-            in_reply_to: None, created_ms: now_ms(), state: "pending".into(), nudge_count: 0, last_nudge_ms: 0,
-        }});
-        if let Some(p) = pane {
-            knocks.push((p, sid, format!("RELEASED: claim '{}' is free; you are first in queue — acquire it now, then continue your current run.", claim_id)));
-        }
-        server.commit(&evs);
-        for (pane, msg_id, body) in knocks {
-            queue_system_knock(server, &pane, &msg_id, &body);
-        }
-    }
-    Resp::data(json!({"claim": claim_id, "status": "released"}))
-}
-
-fn handle_claim_renew(server: &Server, worker_id: String, claim_id: String, lease_ms: Option<u64>) -> Resp {
-    let snap: Option<ClaimRec> = server.state.lock().unwrap().claims.get(&claim_id).cloned();
-    let Some(c) = snap else {
-        return Resp::err(format!("claim {} not found", claim_id));
-    };
-    if c.owner.as_deref() != Some(worker_id.as_str()) {
-        return Resp::err(format!("claim {} is not owned by {}", claim_id, worker_id));
-    }
-    let until = now_ms() + lease_ms.map(|m| m as i64).unwrap_or(DEFAULT_LEASE_MS);
-    server.commit(&[Event::ClaimRenewed { id: claim_id.clone(), lease_until_ms: until }]);
-    Resp::data(json!({"claim": claim_id, "status": "renewed", "lease_until": iso(until)}))
-}
-
-fn handle_claim_wait(server: &Arc<Server>, worker_id: String, claim_id: String, timeout_ms: u64) -> Resp {
-    let timeout_ms = timeout_ms.min(MAX_WAIT_MS);
-
-    // register interest in the FIFO queue while waiting on a live claim
-    {
-        let st = server.state.lock().unwrap();
-        if let Some(c) = st.claims.get(&claim_id) {
-            if c.owner.is_some()
-                && c.owner.as_deref() != Some(worker_id.as_str())
-                && !c.queue.iter().any(|q| q.worker_id == worker_id)
-            {
-                drop(st);
-                server.commit(&[Event::ClaimQueued { id: claim_id.clone(), worker_id: worker_id.clone() }]);
-            }
-        }
-    }
-
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        {
-            let st = server.state.lock().unwrap();
-            match st.claims.get(&claim_id) {
-                None => return Resp::data(json!({"claim": claim_id, "wait_status": "free"})),
-                Some(c) => {
-                    if c.owner.as_deref() == Some(worker_id.as_str()) {
-                        return Resp::data(json!({"claim": claim_id, "wait_status": "owner"}));
-                    }
-                    if c.owner.is_none() && c.reserved_for.as_deref() == Some(worker_id.as_str()) {
-                        return Resp::data(json!({"claim": claim_id, "wait_status": "yours-to-take"}));
-                    }
-                    if c.owner.is_none() {
-                        return Resp::data(json!({"claim": claim_id, "wait_status": "free-unreserved"}));
-                    }
-                    if c.expired_notified {
-                        return Resp::data(json!({
-                            "claim": claim_id, "wait_status": "expired",
-                            "owner": c.owner, "hint": "holder lease expired; --force takeover possible"
-                        }));
-                    }
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            notify_wait_timeout(server, "claim-wait", &worker_id, timeout_ms);
-            return Resp::data(json!({"claim": claim_id, "wait_status": "timeout"}));
-        }
-        std::thread::sleep(Duration::from_millis(POLL_TICK_MS));
-    }
+    let st = server.state.lock().unwrap();
+    let conflicts: Vec<serde_json::Value> = st
+        .tasks
+        .values()
+        .filter(|task| {
+            task_resource_active(&task.status)
+                && ((feature_id.is_some() && task.feature_id == feature_id)
+                    || (worktree_path.is_some() && task.worktree_path == worktree_path))
+        })
+        .map(task_view)
+        .collect();
+    Resp::data(json!({"conflicts": conflicts}))
 }
 
 // ---------- dispatch ----------
 
 fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
     match req {
-        Req::Register { worker_id, token, pane, cwd } => handle_register(server, worker_id, token, pane, cwd),
-        Req::Send { from, to, mtype, body, in_reply_to } => handle_send(server, from, to, mtype, body, in_reply_to),
-        Req::Poll { worker_id, token, timeout_ms } => {
+        Req::Register {
+            worker_id,
+            token,
+            pane,
+            cwd,
+        } => handle_register(server, worker_id, token, pane, cwd),
+        Req::Send {
+            from,
+            to,
+            mtype,
+            body,
+            in_reply_to,
+        } => handle_send(server, from, to, mtype, body, in_reply_to),
+        Req::Poll {
+            worker_id,
+            token,
+            timeout_ms,
+        } => {
             let check = server.state.lock().unwrap();
             if let Err(e) = verify(&check, &worker_id, &token) {
                 return e;
@@ -466,19 +480,45 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             drop(check);
             handle_poll(server, worker_id, timeout_ms)
         }
-        Req::Ack { worker_id, token, ids } => {
+        Req::Ack {
+            worker_id,
+            token,
+            ids,
+        } => {
             let st = server.state.lock().unwrap();
             if let Err(e) = verify(&st, &worker_id, &token) {
                 return e;
             }
-            let owned: Vec<String> = ids.into_iter()
+            let owned: Vec<String> = ids
+                .into_iter()
                 .filter(|id| st.msgs.get(id).map(|m| m.to == worker_id).unwrap_or(false))
+                .collect();
+            let heartbeat_task_updates: Vec<TaskRec> = owned
+                .iter()
+                .filter_map(|id| st.msgs.get(id))
+                .filter(|m| m.from == "collab-server")
+                .filter_map(|m| {
+                    st.tasks.values().find(|t| {
+                        t.owner == worker_id
+                            && t.heartbeat_message_id.as_deref() == Some(m.id.as_str())
+                    })
+                })
+                .map(|task| TaskRec {
+                    heartbeat_pending: false,
+                    heartbeat_message_id: None,
+                    updated_ms: now_ms(),
+                    ..task.clone()
+                })
                 .collect();
             drop(st);
             if owned.is_empty() {
                 return Resp::err("no ackable messages (must address your own inbox)");
             }
-            server.commit(&[Event::Acked { ids: owned.clone() }]);
+            let mut events = vec![Event::Acked { ids: owned.clone() }];
+            for task in heartbeat_task_updates {
+                events.push(Event::TaskUpdated { task });
+            }
+            server.commit(&events);
             Resp::data(json!({"acked": owned}))
         }
         Req::Inbox { worker_id, token } => {
@@ -487,11 +527,16 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 return e;
             }
             let inbox: Vec<&Message> = st.inbox_of(&worker_id);
-            let items: Vec<serde_json::Value> = inbox.iter().map(|m| json!({
-                "id": m.id, "from": m.from, "type": m.mtype,
-                "state": m.state, "created_at": iso(m.created_ms),
-                "body": m.body,
-            })).collect();
+            let items: Vec<serde_json::Value> = inbox
+                .iter()
+                .map(|m| {
+                    json!({
+                        "id": m.id, "from": m.from, "type": m.mtype,
+                        "state": m.state, "created_at": iso(m.created_ms),
+                        "body": m.body,
+                    })
+                })
+                .collect();
             Resp::data(json!({"unread": items.len(), "messages": items}))
         }
         Req::MsgStatus { msg_id } => {
@@ -505,37 +550,64 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 None => Resp::err(format!("message {} not found", msg_id)),
             }
         }
-        Req::ClaimAcquire { worker_id, claim_id, intent, lease_ms, force } =>
-            handle_claim_acquire(server, worker_id, claim_id, intent, lease_ms, force),
-        Req::ClaimRelease { worker_id, claim_id } => handle_claim_release(server, worker_id, claim_id),
-        Req::ClaimRenew { worker_id, claim_id, lease_ms } => handle_claim_renew(server, worker_id, claim_id, lease_ms),
-        Req::ClaimStatus { claim_id } => {
+        Req::TaskRegister {
+            worker_id,
+            token,
+            task_id,
+            owner,
+            feature_id,
+            worktree_path,
+            branch,
+            base_commit,
+        } => handle_task_register(
+            server,
+            worker_id,
+            token,
+            task_id,
+            owner,
+            feature_id,
+            worktree_path,
+            branch,
+            base_commit,
+        ),
+        Req::TaskUpdate {
+            worker_id,
+            token,
+            task_id,
+            status,
+            next_step,
+        } => handle_task_update(server, worker_id, token, task_id, status, next_step),
+        Req::TaskStatus { task_id } => {
             let st = server.state.lock().unwrap();
-            let view = |c: &ClaimRec| json!({
-                "id": c.id, "owner": c.owner, "intent": c.intent,
-                "lease_until": iso(c.lease_until_ms),
-                "expired": c.lease_expired(now_ms()),
-                "reserved_for": c.reserved_for,
-                "queue": c.queue.iter().map(|q| q.worker_id.clone()).collect::<Vec<_>>(),
-            });
-            match claim_id {
-                Some(id) => match st.claims.get(&id) {
-                    Some(c) => Resp::data(view(c)),
-                    None => Resp::err(format!("claim {} not found", id)),
-                },
-                None => {
-                    let all: Vec<serde_json::Value> = st.claims.values().map(|c| view(c)).collect();
-                    Resp::data(json!({"claims": all}))
-                }
+            match task_id {
+                Some(id) => st
+                    .tasks
+                    .get(&id)
+                    .map(task_view)
+                    .map(Resp::data)
+                    .unwrap_or_else(|| Resp::err(format!("task {} not found", id))),
+                None => Resp::data(
+                    json!({"tasks": st.tasks.values().map(task_view).collect::<Vec<_>>()}),
+                ),
             }
         }
-        Req::ClaimWait { worker_id, claim_id, timeout_ms } => handle_claim_wait(server, worker_id, claim_id, timeout_ms),
+        Req::TaskConflicts {
+            feature_id,
+            worktree_path,
+        } => task_conflicts(server, feature_id, worktree_path),
+        Req::Role { worker_id } => {
+            let st = server.state.lock().unwrap();
+            match st.workers.get(&worker_id) {
+                Some(w) => Resp::data(json!({"worker_id": worker_id, "role": w.role})),
+                None => Resp::err(format!("worker {} not registered", worker_id)),
+            }
+        }
         Req::Ping => {
             let st = server.state.lock().unwrap();
             Resp::data(json!({
                 "workers": st.workers.len(),
                 "messages": st.msgs.len(),
-                "claims": st.claims.len(),
+                "tasks": st.tasks.len(),
                 "now": iso(now_ms()),
             }))
         }
@@ -581,7 +653,10 @@ fn replay(root: &Path) -> anyhow::Result<State> {
         }
         match serde_json::from_str::<Event>(line) {
             Ok(ev) => st.apply(&ev),
-            Err(e) => append_log(&root.join(".agent-collab/server/log.txt"), &format!("journal replay skip: {}", e)),
+            Err(e) => append_log(
+                &root.join(".agent-collab/server/log.txt"),
+                &format!("journal replay skip: {}", e),
+            ),
         }
     }
     Ok(st)
@@ -600,7 +675,8 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     }
 
     let journal_file = std::fs::OpenOptions::new()
-        .create(true).append(true)
+        .create(true)
+        .append(true)
         .open(server_dir.join("journal.jsonl"))?;
 
     let state = replay(&scope.root)?;
@@ -614,7 +690,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
 
     let listener = UnixListener::bind(&sock_path)?;
 
-    // background scheduler: leases + nudges
+    // background scheduler: task heartbeats + request escalation
     let sched = server.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -643,8 +719,8 @@ mod tests {
     fn test_server() -> (Server, PathBuf) {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir()
-            .join(format!("collab-send-filter-{}-{n}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("collab-send-filter-{}-{n}", std::process::id()));
         let server_dir = root.join(".agent-collab/server");
         std::fs::create_dir_all(&server_dir).unwrap();
         let journal = std::fs::OpenOptions::new()
@@ -664,6 +740,19 @@ mod tests {
         register_with_pane(server, id, None);
     }
 
+    fn register_role(server: &Server, id: &str, role: &str) {
+        server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: id.into(),
+                token: format!("token-{id}"),
+                pane: None,
+                cwd: "/tmp".into(),
+                registered_ms: now_ms(),
+                role: role.into(),
+            },
+        }]);
+    }
+
     fn register_with_pane(server: &Server, id: &str, pane: Option<&str>) {
         server.commit(&[Event::Registered {
             worker: WorkerRec {
@@ -672,6 +761,7 @@ mod tests {
                 pane: pane.map(str::to_string),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
+                role: default_role(),
             },
         }]);
     }
@@ -706,9 +796,10 @@ mod tests {
 
         let second = send(&server, "sender", "receiver", "request", "second", None);
         assert!(!second.ok);
-        assert!(second.error.unwrap().contains(&format!(
-            "existing_request_id={first_id}"
-        )));
+        assert!(second
+            .error
+            .unwrap()
+            .contains(&format!("existing_request_id={first_id}")));
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -721,7 +812,14 @@ mod tests {
 
         let request = send(&server, "asker", "answerer", "request", "question", None);
         let request_id = request.data["msg_id"].as_str().unwrap().to_string();
-        send(&server, "answerer", "asker", "reply", "old", Some(request_id.clone()));
+        send(
+            &server,
+            "answerer",
+            "asker",
+            "reply",
+            "old",
+            Some(request_id.clone()),
+        );
         let latest = send(
             &server,
             "answerer",
@@ -734,7 +832,10 @@ mod tests {
 
         let st = server.state.lock().unwrap();
         assert_eq!(
-            st.inbox_of("asker").iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            st.inbox_of("asker")
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
             vec![latest_id.as_str()]
         );
         drop(st);
@@ -752,7 +853,14 @@ mod tests {
             .map(|i| {
                 let server = server.clone();
                 std::thread::spawn(move || {
-                    send(&server, "sender", "receiver", "request", &format!("r{i}"), None)
+                    send(
+                        &server,
+                        "sender",
+                        "receiver",
+                        "request",
+                        &format!("r{i}"),
+                        None,
+                    )
                 })
             })
             .collect();
@@ -778,29 +886,6 @@ mod tests {
         assert!(std::fs::read_to_string(server.log_path())
             .unwrap()
             .contains("knock failed pane=%collab-test-missing-pane"));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn claim_wait_timeout_logs_submitted_tmux_reminder() {
-        let (server, root) = test_server();
-        register(&server, "owner");
-        register_with_pane(&server, "waiter", Some("%collab-test-missing-pane"));
-        server.commit(&[Event::ClaimAcquired {
-            id: "build".into(),
-            owner: "owner".into(),
-            intent: None,
-            lease_until_ms: i64::MAX / 2,
-            at_ms: now_ms(),
-        }]);
-
-        let server = Arc::new(server);
-        let response = handle_claim_wait(&server, "waiter".into(), "build".into(), 0);
-        assert_eq!(response.data["wait_status"], json!("timeout"));
-        assert!(std::fs::read_to_string(server.log_path())
-            .unwrap()
-            .contains("knock failed pane=%collab-test-missing-pane"));
-        drop(server);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -852,6 +937,244 @@ mod tests {
         assert!(text.contains("decide collaborate/defer/reject with reason"));
         assert!(text.contains("reply if requested, ack id=system-1"));
         assert!(text.contains("immediately continue the current run's next step"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn first_worker_is_master_and_second_is_worker() {
+        let (server, root) = test_server();
+        let first = handle_register(
+            &server,
+            "first".into(),
+            "token-first".into(),
+            None,
+            "/tmp".into(),
+        );
+        assert!(first.ok);
+        assert_eq!(first.data["role"], "master");
+
+        let second = handle_register(
+            &server,
+            "second".into(),
+            "token-second".into(),
+            None,
+            "/tmp".into(),
+        );
+        assert!(second.ok);
+        assert_eq!(second.data["role"], "worker");
+        assert_eq!(
+            server.state.lock().unwrap().workers["second"].role,
+            "worker"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn task_register_sets_owner_and_conflicts_on_worktree() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_role(&server, "worker", "worker");
+
+        let master = handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-a".into(),
+            Some("worker".into()),
+            Some("feature-a".into()),
+            Some("/tmp/worktree-a".into()),
+            None,
+            None,
+        );
+        assert!(master.ok);
+        assert_eq!(master.data["owner"], "worker");
+
+        let conflict = handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-b".into(),
+            Some("worker".into()),
+            Some("feature-a".into()),
+            Some("/tmp/worktree-b".into()),
+            None,
+            None,
+        );
+        assert!(!conflict.ok);
+        assert!(conflict.error.unwrap().contains("task resource conflict"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn non_master_cannot_register_task_for_another_owner() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_role(&server, "worker", "worker");
+
+        let denied = handle_task_register(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-x".into(),
+            Some("master".into()),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!denied.ok);
+        assert!(denied.error.unwrap().contains("only master"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn closing_task_unregisters_heartbeat() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_role(&server, "worker", "worker");
+        let created = handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-heartbeat".into(),
+            Some("worker".into()),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(created.ok);
+
+        let active = server.state.lock().unwrap();
+        assert!(task_heartbeat_active(
+            &active.tasks["task-heartbeat"].status
+        ));
+        drop(active);
+
+        let delivered = handle_task_update(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-heartbeat".into(),
+            Some("delivered".into()),
+            None,
+        );
+        assert!(delivered.ok);
+        assert_eq!(delivered.data["heartbeat"], "unregistered");
+
+        {
+            let st = server.state.lock().unwrap();
+            assert!(task_resource_active(&st.tasks["task-heartbeat"].status));
+        }
+
+        let closed = handle_task_update(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-heartbeat".into(),
+            Some("merged".into()),
+            None,
+        );
+        assert!(closed.ok);
+        assert_eq!(closed.data["heartbeat"], "unregistered");
+
+        let st = server.state.lock().unwrap();
+        assert!(!task_heartbeat_active(&st.tasks["task-heartbeat"].status));
+        assert!(!task_resource_active(&st.tasks["task-heartbeat"].status));
+        assert_eq!(st.tasks["task-heartbeat"].status, "merged");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn worker_cannot_merge_task() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_role(&server, "worker", "worker");
+        handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-gate".into(),
+            Some("worker".into()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let denied = handle_task_update(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-gate".into(),
+            Some("merged".into()),
+            None,
+        );
+        assert!(!denied.ok);
+        assert!(denied.error.unwrap().contains("only master"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn delivered_task_keeps_resource_conflict_until_master_close() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_role(&server, "worker", "worker");
+        handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-held".into(),
+            Some("worker".into()),
+            Some("feature-held".into()),
+            Some("/tmp/held".into()),
+            None,
+            None,
+        );
+        let delivered = handle_task_update(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-held".into(),
+            Some("delivered".into()),
+            None,
+        );
+        assert!(delivered.ok);
+
+        let conflict = handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-next".into(),
+            Some("worker".into()),
+            Some("feature-held".into()),
+            None,
+            None,
+            None,
+        );
+        assert!(!conflict.ok);
+
+        let closed = handle_task_update(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-held".into(),
+            Some("closed".into()),
+            None,
+        );
+        assert!(closed.ok);
+
+        let acquired = handle_task_register(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-next".into(),
+            None,
+            Some("feature-held".into()),
+            None,
+            None,
+            None,
+        );
+        assert!(acquired.ok);
         std::fs::remove_dir_all(root).ok();
     }
 }

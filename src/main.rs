@@ -11,7 +11,11 @@ use scope::Scope;
 use serde_json::json;
 
 #[derive(Parser)]
-#[command(name = "collab", version, about = "Project-local coordination for multi-agent work")]
+#[command(
+    name = "collab",
+    version,
+    about = "Project-local coordination for multi-agent work"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -28,6 +32,8 @@ enum Cmd {
     Up,
     /// Show server summary
     Status,
+    /// Show your current role (master if first registered, otherwise worker)
+    Role,
     /// Get or create your worker identity and announce your tmux pane
     Whoami {
         #[arg(long)]
@@ -66,46 +72,40 @@ enum Cmd {
         worker: Option<String>,
     },
     /// Query message status (nudges, answered)
-    Msg {
-        msg_id: String,
-    },
-    /// Resource claims with leases and FIFO queue
-    Claim {
+    Msg { msg_id: String },
+    /// Task registration and lifecycle (task owner owns feature/worktree)
+    Task {
         #[command(subcommand)]
-        cmd: ClaimCmd,
+        cmd: TaskCmd,
     },
 }
 
 #[derive(Subcommand)]
-enum ClaimCmd {
-    Acquire {
+enum TaskCmd {
+    /// Register a task; the caller becomes owner unless master passes --owner
+    Register {
         id: String,
-        /// lease length in minutes
         #[arg(long)]
-        lease: Option<u64>,
+        owner: Option<String>,
         #[arg(long)]
-        intent: Option<String>,
+        feature: Option<String>,
         #[arg(long)]
-        force: bool,
+        worktree: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        base_commit: Option<String>,
     },
-    Release {
+    /// Update task status/next step by the task owner or master
+    Update {
         id: String,
-    },
-    Renew {
-        id: String,
-        /// new lease length in minutes
         #[arg(long)]
-        lease: Option<u64>,
+        status: Option<String>,
+        #[arg(long)]
+        next: Option<String>,
     },
-    Status {
-        id: Option<String>,
-    },
-    Wait {
-        id: String,
-        /// max wait in seconds
-        #[arg(long, default_value_t = 1800)]
-        timeout: u64,
-    },
+    /// Show task registry
+    Status { id: Option<String> },
 }
 
 fn out<T: serde::Serialize>(v: &T) {
@@ -115,12 +115,15 @@ fn out<T: serde::Serialize>(v: &T) {
 /// Register an identity with the server (idempotent for the same token).
 fn register(scope: &Scope, ident: &Identity) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?.display().to_string();
-    let _: serde_json::Value = client::call(&scope.sock_path(), &Req::Register {
-        worker_id: ident.worker_id.clone(),
-        token: ident.token.clone(),
-        pane: ident.pane.clone(),
-        cwd,
-    })?;
+    let _: serde_json::Value = client::call(
+        &scope.sock_path(),
+        &Req::Register {
+            worker_id: ident.worker_id.clone(),
+            token: ident.token.clone(),
+            pane: ident.pane.clone(),
+            cwd,
+        },
+    )?;
     Ok(())
 }
 
@@ -155,7 +158,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let scope = Scope::resolve()?;
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(server::run(scope))
-        }        Cmd::Up => {
+        }
+        Cmd::Up => {
             let scope = Scope::resolve()?;
             let sock = scope.sock_path();
             if client::alive(&sock) {
@@ -165,7 +169,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let exe = std::env::current_exe()?;
             use std::os::unix::process::CommandExt;
             let log = std::fs::OpenOptions::new()
-                .create(true).append(true)
+                .create(true)
+                .append(true)
                 .open(scope.server_dir().join("log.txt"))?;
             let err = log.try_clone()?;
             std::process::Command::new(exe)
@@ -190,6 +195,18 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&v);
             Ok(())
         }
+        Cmd::Role => {
+            let scope = Scope::resolve()?;
+            let ident = me(&scope, None)?;
+            let v: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::Role {
+                    worker_id: ident.worker_id,
+                },
+            )?;
+            out(&v);
+            Ok(())
+        }
         Cmd::Whoami { worker, pane } => {
             let scope = Scope::resolve()?;
             let ident = identity::load_or_create(&scope, worker, pane)?;
@@ -197,36 +214,55 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&ident);
             Ok(())
         }
-        Cmd::Send { to, r#type, in_reply_to, body } => {
+        Cmd::Send {
+            to,
+            r#type,
+            in_reply_to,
+            body,
+        } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, None)?;
             let body = body.join(" ");
             if body.is_empty() {
                 anyhow::bail!("empty message body");
             }
-            let v: serde_json::Value = client::call(&scope.sock_path(), &Req::Send {
-                from: ident.worker_id, to, mtype: r#type, body, in_reply_to,
-            })?;
+            let v: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::Send {
+                    from: ident.worker_id,
+                    to,
+                    mtype: r#type,
+                    body,
+                    in_reply_to,
+                },
+            )?;
             out(&v);
             Ok(())
         }
         Cmd::Recv { timeout, worker } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;
-            let v: serde_json::Value = client::call(&scope.sock_path(), &Req::Poll {
-                worker_id: ident.worker_id,
-                token: ident.token,
-                timeout_ms: timeout.saturating_mul(1000),
-            })?;
+            let v: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::Poll {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    timeout_ms: timeout.saturating_mul(1000),
+                },
+            )?;
             out(&v);
             Ok(())
         }
         Cmd::Inbox { worker } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;
-            let v: serde_json::Value = client::call(&scope.sock_path(), &Req::Inbox {
-                worker_id: ident.worker_id, token: ident.token,
-            })?;
+            let v: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::Inbox {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                },
+            )?;
             out(&v);
             Ok(())
         }
@@ -236,36 +272,53 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;
-            let v: serde_json::Value = client::call(&scope.sock_path(), &Req::Ack {
-                worker_id: ident.worker_id, token: ident.token, ids,
-            })?;
+            let v: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::Ack {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    ids,
+                },
+            )?;
             out(&v);
             Ok(())
         }
         Cmd::Msg { msg_id } => {
             let scope = Scope::resolve()?;
-            let v: serde_json::Value = client::call(&scope.sock_path(), &Req::MsgStatus { msg_id })?;
+            let v: serde_json::Value =
+                client::call(&scope.sock_path(), &Req::MsgStatus { msg_id })?;
             out(&v);
             Ok(())
         }
-        Cmd::Claim { cmd } => {
+        Cmd::Task { cmd } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, None)?;
             let req = match cmd {
-                ClaimCmd::Acquire { id, lease, intent, force } => Req::ClaimAcquire {
-                    worker_id: ident.worker_id, claim_id: id, intent,
-                    lease_ms: lease.map(|m| m * 60_000), force,
+                TaskCmd::Register {
+                    id,
+                    owner,
+                    feature,
+                    worktree,
+                    branch,
+                    base_commit,
+                } => Req::TaskRegister {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    task_id: id,
+                    owner,
+                    feature_id: feature,
+                    worktree_path: worktree,
+                    branch,
+                    base_commit,
                 },
-                ClaimCmd::Release { id } => Req::ClaimRelease { worker_id: ident.worker_id, claim_id: id },
-                ClaimCmd::Renew { id, lease } => Req::ClaimRenew {
-                    worker_id: ident.worker_id, claim_id: id,
-                    lease_ms: lease.map(|m| m * 60_000),
+                TaskCmd::Update { id, status, next } => Req::TaskUpdate {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    task_id: id,
+                    status,
+                    next_step: next,
                 },
-                ClaimCmd::Status { id } => Req::ClaimStatus { claim_id: id },
-                ClaimCmd::Wait { id, timeout } => Req::ClaimWait {
-                    worker_id: ident.worker_id, claim_id: id,
-                    timeout_ms: timeout.saturating_mul(1000),
-                },
+                TaskCmd::Status { id } => Req::TaskStatus { task_id: id },
             };
             let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
             out(&v);
