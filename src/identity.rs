@@ -157,7 +157,12 @@ pub fn load_or_create(
         // pane-keyed identity: derive worker_id from pane for traceability
         let p = pane.as_deref().unwrap_or("unknown");
         if let Some(terminal_id) = &herdr_terminal {
-            format!("pane-herdr-{}", pane_file_name(terminal_id))
+            let session_id = p
+                .strip_prefix("herdr:")
+                .and_then(|v| v.rsplit_once('|'))
+                .map(|(socket, _)| pane_file_name(socket))
+                .unwrap_or_else(|| "unknown-session".to_string());
+            format!("pane-herdr-{}-{}", session_id, pane_file_name(terminal_id))
         } else {
             format!("pane-{}", p.trim_start_matches('%'))
         }
