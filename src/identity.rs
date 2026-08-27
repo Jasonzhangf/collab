@@ -2,7 +2,6 @@ use crate::scope::Scope;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
@@ -66,28 +65,12 @@ fn pane_file_name(pane: &str) -> String {
         .collect()
 }
 
-fn herdr_terminal_id(socket: &str, pane: &str) -> anyhow::Result<String> {
-    let output = Command::new("herdr")
-        .env("HERDR_SOCKET_PATH", socket)
-        .args(["pane", "get", pane])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "cannot query Herdr pane {} for a unique terminal identity",
-            pane
-        );
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    parse_terminal_id(&value)
-}
-
-fn parse_terminal_id(value: &serde_json::Value) -> anyhow::Result<String> {
-    value
-        .pointer("/result/pane/terminal_id")
-        .and_then(|v| v.as_str())
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("Herdr pane response has no terminal_id"))
+fn herdr_identity(socket: &str, pane: &str) -> String {
+    format!(
+        "pane-herdr-{}-{}",
+        pane_file_name(socket),
+        pane_file_name(pane)
+    )
 }
 
 /// Load existing identity or create one. Identity is keyed to the tmux pane
@@ -107,11 +90,10 @@ pub fn load_or_create(
             std::env::var("TMUX_PANE").ok()
         }
     });
-    let herdr_terminal = pane
+    let herdr_session = pane
         .as_deref()
         .and_then(|p| p.strip_prefix("herdr:").and_then(|v| v.rsplit_once('|')))
-        .map(|(socket, pane_id)| herdr_terminal_id(socket, pane_id))
-        .transpose()?;
+        .map(|(socket, pane_id)| (socket.to_owned(), pane_id.to_owned()));
 
     let (id, path) = match worker_id {
         Some(w) => {
@@ -126,8 +108,8 @@ pub fn load_or_create(
                     .join("runs")
                     .join("by-pane");
                 std::fs::create_dir_all(&dir)?;
-                let key = if let Some(terminal_id) = &herdr_terminal {
-                    format!("{}-{}", pane_file_name(p), pane_file_name(terminal_id))
+                let key = if let Some((socket, pane_id)) = &herdr_session {
+                    format!("{}-{}", pane_file_name(socket), pane_file_name(pane_id))
                 } else {
                     pane_file_name(p)
                 };
@@ -156,13 +138,8 @@ pub fn load_or_create(
     let id = if id.is_empty() {
         // pane-keyed identity: derive worker_id from pane for traceability
         let p = pane.as_deref().unwrap_or("unknown");
-        if let Some(terminal_id) = &herdr_terminal {
-            let session_id = p
-                .strip_prefix("herdr:")
-                .and_then(|v| v.rsplit_once('|'))
-                .map(|(socket, _)| pane_file_name(socket))
-                .unwrap_or_else(|| "unknown-session".to_string());
-            format!("pane-herdr-{}-{}", session_id, pane_file_name(terminal_id))
+        if let Some((socket, pane_id)) = &herdr_session {
+            herdr_identity(socket, pane_id)
         } else {
             format!("pane-{}", p.trim_start_matches('%'))
         }
@@ -185,17 +162,21 @@ pub fn load_or_create(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_terminal_id;
+    use super::herdr_identity;
 
     #[test]
-    fn parses_herdr_terminal_identity() {
-        let value = serde_json::json!({"result":{"pane":{"terminal_id":"term_123"}}});
-        assert_eq!(parse_terminal_id(&value).unwrap(), "term_123");
+    fn same_herdr_session_and_pane_reuse_identity() {
+        assert_eq!(
+            herdr_identity("/tmp/one.sock", "w1:p1"),
+            herdr_identity("/tmp/one.sock", "w1:p1")
+        );
     }
 
     #[test]
-    fn rejects_missing_herdr_terminal_identity() {
-        let value = serde_json::json!({"result":{"pane":{}}});
-        assert!(parse_terminal_id(&value).is_err());
+    fn different_herdr_sessions_do_not_collide_on_reused_pane() {
+        assert_ne!(
+            herdr_identity("/tmp/one.sock", "w1:p1"),
+            herdr_identity("/tmp/two.sock", "w1:p1")
+        );
     }
 }
