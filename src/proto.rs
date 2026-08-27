@@ -16,6 +16,8 @@ pub enum Req {
         mtype: String,
         body: String,
         in_reply_to: Option<String>,
+        #[serde(default = "default_delivery_mode")]
+        delivery: String,
     },
     Poll {
         worker_id: String,
@@ -87,7 +89,21 @@ pub enum Req {
     },
     Workers,
     MasterId,
+    TransferMaster {
+        worker_id: String,
+        token: String,
+        target_id: String,
+    },
+    RemoveWorker {
+        worker_id: String,
+        token: String,
+        target_id: String,
+    },
     Ping,
+}
+
+fn default_delivery_mode() -> String {
+    "immediate".into()
 }
 
 fn default_poll_timeout() -> u64 {

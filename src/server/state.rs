@@ -17,6 +17,19 @@ pub fn default_priority() -> String {
     "p2".into()
 }
 
+/// Runtime is encoded in the registered pane handle. A worker without a
+/// tmux or Herdr pane is not eligible for project communication.
+pub fn runtime_for_pane(pane: Option<&str>) -> Option<&'static str> {
+    let pane = pane?;
+    if pane.starts_with('%') {
+        Some("tmux")
+    } else if pane.starts_with("herdr:") {
+        Some("herdr")
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRec {
     pub id: String,
@@ -91,7 +104,10 @@ pub fn task_resource_active(status: &str) -> bool {
 #[serde(tag = "ev")]
 pub enum Event {
     Registered { worker: WorkerRec },
+    WorkerRemoved { worker_id: String },
+    MasterTransferred { from: String, to: String },
     Sent { msg: Message },
+    DeliveryMode { msg_id: String, mode: String },
     Delivered { ids: Vec<String> },
     Acked { ids: Vec<String> },
     Nudged { msg_id: String },
@@ -105,6 +121,7 @@ pub struct State {
     pub workers: HashMap<String, WorkerRec>,
     pub msgs: HashMap<String, Message>,
     pub tasks: HashMap<String, TaskRec>,
+    pub delivery_modes: HashMap<String, String>,
 }
 
 impl State {
@@ -133,8 +150,22 @@ impl State {
                 };
                 self.workers.insert(worker.id.clone(), worker);
             }
+            Event::WorkerRemoved { worker_id } => {
+                self.workers.remove(worker_id);
+            }
+            Event::MasterTransferred { from, to } => {
+                if let Some(worker) = self.workers.get_mut(from) {
+                    worker.role = "worker".into();
+                }
+                if let Some(worker) = self.workers.get_mut(to) {
+                    worker.role = "master".into();
+                }
+            }
             Event::Sent { msg } => {
                 self.msgs.insert(msg.id.clone(), msg.clone());
+            }
+            Event::DeliveryMode { msg_id, mode } => {
+                self.delivery_modes.insert(msg_id.clone(), mode.clone());
             }
             Event::Delivered { ids } => {
                 for id in ids {
@@ -249,6 +280,14 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_is_derived_from_pane_namespace() {
+        assert_eq!(runtime_for_pane(Some("%7")), Some("tmux"));
+        assert_eq!(runtime_for_pane(Some("herdr:w4:p1")), Some("herdr"));
+        assert_eq!(runtime_for_pane(None), None);
+        assert_eq!(runtime_for_pane(Some("w4:p1")), None);
+    }
 
     fn msg(id: &str, to: &str, mtype: &str) -> Message {
         Message {

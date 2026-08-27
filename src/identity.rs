@@ -53,6 +53,18 @@ fn identity_path(scope: &Scope, worker_id: &str) -> PathBuf {
         .join("identity.json")
 }
 
+fn pane_file_name(pane: &str) -> String {
+    pane.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Load existing identity or create one. Identity is keyed to the tmux pane
 /// when available (same pane = same worker across invocations), otherwise to
 /// the given worker_id; without either, a fresh identity is created each time.
@@ -61,9 +73,15 @@ pub fn load_or_create(
     worker_id: Option<String>,
     pane_override: Option<String>,
 ) -> anyhow::Result<Identity> {
-    let pane = pane_override
-        .clone()
-        .or_else(|| std::env::var("TMUX_PANE").ok());
+    let pane = pane_override.clone().or_else(|| {
+        if std::env::var("HERDR_ENV").ok().as_deref() == Some("1") {
+            let pane = std::env::var("HERDR_PANE_ID").ok()?;
+            let socket = std::env::var("HERDR_SOCKET_PATH").ok()?;
+            Some(format!("herdr:{}|{}", socket, pane))
+        } else {
+            std::env::var("TMUX_PANE").ok()
+        }
+    });
 
     let (id, path) = match worker_id {
         Some(w) => {
@@ -78,7 +96,7 @@ pub fn load_or_create(
                     .join("runs")
                     .join("by-pane");
                 std::fs::create_dir_all(&dir)?;
-                let file = dir.join(format!("{}.json", p.trim_start_matches('%')));
+                let file = dir.join(format!("{}.json", pane_file_name(p)));
                 (String::new(), file)
             }
             None => {
@@ -103,7 +121,11 @@ pub fn load_or_create(
     let id = if id.is_empty() {
         // pane-keyed identity: derive worker_id from pane for traceability
         let p = pane.as_deref().unwrap_or("unknown");
-        format!("pane-{}", p.trim_start_matches('%'))
+        if let Some(herdr_pane) = p.strip_prefix("herdr:").and_then(|v| v.rsplit_once('|')) {
+            format!("pane-herdr-{}", pane_file_name(herdr_pane.1))
+        } else {
+            format!("pane-{}", p.trim_start_matches('%'))
+        }
     } else {
         id
     };

@@ -7,8 +7,8 @@ use crate::scope::Scope;
 use crate::server::knock::{append_log, knock_or_log, pane_alive};
 use serde_json::json;
 use state::{
-    default_role, now_ms, task_heartbeat_active, task_resource_active, Event, Message, State,
-    TaskRec, WorkerRec,
+    default_role, now_ms, runtime_for_pane, task_heartbeat_active, task_resource_active, Event,
+    Message, State, TaskRec, WorkerRec,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -164,6 +164,15 @@ pub(super) fn queue_system_knock(server: &Server, pane: &str, msg_id: &str, body
     }
 }
 
+pub(super) fn queue_batch_knock(server: &Server, pane: &str, ids: &[String], body: &str) {
+    let prompt = format!(
+        "[MAIL] from=collab-server type=system ids={} | {}",
+        ids.join(","),
+        body
+    );
+    knock_or_log(&server.log_path(), pane, &prompt);
+}
+
 fn timeout_prompt(kind: &str, worker_id: &str, timeout_ms: u64) -> String {
     format!(
         "Blocking collab {} returned without a message for worker {} after {}ms. Continue the current run from its notes/actor next step; do not idle or wait for another request.",
@@ -219,11 +228,23 @@ fn handle_register(
     cwd: String,
 ) -> Resp {
     let mut st = server.state.lock().unwrap();
+    let Some(runtime) = runtime_for_pane(pane.as_deref()) else {
+        return Resp::err("collab registration requires a tmux or herdr pane");
+    };
     if let Some(existing) = st.workers.get(&worker_id).cloned() {
         if existing.token != token {
             return Resp::err(format!(
                 "worker_id {} already registered by another token",
                 worker_id
+            ));
+        }
+        let Some(existing_runtime) = runtime_for_pane(existing.pane.as_deref()) else {
+            return Resp::err("existing worker has no valid tmux or herdr runtime");
+        };
+        if existing_runtime != runtime {
+            return Resp::err(format!(
+                "worker {} cannot change runtime from {} to {}",
+                worker_id, existing_runtime, runtime
             ));
         }
         let role = existing.role.clone();
@@ -236,7 +257,21 @@ fn handle_register(
             role: role.clone(),
         };
         server.commit_locked(&mut st, &[Event::Registered { worker: refreshed }]);
-        return Resp::data(json!({"worker_id": worker_id, "role": role, "reused": true}));
+        return Resp::data(
+            json!({"worker_id": worker_id, "role": role, "runtime": runtime, "reused": true}),
+        );
+    }
+    if let Some(master_id) = st.master_id() {
+        let master = st.workers.get(&master_id).expect("master exists");
+        let Some(master_runtime) = runtime_for_pane(master.pane.as_deref()) else {
+            return Resp::err("master has no valid tmux or herdr runtime");
+        };
+        if master_runtime != runtime {
+            return Resp::err(format!(
+                "runtime mismatch: project master uses {}, new worker uses {}",
+                master_runtime, runtime
+            ));
+        }
     }
     let role = if st.has_master() {
         default_role()
@@ -260,6 +295,7 @@ fn handle_register(
     Resp::data(json!({
         "worker_id": worker_id,
         "role": rec.role,
+        "runtime": runtime,
         "registered_at": iso(rec.registered_ms),
         "role_decision": if rec.role == "master" { "first-registered-worker-default-master" } else { "master-exists-default-worker" }
     }))
@@ -272,7 +308,11 @@ fn handle_send(
     mtype: String,
     body: String,
     in_reply_to: Option<String>,
+    delivery_mode: String,
 ) -> Resp {
+    if delivery_mode != "immediate" && delivery_mode != "idle" {
+        return Resp::err("delivery must be immediate or idle");
+    }
     if !MSG_TYPES.contains(&mtype.as_str()) {
         return Resp::err(format!(
             "invalid type {}; must be one of {:?}",
@@ -280,6 +320,24 @@ fn handle_send(
         ));
     }
     let mut st = server.state.lock().unwrap();
+    let Some(sender) = st.workers.get(&from) else {
+        return Resp::err(format!("sender {} not registered", from));
+    };
+    let Some(recipient) = st.workers.get(&to) else {
+        return Resp::err(format!("recipient {} not registered", to));
+    };
+    let Some(sender_runtime) = runtime_for_pane(sender.pane.as_deref()) else {
+        return Resp::err("sender has no valid tmux or herdr runtime");
+    };
+    let Some(recipient_runtime) = runtime_for_pane(recipient.pane.as_deref()) else {
+        return Resp::err("recipient has no valid tmux or herdr runtime");
+    };
+    if sender_runtime != recipient_runtime {
+        return Resp::err(format!(
+            "runtime mismatch: sender uses {}, recipient uses {}",
+            sender_runtime, recipient_runtime
+        ));
+    }
     if !st.workers.contains_key(&to) {
         return Resp::err(format!("recipient {} not registered", to));
     }
@@ -313,13 +371,26 @@ fn handle_send(
         nudge_count: 0,
         last_nudge_ms: 0,
     };
+    if let Some(existing) = st.msgs.values().find(|m| {
+        m.from == from
+            && m.to == to
+            && m.mtype == mtype
+            && m.body == msg.body
+            && m.state == "pending"
+    }) {
+        return Resp::data(json!({"msg_id": existing.id, "deduplicated": true}));
+    }
     let mid = msg.id.clone();
-    let delivery = delivery_text(&server.root, &from, &mtype, &mid, &msg.body);
-    let delivery = match delivery {
+    let prompt = delivery_text(&server.root, &from, &mtype, &mid, &msg.body);
+    let prompt = match prompt {
         Ok(text) => text,
         Err(e) => return Resp::err(e),
     };
     let mut events = vec![Event::Sent { msg }];
+    events.push(Event::DeliveryMode {
+        msg_id: mid.clone(),
+        mode: delivery_mode.clone(),
+    });
     if !superseded_ids.is_empty() {
         events.push(Event::Superseded {
             ids: superseded_ids,
@@ -328,8 +399,12 @@ fn handle_send(
     let pane = st.worker_pane(&to);
     server.commit_locked(&mut st, &events);
     drop(st);
-    if let Some(p) = pane {
-        knock_or_log(&server.log_path(), &p, &delivery);
+    if delivery_mode == "immediate" {
+        if let Some(p) = pane {
+            if p.starts_with('%') || p.starts_with("herdr:") {
+                knock_or_log(&server.log_path(), &p, &prompt);
+            }
+        }
     }
     Resp::data(json!({"msg_id": mid}))
 }
@@ -809,7 +884,7 @@ fn handle_task_deliver(
     let evidence = evidence.unwrap_or_else(|| "not provided".to_string());
     let master = st.master_id().unwrap_or_else(|| "unassigned".to_string());
     let body = format!(
-        "TASK_DELIVERED id={} status=delivered owner={} feature={} branch={} evidence={}",
+        "TASK_DELIVERED id={} status=delivered owner={} feature={} branch={} evidence={} | MASTER_ACTION: merge/review this delivery, then run collab task status and update the task list before dispatching the next task",
         task.id,
         task.owner,
         task.feature_id.as_deref().unwrap_or("none"),
@@ -1020,6 +1095,73 @@ fn task_conflicts(
     Resp::data(json!({"conflicts": conflicts}))
 }
 
+fn handle_transfer_master(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    target_id: String,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    let Some(current) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if current.token != token || current.role != "master" {
+        return Resp::err("only the current master may transfer master role");
+    }
+    let Some(target) = st.workers.get(&target_id).cloned() else {
+        return Resp::err(format!("target worker {} not registered", target_id));
+    };
+    if target_id == worker_id {
+        return Resp::err("target worker must differ from current master");
+    }
+    if runtime_for_pane(current.pane.as_deref()) != runtime_for_pane(target.pane.as_deref()) {
+        return Resp::err("master transfer requires the same runtime");
+    }
+    server.commit_locked(
+        &mut st,
+        &[Event::MasterTransferred {
+            from: worker_id.clone(),
+            to: target_id.clone(),
+        }],
+    );
+    Resp::data(json!({"master": target_id, "previous_master": worker_id}))
+}
+
+fn handle_remove_worker(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    target_id: String,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    let Some(master) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if master.token != token || master.role != "master" {
+        return Resp::err("only the current master may remove workers");
+    }
+    if target_id == worker_id {
+        return Resp::err("master cannot remove itself; transfer master first");
+    }
+    if !st.workers.contains_key(&target_id) {
+        return Resp::err(format!("target worker {} not registered", target_id));
+    }
+    if st
+        .tasks
+        .values()
+        .any(|task| task.owner == target_id && task_resource_active(&task.status))
+    {
+        return Resp::err("cannot remove worker holding an active task");
+    }
+    server.commit_locked(
+        &mut st,
+        &[Event::WorkerRemoved {
+            worker_id: target_id.clone(),
+        }],
+    );
+    Resp::data(json!({"removed": target_id}))
+}
+
 // ---------- dispatch ----------
 
 fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
@@ -1036,7 +1178,8 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             mtype,
             body,
             in_reply_to,
-        } => handle_send(server, from, to, mtype, body, in_reply_to),
+            delivery,
+        } => handle_send(server, from, to, mtype, body, in_reply_to, delivery),
         Req::Poll {
             worker_id,
             token,
@@ -1221,6 +1364,16 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             let st = server.state.lock().unwrap();
             Resp::data(json!({"master": st.master_id()}))
         }
+        Req::TransferMaster {
+            worker_id,
+            token,
+            target_id,
+        } => handle_transfer_master(server, worker_id, token, target_id),
+        Req::RemoveWorker {
+            worker_id,
+            token,
+            target_id,
+        } => handle_remove_worker(server, worker_id, token, target_id),
         Req::Ping => {
             let st = server.state.lock().unwrap();
             Resp::data(json!({
@@ -1358,7 +1511,7 @@ mod tests {
     }
 
     fn register(server: &Server, id: &str) {
-        register_with_pane(server, id, None);
+        register_with_pane(server, id, Some("%test-default"));
     }
 
     fn register_role(server: &Server, id: &str, role: &str) {
@@ -1366,7 +1519,7 @@ mod tests {
             worker: WorkerRec {
                 id: id.into(),
                 token: format!("token-{id}"),
-                pane: (role == "worker").then(|| format!("%test-{id}")),
+                pane: Some(format!("%test-{id}")),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
                 role: role.into(),
@@ -1402,6 +1555,7 @@ mod tests {
             mtype.into(),
             body.into(),
             in_reply_to,
+            "immediate".into(),
         )
     }
 
@@ -1580,7 +1734,7 @@ mod tests {
             &server,
             "first".into(),
             "token-first".into(),
-            None,
+            Some("%test-first".into()),
             "/tmp".into(),
         );
         assert!(first.ok);
@@ -1590,7 +1744,7 @@ mod tests {
             &server,
             "second".into(),
             "token-second".into(),
-            None,
+            Some("%test-second".into()),
             "/tmp".into(),
         );
         assert!(second.ok);
@@ -1599,6 +1753,107 @@ mod tests {
             server.state.lock().unwrap().workers["second"].role,
             "worker"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn registration_rejects_mixed_runtime() {
+        let (server, root) = test_server();
+        let first = handle_register(
+            &server,
+            "tmux-master".into(),
+            "token-master".into(),
+            Some("%test-master".into()),
+            "/tmp".into(),
+        );
+        assert!(first.ok);
+        let second = handle_register(
+            &server,
+            "herdr-worker".into(),
+            "token-worker".into(),
+            Some("herdr:w4:p2".into()),
+            "/tmp".into(),
+        );
+        assert!(!second.ok);
+        assert!(second.error.unwrap().contains("runtime mismatch"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn message_rejects_cross_runtime_recipient() {
+        let (server, root) = test_server();
+        register_with_pane(&server, "tmux", Some("%test-tmux"));
+        server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: "herdr".into(),
+                token: "token-herdr".into(),
+                pane: Some("herdr:w4:p2".into()),
+                cwd: "/tmp".into(),
+                registered_ms: now_ms(),
+                role: default_role(),
+            },
+        }]);
+        let refused = send(&server, "tmux", "herdr", "notify", "x", None);
+        assert!(!refused.ok);
+        assert!(refused.error.unwrap().contains("runtime mismatch"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_can_transfer_and_remove_old_identity() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_with_pane(&server, "replacement", Some("%test-replacement"));
+        let moved = handle_transfer_master(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "replacement".into(),
+        );
+        assert!(moved.ok);
+        assert_eq!(
+            server.state.lock().unwrap().master_id().as_deref(),
+            Some("replacement")
+        );
+        let removed = handle_remove_worker(
+            &server,
+            "replacement".into(),
+            "token-replacement".into(),
+            "master".into(),
+        );
+        assert!(removed.ok);
+        assert!(!server.state.lock().unwrap().workers.contains_key("master"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn idle_delivery_is_journaled_and_duplicates_coalesce() {
+        let (server, root) = test_server();
+        register_with_pane(&server, "sender", Some("%test-sender"));
+        register_with_pane(&server, "receiver", Some("%test-receiver"));
+        let first = handle_send(
+            &server,
+            "sender".into(),
+            "receiver".into(),
+            "notify".into(),
+            "same".into(),
+            None,
+            "idle".into(),
+        );
+        assert!(first.ok);
+        assert_eq!(server.state.lock().unwrap().delivery_modes.len(), 1);
+        let second = handle_send(
+            &server,
+            "sender".into(),
+            "receiver".into(),
+            "notify".into(),
+            "same".into(),
+            None,
+            "idle".into(),
+        );
+        assert!(second.ok);
+        assert_eq!(second.data["deduplicated"], true);
+        assert_eq!(server.state.lock().unwrap().msgs.len(), 1);
         std::fs::remove_dir_all(root).ok();
     }
 

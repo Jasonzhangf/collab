@@ -39,6 +39,10 @@ enum Cmd {
     Who,
     /// Show the current master worker id
     Master,
+    /// Transfer master role to another registered worker
+    TransferMaster { target: String },
+    /// Remove a stale registered worker (master only)
+    RemoveWorker { target: String },
     /// Get or create your worker identity and announce your tmux pane
     Whoami {
         #[arg(long)]
@@ -54,6 +58,8 @@ enum Cmd {
         r#type: String,
         #[arg(long)]
         in_reply_to: Option<String>,
+        #[arg(long, default_value = "immediate", value_parser = ["immediate", "idle"])]
+        delivery: String,
         #[arg(trailing_var_arg = true)]
         body: Vec<String>,
     },
@@ -175,6 +181,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Init => {
             let cwd = std::env::current_dir()?;
+            let in_herdr = std::env::var("HERDR_ENV").ok().as_deref() == Some("1")
+                && std::env::var_os("HERDR_PANE_ID").is_some();
+            let in_tmux = std::env::var_os("TMUX_PANE").is_some();
+            if !in_herdr && !in_tmux {
+                anyhow::bail!("collab init requires a live tmux pane or Herdr pane (HERDR_ENV=1)");
+            }
             if scope::find_root(&cwd).is_none() || !cwd.join(".agent-collab").is_dir() {
                 let _base = scope::init(&cwd)?;
             }
@@ -285,6 +297,34 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&v);
             Ok(())
         }
+        Cmd::TransferMaster { target } => {
+            let scope = Scope::resolve()?;
+            let ident = me(&scope, None)?;
+            let v: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::TransferMaster {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    target_id: target,
+                },
+            )?;
+            out(&v);
+            Ok(())
+        }
+        Cmd::RemoveWorker { target } => {
+            let scope = Scope::resolve()?;
+            let ident = me(&scope, None)?;
+            let v: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::RemoveWorker {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    target_id: target,
+                },
+            )?;
+            out(&v);
+            Ok(())
+        }
         Cmd::Whoami { worker, pane } => {
             let scope = Scope::resolve()?;
             let ident = identity::load_or_create(&scope, worker, pane)?;
@@ -296,6 +336,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             to,
             r#type,
             in_reply_to,
+            delivery,
             body,
         } => {
             let scope = Scope::resolve()?;
@@ -312,6 +353,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     mtype: r#type,
                     body,
                     in_reply_to,
+                    delivery,
                 },
             )?;
             out(&v);

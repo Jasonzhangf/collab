@@ -42,6 +42,19 @@ This project uses the local `collab` daemon for multi-agent coordination.
 The binary lives in `~/code/collab`; the installed command is
 `~/.cargo/bin/collab`.
 
+## Runtime boundary
+
+- Every registration must come from a live tmux pane or a live Herdr pane.
+- The first registered pane fixes the project runtime (`tmux` or `herdr`).
+- Later workers must use the same runtime; mixed tmux/Herdr projects are
+  rejected, as are messages across runtimes.
+- The runtime is part of the worker identity boundary, not a task preference.
+
+The current master may migrate ownership before a restart:
+`collab transfer-master <worker-id>`. To remove an old registration, use
+`collab remove-worker <worker-id>`; active task owners must deliver or release
+their task first. The master cannot remove itself.
+
 ## Roles
 
 - First registered pane becomes `master`; every later pane becomes `worker`.

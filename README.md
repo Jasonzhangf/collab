@@ -1,5 +1,13 @@
 # collab
 
+## Runtime boundary
+
+Workers must register from exactly one supported terminal runtime: tmux or
+Herdr. The first registration fixes the project runtime; later registrations
+from the other runtime fail, and messages across runtimes fail. The durable
+mailbox is shared only within that project/runtime boundary; tmux wake-ups are
+used only for tmux panes.
+
 Project-local coordination daemon + CLI for multi-agent work inside one working
 tree. Rust, single static binary, no network — a unix socket under
 `.agent-collab/` is the whole transport.

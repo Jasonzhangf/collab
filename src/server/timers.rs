@@ -1,6 +1,8 @@
 use crate::config;
+use crate::server::knock::pane_idle;
 use crate::server::state::{now_ms, task_heartbeat_active, Event, Message, TaskRec};
 use crate::server::Server;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 const NUDGE_INTERVAL_MS: i64 = 5 * 60 * 1000;
@@ -39,6 +41,15 @@ pub fn tick(server: &Arc<Server>) {
     let mut evs: Vec<Event> = Vec::new();
     let mut knocks: Vec<(String, String, String)> = Vec::new();
 
+    let idle_panes: HashSet<String> = {
+        let st = server.state.lock().unwrap();
+        st.workers
+            .values()
+            .filter_map(|worker| worker.pane.clone())
+            .filter(|pane| pane_idle(pane))
+            .collect()
+    };
+
     {
         let st = server.state.lock().unwrap();
 
@@ -51,6 +62,12 @@ pub fn tick(server: &Arc<Server>) {
                 continue;
             }
             let pane = st.worker_pane(&task.owner);
+            if !pane
+                .as_deref()
+                .is_some_and(|value| idle_panes.contains(value))
+            {
+                continue;
+            }
             let body = heartbeat_body(
                 &task.id,
                 &task.owner,
@@ -121,6 +138,40 @@ pub fn tick(server: &Arc<Server>) {
                 msg_id: m.id.clone(),
             });
         }
+
+        for worker in st.workers.values() {
+            let Some(pane) = worker.pane.as_deref() else {
+                continue;
+            };
+            if !idle_panes.contains(pane) {
+                continue;
+            }
+            let pending: Vec<&Message> = st
+                .msgs
+                .values()
+                .filter(|m| {
+                    m.to == worker.id
+                        && m.state == "pending"
+                        && st.delivery_modes.get(&m.id).map(String::as_str) == Some("idle")
+                })
+                .collect();
+            if pending.is_empty() {
+                continue;
+            }
+            let ids = pending.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+            let body = pending
+                .iter()
+                .map(|m| format!("[{}] {}", m.mtype, m.body))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let prompt = format!(
+                "[COLLAB QUEUE] {}; Process these messages now; acknowledge each id: {}",
+                body,
+                ids.join(",")
+            );
+            knocks.push((pane.to_string(), ids.join(","), prompt));
+            evs.push(Event::Delivered { ids });
+        }
     }
 
     if evs.is_empty() {
@@ -128,7 +179,12 @@ pub fn tick(server: &Arc<Server>) {
     }
     server.commit(&evs);
     for (pane, msg_id, body) in knocks {
-        super::queue_system_knock(server, &pane, &msg_id, &body);
+        if msg_id.contains(',') {
+            let ids = msg_id.split(',').map(str::to_owned).collect::<Vec<_>>();
+            super::queue_batch_knock(server, &pane, &ids, &body);
+        } else {
+            super::queue_system_knock(server, &pane, &msg_id, &body);
+        }
     }
 }
 
@@ -194,7 +250,7 @@ mod tests {
             worker: WorkerRec {
                 id: id.into(),
                 token: format!("token-{id}"),
-                pane: None,
+                pane: Some(format!("%test-{id}")),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
                 role: role.into(),
