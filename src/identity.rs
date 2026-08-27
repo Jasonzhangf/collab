@@ -2,6 +2,7 @@ use crate::scope::Scope;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
@@ -65,6 +66,30 @@ fn pane_file_name(pane: &str) -> String {
         .collect()
 }
 
+fn herdr_terminal_id(socket: &str, pane: &str) -> anyhow::Result<String> {
+    let output = Command::new("herdr")
+        .env("HERDR_SOCKET_PATH", socket)
+        .args(["pane", "get", pane])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cannot query Herdr pane {} for a unique terminal identity",
+            pane
+        );
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    parse_terminal_id(&value)
+}
+
+fn parse_terminal_id(value: &serde_json::Value) -> anyhow::Result<String> {
+    value
+        .pointer("/result/pane/terminal_id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Herdr pane response has no terminal_id"))
+}
+
 /// Load existing identity or create one. Identity is keyed to the tmux pane
 /// when available (same pane = same worker across invocations), otherwise to
 /// the given worker_id; without either, a fresh identity is created each time.
@@ -82,6 +107,11 @@ pub fn load_or_create(
             std::env::var("TMUX_PANE").ok()
         }
     });
+    let herdr_terminal = pane
+        .as_deref()
+        .and_then(|p| p.strip_prefix("herdr:").and_then(|v| v.rsplit_once('|')))
+        .map(|(socket, pane_id)| herdr_terminal_id(socket, pane_id))
+        .transpose()?;
 
     let (id, path) = match worker_id {
         Some(w) => {
@@ -96,7 +126,12 @@ pub fn load_or_create(
                     .join("runs")
                     .join("by-pane");
                 std::fs::create_dir_all(&dir)?;
-                let file = dir.join(format!("{}.json", pane_file_name(p)));
+                let key = if let Some(terminal_id) = &herdr_terminal {
+                    format!("{}-{}", pane_file_name(p), pane_file_name(terminal_id))
+                } else {
+                    pane_file_name(p)
+                };
+                let file = dir.join(format!("{}.json", key));
                 (String::new(), file)
             }
             None => {
@@ -121,8 +156,8 @@ pub fn load_or_create(
     let id = if id.is_empty() {
         // pane-keyed identity: derive worker_id from pane for traceability
         let p = pane.as_deref().unwrap_or("unknown");
-        if let Some(herdr_pane) = p.strip_prefix("herdr:").and_then(|v| v.rsplit_once('|')) {
-            format!("pane-herdr-{}", pane_file_name(herdr_pane.1))
+        if let Some(terminal_id) = &herdr_terminal {
+            format!("pane-herdr-{}", pane_file_name(terminal_id))
         } else {
             format!("pane-{}", p.trim_start_matches('%'))
         }
@@ -141,4 +176,21 @@ pub fn load_or_create(
     std::fs::write(&tmp, serde_json::to_string_pretty(&ident)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(ident)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_terminal_id;
+
+    #[test]
+    fn parses_herdr_terminal_identity() {
+        let value = serde_json::json!({"result":{"pane":{"terminal_id":"term_123"}}});
+        assert_eq!(parse_terminal_id(&value).unwrap(), "term_123");
+    }
+
+    #[test]
+    fn rejects_missing_herdr_terminal_identity() {
+        let value = serde_json::json!({"result":{"pane":{}}});
+        assert!(parse_terminal_id(&value).is_err());
+    }
 }
