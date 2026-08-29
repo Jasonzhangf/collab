@@ -1,4 +1,4 @@
-# v2 architecture — v2-design-freeze-1
+# v2 architecture — design-baseline-draft
 
 ```text
 Codis containers -> Cordis orchestrator -> versioned IPC/events -> Rust Core
@@ -22,4 +22,17 @@ commands or events; they do not mutate core state or journal files.
 
 `discover -> validate -> start -> ready -> route switch -> drain -> dispose`.
 An old plugin remains the active implementation until the replacement is
-ready. A failed replacement is explicit and does not change core truth.
+ready. A failed replacement is explicit and does not change core truth. Every
+command/event carries an authenticated control context plus `plugin_instance_id`
+and `route_epoch`; the core rejects stale instances after route switch.
+
+## Commit and replay contract
+
+The core reducer is the only sequence allocator. It checks `command_id`
+idempotency before reducing, appends the committed event durably before
+publishing it, and replays only contiguous sequences. Snapshots bind
+`last_applied_sequence` and `schema_version`; gaps, duplicates, stale epochs,
+and unauthorized control contexts fail explicitly.
+
+Runtime health is control truth owned by Codis/Cordis. It may produce a typed
+observation, but only an authorized core command may change business truth.
