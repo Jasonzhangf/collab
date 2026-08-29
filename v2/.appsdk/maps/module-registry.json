@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "modules": [{
+    "module_id": "core",
+    "status": "active",
+    "owner": "core",
+    "owned_paths": ["src/**", "crates/**", "containers/**", "tests/**", "protocol/**"],
+    "forbidden_paths": ["active/lib/**", "protected/**", "generated/**"],
+    "verification_gates": ["fix_lifecycle_graph", "mainline_merge_identity"]
+  }]
+}

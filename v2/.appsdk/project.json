@@ -1,0 +1,155 @@
+{
+  "access": {
+    "protected_paths": [
+      ".appsdk/**",
+      "generated/**",
+      "protected/source/**"
+    ]
+  },
+  "development_scenarios": {
+    "enabled": [],
+    "manifest": ".appsdk/contracts/development-scenarios.manifest.json"
+  },
+  "governance": {
+    "active_kind": "immutable_consumable_library",
+    "active_root": "active/lib/**",
+    "debug_merge_comment_required": true,
+    "freeze_requirements": [
+      "git_clean",
+      "source_commit_or_tag",
+      "library_hash",
+      "public_api_hash",
+      "review_pass",
+      "previous_active_immutable"
+    ],
+    "generated_kinds": [
+      "compiler_output",
+      "indexes"
+    ],
+    "generated_root": "generated/**",
+    "playground_retention": "archive_then_remove",
+    "playground_root": "playground/experiments/**",
+    "promotion_requires": [
+      "experiment_evidence",
+      "architecture_review_pass",
+      "unique_owner",
+      "required_gates"
+    ],
+    "protected_kinds": [
+      "source",
+      "contracts",
+      "history"
+    ],
+    "protected_root": "protected/**",
+    "record_contracts": [
+      "contracts/records/worktree-record.schema.json",
+      "contracts/records/reproduction-record.schema.json",
+      "contracts/records/evidence-record.schema.json",
+      "contracts/records/fix-candidate-record.schema.json",
+      "contracts/records/goal-clarification-record.schema.json",
+      "contracts/records/review-record.schema.json",
+      "contracts/records/effectiveness-record.schema.json",
+      "contracts/records/pre-review-validation-record.schema.json",
+      "contracts/records/collaboration-record.schema.json",
+      "contracts/records/collaboration-index.schema.json",
+      "contracts/records/merge-queue-record.schema.json",
+      "contracts/records/merge-queue-state.schema.json",
+      "contracts/records/integration-record.schema.json",
+      "contracts/records/mainline-receipt-record.schema.json",
+      "contracts/records/merge-record.schema.json",
+      "contracts/records/promotion-record.schema.json",
+      "contracts/records/regression-report.schema.json",
+      "contracts/records/freeze-record.schema.json",
+      "contracts/records/record-graph.contract.json"
+    ],
+    "runtime_forbidden_roots": [
+      "playground/**",
+      "generated/**"
+    ],
+    "zone_transition_contract": "contracts/transitions/zone-transition-manifest.json"
+  },
+  "lifecycle": {
+    "stage": "controlled_verified"
+  },
+  "lifecycles": {
+    "artifact": "generated",
+    "issue": "open",
+    "library": "draft",
+    "source_snapshot": "mutable"
+  },
+  "modules": [
+    {
+      "active_artifact": "active/lib/core/**",
+      "artifact_paths": [
+        "core-daemon"
+      ],
+      "build": {
+        "args": [
+          "-c",
+          "cargo build --release && mkdir -p generated/modules/core/lib && cp target/release/core-daemon generated/modules/core/lib/core-daemon"
+        ],
+        "program": "sh",
+        "working_directory": "."
+      },
+      "contract_paths": [
+        "contracts/**"
+      ],
+      "dependency_modules": [],
+      "generated_outputs": [
+        "generated/**"
+      ],
+      "module_id": "core",
+      "owned_paths": [
+        "src/**",
+        "crates/**",
+        "containers/**",
+        "tests/**",
+        "protocol/**"
+      ],
+      "regression": {
+        "allow_skipped": false,
+        "command": {
+          "args": [
+            "test"
+          ],
+          "program": "cargo",
+          "working_directory": "."
+        },
+        "input_paths": [
+          "src/**",
+          "crates/**",
+          "containers/**",
+          "tests/**",
+          "protocol/**"
+        ],
+        "minimum_test_count": 1,
+        "ordinary_mode_after_freeze": "disabled",
+        "reenable_on": [
+          "source_change",
+          "contract_change",
+          "public_api_change",
+          "artifact_change",
+          "dependency_change"
+        ],
+        "required_before_freeze": true,
+        "suite_id": "core-regression"
+      },
+      "source_owner": "core",
+      "stage": "architecture_stable",
+      "version_base": {
+        "base_artifact_hash": "sha256:b453554f7de3cc78b43c318805a6f9c4de37326815d5d14167f7e6efe7340c7d",
+        "base_source_commit": "2581c84f02cf807640149022f1738fdc6e6552c7",
+        "new_active_version": "0.1.1",
+        "previous_active_version": "0.1.0"
+      }
+    }
+  ],
+  "project_id": "collab-v2",
+  "schema_version": 1,
+  "sdk": {
+    "bundle_manifest": ".appsdk/contracts/sdk-bundle.manifest.json",
+    "name": "appsdk",
+    "resource_record": ".appsdk/sdk-resources.json",
+    "version": "0.1.5"
+  }
+}

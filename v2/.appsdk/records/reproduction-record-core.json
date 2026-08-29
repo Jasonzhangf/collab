@@ -1,0 +1,1 @@
+{"reproduction_id":"repro-collab-v2-core-a1","issue_id":"collab-v2-core-a1","module_id":"core","worktree_id":"v2-core-a1","base_commit":"6407fc6","input_hashes":["live-task-lifecycle-replay"],"baseline_evidence_id":"ev-baseline","first_divergence":"JS semantic reducer bypassed Rust core","result":"reproduced","created_at":"2026-08-29T14:04:00Z"}

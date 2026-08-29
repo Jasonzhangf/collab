@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "preparation_id": "collab-v2-core-a1",
+  "status": "confirmed",
+  "objective": "Complete the isolated v2 Collab refactor under AppSDK 0.1.5.",
+  "change_kind": "project_refactor",
+  "project_root": ".",
+  "legacy_roots": ["../../src", "../../.agent-collab"],
+  "new_roots": ["crates", "protocol", "src", "containers", "tests", "docs"],
+  "protected_roots": ["protected"],
+  "runtime_forbidden_roots": ["playground", "generated", "active/lib", "../../src", "../../.agent-collab"],
+  "boundary": {
+    "allowed_paths": ["crates/**", "protocol/**", "src/**", "containers/**", "tests/**", "docs/**"],
+    "forbidden_paths": ["../../src/**", "../../.agent-collab/**", "playground/**", "generated/**", "active/lib/**", "protected/**"],
+    "payload_control_separation": "confirmed"
+  },
+  "acceptance_criteria": ["Rust core owns lifecycle truth", "Cordis owns plugin lifecycle", "Codis owns containers", "v1 remains isolated"],
+  "non_goals": ["Do not migrate v1 runtime state", "Do not use cordis-rs in production"],
+  "assumptions": ["Original Cordis Node package is stable", "Rust core is built from v2/Cargo.toml"],
+  "questions": [
+    {"question_id":"scope-kind","question":"Is this a new project, module refactor, project refactor, or debug task?","status":"answered"},
+    {"question_id":"project-root","question":"Which relative directory is the new AppSDK project root?","status":"answered"},
+    {"question_id":"legacy-boundary","question":"Which existing directories remain read-only and outside the new project?","status":"answered"},
+    {"question_id":"new-boundary","question":"Which directories may the new project create or modify?","status":"answered"}
+  ],
+  "confirmed_by": "Jason",
+  "confirmed_at": "2026-08-29T00:00:00Z",
+  "created_at": "2026-08-29T00:00:00Z"
+}

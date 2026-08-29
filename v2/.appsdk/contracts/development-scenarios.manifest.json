@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "scenario_id": "multi_worker_collaboration",
+      "status": "active",
+      "owner": "appsdk::collaboration",
+      "requires": ["multi_worktree_merge_queue"],
+      "invariants": [
+        "one_worker_one_clean_worktree",
+        "one_worker_one_semantic_claim",
+        "one_independently_verifiable_milestone_per_worktree",
+        "workers_never_write_main"
+      ],
+      "required_records": ["CollaborationRecord", "WorktreeRecord"]
+    },
+    {
+      "scenario_id": "multi_worktree_merge_queue",
+      "status": "active",
+      "owner": "appsdk::merge_queue",
+      "requires": ["multi_worker_collaboration"],
+      "invariants": [
+        "single_merge_owner",
+        "serial_queue",
+        "commit_and_merge_every_milestone",
+        "tested_integration_commit_enters_main",
+        "remote_main_receipt_before_cleanup"
+      ],
+      "required_records": [
+        "MergeQueueRecord",
+        "IntegrationRecord",
+        "MainlineReceiptRecord",
+        "MergeRecord"
+      ]
+    }
+  ],
+  "composition_rules": [
+    {
+      "rule_id": "parallel-development-pair",
+      "members": ["multi_worker_collaboration", "multi_worktree_merge_queue"],
+      "activation": "all_or_none"
+    },
+    {
+      "rule_id": "incremental-milestone-delivery",
+      "members": ["multi_worker_collaboration", "multi_worktree_merge_queue"],
+      "activation": "each_claim_is_one_mergeable_milestone"
+    }
+  ]
+}
