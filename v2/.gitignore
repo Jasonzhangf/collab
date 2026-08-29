@@ -2,6 +2,7 @@ node_modules/
 target/
 generated/
 active/lib/
+protected/
 playground/
 .appsdk-control/
 .appsdk/
