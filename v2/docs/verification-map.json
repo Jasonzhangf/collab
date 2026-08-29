@@ -1,0 +1,9 @@
+{
+  "lifecycle_id": "collab-v2",
+  "gates": [
+    {"gate_id": "event-replay", "feature_id": "core.reducer", "positive": "replay reproduces identical snapshot", "negative": "duplicate sequence is rejected"},
+    {"gate_id": "fifo-send-enter", "feature_id": "transport.tmux", "positive": "one text and one Enter per transaction", "negative": "concurrent sends cannot interleave"},
+    {"gate_id": "activation-dispose", "feature_id": "orchestration.cordis", "positive": "new plugin is ready before route switch", "negative": "failed plugin never receives production events"},
+    {"gate_id": "restart-replay", "feature_id": "core.reducer", "positive": "container restart restores task truth", "negative": "restart does not duplicate transitions"}
+  ]
+}

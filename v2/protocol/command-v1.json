@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "collab://v2/protocol/command-v1",
+  "title": "CollabCommandEnvelopeV1",
+  "type": "object",
+  "required": ["command_id", "schema_version", "actor", "command", "payload"],
+  "properties": {
+    "command_id": {"type": "string", "minLength": 1},
+    "schema_version": {"const": "command-v1"},
+    "actor": {"type": "string", "minLength": 1},
+    "command": {"type": "string", "minLength": 1},
+    "payload": {"type": "object"}
+  },
+  "additionalProperties": false
+}

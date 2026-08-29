@@ -1,0 +1,10 @@
+{
+  "lifecycle_id": "collab-v2",
+  "plugins": [
+    {"plugin_id": "collab-transport-tmux", "runtime": "rust", "hot_replace": true, "produces": ["DeliverySucceeded", "DeliveryFailed", "PaneObservation"], "writes_truth": false},
+    {"plugin_id": "collab-probe", "runtime": "rust", "hot_replace": true, "produces": ["WorkerStateObserved"], "writes_truth": false},
+    {"plugin_id": "collab-scheduler", "runtime": "rust", "hot_replace": true, "produces": ["WakeRequested"], "writes_truth": false},
+    {"plugin_id": "collab-task", "runtime": "rust", "hot_replace": false, "produces": ["ClaimCreated", "TaskDelivered", "TaskClosed"], "writes_truth": true},
+    {"plugin_id": "cordis-orchestrator", "runtime": "node", "hot_replace": false, "produces": ["PluginHealthChanged"], "writes_truth": false}
+  ]
+}

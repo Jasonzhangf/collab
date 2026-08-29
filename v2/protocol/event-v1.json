@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "collab://v2/protocol/event-v1",
+  "title": "CollabEventEnvelopeV1",
+  "type": "object",
+  "required": ["event_id", "sequence", "schema_version", "producer", "timestamp", "payload"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "sequence": {"type": "integer", "minimum": 0},
+    "schema_version": {"const": "event-v1"},
+    "producer": {"type": "string", "minLength": 1},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "correlation_id": {"type": ["string", "null"]},
+    "causation_id": {"type": ["string", "null"]},
+    "event_type": {"type": "string", "minLength": 1},
+    "payload": {"type": "object"}
+  },
+  "additionalProperties": false
+}

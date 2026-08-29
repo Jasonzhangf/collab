@@ -1,0 +1,11 @@
+{
+  "lifecycle_id": "collab-v2",
+  "features": [
+    {"feature_id": "core.reducer", "owner": "collab-core", "entry_symbols": ["CoreReducer::apply"], "required_gates": ["event-replay", "duplicate-event", "role-authorization"]},
+    {"feature_id": "identity.session", "owner": "collab-identity", "entry_symbols": ["resolve_tmux_session"], "required_gates": ["same-session-recovery", "different-session-rejection"]},
+    {"feature_id": "task.lifecycle", "owner": "collab-task", "entry_symbols": ["TaskService::claim", "TaskService::deliver", "TaskService::close"], "required_gates": ["claim-flow", "deliver-evidence", "merge-close"]},
+    {"feature_id": "transport.tmux", "owner": "collab-transport-tmux", "entry_symbols": ["TmuxTransport::send"], "required_gates": ["fifo-send-enter", "daemon-down-fail-closed", "single-exit"]},
+    {"feature_id": "probe.tmux", "owner": "collab-probe", "entry_symbols": ["TmuxProbe::observe"], "required_gates": ["idle-running", "stalled-resume", "clock-noise"]},
+    {"feature_id": "orchestration.cordis", "owner": "cordis-orchestrator", "entry_symbols": ["PluginRegistry::replace"], "required_gates": ["activation-dispose", "ready-before-switch"]}
+  ]
+}
