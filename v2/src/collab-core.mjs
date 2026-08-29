@@ -11,7 +11,10 @@ export const CollabCore = (ctx, config = {}) => {
   const persistence = config.persistence ?? null
   let projectState = 'initialized'
   const verifier = config.verifyCapability ?? (async () => true)
-  const core = config.coreClient ?? (config.rustCoreBinary ? createRustCoreClient(config) : null)
+  const core = config.coreClient ?? createRustCoreClient({
+    ...config,
+    rustCoreState: config.rustCoreState ?? (persistence?.statePath ? `${persistence.statePath}.rust` : undefined),
+  })
 
   function restore(state) {
     workers.clear(); identities.clear(); capabilities.clear(); tasks.clear(); messages.clear()
@@ -23,9 +26,27 @@ export const CollabCore = (ctx, config = {}) => {
     for (const message of state.messages ?? []) messages.set(message.messageId, Object.freeze(message))
   }
   restore(persistence?.load?.() ?? {})
+  assertRustProjection()
 
   function persist() {
     persistence?.save({ projectState, workers: [...workers.values()], identities: [...identities.entries()], capabilities: [...capabilities.values()], tasks: [...tasks.values()], messages: [...messages.values()] })
+  }
+
+  function assertRustProjection() {
+    const snapshot = core.snapshot().state
+    const rustIdentities = new Map(snapshot.identities.map((identity) => [identity.id, identity]))
+    const jsWorkers = [...workers.values()]
+    if (rustIdentities.size !== jsWorkers.length) throw new Error(`core projection mismatch: identities=${rustIdentities.size}, workers=${jsWorkers.length}`)
+    for (const worker of jsWorkers) {
+      const identity = rustIdentities.get(worker.agentId)
+      if (!identity || identity.session_id !== worker.panelId || identity.role.toLowerCase() !== worker.role) throw new Error(`core projection mismatch: worker=${worker.agentId}`)
+    }
+    const rustTasks = new Map(snapshot.tasks.map((task) => [task.id, task]))
+    if (rustTasks.size !== tasks.size) throw new Error(`core projection mismatch: tasks=${rustTasks.size}, js_tasks=${tasks.size}`)
+    for (const task of tasks.values()) {
+      const rustTask = rustTasks.get(task.taskId)
+      if (!rustTask || rustTask.state.toLowerCase() !== task.state || rustTask.owner !== task.assignee) throw new Error(`core projection mismatch: task=${task.taskId}`)
+    }
   }
 
   function requireWorker(agentId) {
@@ -45,12 +66,12 @@ export const CollabCore = (ctx, config = {}) => {
     async register(input) {
       assertWorkerRegistration(input)
       if (input.cwd !== scope) throw new Error(`cwd mismatch: expected ${scope}, received ${input.cwd}`)
-      core?.register({ id: input.agentId, session_id: input.panelId, role: workers.size === 0 ? 'Master' : 'Worker' })
       const release = persistence?.acquireLock ? await persistence.acquireLock() : async () => {}
       try {
         if (persistence?.load) restore(persistence.load())
         if (workers.has(input.agentId)) throw new Error(`worker already registered: ${input.agentId}`)
         if (identities.has(input.panelId)) throw new Error(`panel already registered: ${input.panelId}`)
+        core.register({ id: input.agentId, session_id: input.panelId, role: workers.size === 0 ? 'Master' : 'Worker' })
         const verified = []
         for (const raw of input.capabilities) {
           const id = capabilityKey(raw)
@@ -75,6 +96,7 @@ export const CollabCore = (ctx, config = {}) => {
         identities.set(worker.panelId, worker.agentId)
         if (projectState === 'initialized') projectState = 'accepting_workers'
         persist()
+        assertRustProjection()
         return worker
       } finally {
         await release()
@@ -128,34 +150,37 @@ export const CollabCore = (ctx, config = {}) => {
     createTask(input) {
       if (!input || typeof input.taskId !== 'string' || typeof input.title !== 'string') throw new TypeError('taskId and title are required')
       requirePermission(input.actorAgentId, 'assign')
-      core?.createTask(input.actorAgentId, input.taskId)
       if (tasks.has(input.taskId)) throw new Error(`task already exists: ${input.taskId}`)
+      core.createTask(input.actorAgentId, input.taskId)
       const task = Object.freeze({ taskId: input.taskId, title: input.title, state: 'available', assignee: null, createdAt: Date.now() })
       tasks.set(task.taskId, task)
       persist()
+      assertRustProjection()
       return task
     },
     claimTask(taskId, agentId) {
       const task = tasks.get(taskId)
       if (!task) throw new Error(`unknown task: ${taskId}`)
       requireWorker(agentId)
-      core?.claim(agentId, taskId)
       if (task.state !== 'available') throw new Error(`task is not available: ${taskId}`)
+      core.claim(agentId, taskId)
       const claimed = Object.freeze({ ...task, state: 'working', assignee: agentId, claimedAt: Date.now() })
       tasks.set(taskId, claimed)
       persist()
+      assertRustProjection()
       return claimed
     },
     transitionTask(taskId, state, actorAgentId = tasks.get(taskId)?.assignee) {
       const task = tasks.get(taskId)
       if (!task) throw new Error(`unknown task: ${taskId}`)
       if (actorAgentId !== task.assignee) requirePermission(actorAgentId, 'assign')
-      core?.transition(actorAgentId, taskId, state[0].toUpperCase() + state.slice(1))
       const allowed = { available: ['working'], working: ['verifying', 'blocked', 'cancelled'], blocked: ['working', 'cancelled'], verifying: ['reviewing', 'working'], reviewing: ['delivered', 'working'], delivered: ['merged'], merged: ['closed'] }
       if (!allowed[task.state]?.includes(state)) throw new Error(`invalid task transition: ${task.state} -> ${state}`)
+      core.transition(actorAgentId, taskId, state[0].toUpperCase() + state.slice(1))
       const next = Object.freeze({ ...task, state, updatedAt: Date.now() })
       tasks.set(taskId, next)
       persist()
+      assertRustProjection()
       return next
     },
     listTasks: () => [...tasks.values()],

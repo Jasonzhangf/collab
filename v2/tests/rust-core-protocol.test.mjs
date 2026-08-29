@@ -23,6 +23,10 @@ function client() {
 
 test('Rust core stdio protocol enforces lifecycle and role permissions', async () => {
   const process = client()
+  const invalid = await process.send({ op: 'unknown' })
+  assert.equal(invalid.ok, false)
+  assert.equal(invalid.error, 'InvalidCommand')
+  assert.match(invalid.message, /unknown variant `unknown`/)
   assert.deepEqual(await process.send({ op: 'register', identity: { id: 'm', session_id: 'session-1', role: 'Master' } }), { ok: true })
   assert.deepEqual(await process.send({ op: 'register', identity: { id: 'w', session_id: 'session-2', role: 'Worker' } }), { ok: true })
   assert.deepEqual(await process.send({ op: 'create_task', actor: 'w', task_id: 'bad' }), { ok: false, error: 'PermissionDenied' })

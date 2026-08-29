@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 export function createFilePersistence(path) {
   if (typeof path !== 'string' || path.length === 0) throw new TypeError('persistence path is required')
   return {
+    statePath: path,
     load() {
       try { return JSON.parse(readFileSync(path, 'utf8')) } catch (error) {
         if (error.code === 'ENOENT') return {}

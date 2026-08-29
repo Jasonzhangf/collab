@@ -30,6 +30,14 @@ fn error_value(error: CoreError) -> Value {
     json!({"ok": false, "error": format!("{error:?}")})
 }
 
+fn persist_state(path: Option<&PathBuf>, state: &collab_v2_core::CoreState) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let raw = serde_json::to_string(state).map_err(|error| error.to_string())?;
+    std::fs::write(path, raw).map_err(|error| error.to_string())
+}
+
 fn main() {
     let state_path = std::env::args()
         .position(|arg| arg == "--state")
@@ -49,7 +57,7 @@ fn main() {
                 break;
             }
         };
-        let response = match serde_json::from_str::<Command>(&line) {
+        let mut response = match serde_json::from_str::<Command>(&line) {
             Ok(Command::Register { identity }) => {
                 state.register(identity).map(|_| json!({"ok": true}))
             }
@@ -67,13 +75,11 @@ fn main() {
                 .transition(&actor, &task_id, next)
                 .map(|_| json!({"ok": true})),
             Ok(Command::Snapshot) => Ok(json!({"ok": true, "state": state})),
-            Err(error) => Err(CoreError::InvalidTransition)
-                .map(|_: ()| json!({"ok": true, "parse_error": error.to_string()})),
-        }
-        .unwrap_or_else(error_value);
-        if let Some(path) = state_path.as_ref() {
-            if let Ok(raw) = serde_json::to_string(&state) {
-                let _ = std::fs::write(path, raw);
+            Err(error) => Ok(json!({"ok": false, "error": "InvalidCommand", "message": error.to_string()})),
+        }.unwrap_or_else(error_value);
+        if response.get("ok") == Some(&Value::Bool(true)) {
+            if let Err(error) = persist_state(state_path.as_ref(), &state) {
+                response = json!({"ok": false, "error": "PersistenceFailed", "message": error});
             }
         }
         let mut stdout = io::stdout().lock();
