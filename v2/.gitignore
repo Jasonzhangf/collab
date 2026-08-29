@@ -1,0 +1,8 @@
+# BEGIN APPSDK MANAGED
+.appsdk-control/
+.appsdk/sdk.bin
+/active/lib/
+/generated/
+# END APPSDK MANAGED
+.appsdk/
+.appsdk-prepare.json
