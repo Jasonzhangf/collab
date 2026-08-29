@@ -9,3 +9,12 @@
   board counts, `master_action`, and `can_stop`; master continues review,
   decomposition, or dispatch until every published task is `closed` or
   `cancelled`.
+
+- v2 AppSDK admission uses the compiled module record hash, not the raw binary
+  hash. `module.compiled.json.artifact_hash` must bind every pre-review
+  validation and deployment evidence record; binary hashes remain in artifact
+  entries. Review evidence arrays are phase-strict and deployment receipts
+  require one exact producer object across install, restart, and blackbox
+  records. After architecture review, effectiveness evidence must be newly
+  produced after the review. Verified on 2026-08-29 with candidate `05159fa`
+  and governance commit `6b5f60c`.
