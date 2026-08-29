@@ -1,7 +1,6 @@
 import { createCollabV2 } from '../src/index.mjs'
 
 const address = process.env.COLLAB_V2_APP_SERVER ?? 'ws://127.0.0.1:8797'
-const targetPreview = process.env.COLLAB_V2_TARGET_PREVIEW ?? 'READY-B2'
 const ws = new WebSocket(address)
 let nextId = 0
 const pending = new Map()
@@ -28,9 +27,9 @@ await new Promise((resolve, reject) => {
 })
 await call('initialize', { clientInfo: { name: 'collab-v2-live-smoke', title: 'collab-v2-live-smoke', version: '0.1.0-beta.1' } })
 ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} }))
-const list = await call('thread/list', { cursor: null, limit: 10, useStateDbOnly: true, sourceKinds: [] })
-const target = list.data.find((thread) => thread.preview.includes(targetPreview))
-if (!target) throw new Error(`target thread not found: ${targetPreview}`)
+const started = await call('thread/start', { cwd: process.cwd(), ephemeral: true })
+const target = started.thread
+if (!target?.id) throw new Error('thread/start did not return a writable thread')
 
 const runtime = await createCollabV2({ cwd: process.cwd(), codexAppServer: {} })
 await runtime.collab.register({ agentId: 'live-a', kind: 'codex', cwd: process.cwd(), panelId: 'live-panel-a', capabilities: ['app-server'], endpoints: [] })
