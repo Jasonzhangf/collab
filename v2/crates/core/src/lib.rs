@@ -51,7 +51,9 @@ pub enum CoreError {
 
 impl CoreState {
     pub fn register(&mut self, identity: Identity) -> Result<(), CoreError> {
-        if self.identities.iter().any(|existing| existing.id == identity.id || existing.session_id == identity.session_id) {
+        if self.identities.iter().any(|existing| {
+            existing.id == identity.id || existing.session_id == identity.session_id
+        }) {
             return Err(CoreError::DuplicateIdentity);
         }
         if self.identities.is_empty() && identity.role != Role::Master {
@@ -65,37 +67,90 @@ impl CoreState {
     }
 
     pub fn create_task(&mut self, actor: &str, id: impl Into<String>) -> Result<(), CoreError> {
-        let master = self.identities.iter().find(|identity| identity.id == actor).ok_or(CoreError::UnknownIdentity)?;
-        if master.role != Role::Master { return Err(CoreError::PermissionDenied); }
+        let master = self
+            .identities
+            .iter()
+            .find(|identity| identity.id == actor)
+            .ok_or(CoreError::UnknownIdentity)?;
+        if master.role != Role::Master {
+            return Err(CoreError::PermissionDenied);
+        }
         let id = id.into();
-        if self.tasks.iter().any(|task| task.id == id) { return Err(CoreError::TaskAlreadyOwned); }
-        self.tasks.push(Task { id, state: TaskState::Available, owner: None });
+        if self.tasks.iter().any(|task| task.id == id) {
+            return Err(CoreError::TaskAlreadyOwned);
+        }
+        self.tasks.push(Task {
+            id,
+            state: TaskState::Available,
+            owner: None,
+        });
         Ok(())
     }
 
     pub fn claim(&mut self, actor: &str, task_id: &str) -> Result<(), CoreError> {
-        self.identities.iter().find(|identity| identity.id == actor).ok_or(CoreError::UnknownIdentity)?;
-        let task = self.tasks.iter_mut().find(|task| task.id == task_id).ok_or(CoreError::UnknownTask)?;
-        if task.state != TaskState::Available || task.owner.is_some() { return Err(CoreError::TaskAlreadyOwned); }
+        self.identities
+            .iter()
+            .find(|identity| identity.id == actor)
+            .ok_or(CoreError::UnknownIdentity)?;
+        let task = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .ok_or(CoreError::UnknownTask)?;
+        if task.state != TaskState::Available || task.owner.is_some() {
+            return Err(CoreError::TaskAlreadyOwned);
+        }
         task.state = TaskState::Working;
         task.owner = Some(actor.to_owned());
         Ok(())
     }
 
-    pub fn transition(&mut self, actor: &str, task_id: &str, next: TaskState) -> Result<(), CoreError> {
-        let task = self.tasks.iter_mut().find(|task| task.id == task_id).ok_or(CoreError::UnknownTask)?;
+    pub fn transition(
+        &mut self,
+        actor: &str,
+        task_id: &str,
+        next: TaskState,
+    ) -> Result<(), CoreError> {
+        let task = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .ok_or(CoreError::UnknownTask)?;
         let is_owner = task.owner.as_deref() == Some(actor);
-        let is_master = self.identities.iter().find(|identity| identity.id == actor).map(|identity| identity.role == Role::Master).unwrap_or(false);
-        if !is_owner && !is_master { return Err(CoreError::PermissionDenied); }
-        let valid = matches!((task.state, next),
-            (TaskState::Available, TaskState::Working) |
-            (TaskState::Working, TaskState::Verifying | TaskState::Blocked | TaskState::Cancelled) |
-            (TaskState::Blocked, TaskState::Working | TaskState::Cancelled) |
-            (TaskState::Verifying, TaskState::Reviewing | TaskState::Working) |
-            (TaskState::Reviewing, TaskState::Delivered | TaskState::Working) |
-            (TaskState::Delivered, TaskState::Merged) |
-            (TaskState::Merged, TaskState::Closed));
-        if !valid { return Err(CoreError::InvalidTransition); }
+        let is_master = self
+            .identities
+            .iter()
+            .find(|identity| identity.id == actor)
+            .map(|identity| identity.role == Role::Master)
+            .unwrap_or(false);
+        if !is_owner && !is_master {
+            return Err(CoreError::PermissionDenied);
+        }
+        let valid = matches!(
+            (task.state, next),
+            (TaskState::Available, TaskState::Working)
+                | (
+                    TaskState::Working,
+                    TaskState::Verifying | TaskState::Blocked | TaskState::Cancelled
+                )
+                | (
+                    TaskState::Blocked,
+                    TaskState::Working | TaskState::Cancelled
+                )
+                | (
+                    TaskState::Verifying,
+                    TaskState::Reviewing | TaskState::Working
+                )
+                | (
+                    TaskState::Reviewing,
+                    TaskState::Delivered | TaskState::Working
+                )
+                | (TaskState::Delivered, TaskState::Merged)
+                | (TaskState::Merged, TaskState::Closed)
+        );
+        if !valid {
+            return Err(CoreError::InvalidTransition);
+        }
         task.state = next;
         Ok(())
     }
@@ -105,8 +160,20 @@ impl CoreState {
 mod tests {
     use super::*;
 
-    fn master() -> Identity { Identity { id: "m".into(), session_id: "session-1".into(), role: Role::Master } }
-    fn worker() -> Identity { Identity { id: "w".into(), session_id: "session-2".into(), role: Role::Worker } }
+    fn master() -> Identity {
+        Identity {
+            id: "m".into(),
+            session_id: "session-1".into(),
+            role: Role::Master,
+        }
+    }
+    fn worker() -> Identity {
+        Identity {
+            id: "w".into(),
+            session_id: "session-2".into(),
+            role: Role::Worker,
+        }
+    }
 
     #[test]
     fn identity_and_role_are_unique() {
@@ -114,7 +181,14 @@ mod tests {
         assert_eq!(state.register(worker()), Err(CoreError::PermissionDenied));
         state.register(master()).unwrap();
         state.register(worker()).unwrap();
-        assert_eq!(state.register(Identity { id: "w".into(), session_id: "session-3".into(), role: Role::Worker }), Err(CoreError::DuplicateIdentity));
+        assert_eq!(
+            state.register(Identity {
+                id: "w".into(),
+                session_id: "session-3".into(),
+                role: Role::Worker
+            }),
+            Err(CoreError::DuplicateIdentity)
+        );
     }
 
     #[test]
@@ -124,8 +198,19 @@ mod tests {
         state.register(worker()).unwrap();
         state.create_task("m", "t").unwrap();
         state.claim("w", "t").unwrap();
-        assert_eq!(state.transition("m", "t", TaskState::Delivered), Err(CoreError::InvalidTransition));
-        for next in [TaskState::Verifying, TaskState::Reviewing, TaskState::Delivered, TaskState::Merged, TaskState::Closed] { state.transition("w", "t", next).unwrap(); }
+        assert_eq!(
+            state.transition("m", "t", TaskState::Delivered),
+            Err(CoreError::InvalidTransition)
+        );
+        for next in [
+            TaskState::Verifying,
+            TaskState::Reviewing,
+            TaskState::Delivered,
+            TaskState::Merged,
+            TaskState::Closed,
+        ] {
+            state.transition("w", "t", next).unwrap();
+        }
         assert_eq!(state.tasks[0].state, TaskState::Closed);
     }
 }
