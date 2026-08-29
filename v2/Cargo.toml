@@ -1,0 +1,15 @@
+[package]
+name = "collab-v2-core"
+version = "0.1.0"
+edition = "2021"
+description = "Collab v2 semantic truth core"
+
+[lib]
+name = "collab_v2_core"
+path = "crates/core/src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

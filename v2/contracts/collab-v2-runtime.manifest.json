@@ -4,7 +4,7 @@
   "entrypoint": "src/index.mjs#createCollabV2",
   "plugins": [
     {"plugin_id":"collab-appsdk","owner":"src/appsdk-plugin.mjs","truth":"Cordis composition entrypoint"},
-    {"plugin_id":"collab-core","owner":"src/collab-core.mjs","truth":"project/worker/task/message state"},
+    {"plugin_id":"collab-core","owner":"crates/core/src/lib.rs","adapter":"src/collab-core.mjs","truth":"Rust-owned project/worker/task/message state; Cordis adapter is projection and transport boundary"},
     {"plugin_id":"persistence","owner":"src/persistence.mjs","truth":"durable lifecycle state"},
     {"plugin_id":"communication-hub","owner":"src/communication.mjs","truth":"delivery ledger"},
     {"plugin_id":"dashboard-projection","owner":"src/dashboard.mjs","truth":"projection-only"},
