@@ -1,11 +1,11 @@
 {
   "lifecycle_id": "collab-v2",
   "edges": [
-    {"edge_id": "command-to-reducer", "from": "adapter.command", "to": "core.reducer", "owner_feature": "core.reducer"},
-    {"edge_id": "reducer-to-journal", "from": "core.reducer", "to": "journal.append", "owner_feature": "core.reducer"},
-    {"edge_id": "journal-to-event", "from": "journal.replay", "to": "events.publish", "owner_feature": "core.reducer"},
-    {"edge_id": "event-to-plugin", "from": "events.publish", "to": "plugin.subscribe", "owner_feature": "orchestration.cordis"},
-    {"edge_id": "transport-result-to-core", "from": "transport.send", "to": "core.reducer", "owner_feature": "transport.tmux"},
-    {"edge_id": "probe-to-scheduler", "from": "probe.observe", "to": "scheduler.evaluate", "owner_feature": "probe.tmux"}
+    {"edge_id": "command-to-reducer", "from": "CollabCore.register", "to": "CoreState::register", "owner_feature": "core.reducer", "path": "src/collab-core.mjs -> crates/core/src/lib.rs"},
+    {"edge_id": "reducer-to-journal", "from": "CoreState::transition", "to": "persistence.save", "owner_feature": "core.reducer", "path": "crates/core/src/lib.rs -> src/persistence.mjs"},
+    {"edge_id": "journal-to-event", "from": "persistence.load", "to": "CommunicationHub.send", "owner_feature": "core.reducer", "path": "src/persistence.mjs -> src/communication.mjs"},
+    {"edge_id": "event-to-plugin", "from": "CollabAppSdkPlugin", "to": "ctx.plugin", "owner_feature": "orchestration.cordis", "path": "src/appsdk-plugin.mjs"},
+    {"edge_id": "transport-result-to-core", "from": "createTmuxTransport.deliver", "to": "CollabCore.transitionMessage", "owner_feature": "transport.tmux", "path": "src/transports/tmux.mjs -> src/collab-core.mjs"},
+    {"edge_id": "probe-to-scheduler", "from": "createTmuxTransport.deliver", "to": "CommunicationHub.reconcileLifecycle", "owner_feature": "probe.tmux", "path": "src/transports/tmux.mjs -> src/communication.mjs"}
   ]
 }

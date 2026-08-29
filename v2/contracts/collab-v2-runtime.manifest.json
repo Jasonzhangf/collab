@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "lifecycle_id": "collab-v2-runtime",
+  "entrypoint": "src/index.mjs#createCollabV2",
+  "plugins": [
+    {"plugin_id":"collab-appsdk","owner":"src/appsdk-plugin.mjs","truth":"Cordis composition entrypoint"},
+    {"plugin_id":"collab-core","owner":"crates/core/src/lib.rs","adapter":"src/collab-core.mjs","truth":"Rust-owned project/worker/task/message state; Cordis adapter is projection and transport boundary"},
+    {"plugin_id":"persistence","owner":"src/persistence.mjs","truth":"durable lifecycle state"},
+    {"plugin_id":"communication-hub","owner":"src/communication.mjs","truth":"delivery ledger"},
+    {"plugin_id":"dashboard-projection","owner":"src/dashboard.mjs","truth":"projection-only"},
+    {"plugin_id":"appsdk-integration","owner":"src/appsdk-integration.mjs","truth":"integration records"},
+    {"plugin_id":"codex-app-server","owner":"src/transports/codex-app-server.mjs","truth":"transport facts only"},
+    {"plugin_id":"tmux","owner":"src/transports/tmux.mjs","truth":"transport facts only"},
+    {"plugin_id":"mailbox","owner":"src/transports/mailbox.mjs","truth":"durable transport facts only"},
+    {"plugin_id":"generic-app-server","owner":"src/transports/app-server.mjs","truth":"JSON-RPC transport facts only"}
+  ],
+  "transport_contract": {"business_payload_field":"payload", "control_fields_forbidden_in_payload":["routing","presence","health","retry","error","scope","wake"]},
+  "required_gates": ["unit_tests", "build", "cwd_scope", "real_codex_tui_smoke", "installation_restart_online", "restart_recovery"]
+}

@@ -1,8 +1,8 @@
-# BEGIN APPSDK MANAGED
+node_modules/
+target/
+generated/
+active/lib/
+playground/
 .appsdk-control/
-.appsdk/sdk.bin
-/active/lib/
-/generated/
-# END APPSDK MANAGED
 .appsdk/
 .appsdk-prepare.json

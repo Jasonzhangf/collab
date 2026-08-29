@@ -1,4 +1,4 @@
-# v2 design freeze checklist
+# v2 design baseline checklist
 
 - [x] v2 has an independent directory and branch.
 - [x] v1 source and `.agent-collab` state are not shared.
@@ -6,9 +6,11 @@
 - [x] Cordis orchestration boundary is defined.
 - [x] Codis/container boundary is defined.
 - [x] Arc is limited to process-local shared state.
-- [x] Versioned event envelope is defined.
-- [x] Hot replacement lifecycle is defined.
-- [x] Initial three-container deployment is defined.
+- [ ] Versioned event envelope is implemented with typed control/business separation.
+- [ ] Event sequence, idempotency, durability, snapshot and replay gates pass.
+- [ ] Hot replacement fencing, epochs, drain timeout and late-result rejection pass.
+- [ ] Initial three-container deployment is implemented and live-tested.
 
-Implementation may start only after this checklist remains unchanged for the
-current freeze revision.
+This is a design-baseline draft. It is not an implementation freeze. The
+implementation freeze requires source, contracts, maps, tests, artifact,
+installation, restart, live replay, review and regression evidence.

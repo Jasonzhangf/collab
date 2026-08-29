@@ -2,10 +2,10 @@
   "lifecycle_id": "collab-v2",
   "resources": [
     {"resource_id": "core-state", "owner": "collab-core", "truth_store": "journal-v1", "allowed_operations": ["reduce", "replay", "snapshot"], "forbidden_direct_consumers": ["cordis-orchestrator", "codis"]},
-    {"resource_id": "journal-v1", "owner": "collab-journal", "truth_store": ".agent-collab-v2/journal.jsonl", "allowed_operations": ["append", "replay"], "forbidden_direct_consumers": ["plugins"]},
+    {"resource_id": "journal-v1", "owner": "collab-core", "truth_store": ".agent-collab-v2/journal.jsonl", "allowed_operations": ["append", "replay"], "forbidden_direct_consumers": ["plugins", "collab-journal"], "role": "core persistence port; no independent semantic owner"},
     {"resource_id": "event-bus-v1", "owner": "collab-events", "truth_store": "core-state", "allowed_operations": ["publish", "subscribe"], "forbidden_direct_consumers": []},
     {"resource_id": "identity", "owner": "collab-identity", "truth_store": "core-state", "allowed_operations": ["resolve", "recover"], "forbidden_direct_consumers": ["transport"]},
-    {"resource_id": "task-lifecycle", "owner": "collab-task", "truth_store": "core-state", "allowed_operations": ["register", "claim", "block", "deliver", "merge", "close"], "forbidden_direct_consumers": ["codis"]},
+    {"resource_id": "task-lifecycle", "owner": "collab-core", "truth_store": "core-state", "allowed_operations": ["register", "claim", "block", "deliver", "merge", "close"], "forbidden_direct_consumers": ["codis", "collab-task"], "role": "task command adapter cannot mutate truth"},
     {"resource_id": "tmux-transport", "owner": "collab-transport-tmux", "truth_store": "event-bus-v1", "allowed_operations": ["send", "probe_alive"], "forbidden_direct_consumers": ["agents", "codis"]}
   ]
 }

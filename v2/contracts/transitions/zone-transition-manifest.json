@@ -18,9 +18,5 @@
     {"from":"generated","to":"protected","allowed":false,"requirements":[],"owner":"architecture_gate","runtime_allowed":false,"artifact_required":false,"record_required":[]},
     {"from":"generated","to":"generated","allowed":true,"requirements":["compiler"],"owner":"compiler_adapter","runtime_allowed":false,"artifact_required":true,"record_required":["EvidenceRecord"]}
   ],
-  "forbidden_runtime_edges": [
-    {"from":"playground","to":"runtime"},
-    {"from":"protected","to":"runtime"},
-    {"from":"generated","to":"runtime"}
-  ]
+  "forbidden_runtime_edges": [{"from":"playground","to":"runtime"},{"from":"protected","to":"runtime"},{"from":"generated","to":"runtime"}]
 }

@@ -3,17 +3,19 @@
   "$id": "collab://v2/protocol/event-v1",
   "title": "CollabEventEnvelopeV1",
   "type": "object",
-  "required": ["event_id", "sequence", "schema_version", "producer", "timestamp", "payload"],
+  "required": ["event_id", "sequence", "schema_version", "producer", "timestamp", "correlation_id", "causation_id", "event_type", "control", "business_payload"],
   "properties": {
     "event_id": {"type": "string", "minLength": 1},
     "sequence": {"type": "integer", "minimum": 0},
     "schema_version": {"const": "event-v1"},
     "producer": {"type": "string", "minLength": 1},
     "timestamp": {"type": "string", "format": "date-time"},
-    "correlation_id": {"type": ["string", "null"]},
-    "causation_id": {"type": ["string", "null"]},
+    "correlation_id": {"type": "string", "minLength": 1},
+    "causation_id": {"type": "string", "minLength": 1},
     "event_type": {"type": "string", "minLength": 1},
-    "payload": {"type": "object"}
+    "control": {"$ref": "#/$defs/control"},
+    "business_payload": {"type": "object", "additionalProperties": false}
   },
+  "$defs": {"control": {"type":"object","required":["identity","session_id","role","capability","audience","nonce","expires_at","plugin_instance_id","route_epoch"],"properties":{"identity":{"type":"string","minLength":1},"session_id":{"type":"string","minLength":1},"role":{"enum":["master","worker","plugin"]},"capability":{"type":"string","minLength":1},"audience":{"type":"string","minLength":1},"nonce":{"type":"string","minLength":1},"expires_at":{"type":"string","format":"date-time"},"plugin_instance_id":{"type":"string","minLength":1},"route_epoch":{"type":"integer","minimum":0}},"additionalProperties":false}},
   "additionalProperties": false
 }
