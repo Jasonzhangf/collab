@@ -9,7 +9,7 @@ if (!cwd) throw new Error('--cwd requires a path')
 const stateArg = process.argv.indexOf('--state')
 const persistence = stateArg >= 0 ? createFilePersistence(process.argv[stateArg + 1]) : undefined
 
-const runtime = await createCollabV2({ cwd, persistence })
+const runtime = await createCollabV2({ cwd, persistence, rustCoreBinary: new URL('../generated/modules/core/lib/core-daemon', import.meta.url).pathname })
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
 const reply = (value) => process.stdout.write(`${JSON.stringify(value)}\n`)
 
