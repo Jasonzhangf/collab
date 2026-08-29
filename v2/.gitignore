@@ -4,3 +4,5 @@ generated/
 active/lib/
 playground/
 .appsdk-control/
+.appsdk/
+.appsdk-prepare.json
