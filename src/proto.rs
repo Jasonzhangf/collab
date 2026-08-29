@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub enum Req {
     Register {
@@ -49,6 +49,16 @@ pub enum Req {
         #[serde(default = "crate::server::state::default_priority")]
         priority: String,
         next_step: Option<String>,
+        #[serde(default)]
+        goal_prompt: Option<String>,
+    },
+    TaskRelocate {
+        worker_id: String,
+        token: String,
+        task_id: String,
+        worktree_path: String,
+        branch: Option<String>,
+        base_commit: Option<String>,
     },
     TaskUpdate {
         worker_id: String,
@@ -62,11 +72,18 @@ pub enum Req {
         token: String,
         task_id: String,
     },
+    TaskWait {
+        worker_id: String,
+        token: String,
+        task_id: String,
+        blocking_task_id: String,
+    },
     TaskDeliver {
         worker_id: String,
         token: String,
         task_id: String,
         evidence: Option<String>,
+        worktree: Option<String>,
     },
     TaskClose {
         worker_id: String,
@@ -89,6 +106,11 @@ pub enum Req {
     },
     Workers,
     MasterId,
+    MasterRecover {
+        worker_id: String,
+        token: String,
+        session: String,
+    },
     TransferMaster {
         worker_id: String,
         token: String,
@@ -98,6 +120,14 @@ pub enum Req {
         worker_id: String,
         token: String,
         target_id: String,
+        #[serde(default)]
+        force: bool,
+    },
+    ResetBindings {
+        confirm: bool,
+    },
+    Shutdown {
+        worker_id: String,
     },
     Ping,
 }

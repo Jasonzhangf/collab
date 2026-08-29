@@ -2,11 +2,14 @@ use crate::config;
 use crate::server::knock::pane_idle;
 use crate::server::state::{now_ms, task_heartbeat_active, Event, Message, TaskRec};
 use crate::server::Server;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const NUDGE_INTERVAL_MS: i64 = 5 * 60 * 1000;
 const MAX_NUDGES: u32 = 3;
+const DELIVERY_RETRY_INTERVAL_MS: i64 = 30 * 1000;
+const RESOURCE_LOCK_NUDGE_MS: i64 = 15 * 60 * 1000;
+static MASTER_HEARTBEATS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 
 fn heartbeat_interval_ms(server: &Server) -> i64 {
     config::load_or_default(&server.root)
@@ -23,7 +26,7 @@ fn heartbeat_body(
     pane: Option<&str>,
 ) -> String {
     format!(
-        "[COLLAB HEARTBEAT] from=collab-server master={} task={} owner={} status={} pane={} next={} | You have an active claim. Run collab role and collab task status {}; report to master only for a state change, blocker, ETA change, decision, verification, or handoff; otherwise continue the task next step immediately. Do not wait for another message.",
+        "[COLLAB HEARTBEAT] from=collab-server master={} task={} owner={} status={} pane={} next={} | inspect collab role and task status {}, then continue the next safe task step; report only a state change, blocker, ETA change, decision, verification, or handoff; do not wait for another message.",
         master.unwrap_or("unassigned"),
         task_id,
         owner,
@@ -49,23 +52,63 @@ pub fn tick(server: &Arc<Server>) {
             .filter(|pane| pane_idle(pane))
             .collect()
     };
+    // Probe outside the state lock: tmux capture can block on a dead pane and
+    // must never stall task/message state transitions.
+    let probe_panes: Vec<String> = {
+        let st = server.state.lock().unwrap();
+        st.workers
+            .values()
+            .filter(|worker| {
+                st.tasks
+                    .values()
+                    .any(|task| task.owner == worker.id && task_heartbeat_active(&task.status))
+            })
+            .filter_map(|worker| worker.pane.clone())
+            .filter(|pane| pane.starts_with('%'))
+            .collect()
+    };
+    let probe_alerts = super::tmux_probe::poll(&probe_panes);
 
     {
         let st = server.state.lock().unwrap();
 
         // 0) task-scoped heartbeat: only active tasks, one pending per task
         for task in st.tasks.values() {
+            if matches!(
+                task.status.as_str(),
+                "working" | "verifying" | "reviewed" | "rework"
+            ) && !task.heartbeat_stale_notified
+                && now - task.updated_ms >= RESOURCE_LOCK_NUDGE_MS
+            {
+                let body = format!(
+                    "RESOURCE_LOCK_NUDGE task={} owner={} held_for_ms={} | inspect the resource now; execute HOLD/YIELD/SPLIT through Collab and report the decision to master; this message does not release the resource",
+                    task.id, task.owner, now - task.updated_ms
+                );
+                let (event, msg_id, message_body) = sent_system(&task.owner, body);
+                evs.push(event);
+                evs.push(Event::TaskUpdated {
+                    task: TaskRec {
+                        heartbeat_stale_notified: true,
+                        ..task.clone()
+                    },
+                });
+                if let Some(pane) = st.worker_pane(&task.owner) {
+                    if !idle_panes.contains(&pane) {
+                        continue;
+                    }
+                    knocks.push((pane, msg_id, message_body));
+                }
+            }
             if !task_heartbeat_active(&task.status) || task.heartbeat_pending {
                 continue;
             }
             if now - task.last_heartbeat_sent_ms < heartbeat_interval_ms(server) {
                 continue;
             }
-            let pane = st.worker_pane(&task.owner);
-            if !pane
-                .as_deref()
-                .is_some_and(|value| idle_panes.contains(value))
-            {
+            let Some(pane) = st.worker_pane(&task.owner) else {
+                continue;
+            };
+            if !idle_panes.contains(&pane) {
                 continue;
             }
             let body = heartbeat_body(
@@ -74,7 +117,7 @@ pub fn tick(server: &Arc<Server>) {
                 st.master_id().as_deref(),
                 &task.status,
                 task.next_step.as_deref(),
-                pane.as_deref(),
+                Some(&pane),
             );
             let sid = super::gen_msg_id();
             let msg = Message {
@@ -98,12 +141,92 @@ pub fn tick(server: &Arc<Server>) {
                     ..task.clone()
                 },
             });
-            if let Some(p) = pane {
-                knocks.push((p, sid, body));
+            knocks.push((pane, sid, body));
+        }
+
+        // A non-empty board keeps an idle master from silently parking while
+        // workers wait. The reminder is wake-only and never changes state.
+        if !st.tasks.is_empty() {
+            if let Some(master) = st.master_id() {
+                if let Some(pane) = st.worker_pane(&master) {
+                    let due = MASTER_HEARTBEATS
+                        .get_or_init(|| Mutex::new(HashMap::new()))
+                        .lock()
+                        .unwrap()
+                        .get(&master)
+                        .copied()
+                        .map(|last| now - last >= heartbeat_interval_ms(server))
+                        .unwrap_or(true);
+                    if due && idle_panes.contains(&pane) {
+                        let body = "[COLLAB MASTER HEARTBEAT] task board is non-empty; run collab task status, collab who, and collab inbox; review every delivered/blocked/unfinished task, clean or reassign as needed, then dispatch available work. Stop only when all tasks are terminal and worktrees are clean.".to_string();
+                        let (event, msg_id, message_body) = sent_system(&master, body);
+                        evs.push(event);
+                        knocks.push((pane, msg_id, message_body));
+                        MASTER_HEARTBEATS
+                            .get_or_init(|| Mutex::new(HashMap::new()))
+                            .lock()
+                            .unwrap()
+                            .insert(master, now);
+                    }
+                }
             }
         }
 
-        // 1) unanswered request nudges: 5min each, escalate after MAX_NUDGES
+        // Foundational terminal probe: capture each registered tmux pane every
+        // daemon tick (5s). Three unchanged rendered samples indicate a likely
+        // frozen TUI; the alert is durable and wake-only.
+        for (pane, status) in &probe_alerts {
+            let Some(master) = st.master_id() else {
+                continue;
+            };
+            let body = format!(
+                "TMUX_STATUS pane={} status={} | inspect the affected task and pane now; recover or reassign through Collab if work stopped, otherwise continue the next task step",
+                pane, status
+            );
+            let (event, msg_id, message_body) = sent_system(&master, body);
+            evs.push(event);
+            if let Some(master_pane) = st.worker_pane(&master) {
+                if !idle_panes.contains(&master_pane) {
+                    continue;
+                }
+                knocks.push((master_pane, msg_id, message_body));
+            }
+            super::record_activity(
+                &server.root,
+                "tmux_probe",
+                serde_json::json!({"pane": pane, "status": status}),
+            );
+        }
+
+        // 1) durable task-delivery notifications are retried until the
+        // master acknowledges them. A transient dead/stale pane must not
+        // sever deliver -> master review.
+        for m in st.msgs.values() {
+            if m.from != "collab-server"
+                || m.mtype != "system"
+                || !m.body.starts_with("TASK_DELIVERED ")
+                || m.state != "pending"
+                || (if m.last_nudge_ms == 0 {
+                    now - m.created_ms
+                } else {
+                    now - m.last_nudge_ms
+                }) < DELIVERY_RETRY_INTERVAL_MS
+            {
+                continue;
+            }
+            let Some(pane) = st.worker_pane(&m.to) else {
+                continue;
+            };
+            if !idle_panes.contains(&pane) {
+                continue;
+            }
+            knocks.push((pane, m.id.clone(), m.body.clone()));
+            evs.push(Event::Nudged {
+                msg_id: m.id.clone(),
+            });
+        }
+
+        // 2) unanswered request nudges: 5min each, escalate after MAX_NUDGES
         for m in st.msgs.values() {
             if m.mtype != "request" || m.state == "read" || st.answered(&m.id) {
                 continue;
@@ -120,7 +243,9 @@ pub fn tick(server: &Arc<Server>) {
                 let (event, msg_id, message_body) = sent_system(&m.to, nudge_body(&m.id, &m.from));
                 evs.push(event);
                 if let Some(pane) = st.worker_pane(&m.to) {
-                    knocks.push((pane, msg_id, message_body));
+                    if idle_panes.contains(&pane) {
+                        knocks.push((pane, msg_id, message_body));
+                    }
                 }
             }
             if k >= MAX_NUDGES {
@@ -131,7 +256,9 @@ pub fn tick(server: &Arc<Server>) {
                 let (event, msg_id, message_body) = sent_system(&m.from, sender_body);
                 evs.push(event);
                 if let Some(pane) = st.worker_pane(&m.from) {
-                    knocks.push((pane, msg_id, message_body));
+                    if idle_panes.contains(&pane) {
+                        knocks.push((pane, msg_id, message_body));
+                    }
                 }
             }
             evs.push(Event::Nudged {
@@ -165,7 +292,7 @@ pub fn tick(server: &Arc<Server>) {
                 .collect::<Vec<_>>()
                 .join("; ");
             let prompt = format!(
-                "[COLLAB QUEUE] {}; Process these messages now; acknowledge each id: {}",
+                "[COLLAB QUEUE] {}; Process these messages now through Collab, execute the required task actions, and continue; do not reply without executing an action. message_ids={}",
                 body,
                 ids.join(",")
             );
@@ -212,7 +339,7 @@ fn sent_system(to: &str, body: String) -> (Event, String, String) {
 
 fn nudge_body(msg_id: &str, from: &str) -> String {
     format!(
-        "NUDGE: you have an unanswered request '{}' from {}; respond per protocol (HOLD/YIELD/SPLIT or REPLY)",
+        "NUDGE: inspect the unanswered request '{}' from {} now; execute the required Collab action (HOLD/YIELD/SPLIT or substantive reply) and continue the task. Do not answer without taking action.",
         msg_id, from
     )
 }
@@ -278,6 +405,8 @@ mod tests {
                 heartbeat_pending: false,
                 heartbeat_message_id: None,
                 heartbeat_stale_notified: false,
+                goal_prompt: None,
+                goal_busy: false,
             },
         }]);
     }
@@ -298,7 +427,7 @@ mod tests {
         tick(&server);
         {
             let st = server.state.lock().unwrap();
-            assert_eq!(st.msgs.len(), 1);
+            assert!(st.msgs.len() >= 1);
             assert_eq!(st.tasks["t1"].heartbeat_pending, true);
             let hb_id = st.tasks["t1"].heartbeat_message_id.clone().unwrap();
             assert!(st.msgs[&hb_id].body.starts_with("[COLLAB HEARTBEAT]"));
@@ -307,7 +436,12 @@ mod tests {
         tick(&server);
         {
             let st = server.state.lock().unwrap();
-            assert_eq!(st.msgs.len(), 1, "pending heartbeat must not be resent");
+            let worker_hb = st
+                .msgs
+                .values()
+                .filter(|m| m.body.starts_with("[COLLAB HEARTBEAT]"))
+                .count();
+            assert_eq!(worker_hb, 1, "pending heartbeat must not be resent");
         }
         std::fs::remove_dir_all(root).ok();
     }
@@ -321,7 +455,10 @@ mod tests {
 
         tick(&server);
         let st = server.state.lock().unwrap();
-        assert!(st.msgs.is_empty());
+        assert!(st
+            .msgs
+            .values()
+            .all(|message| !message.body.starts_with("[COLLAB HEARTBEAT]")));
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -1,2 +1,13 @@
 /target
 *.log
+
+# Project-local runtime state and detached daemon output.
+.agent-collab/
+
+# Physical worker worktrees are independent repositories.
+playground/
+
+# Local build, test, and editor output.
+*.tmp
+*.swp
+.DS_Store

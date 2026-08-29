@@ -1,10 +1,11 @@
 pub mod knock;
 pub mod state;
 pub mod timers;
+pub mod tmux_probe;
 
 use crate::proto::{Req, Resp, MSG_TYPES};
 use crate::scope::Scope;
-use crate::server::knock::{append_log, knock_or_log, pane_alive};
+use crate::server::knock::{append_log, knock_or_log, pane_alive, pane_idle};
 use serde_json::json;
 use state::{
     default_role, now_ms, runtime_for_pane, task_heartbeat_active, task_resource_active, Event,
@@ -18,9 +19,11 @@ use tokio::net::UnixListener;
 
 const MAX_POLL_MS: u64 = 3_600_000;
 const POLL_TICK_MS: u64 = 250;
-const TASK_STATUSES: [&str; 9] = [
+const TASK_STATUSES: [&str; 11] = [
     "available",
     "working",
+    "blocked",
+    "waiting",
     "verifying",
     "reviewed",
     "delivered",
@@ -29,6 +32,51 @@ const TASK_STATUSES: [&str; 9] = [
     "closed",
     "cancelled",
 ];
+const MAX_WORKTREE_PATH_BYTES: usize = 80;
+
+fn validate_worktree_path(root: &Path, raw: &str) -> Result<(), String> {
+    if raw.trim().is_empty() {
+        return Err("worktree path must be non-empty".into());
+    }
+    let path = Path::new(raw);
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("worktree path may not contain '..'".into());
+    }
+    let playground = root.join("playground");
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let relative = raw.strip_prefix("./").unwrap_or(raw);
+        root.join(relative)
+    };
+    let candidate = candidate.to_string_lossy();
+    let playground = playground.to_string_lossy();
+    if !candidate.starts_with(&format!("{}/", playground)) {
+        return Err("worktree path must be inside ./playground".into());
+    }
+    if candidate.as_bytes().len() > MAX_WORKTREE_PATH_BYTES {
+        return Err(format!(
+            "worktree path exceeds {} bytes; use a short slug under ./playground",
+            MAX_WORKTREE_PATH_BYTES
+        ));
+    }
+    let leaf = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default();
+    if leaf.is_empty()
+        || leaf.len() > 32
+        || !leaf
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+    {
+        return Err("worktree basename must be a short slug (ASCII letters, digits, '.', '-' or '_'; max 32 chars)".into());
+    }
+    Ok(())
+}
 
 fn priority_rank(priority: &str) -> u8 {
     match priority {
@@ -40,11 +88,53 @@ fn priority_rank(priority: &str) -> u8 {
     }
 }
 
+fn task_claim_held(status: &str) -> bool {
+    matches!(
+        status,
+        "working" | "verifying" | "reviewed" | "delivered" | "rework" | "merged"
+    )
+}
+
 pub struct Server {
     pub root: PathBuf,
     pub state: Mutex<State>,
     pub journal: Mutex<std::fs::File>,
     pub pane_alive_check: fn(&str) -> bool,
+}
+
+fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) {
+    let path = root.join(".agent-collab/server/events.jsonl");
+    let record = json!({
+        "ts": now_ms(),
+        "kind": kind,
+        "detail": detail,
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let mut line = serde_json::to_vec(&record).unwrap_or_default();
+        line.push(b'\n');
+        let _ = file.write_all(&line);
+    }
+}
+
+fn request_activity(req: &Req, resp: &Resp) -> serde_json::Value {
+    let mut request = serde_json::to_value(req).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = request.as_object_mut() {
+        obj.remove("token");
+    }
+    json!({
+        "op": request.get("op").cloned().unwrap_or(json!("unknown")),
+        "actor": request.get("worker_id").or_else(|| request.get("from")).cloned(),
+        "task_id": request.get("task_id").cloned(),
+        "target": request.get("to").cloned(),
+        "ok": resp.ok,
+        "error": resp.error,
+        "request": request,
+    })
 }
 
 impl Server {
@@ -106,7 +196,8 @@ pub fn gen_msg_id() -> String {
     format!("m{}-{}", now_ms(), n)
 }
 
-const LONG_BODY_THRESHOLD_CHARS: usize = 500;
+const LONG_BODY_THRESHOLD_CHARS: usize = 200;
+const DELIVERY_SUMMARY_CHARS: usize = 80;
 
 fn message_doc_path(root: &Path, msg_id: &str) -> PathBuf {
     root.join(".agent-collab")
@@ -135,10 +226,16 @@ fn delivery_text(
     body: &str,
 ) -> Result<String, String> {
     let prefix = format!("[MAIL] from={} type={} id={}:", from, mtype, msg_id);
-    let next = format!(
-        "next=\"Process this collab input now: read the mailbox body, decide collaborate/defer/reject with reason, reply if requested, ack id={}, then immediately continue the current run's next step.\"",
-        msg_id
-    );
+    if body.starts_with("/goal") {
+        return Ok(body.to_string());
+    }
+    let next = if body.starts_with("TASK_DELIVERED ") || body.starts_with("TASK_CLOSED ") {
+        "action=\"inspect status/evidence, execute review/merge/close or next dispatch; do not reply without acting\"".to_string()
+    } else {
+        format!(
+            "action=\"inspect this input, execute the required Collab state action, then continue the current run; do not reply without acting\"",
+        )
+    };
     if body.chars().count() <= LONG_BODY_THRESHOLD_CHARS {
         return Ok(format!("{prefix} {} | {next}", one_line(body)));
     }
@@ -147,8 +244,10 @@ fn delivery_text(
     let relative = path
         .strip_prefix(root)
         .map_err(|e| format!("cannot make message reference relative: {e}"))?;
+    let summary: String = one_line(body).chars().take(DELIVERY_SUMMARY_CHARS).collect();
     Ok(format!(
-        "{prefix} body-ref={} {next}",
+        "{prefix} summary={}... body-ref={} {next}",
+        summary,
         relative.display(),
         next = next,
     ))
@@ -175,7 +274,7 @@ pub(super) fn queue_batch_knock(server: &Server, pane: &str, ids: &[String], bod
 
 fn timeout_prompt(kind: &str, worker_id: &str, timeout_ms: u64) -> String {
     format!(
-        "Blocking collab {} returned without a message for worker {} after {}ms. Continue the current run from its notes/actor next step; do not idle or wait for another request.",
+        "Blocking collab {} returned without a message for worker {} after {}ms. Verify role with collab role, inspect notes/actor next step, and continue the current run; do not idle or wait for another request.",
         kind, worker_id, timeout_ms
     )
 }
@@ -231,8 +330,43 @@ fn handle_register(
     let Some(runtime) = runtime_for_pane(pane.as_deref()) else {
         return Resp::err("collab registration requires a tmux or herdr pane");
     };
+    if runtime != "tmux" {
+        return Resp::err("collab registration requires a tmux pane; Herdr runtime is disabled");
+    }
     if let Some(existing) = st.workers.get(&worker_id).cloned() {
         if existing.token != token {
+            // The tmux session name is the sole external identity. When the
+            // same session comes back after a restart, its persisted token is
+            // stale; rotate it atomically instead of exposing an internal
+            // token conflict to the correctly named agent.
+            let same_session = pane
+                .as_deref()
+                .and_then(tmux_session_for_pane)
+                .is_some_and(|session| session == worker_id)
+                && existing
+                    .pane
+                    .as_deref()
+                    .and_then(tmux_session_for_pane)
+                    .is_some_and(|session| session == worker_id);
+            if same_session {
+                let refreshed = WorkerRec {
+                    id: worker_id.clone(),
+                    token,
+                    pane,
+                    cwd,
+                    registered_ms: existing.registered_ms,
+                    role: existing.role.clone(),
+                };
+                let role = refreshed.role.clone();
+                server.commit_locked(&mut st, &[Event::Registered { worker: refreshed }]);
+                return Resp::data(json!({
+                    "worker_id": worker_id,
+                    "role": role,
+                    "runtime": runtime,
+                    "recovered": true,
+                    "identity_source": "tmux_session"
+                }));
+            }
             return Resp::err(format!(
                 "worker_id {} already registered by another token",
                 worker_id
@@ -267,6 +401,32 @@ fn handle_register(
             return Resp::err("master has no valid tmux or herdr runtime");
         };
         if master_runtime != runtime {
+            // A tmux pane is allowed to enter a legacy Herdr project only as
+            // the explicit migration/recovery candidate. `master recover`
+            // must complete the handoff before any task work or dispatch;
+            // ordinary mixed-runtime messaging remains rejected.
+            if master_runtime == "herdr" && runtime == "tmux" {
+                let rec = WorkerRec {
+                    id: worker_id.clone(),
+                    token,
+                    pane,
+                    cwd,
+                    registered_ms: now_ms(),
+                    role: default_role(),
+                };
+                server.commit_locked(
+                    &mut st,
+                    &[Event::Registered {
+                        worker: rec.clone(),
+                    }],
+                );
+                return Resp::data(json!({
+                    "worker_id": worker_id,
+                    "role": rec.role,
+                    "runtime": runtime,
+                    "migration": "herdr-to-tmux-pending-master-recover"
+                }));
+            }
             return Resp::err(format!(
                 "runtime mismatch: project master uses {}, new worker uses {}",
                 master_runtime, runtime
@@ -434,6 +594,7 @@ fn handle_task_register(
         base_commit,
         priority,
         None,
+        None,
     )
 }
 
@@ -449,6 +610,7 @@ fn handle_task_register_with_next(
     base_commit: Option<String>,
     priority: String,
     next_step: Option<String>,
+    goal_prompt: Option<String>,
 ) -> Resp {
     let mut st = server.state.lock().unwrap();
     let Some(worker) = st.workers.get(&worker_id).cloned() else {
@@ -460,8 +622,18 @@ fn handle_task_register_with_next(
     if st.tasks.contains_key(&task_id) {
         return Resp::err(format!("task {} already registered", task_id));
     }
-    if worker.role != "master" {
-        return Resp::err("only master may register tasks; claim available tasks instead");
+    if let Some(prompt) = &goal_prompt {
+        if !prompt.starts_with("/goal") {
+            return Resp::err("goal prompt must begin with /goal");
+        }
+        if prompt.trim().len() <= 5 {
+            return Resp::err("goal prompt must be a complete task, not only /goal");
+        }
+    }
+    if worker.role != "master" && owner.as_deref() != Some(worker_id.as_str()) {
+        return Resp::err(
+            "worker may register only a self-created task with --owner <自身worker_id>",
+        );
     }
     if !matches!(priority.as_str(), "p0" | "p1" | "p2" | "p3" | "p4") {
         return Resp::err(format!(
@@ -473,6 +645,16 @@ fn handle_task_register_with_next(
     let task_owner = owner.unwrap_or_else(|| worker_id.clone());
     if !st.workers.contains_key(&task_owner) {
         return Resp::err(format!("task owner {} not registered", task_owner));
+    }
+    if let Some(path) = &worktree_path {
+        let project_path = path.starts_with("./playground/")
+            || path.starts_with("playground/")
+            || path.contains("/playground/");
+        if project_path {
+            if let Err(e) = validate_worktree_path(&server.root, path) {
+                return Resp::err(e);
+            }
+        }
     }
     if let Some(existing) = st.tasks.values().find(|task| {
         task_resource_active(&task.status)
@@ -497,6 +679,8 @@ fn handle_task_register_with_next(
             "working".to_string()
         },
         next_step,
+        goal_busy: goal_prompt.is_some(),
+        goal_prompt,
         created_ms: now,
         updated_ms: now,
         last_heartbeat_sent_ms: now,
@@ -506,8 +690,65 @@ fn handle_task_register_with_next(
     };
     server.commit_locked(&mut st, &[Event::TaskCreated { task: task.clone() }]);
     Resp::data(
-        json!({"task": task.id, "owner": task.owner, "status": task.status, "heartbeat": "active"}),
+        json!({"task": task.id, "owner": task.owner, "status": task.status, "goal_busy": task.goal_busy, "heartbeat": "active"}),
     )
+}
+
+fn handle_task_relocate(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    task_id: String,
+    worktree_path: String,
+    branch: Option<String>,
+    base_commit: Option<String>,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    let Some(master) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if master.token != token || master.role != "master" {
+        return Resp::err("only master may relocate a task worktree");
+    }
+    if let Err(e) = validate_worktree_path(&server.root, &worktree_path) {
+        return Resp::err(e);
+    }
+    let Some(mut task) = st.tasks.get(&task_id).cloned() else {
+        return Resp::err(format!("task {} not found", task_id));
+    };
+    if matches!(task.status.as_str(), "closed" | "cancelled") {
+        return Resp::err("terminal tasks cannot be relocated");
+    }
+    if let Some(existing) = st.tasks.values().find(|other| {
+        other.id != task_id
+            && task_resource_active(&other.status)
+            && other.worktree_path.as_deref() == Some(worktree_path.as_str())
+    }) {
+        return Resp::err(format!(
+            "worktree is already declared by task {}",
+            existing.id
+        ));
+    }
+    let old_worktree = task.worktree_path.clone();
+    task.worktree_path = Some(worktree_path.clone());
+    if branch.is_some() {
+        task.branch = branch;
+    }
+    if base_commit.is_some() {
+        task.base_commit = base_commit;
+    }
+    task.updated_ms = now_ms();
+    server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
+    Resp::data(json!({
+        "task": task.id,
+        "relocated": true,
+        "old_worktree": old_worktree,
+        "worktree": task.worktree_path,
+        "branch": task.branch,
+        "base_commit": task.base_commit,
+        "status": task.status,
+        "next": "verify git worktree list and continue the existing claim; evidence remains attached"
+    }))
 }
 
 fn handle_task_dispatch(server: &Server, worker_id: String, token: String) -> Resp {
@@ -527,13 +768,15 @@ fn handle_task_dispatch(server: &Server, worker_id: String, token: String) -> Re
         server.commit_locked(&mut st, &dispatch_events);
     }
     let available_tasks = available_task_views(&st);
+    let stale_workers = stale_worker_views(&st, &server.pane_alive_check);
     drop(st);
     for (pane, prompt_id, prompt) in dispatch_knocks {
         queue_system_knock(server, &pane, &prompt_id, &prompt);
     }
     Resp::data(json!({
         "dispatched_tasks": dispatched,
-        "available_tasks": available_tasks,
+        "available_tasks": available_tasks.clone(),
+        "stale_workers": stale_workers,
     }))
 }
 
@@ -545,9 +788,6 @@ fn handle_task_claim(server: &Server, worker_id: String, token: String, task_id:
     if worker.token != token {
         return Resp::err("token mismatch: identity does not own this worker_id");
     }
-    if worker.role != "worker" {
-        return Resp::err("only workers may claim available tasks");
-    }
     let Some(mut task) = st.tasks.get(&task_id).cloned() else {
         return Resp::err(format!("task {} not found", task_id));
     };
@@ -557,15 +797,14 @@ fn handle_task_claim(server: &Server, worker_id: String, token: String, task_id:
             task_id, task.status
         ));
     }
-    if let Some(existing) = st
-        .tasks
-        .values()
-        .find(|t| t.id != task.id && t.owner == worker_id && task_heartbeat_active(&t.status))
-    {
-        return Resp::err(format!(
-            "you already hold active task {}; deliver or await master close before claiming another",
-            existing.id
-        ));
+    if worker.role == "master" {
+        let idle_workers = idle_worker_ids(&st);
+        if !idle_workers.is_empty() {
+            return Resp::err(format!(
+                "master must run collab task dispatch before self-claim; idle workers available: {}",
+                idle_workers.join(", ")
+            ));
+        }
     }
     task.owner = worker_id;
     task.status = "working".to_string();
@@ -597,9 +836,7 @@ fn handle_task_update(
     let Some(mut task) = st.tasks.get(&task_id).cloned() else {
         return Resp::err(format!("task {} not found", task_id));
     };
-    if task.owner != worker_id && worker.role != "master" {
-        return Resp::err("only task owner or master may update this task");
-    }
+    let is_owner = task.owner == worker_id;
     if let Some(new_status) = status {
         if !TASK_STATUSES.contains(&new_status.as_str()) {
             return Resp::err(format!(
@@ -610,15 +847,29 @@ fn handle_task_update(
         if matches!(new_status.as_str(), "merged" | "cancelled") && worker.role != "master" {
             return Resp::err("only master may merge or cancel a task");
         }
-        if new_status == "closed" && worker.role != "master" {
+        if new_status == "closed" {
+            return Resp::err("use collab task close after master merge and cleanup");
+        }
+        if new_status == "delivered" {
             return Resp::err(
-                "only master may close; use collab task close after merge and cleanup",
+                "use collab task deliver to complete a claim; direct status mutation is rejected",
             );
         }
-        if new_status == "rework" && task.owner != worker_id && worker.role != "master" {
+        if new_status == "working" && worker.role == "worker" && task.status != "rework" {
             return Resp::err(
-                "rework must be requested by master or set by task owner; use working after receiving it",
+                "workers enter working through collab task claim, or resume only from rework",
             );
+        }
+        if new_status == "available" && worker.role != "master" {
+            return Resp::err("only master may release a task back to available");
+        }
+        let master_management = worker.role == "master"
+            && matches!(
+                new_status.as_str(),
+                "available" | "rework" | "merged" | "cancelled"
+            );
+        if !is_owner && !master_management {
+            return Resp::err("only the task owner may update its work state; master may rework");
         }
         task.status = new_status;
     }
@@ -634,8 +885,48 @@ fn handle_task_update(
         task.heartbeat_pending = false;
     }
     server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
+    let mut dispatched = Vec::new();
+    if worker.role == "master" {
+        let (events, knocks, assigned) =
+            dispatch_available_to_idle(&mut st, &server.pane_alive_check);
+        if !events.is_empty() {
+            server.commit_locked(&mut st, &events);
+        }
+        dispatched = assigned;
+        for (pane, prompt_id, prompt) in knocks {
+            queue_system_knock(server, &pane, &prompt_id, &prompt);
+        }
+    }
+    let mut block_notification = serde_json::Value::Null;
+    if task.status == "blocked" && worker.role == "worker" {
+        let master = st.master_id().unwrap_or_else(|| "unassigned".into());
+        let body = format!(
+            "TASK_BLOCKED id={} owner={} next={}; MASTER_ACTION: inspect the blocker and set rework or available through Collab",
+            task.id,
+            task.owner,
+            task.next_step.as_deref().unwrap_or("inspect blocker")
+        );
+        let mid = gen_msg_id();
+        let message = Message {
+            id: mid.clone(),
+            from: "collab-server".into(),
+            to: master.clone(),
+            mtype: "system".into(),
+            body: body.clone(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            nudge_count: 0,
+            last_nudge_ms: 0,
+        };
+        server.commit_locked(&mut st, &[Event::Sent { msg: message }]);
+        if let Some(pane) = st.worker_pane(&master) {
+            queue_system_knock(server, &pane, &mid, &body);
+        }
+        block_notification = json!({"message_id": mid, "durable": true, "target": master});
+    }
     Resp::data(
-        json!({"task": task.id, "status": task.status, "heartbeat": if task_heartbeat_active(&task.status) { "active" } else { "unregistered" }}),
+        json!({"task": task.id, "status": task.status, "heartbeat": if task_heartbeat_active(&task.status) { "active" } else { "unregistered" }, "dispatched_tasks": dispatched, "block_notification": block_notification}),
     )
 }
 
@@ -662,6 +953,7 @@ fn available_task_views(st: &State) -> Vec<serde_json::Value> {
                 "feature_id": task.feature_id,
                 "priority": task.priority,
                 "branch": task.branch,
+                "goal_busy": task.goal_busy,
             })
         })
         .collect()
@@ -674,10 +966,10 @@ fn idle_worker_ids(st: &State) -> Vec<String> {
         .filter(|w| {
             w.role == "worker"
                 && w.pane.is_some()
-                && !st
-                    .tasks
-                    .values()
-                    .any(|task| task.owner == w.id && task_heartbeat_active(&task.status))
+                && w.pane.as_deref().is_some_and(pane_idle)
+                && !st.tasks.values().any(|task| {
+                    task.owner == w.id && task.goal_busy && task_claim_held(&task.status)
+                })
         })
         .collect();
     workers.sort_by(|a, b| a.id.cmp(&b.id));
@@ -687,20 +979,94 @@ fn idle_worker_ids(st: &State) -> Vec<String> {
         .collect()
 }
 
-fn assignment_body(task: &TaskRec, master_id: Option<&str>) -> String {
-    format!(
-        "TASK_ASSIGNED id={} owner={} feature={} worktree={} branch={} base={} priority={} master={} next={} | Process this collab input now: run collab role and collab task status {}; claim is already active, so read the task scope and immediately continue its next step. Do not ask for approval or send an ACK.",
-        task.id,
-        task.owner,
-        task.feature_id.as_deref().unwrap_or("none"),
-        task.worktree_path.as_deref().unwrap_or("none"),
-        task.branch.as_deref().unwrap_or("none"),
-        task.base_commit.as_deref().unwrap_or("none"),
-        task.priority,
-        master_id.unwrap_or("unassigned"),
-        task.next_step.as_deref().unwrap_or("inspect task status; continue the first safe implementation step"),
-        task.id,
-    )
+fn stale_worker_views(st: &State, is_reachable: &dyn Fn(&str) -> bool) -> Vec<serde_json::Value> {
+    st.workers
+        .values()
+        .filter(|worker| worker.pane.is_some() && !worker.pane.as_deref().is_some_and(is_reachable))
+        .map(|worker| {
+            let active_tasks: Vec<String> = st
+                .tasks
+                .values()
+                .filter(|task| task.owner == worker.id && task_resource_active(&task.status))
+                .map(|task| task.id.clone())
+                .collect();
+            json!({
+                "worker": worker.id,
+                "role": worker.role,
+                "pane": worker.pane,
+                "active_tasks": active_tasks,
+                "action": "master verify zombie, then collab remove-worker <worker-id> [--force]"
+            })
+        })
+        .collect()
+}
+
+fn tmux_sessions_for_cwd(cwd: &str) -> Vec<String> {
+    let prefix = Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ".-_".contains(ch) {
+                        ch
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}\t#{session_path}"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (name, path) = line.split_once('\t')?;
+            (path == cwd && name.starts_with(&format!("{}-", prefix))).then_some(name.to_string())
+        })
+        .collect()
+}
+
+fn tmux_session_for_pane(pane: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "-t", pane, "#S"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+fn tmux_panes_for_sessions(sessions: &[String]) -> Vec<(String, String)> {
+    let output = Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{session_name}\t#{pane_id}"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (session, pane) = line.split_once('\t')?;
+            sessions
+                .iter()
+                .any(|candidate| candidate == session)
+                .then_some((session.to_string(), pane.to_string()))
+        })
+        .collect()
 }
 
 fn dispatch_available_to_idle(
@@ -711,24 +1077,12 @@ fn dispatch_available_to_idle(
     Vec<(String, String, String)>,
     Vec<serde_json::Value>,
 ) {
-    let mut available: Vec<TaskRec> = st
-        .tasks
-        .values()
-        .filter(|task| task.status == "available")
-        .cloned()
-        .collect();
-    available.sort_by(|a, b| {
-        (priority_rank(&a.priority), a.created_ms, a.id.as_str()).cmp(&(
-            priority_rank(&b.priority),
-            b.created_ms,
-            b.id.as_str(),
-        ))
-    });
+    let available_tasks = available_task_views(st);
 
     let mut events = Vec::new();
     let mut knocks = Vec::new();
     let mut assignments = Vec::new();
-    let mut idle: Vec<String> = idle_worker_ids(st)
+    let idle: Vec<String> = idle_worker_ids(st)
         .into_iter()
         .filter(|worker_id| {
             st.worker_pane(worker_id)
@@ -736,22 +1090,25 @@ fn dispatch_available_to_idle(
                 .is_some_and(|pane| is_reachable(pane))
         })
         .collect();
-    let master = st.master_id();
-
-    for mut task in available {
-        if idle.is_empty() {
-            break;
-        }
-        let worker_id = idle.remove(0);
+    for worker_id in idle {
         let Some(pane) = st.worker_pane(&worker_id) else {
             continue;
         };
-        let body = assignment_body(&task, master.as_deref());
+        let goal = available_tasks
+            .iter()
+            .find(|task| task["goal_busy"] == true);
+        let body = if let Some(goal) = goal {
+            let id = goal["id"].as_str().unwrap_or_default();
+            let prompt = st
+                .tasks
+                .get(id)
+                .and_then(|task| task.goal_prompt.as_deref())
+                .unwrap_or_default();
+            prompt.to_string()
+        } else {
+            format!("TASK_OFFER worker={} available_tasks={} | Choose one task and call collab task claim <task-id>; this offer does not assign ownership", worker_id, serde_json::to_string(&available_tasks).unwrap_or_else(|_| "[]".into()))
+        };
         let mid = gen_msg_id();
-        task.owner = worker_id.clone();
-        task.status = "working".to_string();
-        task.updated_ms = now_ms();
-        task.last_heartbeat_sent_ms = now_ms();
 
         let message = Message {
             id: mid.clone(),
@@ -766,11 +1123,10 @@ fn dispatch_available_to_idle(
             last_nudge_ms: 0,
         };
         events.push(Event::Sent { msg: message });
-        events.push(Event::TaskUpdated { task: task.clone() });
         assignments.push(json!({
-            "task": task.id,
-            "owner": task.owner,
-            "status": task.status,
+            "worker": worker_id,
+            "status": "offered",
+            "available_tasks": available_tasks.clone(),
             "message": mid,
         }));
         knocks.push((pane, mid, body));
@@ -860,6 +1216,7 @@ fn handle_task_deliver(
     token: String,
     task_id: String,
     evidence: Option<String>,
+    worktree: Option<String>,
 ) -> Resp {
     let mut st = server.state.lock().unwrap();
     let Some(worker) = st.workers.get(&worker_id).cloned() else {
@@ -867,9 +1224,6 @@ fn handle_task_deliver(
     };
     if worker.token != token {
         return Resp::err("token mismatch: identity does not own this worker_id");
-    }
-    if worker.role != "worker" {
-        return Resp::err("only workers may deliver claimed tasks");
     }
     let Some(mut task) = st.tasks.get(&task_id).cloned() else {
         return Resp::err(format!("task {} not found", task_id));
@@ -881,13 +1235,27 @@ fn handle_task_deliver(
         ));
     }
 
-    let evidence = evidence.unwrap_or_else(|| "not provided".to_string());
+    let Some(evidence) = evidence.filter(|value| !value.trim().is_empty()) else {
+        return Resp::err("task deliver requires non-empty --evidence");
+    };
+    let Some(worktree) = worktree.filter(|value| !value.trim().is_empty()) else {
+        return Resp::err("task deliver requires non-empty --worktree");
+    };
+    if task
+        .worktree_path
+        .as_deref()
+        .is_some_and(|registered| registered != worktree)
+    {
+        return Resp::err("task deliver --worktree must match the registered task worktree");
+    }
     let master = st.master_id().unwrap_or_else(|| "unassigned".to_string());
+    let available_tasks = available_task_views(&st);
     let body = format!(
-        "TASK_DELIVERED id={} status=delivered owner={} feature={} branch={} evidence={} | MASTER_ACTION: merge/review this delivery, then run collab task status and update the task list before dispatching the next task",
+        "TASK_DELIVERED id={} status=delivered owner={} feature={} worktree={} branch={} evidence={} | MASTER_ACTION: review this delivery; rework or merge, then run collab task close before dispatching the next task",
         task.id,
         task.owner,
         task.feature_id.as_deref().unwrap_or("none"),
+        worktree,
         task.branch.as_deref().unwrap_or("none"),
         evidence
     );
@@ -926,10 +1294,26 @@ fn handle_task_deliver(
     Resp::data(json!({
         "delivered": task.id,
         "status": task.status,
-        "master_notified": master,
-        "next_action": "claim one available task immediately; do not report delivery again",
+        "master_notified": master.clone(),
+        "notification": {
+            "message_id": mid,
+            "durable": true,
+            "target": master,
+            "wake_attempted": st.worker_pane(&master).is_some()
+        },
+        "master_action": {
+            "required": true,
+            "review": "review evidence and worktree",
+            "on_valid": "collab task update <task-id> --status merged, then collab task close <task-id>",
+            "on_invalid": "collab task update <task-id> --status rework"
+        },
+        "worker_action": {
+            "claim_allowed": false,
+            "next": "wait for master close; do not claim another task while this claim is delivered"
+        },
+        "available_tasks": available_tasks,
+        "next_action": "master must review/merge or rework; worker claim remains held until collab task close",
         "identity": {"worker_id": worker.id, "role": worker.role},
-        "available_tasks": available_task_views(&st),
     }))
 }
 
@@ -950,9 +1334,9 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
     if task.owner == worker_id && task.status == "available" {
         return Resp::err("cancel an unclaimed task with task update --status cancelled");
     }
-    if task.status != "delivered" && task.status != "merged" {
+    if task.status != "merged" {
         return Resp::err(format!(
-            "task {} must be delivered or merged before close (current: {})",
+            "task {} must be merged by master before close (current: {})",
             task_id, task.status
         ));
     }
@@ -977,7 +1361,7 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
     );
 
     let body = format!(
-        "TASK_CLOSED id={} owner={} feature={} status=closed; claim the next available task or remain idle without heartbeat.",
+        "TASK_CLOSED id={} owner={} feature={} status=closed; MASTER_ACTION: re-analyze the goal, publish the next tasks if the goal is incomplete, then dispatch; owner may claim only after close.",
         closed.id, closed.owner, closed.feature_id.as_deref().unwrap_or("none")
     );
     let mid = gen_msg_id();
@@ -998,6 +1382,47 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
         queue_system_knock(server, &pane, &mid, &body);
     }
 
+    // Closing the lock-holder wakes every durable waiter. The wake is only a
+    // prompt; each waiter must re-query conflicts before resuming.
+    let waiting: Vec<(String, String)> = st
+        .tasks
+        .values()
+        .filter(|candidate| {
+            candidate.status == "waiting"
+                && candidate.next_step.as_deref() == Some(&format!("WAITING_FOR={}", closed.id))
+        })
+        .filter_map(|candidate| {
+            st.worker_pane(&candidate.owner)
+                .map(|pane| (candidate.owner.clone(), pane))
+        })
+        .collect();
+    let mut wait_knocks = Vec::new();
+    for (waiter, pane) in waiting {
+        let wait_id = gen_msg_id();
+        let wait_body = format!(
+            "RESOURCE_RELEASED task={} waiter={} | Re-check collab task conflicts now; claim/resume only after the Server confirms the resource is free",
+            closed.id, waiter
+        );
+        server.commit_locked(
+            &mut st,
+            &[Event::Sent {
+                msg: Message {
+                    id: wait_id.clone(),
+                    from: "collab-server".into(),
+                    to: waiter,
+                    mtype: "system".into(),
+                    body: wait_body.clone(),
+                    in_reply_to: None,
+                    created_ms: now_ms(),
+                    state: "pending".into(),
+                    nudge_count: 0,
+                    last_nudge_ms: 0,
+                },
+            }],
+        );
+        wait_knocks.push((pane, wait_id, wait_body));
+    }
+
     // Merge closure frees the feature/worktree resource. Reconcile the board
     // immediately so an already-published task reaches an idle worker without
     // another master approval round.
@@ -1007,7 +1432,11 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
         server.commit_locked(&mut st, &dispatch_events);
     }
     let available_tasks = available_task_views(&st);
+    let stale_workers = stale_worker_views(&st, &server.pane_alive_check);
     drop(st);
+    for (pane, prompt_id, prompt) in wait_knocks {
+        queue_system_knock(server, &pane, &prompt_id, &prompt);
+    }
     for (pane, prompt_id, prompt) in dispatch_knocks {
         queue_system_knock(server, &pane, &prompt_id, &prompt);
     }
@@ -1023,6 +1452,14 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
         },
         "dispatched_tasks": dispatched,
         "available_tasks": available_tasks,
+        "stale_workers": stale_workers,
+        "master_action": "re-analyze the goal and publish/dispatch next tasks if incomplete",
+        "worker_action": {
+            "claim_allowed": true,
+            "available_tasks": available_tasks,
+            "next": "claim one returned available task, or remain idle if the goal is complete"
+        },
+        "next_action": "master re-analyze and dispatch; owner may claim one returned available task after close",
     }))
 }
 
@@ -1038,6 +1475,8 @@ fn task_view(task: &TaskRec) -> serde_json::Value {
         "priority": task.priority,
         "status": task.status,
         "next_step": task.next_step,
+        "goal_busy": task.goal_busy,
+        "goal_prompt": task.goal_prompt,
         "heartbeat": if task_heartbeat_active(&task.status) { "active" } else { "unregistered" },
         "updated_at": iso(task.updated_ms),
     })
@@ -1095,6 +1534,72 @@ fn task_conflicts(
     Resp::data(json!({"conflicts": conflicts}))
 }
 
+fn handle_task_wait(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    task_id: String,
+    blocking_task_id: String,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    let Some(worker) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if worker.token != token || worker.role != "worker" {
+        return Resp::err("only the owning worker may wait on a resource conflict");
+    }
+    let Some(mut task) = st.tasks.get(&task_id).cloned() else {
+        return Resp::err(format!("task {} not found", task_id));
+    };
+    if task.owner != worker_id || !task_claim_held(&task.status) {
+        return Resp::err("only an owned active task may enter waiting");
+    }
+    let Some(blocking) = st.tasks.get(&blocking_task_id).cloned() else {
+        return Resp::err(format!("blocking task {} not found", blocking_task_id));
+    };
+    let conflict = task_resource_active(&blocking.status)
+        && ((task.feature_id.is_some() && task.feature_id == blocking.feature_id)
+            || (task.worktree_path.is_some() && task.worktree_path == blocking.worktree_path));
+    if !conflict {
+        return Resp::err("blocking task does not hold a matching active resource");
+    }
+    task.status = "waiting".into();
+    task.next_step = Some(format!("WAITING_FOR={}", blocking_task_id));
+    task.heartbeat_pending = false;
+    task.heartbeat_message_id = None;
+    task.updated_ms = now_ms();
+    server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
+    let master = st.master_id().unwrap_or_else(|| "unassigned".into());
+    let body = format!(
+        "RESOURCE_WAITING id={} owner={} waiting_for={}; MASTER_ACTION: resolve priority and keep the waiter paused until the lock is released",
+        task.id, worker_id, blocking_task_id
+    );
+    let mid = gen_msg_id();
+    server.commit_locked(
+        &mut st,
+        &[Event::Sent {
+            msg: Message {
+                id: mid.clone(),
+                from: "collab-server".into(),
+                to: master.clone(),
+                mtype: "system".into(),
+                body: body.clone(),
+                in_reply_to: None,
+                created_ms: now_ms(),
+                state: "pending".into(),
+                nudge_count: 0,
+                last_nudge_ms: 0,
+            },
+        }],
+    );
+    if let Some(pane) = st.worker_pane(&master) {
+        queue_system_knock(server, &pane, &mid, &body);
+    }
+    Resp::data(
+        json!({"task": task.id, "status": task.status, "waiting_for": blocking_task_id, "master_notification": mid}),
+    )
+}
+
 fn handle_transfer_master(
     server: &Server,
     worker_id: String,
@@ -1127,11 +1632,119 @@ fn handle_transfer_master(
     Resp::data(json!({"master": target_id, "previous_master": worker_id}))
 }
 
+fn handle_master_recover(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    session: String,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    let Some(current) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if current.token != token {
+        return Resp::err("token mismatch: identity does not own this worker_id");
+    }
+    if runtime_for_pane(current.pane.as_deref()) != Some("tmux") {
+        return Resp::err("master recover requires a tmux pane");
+    }
+    if session.trim().is_empty() {
+        return Resp::err("master recover requires a non-empty tmux session name");
+    }
+    let Some(previous) = st.master_id() else {
+        return Resp::err("no registered master to recover");
+    };
+    if previous == worker_id {
+        return Resp::data(
+            json!({"master": worker_id, "session": session, "recovered": false, "broadcast": 0}),
+        );
+    }
+    let previous_pane = st.worker_pane(&previous);
+    if previous_pane.as_deref().is_some_and(pane_alive) {
+        return Resp::err("current master endpoint is live; use collab transfer-master instead");
+    }
+    server.commit_locked(
+        &mut st,
+        &[Event::MasterTransferred {
+            from: previous.clone(),
+            to: worker_id.clone(),
+        }],
+    );
+    let sessions = tmux_sessions_for_cwd(&current.cwd);
+    let registered_recipients: Vec<(String, String)> = st
+        .workers
+        .values()
+        .filter(|worker| worker.id != worker_id)
+        .filter_map(|worker| {
+            let pane = worker.pane.clone()?;
+            let session_name = tmux_session_for_pane(&pane)?;
+            sessions
+                .contains(&session_name)
+                .then_some((worker.id.clone(), pane))
+        })
+        .collect();
+    let body = format!(
+        "MASTER_RECOVERED master={} session={} previous_master={}; re-run collab role, collab who, and collab master, reconcile active claims, then resume review and dispatch; do not infer identity from this message",
+        worker_id, session, previous
+    );
+    let mut knocks = Vec::new();
+    let mut broadcast = 0usize;
+    let mut registered_panes = std::collections::HashSet::new();
+    for (recipient, pane) in registered_recipients {
+        registered_panes.insert(pane.clone());
+        let mid = gen_msg_id();
+        server.commit_locked(
+            &mut st,
+            &[Event::Sent {
+                msg: Message {
+                    id: mid.clone(),
+                    from: "collab-server".into(),
+                    to: recipient,
+                    mtype: "system".into(),
+                    body: body.clone(),
+                    in_reply_to: None,
+                    created_ms: now_ms(),
+                    state: "pending".into(),
+                    nudge_count: 0,
+                    last_nudge_ms: 0,
+                },
+            }],
+        );
+        knocks.push((pane, mid));
+        broadcast += 1;
+    }
+    // The tm group is the discovery boundary. Wake every live pane in the
+    // directory-prefixed session group, including panes that have not yet
+    // rebuilt their identity. Unregistered panes receive no mailbox record;
+    // they must run `collab init` and query the Server after waking.
+    for (_session, pane) in tmux_panes_for_sessions(&sessions) {
+        if pane == current.pane.clone().unwrap_or_default() || registered_panes.contains(&pane) {
+            continue;
+        }
+        let mid = gen_msg_id();
+        knocks.push((pane, mid));
+        broadcast += 1;
+    }
+    drop(st);
+    for (pane, mid) in knocks {
+        queue_system_knock(server, &pane, &mid, &body);
+    }
+    Resp::data(json!({
+        "master": worker_id,
+        "previous_master": previous,
+        "session": session,
+        "recovered": true,
+        "broadcast": broadcast,
+        "next": "workers must re-run collab role/who/master; task state remains journal-authoritative"
+    }))
+}
+
 fn handle_remove_worker(
     server: &Server,
     worker_id: String,
     token: String,
     target_id: String,
+    force: bool,
 ) -> Resp {
     let mut st = server.state.lock().unwrap();
     let Some(master) = st.workers.get(&worker_id).cloned() else {
@@ -1146,20 +1759,90 @@ fn handle_remove_worker(
     if !st.workers.contains_key(&target_id) {
         return Resp::err(format!("target worker {} not registered", target_id));
     }
-    if st
+    let active_task_ids: Vec<String> = st
         .tasks
         .values()
-        .any(|task| task.owner == target_id && task_resource_active(&task.status))
-    {
+        .filter(|task| task.owner == target_id && task_resource_active(&task.status))
+        .map(|task| task.id.clone())
+        .collect();
+    let endpoint_live = st
+        .worker_pane(&target_id)
+        .as_deref()
+        .is_some_and(pane_alive);
+    if endpoint_live && !force {
+        return Resp::err(
+            "worker endpoint is still live; confirm zombie state before --force removal",
+        );
+    }
+    if !active_task_ids.is_empty() && !force {
         return Resp::err("cannot remove worker holding an active task");
     }
-    server.commit_locked(
-        &mut st,
-        &[Event::WorkerRemoved {
-            worker_id: target_id.clone(),
-        }],
-    );
-    Resp::data(json!({"removed": target_id}))
+    let mut events = Vec::new();
+    for task_id in &active_task_ids {
+        if let Some(task) = st.tasks.get(task_id).cloned() {
+            events.push(Event::TaskUpdated {
+                task: TaskRec {
+                    owner: master.id.clone(),
+                    status: "available".into(),
+                    next_step: Some("requeued after master removed stale worker".into()),
+                    heartbeat_pending: false,
+                    heartbeat_message_id: None,
+                    heartbeat_stale_notified: false,
+                    updated_ms: now_ms(),
+                    ..task
+                },
+            });
+        }
+    }
+    events.push(Event::WorkerRemoved {
+        worker_id: target_id.clone(),
+    });
+    server.commit_locked(&mut st, &events);
+    Resp::data(json!({"removed": target_id, "requeued_tasks": active_task_ids}))
+}
+
+fn handle_reset_bindings(server: &Server, confirm: bool) -> Resp {
+    if !confirm {
+        return Resp::err("collab reset requires explicit confirmation");
+    }
+    let mut st = server.state.lock().unwrap();
+    let worker_ids: Vec<String> = st.workers.keys().cloned().collect();
+    let mut events = Vec::new();
+    for task in st
+        .tasks
+        .values()
+        .filter(|task| task_resource_active(&task.status))
+    {
+        let status = if task.status == "delivered" {
+            "delivered"
+        } else {
+            "available"
+        };
+        events.push(Event::TaskUpdated {
+            task: TaskRec {
+                owner: String::new(),
+                status: status.into(),
+                next_step: Some("rebuild after runtime identity reset".into()),
+                heartbeat_pending: false,
+                heartbeat_message_id: None,
+                heartbeat_stale_notified: false,
+                updated_ms: now_ms(),
+                ..task.clone()
+            },
+        });
+    }
+    for worker_id in &worker_ids {
+        events.push(Event::WorkerRemoved {
+            worker_id: worker_id.clone(),
+        });
+    }
+    server.commit_locked(&mut st, &events);
+    Resp::data(json!({
+        "reset": true,
+        "removed_workers": worker_ids,
+        "requeued_tasks": st.tasks.values().filter(|task| task.status == "available" && task.next_step.as_deref() == Some("rebuild after runtime identity reset")).count(),
+        "next": "start tmux group; run collab init in first pane; then verify role and rebuild board"
+    }))
 }
 
 // ---------- dispatch ----------
@@ -1273,6 +1956,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             base_commit,
             priority,
             next_step,
+            goal_prompt,
         } => handle_task_register_with_next(
             server,
             worker_id,
@@ -1285,6 +1969,23 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             base_commit,
             priority,
             next_step,
+            goal_prompt,
+        ),
+        Req::TaskRelocate {
+            worker_id,
+            token,
+            task_id,
+            worktree_path,
+            branch,
+            base_commit,
+        } => handle_task_relocate(
+            server,
+            worker_id,
+            token,
+            task_id,
+            worktree_path,
+            branch,
+            base_commit,
         ),
         Req::TaskUpdate {
             worker_id,
@@ -1298,12 +1999,19 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             token,
             task_id,
         } => handle_task_claim(server, worker_id, token, task_id),
+        Req::TaskWait {
+            worker_id,
+            token,
+            task_id,
+            blocking_task_id,
+        } => handle_task_wait(server, worker_id, token, task_id, blocking_task_id),
         Req::TaskDeliver {
             worker_id,
             token,
             task_id,
             evidence,
-        } => handle_task_deliver(server, worker_id, token, task_id, evidence),
+            worktree,
+        } => handle_task_deliver(server, worker_id, token, task_id, evidence, worktree),
         Req::TaskClose {
             worker_id,
             token,
@@ -1349,8 +2057,10 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                         "id": w.id,
                         "role": w.role,
                         "pane": w.pane,
+                        "endpoint_live": w.pane.as_deref().is_some_and(pane_alive),
                         "active_task": active.map(|task| task.id.as_str()),
                         "active_status": active.map(|task| task.status.as_str()),
+                        "goal_busy": active.is_some_and(|task| task.goal_busy),
                     })
                 })
                 .collect();
@@ -1364,6 +2074,11 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             let st = server.state.lock().unwrap();
             Resp::data(json!({"master": st.master_id()}))
         }
+        Req::MasterRecover {
+            worker_id,
+            token,
+            session,
+        } => handle_master_recover(server, worker_id, token, session),
         Req::TransferMaster {
             worker_id,
             token,
@@ -1373,7 +2088,21 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             worker_id,
             token,
             target_id,
-        } => handle_remove_worker(server, worker_id, token, target_id),
+            force,
+        } => handle_remove_worker(server, worker_id, token, target_id, force),
+        Req::ResetBindings { confirm } => handle_reset_bindings(server, confirm),
+        Req::Shutdown { worker_id } => {
+            let st = server.state.lock().unwrap();
+            let Some(worker) = st.workers.get(&worker_id) else {
+                return Resp::err("shutdown denied: identity is not registered");
+            };
+            if worker.role != "master" {
+                return Resp::err(
+                    "shutdown denied: only the authenticated master may stop the daemon",
+                );
+            }
+            Resp::data(json!({"authorized": true, "role": worker.role}))
+        }
         Req::Ping => {
             let st = server.state.lock().unwrap();
             Resp::data(json!({
@@ -1396,13 +2125,24 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
         }
         let resp = match serde_json::from_str::<Req>(&line) {
             Ok(req) => {
+                let activity_req = req.clone();
                 // blocking handlers (poll/wait) run off the async reactor thread pool
                 let srv = server.clone();
-                tokio::task::spawn_blocking(move || dispatch(&srv, req))
+                let resp = tokio::task::spawn_blocking(move || dispatch(&srv, req))
                     .await
-                    .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e)))
+                    .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e)));
+                record_activity(
+                    &server.root,
+                    "request",
+                    request_activity(&activity_req, &resp),
+                );
+                resp
             }
-            Err(e) => Resp::err(format!("bad request: {}", e)),
+            Err(e) => {
+                let resp = Resp::err(format!("bad request: {}", e));
+                record_activity(&server.root, "protocol_error", json!({"error": resp.error}));
+                resp
+            }
         };
         let mut out = serde_json::to_string(&resp).expect("serialize resp");
         out.push('\n');
@@ -1438,6 +2178,15 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     let sock_path = scope.sock_path();
     let server_dir = scope.server_dir();
     std::fs::create_dir_all(&server_dir)?;
+    std::fs::write(
+        server_dir.join("server.pid"),
+        std::process::id().to_string(),
+    )?;
+    record_activity(
+        &scope.root,
+        "daemon_start",
+        json!({"pid": std::process::id()}),
+    );
 
     if sock_path.exists() {
         if crate::client::alive(&sock_path) {
@@ -1486,6 +2235,18 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_path_budget_accepts_short_slug_and_rejects_long_or_escape() {
+        let root = PathBuf::from("/tmp/project");
+        assert!(validate_worktree_path(&root, "./playground/ar03-0828").is_ok());
+        assert!(validate_worktree_path(
+            &root,
+            "./playground/v3-direct-sse-terminal-observability-20260827-long-run-id"
+        )
+        .is_err());
+        assert!(validate_worktree_path(&root, "./playground/../outside").is_err());
+    }
     use crate::server::state::default_priority;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1679,13 +2440,13 @@ mod tests {
     #[test]
     fn short_delivery_is_single_line_and_bounded() {
         let (_, root) = test_server();
-        let body = "x".repeat(500);
+        let body = "x".repeat(150);
         let text = delivery_text(&root, "sender", "notify", "m1", &body).unwrap();
         assert!(text.starts_with("[MAIL] from=sender type=notify id=m1: "));
         assert!(text.contains(&body));
-        assert!(text.contains("Process this collab input now"));
-        assert!(text.contains("ack id=m1"));
-        assert!(text.contains("continue the current run's next step"));
+        assert!(text.contains("action=\"inspect this input"));
+        assert!(!text.to_ascii_lowercase().contains("ack"));
+        assert!(text.contains("continue the current run"));
         assert!(text.chars().count() <= 850);
         assert!(!text.contains('\n'));
         assert!(!message_doc_path(&root, "m1").exists());
@@ -1699,8 +2460,8 @@ mod tests {
         let text = delivery_text(&root, "sender", "notify", "m2", &body).unwrap();
         assert!(text.chars().count() <= 300);
         assert!(text.contains("body-ref=.agent-collab/messages/m2.md"));
-        assert!(text.contains("Process this collab input now"));
-        assert!(text.contains("ack id=m2"));
+        assert!(text.contains("body-ref=.agent-collab/messages/m2.md"));
+        assert!(!text.to_ascii_lowercase().contains("ack"));
         assert_eq!(
             std::fs::read_to_string(message_doc_path(&root, "m2")).unwrap(),
             body
@@ -1721,9 +2482,34 @@ mod tests {
         .unwrap();
         assert!(text.contains("from=collab-server type=system id=system-1"));
         assert!(text.contains("NUDGE: request needs a substantive response"));
-        assert!(text.contains("decide collaborate/defer/reject with reason"));
-        assert!(text.contains("reply if requested, ack id=system-1"));
-        assert!(text.contains("immediately continue the current run's next step"));
+        assert!(text.contains("action=\"inspect this input"));
+        assert!(!text.to_ascii_lowercase().contains("ack"));
+        assert!(text.contains("execute the required Collab state action"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn task_delivery_and_close_have_actionable_next_steps() {
+        let (_, root) = test_server();
+        let delivered = delivery_text(
+            &root,
+            "collab-server",
+            "system",
+            "deliver-1",
+            "TASK_DELIVERED id=t status=delivered | MASTER_ACTION: review",
+        )
+        .unwrap();
+        assert!(delivered.contains("inspect status/evidence"));
+        assert!(!delivered.contains("ack id=deliver-1"));
+        let closed = delivery_text(
+            &root,
+            "collab-server",
+            "system",
+            "close-1",
+            "TASK_CLOSED id=t status=closed",
+        )
+        .unwrap();
+        assert!(closed.contains("inspect status/evidence"));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1775,7 +2561,54 @@ mod tests {
             "/tmp".into(),
         );
         assert!(!second.ok);
-        assert!(second.error.unwrap().contains("runtime mismatch"));
+        assert!(second.error.unwrap().contains("Herdr runtime is disabled"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tmux_registration_is_allowed_as_herdr_migration_candidate() {
+        let (server, root) = test_server();
+        server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: "legacy-master".into(),
+                token: "token-master".into(),
+                pane: Some("herdr:w4:p1".into()),
+                cwd: "/tmp".into(),
+                registered_ms: now_ms(),
+                role: "master".into(),
+            },
+        }]);
+        let replacement = handle_register(
+            &server,
+            "tmux-replacement".into(),
+            "token-replacement".into(),
+            Some("%test-replacement".into()),
+            "/tmp".into(),
+        );
+        assert!(replacement.ok);
+        assert_eq!(
+            replacement.data["migration"],
+            "herdr-to-tmux-pending-master-recover"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reset_bindings_removes_all_runtime_identities() {
+        let (server, root) = test_server();
+        server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: "old-master".into(),
+                token: "token-master".into(),
+                pane: Some("herdr:w4:p1".into()),
+                cwd: "/tmp".into(),
+                registered_ms: now_ms(),
+                role: "master".into(),
+            },
+        }]);
+        let reset = handle_reset_bindings(&server, true);
+        assert!(reset.ok);
+        assert!(server.state.lock().unwrap().workers.is_empty());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1820,6 +2653,7 @@ mod tests {
             "replacement".into(),
             "token-replacement".into(),
             "master".into(),
+            false,
         );
         assert!(removed.ok);
         assert!(!server.state.lock().unwrap().workers.contains_key("master"));
@@ -1896,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_cannot_register_tasks() {
+    fn worker_registers_only_self_created_task() {
         let (server, root) = test_server();
         register_role(&server, "master", "master");
         register_role(&server, "worker", "worker");
@@ -1914,7 +2748,22 @@ mod tests {
             default_priority(),
         );
         assert!(!denied.ok);
-        assert!(denied.error.unwrap().contains("only master"));
+        assert!(denied.error.unwrap().contains("self-created"));
+        let created = handle_task_register(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-self".into(),
+            Some("worker".into()),
+            Some("feature-self".into()),
+            None,
+            None,
+            None,
+            default_priority(),
+        );
+        assert!(created.ok);
+        assert_eq!(created.data["status"], "working");
+        assert_eq!(created.data["owner"], "worker");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1943,16 +2792,16 @@ mod tests {
         ));
         drop(active);
 
-        let delivered = handle_task_update(
+        let delivered = handle_task_deliver(
             &server,
             "worker".into(),
             "token-worker".into(),
             "task-heartbeat".into(),
-            Some("delivered".into()),
-            None,
+            Some("heartbeat gate passed".into()),
+            Some("/tmp/task-heartbeat".into()),
         );
         assert!(delivered.ok);
-        assert_eq!(delivered.data["heartbeat"], "unregistered");
+        assert_eq!(delivered.data["status"], "delivered");
 
         {
             let st = server.state.lock().unwrap();
@@ -2025,13 +2874,13 @@ mod tests {
             default_priority(),
         );
 
-        let delivered = handle_task_update(
+        let delivered = handle_task_deliver(
             &server,
             "worker".into(),
             "token-worker".into(),
             "task-rework".into(),
-            Some("delivered".into()),
-            None,
+            Some("rework gate passed".into()),
+            Some("/tmp/task-rework".into()),
         );
         assert!(delivered.ok);
 
@@ -2077,18 +2926,18 @@ mod tests {
             "task-held".into(),
             Some("worker".into()),
             Some("feature-held".into()),
-            Some("/tmp/held".into()),
+            None,
             None,
             None,
             default_priority(),
         );
-        let delivered = handle_task_update(
+        let delivered = handle_task_deliver(
             &server,
             "worker".into(),
             "token-worker".into(),
             "task-held".into(),
-            Some("delivered".into()),
-            None,
+            Some("resource gate passed".into()),
+            Some("/tmp/task-held".into()),
         );
         assert!(delivered.ok);
 
@@ -2106,13 +2955,20 @@ mod tests {
         );
         assert!(!conflict.ok);
 
-        let closed = handle_task_update(
+        let merged = handle_task_update(
             &server,
             "master".into(),
             "token-master".into(),
             "task-held".into(),
-            Some("closed".into()),
+            Some("merged".into()),
             None,
+        );
+        assert!(merged.ok);
+        let closed = handle_task_close(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-held".into(),
         );
         assert!(closed.ok);
 
@@ -2252,23 +3108,21 @@ mod tests {
             default_priority(),
         );
         assert!(second.ok);
-        let denied = handle_task_claim(
+        let second_claim = handle_task_claim(
             &server,
             "worker".into(),
             "token-worker".into(),
             "task-second".into(),
         );
-        assert!(!denied.ok);
-        assert!(denied.error.unwrap().contains("already hold active task"));
+        assert!(second_claim.ok);
 
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn master_cannot_claim_available_task() {
+    fn master_can_claim_available_task_as_owner() {
         let (server, root) = test_server();
         register_role(&server, "master", "master");
-        register_role(&server, "worker", "worker");
         let created = handle_task_register(
             &server,
             "master".into(),
@@ -2282,19 +3136,20 @@ mod tests {
             default_priority(),
         );
         assert!(created.ok);
-        let denied = handle_task_claim(
+        let claimed = handle_task_claim(
             &server,
             "master".into(),
             "token-master".into(),
             "task-master-claim".into(),
         );
-        assert!(!denied.ok);
-        assert!(denied.error.unwrap().contains("only workers may claim"));
+        assert!(claimed.ok);
+        assert_eq!(claimed.data["owner"], "master");
+        assert_eq!(claimed.data["status"], "working");
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn deliver_notifies_master_and_returns_priority_ordered_available_tasks() {
+    fn deliver_notifies_master_and_waits_for_close_before_next_claim() {
         let (server, root) = test_server();
         register_role(&server, "master", "master");
         register_role(&server, "worker", "worker");
@@ -2306,7 +3161,7 @@ mod tests {
             "claimed".into(),
             None,
             Some("feature-claimed".into()),
-            None,
+            Some("/tmp/claimed".into()),
             None,
             None,
             "p2".into(),
@@ -2348,20 +3203,40 @@ mod tests {
             .ok
         );
 
+        let missing_evidence = handle_task_deliver(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "claimed".into(),
+            None,
+            None,
+        );
+        assert!(!missing_evidence.ok);
+        assert!(missing_evidence
+            .error
+            .unwrap()
+            .contains("requires non-empty --evidence"));
+
         let delivered = handle_task_deliver(
             &server,
             "worker".into(),
             "token-worker".into(),
             "claimed".into(),
             Some("all gates pass".into()),
+            Some("/tmp/claimed".into()),
         );
         assert!(delivered.ok);
         assert_eq!(delivered.data["status"], "delivered");
         assert_eq!(delivered.data["master_notified"], "master");
         assert_eq!(delivered.data["identity"]["worker_id"], "worker");
-        let available = delivered.data["available_tasks"].as_array().unwrap();
-        assert_eq!(available[0]["id"], "high");
-        assert_eq!(available[1]["id"], "low");
+        assert!(delivered.data["available_tasks"].is_array());
+        let second_claim = handle_task_claim(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "high".into(),
+        );
+        assert!(second_claim.ok);
 
         let st = server.state.lock().unwrap();
         assert_eq!(st.tasks["claimed"].status, "delivered");
@@ -2395,13 +3270,13 @@ mod tests {
         );
         assert!(created.ok);
         assert!(
-            handle_task_update(
+            handle_task_deliver(
                 &server,
                 "worker".into(),
                 "token-worker".into(),
                 "task-close".into(),
-                Some("delivered".into()),
-                None,
+                Some("close gate passed".into()),
+                Some("/tmp/task-close".into()),
             )
             .ok
         );
@@ -2415,6 +3290,15 @@ mod tests {
         assert!(!denied.ok);
         assert!(denied.error.unwrap().contains("only master"));
 
+        let merged = handle_task_update(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-close".into(),
+            Some("merged".into()),
+            None,
+        );
+        assert!(merged.ok);
         let closed = handle_task_close(
             &server,
             "master".into(),
@@ -2426,6 +3310,56 @@ mod tests {
         let st = server.state.lock().unwrap();
         assert!(!task_heartbeat_active(&st.tasks["task-close"].status));
         assert!(!task_resource_active(&st.tasks["task-close"].status));
+        drop(st);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn worker_block_records_state_and_notifies_master() {
+        let (server, root) = test_server();
+        register_role(&server, "master", "master");
+        register_role(&server, "worker", "worker");
+        let created = handle_task_register(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-blocked".into(),
+            None,
+            Some("feature-blocked".into()),
+            None,
+            None,
+            None,
+            default_priority(),
+        );
+        assert!(created.ok);
+        assert!(
+            handle_task_claim(
+                &server,
+                "worker".into(),
+                "token-worker".into(),
+                "task-blocked".into(),
+            )
+            .ok
+        );
+
+        let blocked = handle_task_update(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-blocked".into(),
+            Some("blocked".into()),
+            Some("waiting for upstream schema".into()),
+        );
+        assert!(blocked.ok);
+        assert_eq!(blocked.data["status"], "blocked");
+        assert_eq!(blocked.data["block_notification"]["target"], "master");
+        let st = server.state.lock().unwrap();
+        assert_eq!(st.tasks["task-blocked"].status, "blocked");
+        assert!(st.msgs.values().any(|m| {
+            m.from == "collab-server"
+                && m.to == "master"
+                && m.body.contains("TASK_BLOCKED id=task-blocked")
+        }));
         drop(st);
         std::fs::remove_dir_all(root).ok();
     }
@@ -2451,13 +3385,13 @@ mod tests {
         );
         assert!(created.ok);
         assert!(
-            handle_task_update(
+            handle_task_deliver(
                 &server,
                 "worker-a".into(),
                 "token-worker-a".into(),
                 "task-close".into(),
-                Some("delivered".into()),
-                None,
+                Some("dispatch gate passed".into()),
+                Some("/tmp/task-close".into()),
             )
             .ok
         );
@@ -2489,6 +3423,15 @@ mod tests {
         );
         assert!(high.ok);
 
+        let merged = handle_task_update(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "task-close".into(),
+            Some("merged".into()),
+            None,
+        );
+        assert!(merged.ok);
         let closed = handle_task_close(
             &server,
             "master".into(),
@@ -2498,32 +3441,29 @@ mod tests {
         assert!(closed.ok);
         let dispatched = closed.data["dispatched_tasks"].as_array().unwrap();
         assert_eq!(dispatched.len(), 2);
-        assert_eq!(dispatched[0]["task"], "dispatch-high");
-        assert_eq!(dispatched[0]["owner"], "worker-a");
-        assert_eq!(dispatched[1]["task"], "dispatch-low");
-        assert_eq!(dispatched[1]["owner"], "worker-b");
-        assert_eq!(closed.data["available_tasks"].as_array().unwrap().len(), 0);
+        assert_eq!(dispatched[0]["worker"], "worker-a");
+        assert_eq!(dispatched[0]["status"], "offered");
+        assert_eq!(dispatched[1]["worker"], "worker-b");
+        assert_eq!(closed.data["available_tasks"].as_array().unwrap().len(), 2);
 
         let st = server.state.lock().unwrap();
-        assert_eq!(st.tasks["dispatch-high"].status, "working");
-        assert_eq!(st.tasks["dispatch-high"].owner, "worker-a");
-        assert_eq!(st.tasks["dispatch-low"].status, "working");
-        assert_eq!(st.tasks["dispatch-low"].owner, "worker-b");
-        let assigned = st
+        assert_eq!(st.tasks["dispatch-high"].status, "available");
+        assert_eq!(st.tasks["dispatch-high"].owner, "master");
+        assert_eq!(st.tasks["dispatch-low"].status, "available");
+        assert_eq!(st.tasks["dispatch-low"].owner, "master");
+        let offered = st
             .msgs
             .values()
-            .find(|m| {
-                m.from == "collab-server" && m.body.contains("TASK_ASSIGNED id=dispatch-high")
-            })
+            .find(|m| m.from == "collab-server" && m.body.contains("TASK_OFFER"))
             .unwrap();
-        assert!(assigned.body.contains("feature=feature-high"));
-        assert!(assigned.body.contains("claim is already active"));
+        assert!(offered.body.contains("dispatch-high"));
+        assert!(offered.body.contains("dispatch-low"));
         drop(st);
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn dispatch_command_assigns_available_tasks_to_idle_workers() {
+    fn dispatch_command_offers_available_tasks_to_idle_workers() {
         let (server, root) = test_server();
         register_role(&server, "master", "master");
         register_role(&server, "worker-a", "worker");
@@ -2559,18 +3499,20 @@ mod tests {
         let dispatched = handle_task_dispatch(&server, "master".into(), "token-master".into());
         assert!(dispatched.ok);
         let tasks = dispatched.data["dispatched_tasks"].as_array().unwrap();
-        assert_eq!(tasks[0]["task"], "dispatch-high");
-        assert_eq!(tasks[0]["owner"], "worker-a");
-        assert_eq!(tasks[1]["task"], "dispatch-low");
-        assert_eq!(tasks[1]["owner"], "worker-b");
+        assert_eq!(tasks[0]["worker"], "worker-a");
+        assert_eq!(tasks[0]["status"], "offered");
+        assert_eq!(tasks[1]["worker"], "worker-b");
+        assert_eq!(tasks[1]["status"], "offered");
         assert_eq!(
             dispatched.data["available_tasks"].as_array().unwrap().len(),
-            0
+            2
         );
 
         let st = server.state.lock().unwrap();
-        assert_eq!(st.tasks["dispatch-high"].status, "working");
-        assert_eq!(st.tasks["dispatch-low"].owner, "worker-b");
+        assert_eq!(st.tasks["dispatch-high"].status, "available");
+        assert_eq!(st.tasks["dispatch-high"].owner, "master");
+        assert_eq!(st.tasks["dispatch-low"].status, "available");
+        assert_eq!(st.tasks["dispatch-low"].owner, "master");
         drop(st);
         std::fs::remove_dir_all(root).ok();
     }
@@ -2656,20 +3598,24 @@ mod tests {
         for event in &events {
             st.apply(event);
         }
-        assert_eq!(events.len(), 2, "assignment message + task update");
+        assert_eq!(
+            events.len(),
+            1,
+            "offer message only; worker claims separately"
+        );
         assert_eq!(knocks.len(), 1);
         assert_eq!(dispatched.len(), 1);
         assert_eq!(
-            dispatched[0]["owner"], "worker-live-pane",
-            "task must be assigned to worker-live-pane"
+            dispatched[0]["worker"], "worker-live-pane",
+            "offer must target worker-live-pane"
         );
-        assert_eq!(dispatched[0]["status"], "working");
+        assert_eq!(dispatched[0]["status"], "offered");
 
         assert_eq!(
-            st.tasks["dispatch-reachable"].owner, "worker-live-pane",
-            "task owner must be worker-live-pane after dispatch"
+            st.tasks["dispatch-reachable"].owner, "master",
+            "offer must not mutate task owner"
         );
-        assert_eq!(st.tasks["dispatch-reachable"].status, "working");
+        assert_eq!(st.tasks["dispatch-reachable"].status, "available");
         drop(st);
         std::fs::remove_dir_all(root).ok();
     }

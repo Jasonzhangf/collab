@@ -78,6 +78,10 @@ pub struct TaskRec {
     pub status: String,
     #[serde(default)]
     pub next_step: Option<String>,
+    #[serde(default)]
+    pub goal_prompt: Option<String>,
+    #[serde(default)]
+    pub goal_busy: bool,
     pub created_ms: i64,
     pub updated_ms: i64,
     pub last_heartbeat_sent_ms: i64,
@@ -90,12 +94,12 @@ pub struct TaskRec {
 pub fn task_heartbeat_active(status: &str) -> bool {
     !matches!(
         status,
-        "available" | "delivered" | "merged" | "closed" | "cancelled"
+        "available" | "waiting" | "delivered" | "merged" | "closed" | "cancelled"
     )
 }
 
 pub fn task_resource_active(status: &str) -> bool {
-    !matches!(status, "merged" | "closed" | "cancelled")
+    !matches!(status, "waiting" | "merged" | "closed" | "cancelled")
 }
 
 /// Journal events. Every mutation is an event: live path applies + appends,

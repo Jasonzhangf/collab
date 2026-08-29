@@ -36,7 +36,7 @@ pub fn pane_alive(pane: &str) -> bool {
 }
 
 pub fn pane_idle(pane: &str) -> bool {
-    if cfg!(test) && pane.starts_with("%test-") {
+    if cfg!(test) && pane.starts_with('%') {
         return true;
     }
     if let Some((socket, pane_id)) = pane.strip_prefix("herdr:").and_then(|v| v.split_once('|')) {
@@ -72,6 +72,21 @@ pub fn pane_idle(pane: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn herdr_accepting_input(socket: &str, pane_id: &str) -> bool {
+    Command::new("herdr")
+        .env("HERDR_SOCKET_PATH", socket)
+        .args(["pane", "get", pane_id])
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| {
+            v.pointer("/result/pane/agent_status")
+                .and_then(|s| s.as_str())
+                .map(|status| matches!(status, "idle" | "working"))
+        })
+        .unwrap_or(false)
+}
+
 fn literal_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
     ["send-keys", "-t", pane, "-l", "--", text]
 }
@@ -84,6 +99,9 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if let Some((socket, pane_id)) = pane.strip_prefix("herdr:").and_then(|v| v.split_once('|')) {
         if !pane_alive(pane) {
             anyhow::bail!("Herdr pane {} not alive", pane_id);
+        }
+        if !herdr_accepting_input(socket, pane_id) {
+            anyhow::bail!("Herdr pane {} agent is not accepting input", pane_id);
         }
         let sent = Command::new("herdr")
             .env("HERDR_SOCKET_PATH", socket)
@@ -105,13 +123,33 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if !pane_alive(pane) {
         anyhow::bail!("pane {} not alive", pane);
     }
-    // Wait for the TUI to finish processing literal text before submitting.
+    // `/goal` is a slash command: tmux must receive its five-byte prefix as
+    // individual key events. Pasting the prefix does not activate Codex's
+    // slash-command parser; the remainder stays literal for efficiency.
     const SUBMIT_DELAY_MS: u64 = 2_000;
-    let sent = Command::new("tmux")
-        .args(literal_args(pane, text))
-        .status()?;
-    if !sent.success() {
-        anyhow::bail!("tmux text delivery failed for pane {}", pane);
+    if text.starts_with("/goal") {
+        for ch in "/goal".chars() {
+            let key = ch.to_string();
+            let sent = Command::new("tmux")
+                .args(literal_args(pane, &key))
+                .status()?;
+            if !sent.success() {
+                anyhow::bail!("tmux goal prefix delivery failed for pane {}", pane);
+            }
+        }
+        let sent = Command::new("tmux")
+            .args(literal_args(pane, &text[5..]))
+            .status()?;
+        if !sent.success() {
+            anyhow::bail!("tmux goal body delivery failed for pane {}", pane);
+        }
+    } else {
+        let sent = Command::new("tmux")
+            .args(literal_args(pane, text))
+            .status()?;
+        if !sent.success() {
+            anyhow::bail!("tmux text delivery failed for pane {}", pane);
+        }
     }
     sleep(Duration::from_millis(SUBMIT_DELAY_MS));
     let submitted = Command::new("tmux").args(submit_args(pane)).status()?;

@@ -2,6 +2,6 @@
 
 | feature_id | positive gate | negative gate |
 |---|---|---|
-| identity.herdr_session | session socket + pane produces stable identity | another session with a reused pane ID does not collide |
-| identity.registration | repeated commands in one Herdr pane reuse identity | another Herdr session with a reused pane ID does not collide |
+| identity.registration | repeated commands in one tmux session+pane reuse identity | another tmux pane does not collide |
 | runtime.queue | immediate/idle delivery reaches same-runtime pane | cross-runtime delivery and non-idle heartbeat are rejected |
+| task.lifecycle | deliver holds claim; master close releases it and returns available tasks | worker cannot claim another task before close or mutate delivered/closed directly |

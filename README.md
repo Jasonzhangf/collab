@@ -2,11 +2,9 @@
 
 ## Runtime boundary
 
-Workers must register from exactly one supported terminal runtime: tmux or
-Herdr. The first registration fixes the project runtime; later registrations
-from the other runtime fail, and messages across runtimes fail. The durable
-mailbox is shared only within that project/runtime boundary; tmux wake-ups are
-used only for tmux panes.
+Workers must register from tmux. Herdr registration is disabled for the
+rebuilt profile. The durable mailbox is shared only within the project; tmux
+wake-ups are read-only signals.
 
 Project-local coordination daemon + CLI for multi-agent work inside one working
 tree. Rust, single static binary, no network — a unix socket under
@@ -23,6 +21,9 @@ agents. `collab` gives them:
   checked at registration
 - tmux knock: when a message lands, the server types `[MAIL] ...` into the
   target worker's tmux pane, waking the agent immediately
+- wake-ups are read-only signals; all task state transitions are journaled by
+  the daemon and can be recovered from `collab init`, `collab task status`, and
+  `collab inbox` after a master restart
 - server-side timers: task-scoped heartbeats (45 minutes by default) and request
   escalation, all journaled
 - request filtering: one live request per sender/recipient direction during a
@@ -34,6 +35,8 @@ agents. `collab` gives them:
 ```sh
 cargo install --path . --force
 which collab
+# The same install also provides the stdio MCP adaptor:
+which collab-mcp
 ```
 
 ## Usage
@@ -53,13 +56,17 @@ collab ack <msg_id>          # mark read (clears nudges)
 collab msg <msg_id>          # delivery state + nudge count for a sent request
 
 collab role                  # master if first registered, otherwise worker
+collab master recover        # current tmux session reclaims stale master role
+collab worker recover        # refresh this worker's tmux pane/session identity
+collab remove-worker <worker-id>             # master: remove confirmed stale worker
+collab remove-worker <worker-id> --force     # master: requeue active claims, then remove
 collab config                # show .agent-collab/collab.json
 collab config --heartbeat-minutes 45
 
 # Master creates a dispatchable task. It stays owned by master and available.
 collab task register my-task \
   --feature zterm.feature-id \
-  --worktree ./playground/my-task-<run-id> \
+  --worktree ./playground/my-task-0828 \
   --branch codex/my-task \
   --base-commit <sha> \
   --priority p1              # p0 highest through p4 lowest; defaults to p2
@@ -74,8 +81,9 @@ collab task register peer-task --owner pane-552 --feature other.feature-id
 collab task status [task-id]
 collab task update my-task --status verifying --next "run integration gate"
 collab task deliver my-task --evidence "commit=<sha>; gates=pass" # worker completion
+collab task block my-task --next "blocked: waiting for upstream schema decision" # worker blocker
 collab task update my-task --status merged      # master only
-collab task dispatch                            # master only: assign available to idle
+collab task dispatch                            # master only: offer board to idle workers
 collab task close my-task                       # master closes merged work and cleans resources
 ```
 
@@ -99,10 +107,15 @@ Outside tmux you can pass `--worker <id>` to act as a specific identity.
   master is temporarily unavailable.
 - Only master may register tasks. A worker must claim an existing `available`
   task; registration by a worker is rejected.
+- Work completed outside a dispatch is not implicitly a task. The worker sends
+  one request with scope, worktree, branch, base commit, and evidence; master
+  validates it and registers with `--owner <worker-id>`. The worker then
+  consumes that returned claim and delivers normally. Master still reviews,
+  merges, and closes it.
 - The fixed task record is `id / owner / feature_id / worktree_path / branch /
   base_commit / priority / status`. Valid statuses are exactly `available`,
-  `working`, `verifying`, `reviewed`, `delivered`, `rework`, `merged`,
-  `closed`, and `cancelled`.
+  `working`, `blocked`, `verifying`, `reviewed`, `delivered`, `rework`,
+  `merged`, `closed`, and `cancelled`.
 - Available tasks are returned in priority order (`p0` through `p4`), then by
   creation time.
 - An `available` task is held by master as a dispatch placeholder. Worker claim
@@ -113,10 +126,15 @@ Outside tmux you can pass `--worker <id>` to act as a specific identity.
   `collab task status` before choosing independent parallel work.
 - Worker lifecycle: claim turns `available` into `working`; the worker may move
   its own claim through `working -> verifying -> reviewed`; `collab task
-  deliver <id> --evidence ...` atomically sets `delivered`, notifies master,
-  returns this worker's identity, and returns the available board in priority
-  order. The worker should immediately claim from that response instead of
-  sending another completion report.
+  deliver <id> --evidence ...` atomically sets `delivered`, writes a durable
+  master notification, wakes master, and returns structured master/worker
+  actions plus the current `available_tasks` board. The board is informational:
+  the worker claim remains held and no second claim is allowed until master
+  merge and `task close`.
+- If execution is blocked, the worker calls `collab task block <id> --next
+  "<evidence and next condition>"`. The Server records `blocked`, writes a
+  durable `TASK_BLOCKED` notification to master, wakes master, and keeps the
+  claim held; the worker must not release or rewrite the task locally.
 - Master rejection is sent as one message; after the worker consumes it, it
   moves the same task back to `working`. `delivered` stops heartbeat but keeps
   resource conflict until master closes it.
@@ -126,14 +144,14 @@ Outside tmux you can pass `--worker <id>` to act as a specific identity.
   clean declared worktree under `./playground/`, safe-deletes the merged branch
   with Git's own safety checks, marks the task `closed`, and notifies the former
   owner. Close then reconciles the board in the same state transaction:
-  available tasks are dispatched in priority order (`p0` first) to idle
-  workers with no active claim; each assignment becomes `working`, records the
-  worker as owner, writes a mailbox message, and submits a tmux prompt. When
-  all workers are busy, the remaining board stays `available` and no duplicate
-  message is sent. Any dirty, missing, outside-playground, or unmerged resource
+  available tasks are offered in priority order (`p0` first) to each idle
+  worker with no active claim; an offer writes a mailbox message and submits a
+  tmux prompt but leaves status/owner unchanged until that worker claims one.
+  When all workers are busy, the board stays `available`. Any dirty, missing,
+  outside-playground, or unmerged resource
   fails closed before state mutation.
 - Master can also run `collab task dispatch` after registering a new batch. It
-  performs the same available-to-idle assignment without waiting for another
+  performs the same available-board offer without waiting for another
   close, so the merge → decompose → register → dispatch loop is immediate.
 - Only master may set `merged`, `cancelled`, or `closed`.
 - Task heartbeat runs every 45 minutes only while status is
@@ -156,15 +174,15 @@ Outside tmux you can pass `--worker <id>` to act as a specific identity.
 - Master's post-merge workflow is deterministic: after each merge, run
   `collab task close <id>`, then immediately register the next decomposed
   tasks with `--next`, then run `collab task dispatch`. If a worker is idle,
-  dispatch assigns an `available` task to that worker automatically. If every
+  dispatch offers the available board to that worker. If every
   worker is busy, leave the new tasks `available`; workers claim them from the
   returned board.
 - Master task registration is the task decomposition contract: every task must
   carry a stable `id`, `feature_id`, worktree path, branch, base commit,
   priority, and next-step text. The daemon uses that fixed format in the
-  automatic assignment prompt.
-- After delivery, a worker immediately checks the board and claims the next
-  available task without asking permission. Rework on a previously delivered
+  offer prompt.
+- After `task close` returns the board, a worker checks the returned available
+  tasks and claims one through Collab without asking permission. Rework on a previously delivered
   task takes precedence over the interrupted task, especially when it blocks
   another worker or merge. For a new dispatch during active work, finish the
   current task unless the new task has explicitly higher priority or blocks the

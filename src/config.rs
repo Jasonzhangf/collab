@@ -14,7 +14,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            heartbeat_minutes: 45,
+            heartbeat_minutes: 15,
         }
     }
 }
@@ -61,7 +61,7 @@ mod tests {
     #[test]
     fn missing_config_uses_default() {
         let root = std::env::temp_dir();
-        assert_eq!(load(&root).unwrap().heartbeat_minutes, 45);
+        assert_eq!(load(&root).unwrap().heartbeat_minutes, 15);
     }
 
     #[test]

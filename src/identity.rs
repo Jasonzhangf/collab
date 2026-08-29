@@ -8,6 +8,8 @@ pub struct Identity {
     pub worker_id: String,
     pub token: String,
     pub pane: Option<String>,
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 fn now_compact() -> String {
@@ -73,9 +75,50 @@ fn herdr_identity(socket: &str, pane: &str) -> String {
     )
 }
 
-/// Load existing identity or create one. Identity is keyed to the tmux pane
-/// when available (same pane = same worker across invocations), otherwise to
-/// the given worker_id; without either, a fresh identity is created each time.
+fn tmux_session(pane: &str) -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", pane, "#S"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let session = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!session.is_empty()).then_some(session)
+}
+
+/// Resolve the current Herdr pane through Herdr's own socket API. Some Herdr
+/// launch paths do not export HERDR_* variables into the child agent process.
+pub fn current_herdr_pane() -> Option<String> {
+    let output = std::process::Command::new("herdr")
+        .args(["pane", "current"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let pane = value.get("result")?.get("pane")?;
+    let socket = pane
+        .get("session_socket")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            let status = std::process::Command::new("herdr")
+                .args(["status", "server", "--json"])
+                .output()
+                .ok()?;
+            let value: serde_json::Value = serde_json::from_slice(&status.stdout).ok()?;
+            Some(value.get("socket")?.as_str()?.to_owned())
+        })?;
+    let pane_id = pane.get("pane_id")?.as_str()?;
+    Some(format!("herdr:{}|{}", socket, pane_id))
+}
+
+/// Load existing identity or create one. A tmux session is the stable
+/// deployment identity; the pane remains an endpoint only. Without tmux,
+/// Herdr keeps its session/pane identity and a supplied worker_id remains
+/// authoritative.
 pub fn load_or_create(
     scope: &Scope,
     worker_id: Option<String>,
@@ -87,13 +130,20 @@ pub fn load_or_create(
             let socket = std::env::var("HERDR_SOCKET_PATH").ok()?;
             Some(format!("herdr:{}|{}", socket, pane))
         } else {
-            std::env::var("TMUX_PANE").ok()
+            std::env::var("TMUX_PANE").ok().or_else(current_herdr_pane)
         }
     });
     let herdr_session = pane
         .as_deref()
         .and_then(|p| p.strip_prefix("herdr:").and_then(|v| v.rsplit_once('|')))
         .map(|(socket, pane_id)| (socket.to_owned(), pane_id.to_owned()));
+    let tmux_session = pane.as_deref().and_then(|p| {
+        if p.starts_with('%') {
+            tmux_session(p)
+        } else {
+            None
+        }
+    });
 
     let (id, path) = match worker_id {
         Some(w) => {
@@ -108,7 +158,9 @@ pub fn load_or_create(
                     .join("runs")
                     .join("by-pane");
                 std::fs::create_dir_all(&dir)?;
-                let key = if let Some((socket, pane_id)) = &herdr_session {
+                let key = if let Some(session) = &tmux_session {
+                    format!("tmux-{}", pane_file_name(session))
+                } else if let Some((socket, pane_id)) = &herdr_session {
                     format!("{}-{}", pane_file_name(socket), pane_file_name(pane_id))
                 } else {
                     pane_file_name(p)
@@ -126,9 +178,10 @@ pub fn load_or_create(
 
     if path.exists() {
         let ident: Identity = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        if let Some(p) = pane_override.as_ref() {
+        if pane.is_some() {
             return Ok(Identity {
-                pane: Some(p.clone()),
+                pane,
+                session: tmux_session.or(ident.session),
                 ..ident
             });
         }
@@ -136,11 +189,13 @@ pub fn load_or_create(
     }
 
     let id = if id.is_empty() {
-        // pane-keyed identity: derive worker_id from pane for traceability
-        let p = pane.as_deref().unwrap_or("unknown");
-        if let Some((socket, pane_id)) = &herdr_session {
+        // tmux session is the deployment identity; panes are wake endpoints.
+        if let Some(session) = &tmux_session {
+            session.clone()
+        } else if let Some((socket, pane_id)) = &herdr_session {
             herdr_identity(socket, pane_id)
         } else {
+            let p = pane.as_deref().unwrap_or("unknown");
             format!("pane-{}", p.trim_start_matches('%'))
         }
     } else {
@@ -150,6 +205,7 @@ pub fn load_or_create(
         worker_id: id,
         token: hex(16),
         pane,
+        session: tmux_session,
     };
     let dir = path.parent().unwrap();
     std::fs::create_dir_all(dir)?;
