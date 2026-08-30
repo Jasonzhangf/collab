@@ -25,6 +25,7 @@ const tools = [
   tool('collab_notify_methods', 'List supported opt-in live notification methods.'),
   tool('collab_notify_subscribe', 'Register an exact finite one-shot wake subscription.', { subscriptionId: { type: 'string' }, event: { type: 'string', enum: ['direct-message', 'resource-released', 'deadline', 'async-result'] }, subject: { type: 'string' }, ttlMs: { type: 'integer' } }, ['subscriptionId', 'event', 'ttlMs']),
   tool('collab_notify_status', 'Read this peer notification subscriptions.'),
+  tool('collab_notify_unsubscribe', 'Cancel this peer owned armed subscription.', { subscriptionId: { type: 'string' } }, ['subscriptionId']),
   tool('collab_migrate_inspect', 'Inspect fixed role-based v2 beta state without mutation.'),
   tool('collab_migrate_plan', 'Build a deterministic role-free migration plan or return blocking issues.'),
   tool('collab_migrate_apply', 'Freeze mutations and apply the deterministic migration plan.'),
@@ -60,6 +61,7 @@ async function call(name, args = {}) {
   if (name === 'collab_notify_methods') return { methods: [{ method: 'tmux', live: true, opt_in: true, payload: 'COLLAB_NOTIFY <message-id>' }] }
   if (name === 'collab_notify_subscribe') return runtime.collab.subscribe({ owner: identity.id, subscriptionId: args.subscriptionId, event: args.event, subject: args.subject ?? null, expiresAtMs: Date.now() + args.ttlMs, nowMs: Date.now() })
   if (name === 'collab_notify_status') return runtime.collab.snapshot().subscriptions.filter((subscription) => subscription.owner === identity.id)
+  if (name === 'collab_notify_unsubscribe') return runtime.collab.unsubscribe({ owner: identity.id, subscriptionId: args.subscriptionId })
   if (name === 'collab_migrate_inspect') return runtime.collab.migrationInspect()
   if (name === 'collab_migrate_plan') return runtime.collab.migrationPlan()
   if (name === 'collab_migrate_apply') return runtime.collab.migrationApply()

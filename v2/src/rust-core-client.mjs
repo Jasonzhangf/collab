@@ -27,11 +27,16 @@ export function createRustCoreClient(config = {}) {
     sendResourceNotice: ({ messageId, from, to, notice, subject }) => invoke({ op: 'send_resource_notice', message_id: messageId, from, to, notice, subject }),
     beginWakeAttempt: ({ messageId, agentState, nowMs }) => invoke({ op: 'begin_wake_attempt', message_id: messageId, agent_state: agentState, now_ms: nowMs }),
     completeWakeAttempt: ({ messageId, attempt, succeeded }) => invoke({ op: 'complete_wake_attempt', message_id: messageId, attempt, succeeded }),
+    recoverWakeAttempt: ({ messageId, nowMs }) => invoke({ op: 'recover_wake_attempt', message_id: messageId, now_ms: nowMs }),
     migrationInspect: () => invoke({ op: 'migration_inspect' }),
     migrationPlan: () => invoke({ op: 'migration_plan' }),
     migrationApply: () => invoke({ op: 'migration_apply' }),
     migrationVerify: () => invoke({ op: 'migration_verify' }),
     migrationResume: () => invoke({ op: 'migration_resume' }),
+    unsubscribe: ({ owner, subscriptionId }) => invoke({ op: 'unsubscribe', owner, subscription_id: subscriptionId }),
+    expireSubscriptions: ({ nowMs }) => invoke({ op: 'expire_subscriptions', now_ms: nowMs }),
+    publishSubscriptionEvent: ({ messageId, subscriptionId, event, subject, nowMs }) => invoke({ op: 'publish_subscription_event', message_id: messageId, subscription_id: subscriptionId, event, subject, now_ms: nowMs }),
+    expireWaits: ({ nowMs }) => invoke({ op: 'expire_waits', now_ms: nowMs }),
     snapshot: () => {
       const result = spawnSync(binary, ['--state', state], { input: '{"op":"snapshot"}\n', encoding: 'utf8' })
       if (result.error) throw result.error

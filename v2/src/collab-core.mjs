@@ -69,11 +69,25 @@ export const CollabCore = (ctx, config = {}) => {
       if (!input || typeof input !== 'object') throw new TypeError('wake completion is required')
       return core.completeWakeAttempt({ messageId: required(input.messageId, 'messageId'), attempt: input.attempt, succeeded: input.succeeded === true })
     },
+    recoverWakeAttempt(input) {
+      if (!input || typeof input !== 'object') throw new TypeError('wake recovery is required')
+      return core.recoverWakeAttempt({ messageId: required(input.messageId, 'messageId'), nowMs: input.nowMs })
+    },
     migrationInspect: () => core.migrationInspect(),
     migrationPlan: () => core.migrationPlan(),
     migrationApply: () => core.migrationApply(),
     migrationVerify: () => core.migrationVerify(),
     migrationResume: () => core.migrationResume(),
+    unsubscribe(input) {
+      if (!input || typeof input !== 'object') throw new TypeError('unsubscribe is required')
+      return core.unsubscribe({ owner: required(input.owner, 'owner'), subscriptionId: required(input.subscriptionId, 'subscriptionId') })
+    },
+    expireSubscriptions: (nowMs) => core.expireSubscriptions({ nowMs }),
+    publishSubscriptionEvent(input) {
+      if (!input || typeof input !== 'object') throw new TypeError('subscription event is required')
+      return core.publishSubscriptionEvent({ messageId: required(input.messageId, 'messageId'), subscriptionId: required(input.subscriptionId, 'subscriptionId'), event: required(input.event, 'event'), subject: required(input.subject, 'subject'), nowMs: input.nowMs })
+    },
+    expireWaits: (nowMs) => core.expireWaits({ nowMs }),
     snapshot: () => core.snapshot(),
   })
 

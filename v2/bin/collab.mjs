@@ -28,7 +28,7 @@ const identity = () => sessionId ? snapshot().identities.find((entry) => entry.s
 try {
   const [command, subcommand, target] = argv
   if (!command || command === '--help' || command === '-h') {
-    output({ usage: ['collab register', 'collab who', 'collab context', 'collab task register|update|wait', 'collab send', 'collab notify methods|subscribe|status', 'collab migrate inspect|plan|apply|verify|resume'] })
+    output({ usage: ['collab register', 'collab who', 'collab context', 'collab task register|update|wait', 'collab send', 'collab notify methods|subscribe|status|unsubscribe', 'collab migrate inspect|plan|apply|verify|resume'] })
   } else if (command === 'register') {
     if (!inheritedPane || !sessionId) throw new Error('registration requires an inherited tmux pane')
     runtime.collab.register({ id: sessionId, sessionId, pane: inheritedPane })
@@ -71,6 +71,11 @@ try {
   } else if (command === 'notify' && subcommand === 'status') {
     const current = identity()
     output(current ? snapshot().subscriptions.filter((subscription) => subscription.owner === current.id) : [])
+  } else if (command === 'notify' && subcommand === 'unsubscribe') {
+    const current = identity()
+    if (!current) throw new Error('registration required')
+    runtime.collab.unsubscribe({ owner: current.id, subscriptionId: target })
+    output(snapshot().subscriptions.find((subscription) => subscription.id === target))
   } else if (command === 'migrate' && ['inspect', 'plan', 'apply', 'verify', 'resume'].includes(subcommand)) {
     const method = `migration${subcommand[0].toUpperCase()}${subcommand.slice(1)}`
     output(runtime.collab[method]())

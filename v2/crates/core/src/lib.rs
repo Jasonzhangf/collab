@@ -52,6 +52,7 @@ pub enum AgentState {
 pub enum WakeDisposition {
     Skipped,
     AttemptGranted,
+    LeaseRecovered,
     RetryPending,
     Delivered,
     Exhausted,
@@ -113,15 +114,18 @@ pub struct NotificationSubscription {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Message {
     pub id: String,
-    pub from: String,
+    pub from: Option<String>,
     pub to: String,
-    pub notice: ResourceNotice,
+    pub event: NotificationEvent,
+    pub notice: Option<ResourceNotice>,
     pub subject: String,
     pub subscription_id: Option<String>,
     pub wake_attempt_count: u8,
     pub last_wake_attempt_ms: Option<u64>,
     #[serde(default)]
     pub wake_in_flight: bool,
+    #[serde(default)]
+    pub wake_lease_expires_at_ms: Option<u64>,
     pub delivered: bool,
 }
 
@@ -187,8 +191,10 @@ pub enum CoreError {
     DuplicateCommand,
     WakeAttemptInFlight,
     InvalidWakeCompletion,
+    InvalidWakeRecovery,
     MigrationBlocked,
     InvalidMigrationState,
+    UnknownSubscription,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,11 +246,32 @@ pub enum CoreCommand {
         attempt: u8,
         succeeded: bool,
     },
+    RecoverWakeAttempt {
+        message_id: String,
+        now_ms: u64,
+    },
     ApplyMigration {
         plan: LegacyMigrationPlan,
     },
     VerifyMigration,
     ResumeMigration,
+    Unsubscribe {
+        owner: String,
+        subscription_id: String,
+    },
+    ExpireSubscriptions {
+        now_ms: u64,
+    },
+    PublishSubscriptionEvent {
+        message_id: String,
+        subscription_id: String,
+        event: NotificationEvent,
+        subject: String,
+        now_ms: u64,
+    },
+    ExpireWaits {
+        now_ms: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -449,9 +476,33 @@ impl CoreState {
             } => self
                 .complete_wake_attempt(message_id, *attempt, *succeeded)
                 .map(Some),
+            CoreCommand::RecoverWakeAttempt { message_id, now_ms } => {
+                self.recover_wake_attempt(message_id, *now_ms).map(Some)
+            }
             CoreCommand::ApplyMigration { plan } => self.apply_migration(plan).map(|_| None),
             CoreCommand::VerifyMigration => self.verify_migration().map(|_| None),
             CoreCommand::ResumeMigration => self.resume_migration().map(|_| None),
+            CoreCommand::Unsubscribe {
+                owner,
+                subscription_id,
+            } => self.unsubscribe(owner, subscription_id).map(|_| None),
+            CoreCommand::ExpireSubscriptions { now_ms } => {
+                self.expire_subscriptions(*now_ms);
+                Ok(None)
+            }
+            CoreCommand::PublishSubscriptionEvent {
+                message_id,
+                subscription_id,
+                event,
+                subject,
+                now_ms,
+            } => self
+                .publish_subscription_event(message_id, subscription_id, *event, subject, *now_ms)
+                .map(|_| None),
+            CoreCommand::ExpireWaits { now_ms } => {
+                self.expire_waits(*now_ms);
+                Ok(None)
+            }
         }
     }
 
@@ -780,6 +831,89 @@ impl CoreState {
         Ok(())
     }
 
+    pub fn unsubscribe(&mut self, owner: &str, subscription_id: &str) -> Result<(), CoreError> {
+        let subscription = self
+            .subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.id == subscription_id)
+            .ok_or(CoreError::UnknownSubscription)?;
+        if subscription.owner != owner || subscription.state != SubscriptionState::Armed {
+            return Err(CoreError::PermissionDenied);
+        }
+        subscription.state = SubscriptionState::Cancelled;
+        Ok(())
+    }
+
+    pub fn expire_subscriptions(&mut self, now_ms: u64) {
+        for subscription in &mut self.subscriptions {
+            if subscription.state == SubscriptionState::Armed
+                && subscription.expires_at_ms <= now_ms
+            {
+                subscription.state = SubscriptionState::Expired;
+            }
+        }
+    }
+
+    pub fn publish_subscription_event(
+        &mut self,
+        message_id: &str,
+        subscription_id: &str,
+        event: NotificationEvent,
+        subject: &str,
+        now_ms: u64,
+    ) -> Result<(), CoreError> {
+        if event == NotificationEvent::DirectMessage
+            || subject.is_empty()
+            || self.messages.iter().any(|message| message.id == message_id)
+        {
+            return Err(CoreError::InvalidSubscription);
+        }
+        let subscription = self
+            .subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.id == subscription_id)
+            .ok_or(CoreError::UnknownSubscription)?;
+        if subscription.state != SubscriptionState::Armed
+            || subscription.event != event
+            || subscription.subject.as_deref() != Some(subject)
+        {
+            return Err(CoreError::InvalidSubscription);
+        }
+        if subscription.expires_at_ms <= now_ms {
+            subscription.state = SubscriptionState::Expired;
+            return Err(CoreError::InvalidSubscription);
+        }
+        self.messages.push(Message {
+            id: message_id.to_owned(),
+            from: None,
+            to: subscription.owner.clone(),
+            event,
+            notice: None,
+            subject: subject.to_owned(),
+            subscription_id: Some(subscription.id.clone()),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: None,
+            wake_in_flight: false,
+            wake_lease_expires_at_ms: None,
+            delivered: false,
+        });
+        Ok(())
+    }
+
+    pub fn expire_waits(&mut self, now_ms: u64) {
+        for task in &mut self.tasks {
+            if task.state == TaskState::Waiting
+                && task
+                    .wait
+                    .as_ref()
+                    .is_some_and(|wait| wait.deadline_ms <= now_ms)
+            {
+                task.state = TaskState::Blocked;
+                task.wait = None;
+            }
+        }
+    }
+
     pub fn send_resource_notice(
         &mut self,
         id: impl Into<String>,
@@ -805,14 +939,20 @@ impl CoreState {
         });
         self.messages.push(Message {
             id,
-            from: from.to_owned(),
+            from: Some(from.to_owned()),
             to: to.to_owned(),
-            notice,
+            event: if notice == ResourceNotice::Released {
+                NotificationEvent::ResourceReleased
+            } else {
+                NotificationEvent::DirectMessage
+            },
+            notice: Some(notice),
             subject: subject.to_owned(),
             subscription_id: subscription.map(|subscription| subscription.id.clone()),
             wake_attempt_count: 0,
             last_wake_attempt_ms: None,
             wake_in_flight: false,
+            wake_lease_expires_at_ms: None,
             delivered: false,
         });
         Ok(())
@@ -853,6 +993,7 @@ impl CoreState {
         message.wake_attempt_count += 1;
         message.last_wake_attempt_ms = Some(now_ms);
         message.wake_in_flight = true;
+        message.wake_lease_expires_at_ms = Some(now_ms.saturating_add(60_000));
         Ok(WakeDisposition::AttemptGranted)
     }
 
@@ -880,6 +1021,7 @@ impl CoreState {
             .find(|subscription| subscription.id == *subscription_id)
             .ok_or(CoreError::InvalidSubscription)?;
         message.wake_in_flight = false;
+        message.wake_lease_expires_at_ms = None;
         if succeeded {
             message.delivered = true;
             subscription.state = SubscriptionState::Consumed;
@@ -890,6 +1032,42 @@ impl CoreState {
             Ok(WakeDisposition::Exhausted)
         } else {
             Ok(WakeDisposition::RetryPending)
+        }
+    }
+
+    pub fn recover_wake_attempt(
+        &mut self,
+        message_id: &str,
+        now_ms: u64,
+    ) -> Result<WakeDisposition, CoreError> {
+        let message = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id)
+            .ok_or(CoreError::UnknownMessage)?;
+        if !message.wake_in_flight
+            || message
+                .wake_lease_expires_at_ms
+                .is_none_or(|expires_at| expires_at > now_ms)
+        {
+            return Err(CoreError::InvalidWakeRecovery);
+        }
+        let subscription_id = message
+            .subscription_id
+            .as_ref()
+            .ok_or(CoreError::InvalidSubscription)?;
+        let subscription = self
+            .subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.id == *subscription_id)
+            .ok_or(CoreError::InvalidSubscription)?;
+        message.wake_in_flight = false;
+        message.wake_lease_expires_at_ms = None;
+        if message.wake_attempt_count >= 3 {
+            subscription.state = SubscriptionState::Exhausted;
+            Ok(WakeDisposition::Exhausted)
+        } else {
+            Ok(WakeDisposition::LeaseRecovered)
         }
     }
 }
@@ -1032,6 +1210,93 @@ mod tests {
     }
 
     #[test]
+    fn expired_wake_lease_recovers_without_retry_or_implicit_delivery() {
+        let mut state = CoreState::default();
+        state.register(peer("a", "session-a")).unwrap();
+        state.register(peer("b", "session-b")).unwrap();
+        state
+            .subscribe(
+                "b",
+                "sub",
+                NotificationEvent::DirectMessage,
+                None,
+                200_000,
+                100,
+            )
+            .unwrap();
+        state
+            .send_resource_notice("message", "a", "b", ResourceNotice::Occupied, "resource")
+            .unwrap();
+        assert_eq!(
+            state.begin_wake_attempt("message", AgentState::Waiting, 100_000),
+            Ok(WakeDisposition::AttemptGranted)
+        );
+        assert_eq!(state.messages[0].wake_attempt_count, 1);
+        assert_eq!(
+            state.begin_wake_attempt("message", AgentState::Waiting, 100_001),
+            Err(CoreError::WakeAttemptInFlight)
+        );
+        assert_eq!(
+            state.recover_wake_attempt("message", 160_000),
+            Ok(WakeDisposition::LeaseRecovered)
+        );
+        assert_eq!(state.messages[0].wake_attempt_count, 1);
+        assert!(!state.messages[0].wake_in_flight);
+        assert!(!state.messages[0].delivered);
+        assert_eq!(
+            state.recover_wake_attempt("message", 160_001),
+            Err(CoreError::InvalidWakeRecovery)
+        );
+        assert_eq!(
+            state.begin_wake_attempt("message", AgentState::Waiting, 160_001),
+            Ok(WakeDisposition::AttemptGranted)
+        );
+    }
+
+    #[test]
+    fn recovering_third_expired_lease_exhausts_without_resetting_cap() {
+        let mut state = CoreState::default();
+        state.register(peer("a", "session-a")).unwrap();
+        state.register(peer("b", "session-b")).unwrap();
+        state
+            .subscribe(
+                "b",
+                "sub",
+                NotificationEvent::DirectMessage,
+                None,
+                1_000_000,
+                1,
+            )
+            .unwrap();
+        state
+            .send_resource_notice("message", "a", "b", ResourceNotice::Occupied, "resource")
+            .unwrap();
+        for (attempt, now) in [(1, 1_000), (2, 61_000)] {
+            assert_eq!(
+                state.begin_wake_attempt("message", AgentState::Waiting, now),
+                Ok(WakeDisposition::AttemptGranted)
+            );
+            assert_eq!(
+                state.complete_wake_attempt("message", attempt, false),
+                Ok(WakeDisposition::RetryPending)
+            );
+        }
+        assert_eq!(
+            state.begin_wake_attempt("message", AgentState::Waiting, 121_000),
+            Ok(WakeDisposition::AttemptGranted)
+        );
+        assert_eq!(
+            state.recover_wake_attempt("message", 181_000),
+            Ok(WakeDisposition::Exhausted)
+        );
+        assert_eq!(state.messages[0].wake_attempt_count, 3);
+        assert_eq!(
+            state.begin_wake_attempt("message", AgentState::Waiting, 181_001),
+            Err(CoreError::WakeExhausted)
+        );
+    }
+
+    #[test]
     fn journal_replay_is_contiguous_idempotent_and_deterministic() {
         let entries = vec![
             JournalEntry {
@@ -1119,5 +1384,111 @@ mod tests {
             Err(CoreError::MigrationBlocked)
         );
         assert_eq!(state, CoreState::default());
+    }
+
+    #[test]
+    fn exact_subscription_and_wait_deadlines_terminate_without_retry_loop() {
+        let mut state = CoreState::default();
+        state.register(peer("a", "session-a")).unwrap();
+        state.register(peer("b", "session-b")).unwrap();
+        state
+            .register_task("a", "task-a", "feature", "resource")
+            .unwrap();
+        state
+            .register_task("b", "task-b", "feature", "resource")
+            .unwrap();
+        state.wait_task("a", "task-a", "task-b", 150, 100).unwrap();
+        state.expire_waits(150);
+        assert_eq!(state.tasks[0].state, TaskState::Blocked);
+        assert!(state.tasks[0].wait.is_none());
+        assert!(state.messages.is_empty());
+
+        state
+            .subscribe(
+                "a",
+                "deadline",
+                NotificationEvent::Deadline,
+                Some("timer".into()),
+                200,
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            state.publish_subscription_event(
+                "wrong",
+                "deadline",
+                NotificationEvent::Deadline,
+                "other",
+                110
+            ),
+            Err(CoreError::InvalidSubscription)
+        );
+        state
+            .publish_subscription_event(
+                "deadline-message",
+                "deadline",
+                NotificationEvent::Deadline,
+                "timer",
+                110,
+            )
+            .unwrap();
+        assert_eq!(
+            state.begin_wake_attempt("deadline-message", AgentState::Waiting, 111),
+            Ok(WakeDisposition::AttemptGranted)
+        );
+        assert_eq!(
+            state.complete_wake_attempt("deadline-message", 1, true),
+            Ok(WakeDisposition::Delivered)
+        );
+        assert_eq!(
+            state
+                .subscriptions
+                .iter()
+                .find(|subscription| subscription.id == "deadline")
+                .unwrap()
+                .state,
+            SubscriptionState::Consumed
+        );
+
+        state
+            .subscribe(
+                "a",
+                "async",
+                NotificationEvent::AsyncResult,
+                Some("operation".into()),
+                120,
+                100,
+            )
+            .unwrap();
+        state.expire_subscriptions(120);
+        assert_eq!(
+            state
+                .subscriptions
+                .iter()
+                .find(|subscription| subscription.id == "async")
+                .unwrap()
+                .state,
+            SubscriptionState::Expired
+        );
+        state
+            .subscribe(
+                "a",
+                "cancel",
+                NotificationEvent::ResourceReleased,
+                Some("resource".into()),
+                200,
+                100,
+            )
+            .unwrap();
+        state.unsubscribe("a", "cancel").unwrap();
+        assert_eq!(
+            state
+                .subscriptions
+                .iter()
+                .find(|subscription| subscription.id == "cancel")
+                .unwrap()
+                .state,
+            SubscriptionState::Cancelled
+        );
     }
 }
