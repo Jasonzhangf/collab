@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +51,7 @@ pub enum AgentState {
 #[serde(rename_all = "snake_case")]
 pub enum WakeDisposition {
     Skipped,
+    AttemptGranted,
     RetryPending,
     Delivered,
     Exhausted,
@@ -118,6 +120,8 @@ pub struct Message {
     pub subscription_id: Option<String>,
     pub wake_attempt_count: u8,
     pub last_wake_attempt_ms: Option<u64>,
+    #[serde(default)]
+    pub wake_in_flight: bool,
     pub delivered: bool,
 }
 
@@ -133,6 +137,36 @@ pub struct CoreState {
     pub subscriptions: Vec<NotificationSubscription>,
     #[serde(default)]
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub migration: Option<MigrationRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationPhase {
+    Frozen,
+    Verified,
+    Resumed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MigrationRecord {
+    pub source_sha256: String,
+    pub identity_count: usize,
+    pub task_count: usize,
+    pub continuity_sha256: String,
+    pub phase: MigrationPhase,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LegacyMigrationPlan {
+    pub source_sha256: String,
+    pub identity_count: usize,
+    pub task_count: usize,
+    pub issues: Vec<String>,
+    pub identities: Vec<Identity>,
+    pub tasks: Vec<Task>,
+    pub continuity_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,9 +183,378 @@ pub enum CoreError {
     UnknownMessage,
     DuplicateMessage,
     WakeExhausted,
+    JournalGap,
+    DuplicateCommand,
+    WakeAttemptInFlight,
+    InvalidWakeCompletion,
+    MigrationBlocked,
+    InvalidMigrationState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum CoreCommand {
+    Register {
+        identity: Identity,
+    },
+    RegisterTask {
+        actor: String,
+        task_id: String,
+        feature_id: String,
+        resource_id: String,
+    },
+    TransitionTask {
+        actor: String,
+        task_id: String,
+        state: TaskState,
+    },
+    WaitTask {
+        actor: String,
+        task_id: String,
+        blocking_task_id: String,
+        deadline_ms: u64,
+        now_ms: u64,
+    },
+    Subscribe {
+        owner: String,
+        subscription_id: String,
+        event: NotificationEvent,
+        subject: Option<String>,
+        expires_at_ms: u64,
+        now_ms: u64,
+    },
+    SendResourceNotice {
+        message_id: String,
+        from: String,
+        to: String,
+        notice: ResourceNotice,
+        subject: String,
+    },
+    BeginWakeAttempt {
+        message_id: String,
+        agent_state: AgentState,
+        now_ms: u64,
+    },
+    CompleteWakeAttempt {
+        message_id: String,
+        attempt: u8,
+        succeeded: bool,
+    },
+    ApplyMigration {
+        plan: LegacyMigrationPlan,
+    },
+    VerifyMigration,
+    ResumeMigration,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct JournalEntry {
+    pub sequence: u64,
+    pub command_id: String,
+    pub command: CoreCommand,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyBetaState {
+    identities: Vec<LegacyIdentity>,
+    tasks: Vec<LegacyTask>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyIdentity {
+    id: String,
+    session_id: String,
+    role: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+enum LegacyTaskState {
+    Available,
+    Working,
+    Verifying,
+    Reviewing,
+    Delivered,
+    Merged,
+    Closed,
+    Blocked,
+    Cancelled,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTask {
+    id: String,
+    state: LegacyTaskState,
+    owner: Option<String>,
+}
+
+pub fn plan_legacy_beta_migration(raw: &str) -> Result<LegacyMigrationPlan, String> {
+    let legacy: LegacyBetaState = serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    let source_sha256 = Sha256::digest(raw.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let identities: Vec<Identity> = legacy
+        .identities
+        .iter()
+        .map(|identity| {
+            if identity.role.is_null() {
+                return Err(format!("identity {} has no legacy role", identity.id));
+            }
+            Ok(Identity {
+                id: identity.id.clone(),
+                session_id: identity.session_id.clone(),
+                pane: String::new(),
+                kind: IdentityKind::Peer,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let mut issues = Vec::new();
+    let mut tasks = Vec::new();
+    for task in &legacy.tasks {
+        let Some(owner) = task.owner.as_ref() else {
+            issues.push(format!("task {} has no owner", task.id));
+            continue;
+        };
+        if !identities.iter().any(|identity| identity.id == *owner) {
+            issues.push(format!("task {} owner {} is missing", task.id, owner));
+            continue;
+        }
+        if matches!(task.state, LegacyTaskState::Available) {
+            issues.push(format!("task {} is unowned available work", task.id));
+            continue;
+        }
+        let state = match task.state {
+            LegacyTaskState::Working => TaskState::Working,
+            LegacyTaskState::Verifying => TaskState::Verifying,
+            LegacyTaskState::Reviewing => TaskState::Reviewed,
+            LegacyTaskState::Delivered => TaskState::Delivered,
+            LegacyTaskState::Merged => TaskState::Merged,
+            LegacyTaskState::Closed => TaskState::Closed,
+            LegacyTaskState::Blocked => TaskState::Blocked,
+            LegacyTaskState::Cancelled => TaskState::Cancelled,
+            LegacyTaskState::Available => unreachable!(),
+        };
+        tasks.push(Task {
+            id: task.id.clone(),
+            owner: owner.clone(),
+            feature_id: "legacy-v2-beta".into(),
+            resource_id: format!("legacy-task:{}", task.id),
+            state,
+            wait: None,
+        });
+    }
+    let mut plan = LegacyMigrationPlan {
+        source_sha256,
+        identity_count: identities.len(),
+        task_count: legacy.tasks.len(),
+        issues,
+        identities,
+        tasks,
+        continuity_sha256: None,
+    };
+    if plan.issues.is_empty() {
+        let preview = CoreState {
+            identities: plan.identities.clone(),
+            tasks: plan.tasks.clone(),
+            ..CoreState::default()
+        };
+        plan.continuity_sha256 = Some(
+            preview
+                .continuity_sha256()
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(plan)
 }
 
 impl CoreState {
+    pub fn apply(&mut self, command: &CoreCommand) -> Result<Option<WakeDisposition>, CoreError> {
+        if self.migration.as_ref().is_some_and(|migration| {
+            matches!(
+                migration.phase,
+                MigrationPhase::Frozen | MigrationPhase::Verified
+            )
+        }) && !matches!(
+            command,
+            CoreCommand::Register { .. }
+                | CoreCommand::VerifyMigration
+                | CoreCommand::ResumeMigration
+        ) {
+            return Err(CoreError::InvalidMigrationState);
+        }
+        match command {
+            CoreCommand::Register { identity } => self.register(identity.clone()).map(|_| None),
+            CoreCommand::RegisterTask {
+                actor,
+                task_id,
+                feature_id,
+                resource_id,
+            } => self
+                .register_task(actor, task_id, feature_id, resource_id)
+                .map(|_| None),
+            CoreCommand::TransitionTask {
+                actor,
+                task_id,
+                state,
+            } => self.transition_task(actor, task_id, *state).map(|_| None),
+            CoreCommand::WaitTask {
+                actor,
+                task_id,
+                blocking_task_id,
+                deadline_ms,
+                now_ms,
+            } => self
+                .wait_task(actor, task_id, blocking_task_id, *deadline_ms, *now_ms)
+                .map(|_| None),
+            CoreCommand::Subscribe {
+                owner,
+                subscription_id,
+                event,
+                subject,
+                expires_at_ms,
+                now_ms,
+            } => self
+                .subscribe(
+                    owner,
+                    subscription_id,
+                    *event,
+                    subject.clone(),
+                    *expires_at_ms,
+                    *now_ms,
+                )
+                .map(|_| None),
+            CoreCommand::SendResourceNotice {
+                message_id,
+                from,
+                to,
+                notice,
+                subject,
+            } => self
+                .send_resource_notice(message_id, from, to, *notice, subject)
+                .map(|_| None),
+            CoreCommand::BeginWakeAttempt {
+                message_id,
+                agent_state,
+                now_ms,
+            } => self
+                .begin_wake_attempt(message_id, *agent_state, *now_ms)
+                .map(Some),
+            CoreCommand::CompleteWakeAttempt {
+                message_id,
+                attempt,
+                succeeded,
+            } => self
+                .complete_wake_attempt(message_id, *attempt, *succeeded)
+                .map(Some),
+            CoreCommand::ApplyMigration { plan } => self.apply_migration(plan).map(|_| None),
+            CoreCommand::VerifyMigration => self.verify_migration().map(|_| None),
+            CoreCommand::ResumeMigration => self.resume_migration().map(|_| None),
+        }
+    }
+
+    pub fn replay(entries: &[JournalEntry]) -> Result<Self, CoreError> {
+        let mut state = Self::default();
+        let mut command_ids = std::collections::BTreeSet::new();
+        for entry in entries {
+            if entry.sequence != state.sequence + 1 {
+                return Err(CoreError::JournalGap);
+            }
+            if !command_ids.insert(entry.command_id.as_str()) {
+                return Err(CoreError::DuplicateCommand);
+            }
+            state.apply(&entry.command)?;
+            state.sequence = entry.sequence;
+        }
+        Ok(state)
+    }
+
+    pub fn snapshot_sha256(&self) -> Result<String, serde_json::Error> {
+        let raw = serde_json::to_vec(self)?;
+        Ok(Sha256::digest(raw)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    pub fn continuity_sha256(&self) -> Result<String, serde_json::Error> {
+        let stable_identities: Vec<_> = self
+            .identities
+            .iter()
+            .map(|identity| (&identity.id, &identity.session_id, identity.kind))
+            .collect();
+        let raw = serde_json::to_vec(&(
+            stable_identities,
+            &self.tasks,
+            &self.subscriptions,
+            &self.messages,
+        ))?;
+        Ok(Sha256::digest(raw)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    fn apply_migration(&mut self, plan: &LegacyMigrationPlan) -> Result<(), CoreError> {
+        if self.sequence != 0
+            || !self.identities.is_empty()
+            || !self.tasks.is_empty()
+            || self.migration.is_some()
+            || !plan.issues.is_empty()
+        {
+            return Err(CoreError::MigrationBlocked);
+        }
+        self.identities = plan.identities.clone();
+        self.tasks = plan.tasks.clone();
+        let continuity_sha256 = self
+            .continuity_sha256()
+            .map_err(|_| CoreError::MigrationBlocked)?;
+        if plan.continuity_sha256.as_deref() != Some(&continuity_sha256) {
+            return Err(CoreError::MigrationBlocked);
+        }
+        self.migration = Some(MigrationRecord {
+            source_sha256: plan.source_sha256.clone(),
+            identity_count: plan.identity_count,
+            task_count: plan.task_count,
+            continuity_sha256,
+            phase: MigrationPhase::Frozen,
+        });
+        Ok(())
+    }
+
+    fn verify_migration(&mut self) -> Result<(), CoreError> {
+        let continuity = self
+            .continuity_sha256()
+            .map_err(|_| CoreError::InvalidMigrationState)?;
+        let migration = self
+            .migration
+            .as_mut()
+            .ok_or(CoreError::InvalidMigrationState)?;
+        if migration.phase != MigrationPhase::Frozen
+            || migration.identity_count != self.identities.len()
+            || migration.task_count != self.tasks.len()
+            || migration.continuity_sha256 != continuity
+        {
+            return Err(CoreError::InvalidMigrationState);
+        }
+        migration.phase = MigrationPhase::Verified;
+        Ok(())
+    }
+
+    fn resume_migration(&mut self) -> Result<(), CoreError> {
+        let migration = self
+            .migration
+            .as_mut()
+            .ok_or(CoreError::InvalidMigrationState)?;
+        if migration.phase != MigrationPhase::Verified {
+            return Err(CoreError::InvalidMigrationState);
+        }
+        migration.phase = MigrationPhase::Resumed;
+        Ok(())
+    }
+
     fn has_identity(&self, actor: &str) -> bool {
         self.identities.iter().any(|identity| identity.id == actor)
     }
@@ -409,16 +812,16 @@ impl CoreState {
             subscription_id: subscription.map(|subscription| subscription.id.clone()),
             wake_attempt_count: 0,
             last_wake_attempt_ms: None,
+            wake_in_flight: false,
             delivered: false,
         });
         Ok(())
     }
 
-    pub fn record_wake_attempt(
+    pub fn begin_wake_attempt(
         &mut self,
         message_id: &str,
         agent_state: AgentState,
-        succeeded: bool,
         now_ms: u64,
     ) -> Result<WakeDisposition, CoreError> {
         if !matches!(agent_state, AgentState::Waiting) {
@@ -435,6 +838,9 @@ impl CoreState {
         if message.wake_attempt_count >= 3 {
             return Err(CoreError::WakeExhausted);
         }
+        if message.wake_in_flight {
+            return Err(CoreError::WakeAttemptInFlight);
+        }
         let subscription = self
             .subscriptions
             .iter_mut()
@@ -446,12 +852,40 @@ impl CoreState {
         }
         message.wake_attempt_count += 1;
         message.last_wake_attempt_ms = Some(now_ms);
+        message.wake_in_flight = true;
+        Ok(WakeDisposition::AttemptGranted)
+    }
+
+    pub fn complete_wake_attempt(
+        &mut self,
+        message_id: &str,
+        attempt: u8,
+        succeeded: bool,
+    ) -> Result<WakeDisposition, CoreError> {
+        let message = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id)
+            .ok_or(CoreError::UnknownMessage)?;
+        if !message.wake_in_flight || message.wake_attempt_count != attempt {
+            return Err(CoreError::InvalidWakeCompletion);
+        }
+        let subscription_id = message
+            .subscription_id
+            .as_ref()
+            .ok_or(CoreError::InvalidSubscription)?;
+        let subscription = self
+            .subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.id == *subscription_id)
+            .ok_or(CoreError::InvalidSubscription)?;
+        message.wake_in_flight = false;
         if succeeded {
             message.delivered = true;
             subscription.state = SubscriptionState::Consumed;
             return Ok(WakeDisposition::Delivered);
         }
-        if message.wake_attempt_count == 3 {
+        if attempt == 3 {
             subscription.state = SubscriptionState::Exhausted;
             Ok(WakeDisposition::Exhausted)
         } else {
@@ -552,21 +986,29 @@ mod tests {
             .send_resource_notice("message", "a", "b", ResourceNotice::Occupied, "resource")
             .unwrap();
         assert_eq!(
-            state.record_wake_attempt("message", AgentState::Unknown, false, 110),
+            state.begin_wake_attempt("message", AgentState::Unknown, 110),
             Ok(WakeDisposition::Skipped)
         );
-        for now in [111, 112] {
+        for (attempt, now) in [(1, 111), (2, 112)] {
             assert_eq!(
-                state.record_wake_attempt("message", AgentState::Waiting, false, now),
+                state.begin_wake_attempt("message", AgentState::Waiting, now),
+                Ok(WakeDisposition::AttemptGranted)
+            );
+            assert_eq!(
+                state.complete_wake_attempt("message", attempt, false),
                 Ok(WakeDisposition::RetryPending)
             );
         }
         assert_eq!(
-            state.record_wake_attempt("message", AgentState::Waiting, false, 113),
+            state.begin_wake_attempt("message", AgentState::Waiting, 113),
+            Ok(WakeDisposition::AttemptGranted)
+        );
+        assert_eq!(
+            state.complete_wake_attempt("message", 3, false),
             Ok(WakeDisposition::Exhausted)
         );
         assert_eq!(
-            state.record_wake_attempt("message", AgentState::Waiting, false, 114),
+            state.begin_wake_attempt("message", AgentState::Waiting, 114),
             Err(CoreError::WakeExhausted)
         );
         assert_eq!(state.messages[0].wake_attempt_count, 3);
@@ -583,9 +1025,99 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].wake_attempt_count, 0);
         assert_eq!(
-            state.record_wake_attempt("message", AgentState::Waiting, false, 110),
+            state.begin_wake_attempt("message", AgentState::Waiting, 110),
             Ok(WakeDisposition::Skipped)
         );
         assert_eq!(state.messages[0].wake_attempt_count, 0);
+    }
+
+    #[test]
+    fn journal_replay_is_contiguous_idempotent_and_deterministic() {
+        let entries = vec![
+            JournalEntry {
+                sequence: 1,
+                command_id: "command-1".into(),
+                command: CoreCommand::Register {
+                    identity: peer("a", "session-a"),
+                },
+            },
+            JournalEntry {
+                sequence: 2,
+                command_id: "command-2".into(),
+                command: CoreCommand::RegisterTask {
+                    actor: "a".into(),
+                    task_id: "task".into(),
+                    feature_id: "feature".into(),
+                    resource_id: "resource".into(),
+                },
+            },
+        ];
+        let first = CoreState::replay(&entries).unwrap();
+        let second = CoreState::replay(&entries).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.snapshot_sha256().unwrap(),
+            second.snapshot_sha256().unwrap()
+        );
+        let mut gap = entries.clone();
+        gap[1].sequence = 3;
+        assert_eq!(CoreState::replay(&gap), Err(CoreError::JournalGap));
+        let mut duplicate = entries;
+        duplicate[1].command_id = "command-1".into();
+        assert_eq!(
+            CoreState::replay(&duplicate),
+            Err(CoreError::DuplicateCommand)
+        );
+    }
+
+    #[test]
+    fn legacy_beta_migration_freezes_verifies_and_resumes_without_roles() {
+        let raw = r#"{"identities":[{"id":"a","session_id":"session-a","role":"Master"}],"tasks":[{"id":"task","state":"Reviewing","owner":"a"}]}"#;
+        let plan = plan_legacy_beta_migration(raw).unwrap();
+        assert!(plan.issues.is_empty());
+        assert!(!serde_json::to_string(&plan).unwrap().contains("role"));
+        let mut state = CoreState::default();
+        state.apply(&CoreCommand::ApplyMigration { plan }).unwrap();
+        assert_eq!(
+            state.migration.as_ref().unwrap().phase,
+            MigrationPhase::Frozen
+        );
+        assert_eq!(state.tasks[0].state, TaskState::Reviewed);
+        assert_eq!(
+            state.apply(&CoreCommand::TransitionTask {
+                actor: "a".into(),
+                task_id: "task".into(),
+                state: TaskState::Delivered
+            }),
+            Err(CoreError::InvalidMigrationState)
+        );
+        state
+            .apply(&CoreCommand::Register {
+                identity: peer("a", "session-a"),
+            })
+            .unwrap();
+        state.apply(&CoreCommand::VerifyMigration).unwrap();
+        state.apply(&CoreCommand::ResumeMigration).unwrap();
+        state
+            .apply(&CoreCommand::TransitionTask {
+                actor: "a".into(),
+                task_id: "task".into(),
+                state: TaskState::Delivered,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_available_task_blocks_migration_without_inventing_owner() {
+        let raw = r#"{"identities":[{"id":"a","session_id":"session-a","role":"Master"}],"tasks":[{"id":"task","state":"Available","owner":null}]}"#;
+        let plan = plan_legacy_beta_migration(raw).unwrap();
+        assert_eq!(plan.issues, vec!["task task has no owner"]);
+        assert_eq!(plan.continuity_sha256, None);
+        let mut state = CoreState::default();
+        assert_eq!(
+            state.apply(&CoreCommand::ApplyMigration { plan }),
+            Err(CoreError::MigrationBlocked)
+        );
+        assert_eq!(state, CoreState::default());
     }
 }

@@ -8,15 +8,15 @@
     {"resource_id":"notification-subscription","status":"active","owner":"rust-core","truth_store":"CoreState.subscriptions","allowed_operations":["subscribe","consume","expire","cancel","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
     {"resource_id":"resource-notice-mailbox","status":"active","owner":"rust-core","truth_store":"CoreState.messages","allowed_operations":["commit","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
     {"resource_id":"wake-attempt-ledger","status":"active","owner":"rust-core","truth_store":"Message.wake_attempt_count","allowed_operations":["record","deliver","exhaust","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
-    {"resource_id":"core-snapshot-file","status":"design","owner":"rust-core-daemon","truth_store":"--state path","allowed_operations":["load","replace"],"forbidden_direct_consumers":["cordis","codis","transport"],"pending_reason":"atomic replace and explicit parse failure are not implemented"},
-    {"resource_id":"journal-sequence","status":"pending","owner":"rust-core","truth_store":".agent-collab-v2/journal.jsonl","allowed_operations":["append","replay","snapshot"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
-    {"resource_id":"migration-transaction","status":"pending","owner":"rust-core","truth_store":".agent-collab-v2/migration.json","allowed_operations":["inspect","plan","freeze","verify","resume"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
+    {"resource_id":"core-snapshot-file","status":"active","owner":"rust-core-daemon","truth_store":".agent-collab-v2/state.json","allowed_operations":["atomic_replace","verify_hash"],"forbidden_direct_consumers":["cordis","codis","transport"]},
+    {"resource_id":"journal-sequence","status":"active","owner":"rust-core","truth_store":".agent-collab-v2/journal.jsonl","allowed_operations":["append","replay","snapshot"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
+    {"resource_id":"migration-transaction","status":"active","owner":"rust-core","truth_store":"CoreState.migration","allowed_operations":["inspect","plan","freeze","verify","resume"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
     {"resource_id":"daemon-operator-capability","status":"pending","owner":"rust-core-daemon","truth_store":"typed local operator command","allowed_operations":["down","up","status"],"forbidden_direct_consumers":["identity","message","business-payload"]},
     {"resource_id":"tmux-wake-signal","status":"active","owner":"tmux-transport","truth_store":"transport result only","allowed_operations":["send_short_wake"],"forbidden_direct_consumers":["business-payload","mailbox-body"]}
   ],
   "relations": [
     {"from":"resource-notice-mailbox","to":"tmux-wake-signal","status":"active","via":["notification-subscription","wake-attempt-ledger"],"forbid_direct":true},
     {"from":"task-lifecycle","to":"resource-notice-mailbox","status":"pending","via":["wait-graph","notification-subscription"],"forbid_direct":true},
-    {"from":"journal-sequence","to":"core-snapshot-file","status":"pending","via":["rust-core"],"forbid_direct":true}
+    {"from":"journal-sequence","to":"core-snapshot-file","status":"active","via":["rust-core"],"forbid_direct":true}
   ]
 }

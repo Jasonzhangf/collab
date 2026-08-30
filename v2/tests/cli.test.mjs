@@ -68,7 +68,7 @@ test('MCP exposes only role-free environment-owned tools', async () => {
     child.on('error', reject)
   })
   const names = response.result.tools.map(({ name }) => name)
-  assert.deepEqual(names, ['collab_register', 'collab_context', 'collab_task_register', 'collab_task_update', 'collab_task_wait', 'collab_send_resource_notice', 'collab_notify_methods', 'collab_notify_subscribe', 'collab_notify_status'])
+  assert.deepEqual(names, ['collab_register', 'collab_context', 'collab_task_register', 'collab_task_update', 'collab_task_wait', 'collab_send_resource_notice', 'collab_notify_methods', 'collab_notify_subscribe', 'collab_notify_status', 'collab_migrate_inspect', 'collab_migrate_plan', 'collab_migrate_apply', 'collab_migrate_verify', 'collab_migrate_resume'])
   assert.equal(names.some((name) => /master|claim|presence/.test(name)), false)
   assert.equal(JSON.stringify(response.result.tools).includes('projectRoot'), false)
   child.kill('SIGTERM')

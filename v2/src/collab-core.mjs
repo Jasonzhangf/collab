@@ -61,10 +61,19 @@ export const CollabCore = (ctx, config = {}) => {
         subject: required(input.subject, 'subject'),
       })
     },
-    wakeAttempt(input) {
+    beginWakeAttempt(input) {
       if (!input || typeof input !== 'object') throw new TypeError('wake attempt is required')
-      return core.wakeAttempt({ messageId: required(input.messageId, 'messageId'), agentState: required(input.agentState, 'agentState'), succeeded: input.succeeded === true, nowMs: input.nowMs })
+      return core.beginWakeAttempt({ messageId: required(input.messageId, 'messageId'), agentState: required(input.agentState, 'agentState'), nowMs: input.nowMs })
     },
+    completeWakeAttempt(input) {
+      if (!input || typeof input !== 'object') throw new TypeError('wake completion is required')
+      return core.completeWakeAttempt({ messageId: required(input.messageId, 'messageId'), attempt: input.attempt, succeeded: input.succeeded === true })
+    },
+    migrationInspect: () => core.migrationInspect(),
+    migrationPlan: () => core.migrationPlan(),
+    migrationApply: () => core.migrationApply(),
+    migrationVerify: () => core.migrationVerify(),
+    migrationResume: () => core.migrationResume(),
     snapshot: () => core.snapshot(),
   })
 

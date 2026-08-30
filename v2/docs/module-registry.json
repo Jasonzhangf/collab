@@ -4,7 +4,7 @@
   "source_roots": ["bin", "containers", "crates/core/src", "protocol", "scripts", "src", "tests"],
   "modules": [
     {"module_id":"rust-core","status":"active","owner":"rust-core","owned_paths":["crates/core/src/lib.rs"],"forbidden_responsibilities":["transport","process-lifecycle","plugin-lifecycle"]},
-    {"module_id":"rust-core-daemon","status":"design","owner":"rust-core-daemon","owned_paths":["crates/core/src/bin/core-daemon.rs"],"forbidden_responsibilities":["business-payload-repair","transport-selection"]},
+    {"module_id":"rust-core-daemon","status":"active","owner":"rust-core-daemon","owned_paths":["crates/core/src/bin/core-daemon.rs"],"forbidden_responsibilities":["business-payload-repair","transport-selection"]},
     {"module_id":"node-adapter","status":"active","owner":"node-adapter","owned_paths":["src/collab-core.mjs","src/communication.mjs","src/contracts.mjs","src/dashboard.mjs","src/project-environment.mjs","src/rust-core-client.mjs"],"forbidden_responsibilities":["semantic-truth","journal-write","role-inference"]},
     {"module_id":"cordis-composition","status":"design","owner":"cordis","owned_paths":["src/appsdk-integration.mjs","src/appsdk-plugin.mjs","src/index.mjs"],"forbidden_responsibilities":["semantic-truth","process-lifecycle"]},
     {"module_id":"operator-surface","status":"design","owner":"operator-cli-mcp","owned_paths":["bin/collab-mcp.mjs","bin/collab-v2-init.mjs","bin/collab-v2.mjs","bin/collab.mjs","src/profile-config.mjs"],"forbidden_responsibilities":["agent-selected-project-root","agent-selected-pane","semantic-truth"]},

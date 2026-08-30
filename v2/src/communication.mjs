@@ -14,19 +14,21 @@ export const CommunicationHub = (ctx, config = {}) => {
       const snapshot = ctx.collab.snapshot()
       const message = snapshot.messages.find(({ id }) => id === input.messageId)
       if (!message) throw new Error(`unknown message: ${input.messageId}`)
-      if (message.delivered || message.wake_attempt_count >= 3 || message.subscription_id === null) return ctx.collab.wakeAttempt({ messageId: input.messageId, agentState: 'unknown', succeeded: false, nowMs: input.nowMs })
+      if (message.delivered || message.wake_attempt_count >= 3 || message.subscription_id === null) return ctx.collab.beginWakeAttempt({ messageId: input.messageId, agentState: 'unknown', nowMs: input.nowMs })
       const identity = snapshot.identities.find(({ id }) => id === message.to)
       if (!identity) throw new Error(`unknown target identity: ${message.to}`)
       const agentState = await probe(identity)
       if (!AGENT_STATES.has(agentState)) throw new Error(`invalid agent state: ${agentState}`)
-      if (agentState !== 'waiting') return ctx.collab.wakeAttempt({ messageId: input.messageId, agentState, succeeded: false, nowMs: input.nowMs })
-      if (!tmux) throw new Error('tmux transport is unavailable')
+      if (agentState !== 'waiting') return ctx.collab.beginWakeAttempt({ messageId: input.messageId, agentState, nowMs: input.nowMs })
+      const lease = ctx.collab.beginWakeAttempt({ messageId: input.messageId, agentState, nowMs: input.nowMs })
+      const attempt = ctx.collab.snapshot().messages.find(({ id }) => id === input.messageId).wake_attempt_count
       try {
+        if (!tmux) throw new Error('tmux transport is unavailable')
         const receipt = await tmux.deliver({ target: identity.pane, messageId: input.messageId })
-        const result = ctx.collab.wakeAttempt({ messageId: input.messageId, agentState, succeeded: true, nowMs: input.nowMs })
-        return Object.freeze({ result, receipt })
+        const completion = ctx.collab.completeWakeAttempt({ messageId: input.messageId, attempt, succeeded: true })
+        return Object.freeze({ lease, completion, receipt })
       } catch (error) {
-        ctx.collab.wakeAttempt({ messageId: input.messageId, agentState, succeeded: false, nowMs: input.nowMs })
+        ctx.collab.completeWakeAttempt({ messageId: input.messageId, attempt, succeeded: false })
         throw error
       }
     },
