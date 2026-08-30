@@ -71,7 +71,7 @@
     "zone_transition_contract": "contracts/transitions/zone-transition-manifest.json"
   },
   "lifecycle": {
-    "stage": "contract_bound"
+    "stage": "compiled"
   },
   "lifecycles": {
     "artifact": "generated",
@@ -148,7 +148,7 @@
         "suite_id": "core-regression"
       },
       "source_owner": "core",
-      "stage": "source_implemented"
+      "stage": "architecture_stable"
     }
   ],
   "project_id": "collab-v2",
