@@ -1,11 +1,13 @@
 {
-  "lifecycle_id": "collab-v2",
+  "schema_version": 2,
+  "lifecycle_id": "collab-v2-runtime",
   "edges": [
-    {"edge_id": "command-to-reducer", "from": "CollabCore.register", "to": "CoreState::register", "owner_feature": "core.reducer", "path": "src/collab-core.mjs -> crates/core/src/lib.rs"},
-    {"edge_id": "reducer-to-journal", "from": "CoreState::transition", "to": "persistence.save", "owner_feature": "core.reducer", "path": "crates/core/src/lib.rs -> src/persistence.mjs"},
-    {"edge_id": "journal-to-event", "from": "persistence.load", "to": "CommunicationHub.send", "owner_feature": "core.reducer", "path": "src/persistence.mjs -> src/communication.mjs"},
-    {"edge_id": "event-to-plugin", "from": "CollabAppSdkPlugin", "to": "ctx.plugin", "owner_feature": "orchestration.cordis", "path": "src/appsdk-plugin.mjs"},
-    {"edge_id": "transport-result-to-core", "from": "createTmuxTransport.deliver", "to": "CollabCore.transitionMessage", "owner_feature": "transport.tmux", "path": "src/transports/tmux.mjs -> src/collab-core.mjs"},
-    {"edge_id": "probe-to-scheduler", "from": "createTmuxTransport.deliver", "to": "CommunicationHub.reconcileLifecycle", "owner_feature": "probe.tmux", "path": "src/transports/tmux.mjs -> src/communication.mjs"}
+    {"edge_id":"node-client-to-daemon","status":"active","from":"createRustCoreClient.invoke","to":"core-daemon Command parser","owner_feature":"core.command-adapter","path":"src/rust-core-client.mjs -> crates/core/src/bin/core-daemon.rs","input_resource_id":"typed-command","output_resource_id":"typed-result","error_resource_id":"typed-error"},
+    {"edge_id":"daemon-register-to-identity","status":"active","from":"Command::Register","to":"CoreState::register","owner_feature":"identity.session","path":"crates/core/src/bin/core-daemon.rs -> crates/core/src/lib.rs","input_resource_id":"peer-identity-command","output_resource_id":"peer-identity","error_resource_id":"typed-error"},
+    {"edge_id":"daemon-task-to-lifecycle","status":"active","from":"Command::RegisterTask|TransitionTask","to":"CoreState::register_task|transition_task","owner_feature":"task.lifecycle","path":"crates/core/src/bin/core-daemon.rs -> crates/core/src/lib.rs","input_resource_id":"task-command","output_resource_id":"task-lifecycle","error_resource_id":"typed-error"},
+    {"edge_id":"daemon-wait-to-graph","status":"active","from":"Command::WaitTask","to":"CoreState::wait_task","owner_feature":"wait.graph","path":"crates/core/src/bin/core-daemon.rs -> crates/core/src/lib.rs","input_resource_id":"wait-command","output_resource_id":"wait-graph","error_resource_id":"typed-error"},
+    {"edge_id":"daemon-notify-to-ledger","status":"active","from":"Command::Subscribe|SendResourceNotice|WakeAttempt","to":"CoreState::subscribe|send_resource_notice|record_wake_attempt","owner_feature":"notification.subscription","path":"crates/core/src/bin/core-daemon.rs -> crates/core/src/lib.rs","input_resource_id":"notification-command","output_resource_id":"wake-attempt-ledger","error_resource_id":"typed-error"},
+    {"edge_id":"rust-truth-to-node-projection","status":"pending","from":"CoreState snapshot","to":"CollabCore projection","owner_feature":"node.thin-projection","path":"crates/core/src/lib.rs -> src/collab-core.mjs","input_resource_id":"core-snapshot-file","output_resource_id":"read-only-projection","error_resource_id":"typed-error"},
+    {"edge_id":"mailbox-to-tmux-wake","status":"pending","from":"resource-notice-mailbox","to":"createTmuxTransport.deliver","owner_feature":"transport.tmux-wake","path":"crates/core/src/lib.rs -> src/transports/tmux.mjs","input_resource_id":"wake-attempt-ledger","output_resource_id":"tmux-wake-signal","error_resource_id":"typed-error"}
   ]
 }

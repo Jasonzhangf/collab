@@ -1,11 +1,22 @@
 {
-  "lifecycle_id": "collab-v2",
+  "schema_version": 2,
+  "lifecycle_id": "collab-v2-runtime",
   "resources": [
-    {"resource_id": "core-state", "owner": "collab-core", "truth_store": "journal-v1", "allowed_operations": ["reduce", "replay", "snapshot"], "forbidden_direct_consumers": ["cordis-orchestrator", "codis"]},
-    {"resource_id": "journal-v1", "owner": "collab-core", "truth_store": ".agent-collab-v2/journal.jsonl", "allowed_operations": ["append", "replay"], "forbidden_direct_consumers": ["plugins", "collab-journal"], "role": "core persistence port; no independent semantic owner"},
-    {"resource_id": "event-bus-v1", "owner": "collab-events", "truth_store": "core-state", "allowed_operations": ["publish", "subscribe"], "forbidden_direct_consumers": []},
-    {"resource_id": "identity", "owner": "collab-identity", "truth_store": "core-state", "allowed_operations": ["resolve", "recover"], "forbidden_direct_consumers": ["transport"]},
-    {"resource_id": "task-lifecycle", "owner": "collab-core", "truth_store": "core-state", "allowed_operations": ["register", "claim", "block", "deliver", "merge", "close"], "forbidden_direct_consumers": ["codis", "collab-task"], "role": "task command adapter cannot mutate truth"},
-    {"resource_id": "tmux-transport", "owner": "collab-transport-tmux", "truth_store": "event-bus-v1", "allowed_operations": ["send", "probe_alive"], "forbidden_direct_consumers": ["agents", "codis"]}
+    {"resource_id":"peer-identity","status":"active","owner":"rust-core","truth_store":"CoreState.identities","allowed_operations":["register","rebind","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"task-lifecycle","status":"active","owner":"rust-core","truth_store":"CoreState.tasks","allowed_operations":["register","transition","wait","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"wait-graph","status":"active","owner":"rust-core","truth_store":"Task.wait","allowed_operations":["create","validate","release","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"notification-subscription","status":"active","owner":"rust-core","truth_store":"CoreState.subscriptions","allowed_operations":["subscribe","consume","expire","cancel","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"resource-notice-mailbox","status":"active","owner":"rust-core","truth_store":"CoreState.messages","allowed_operations":["commit","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"wake-attempt-ledger","status":"active","owner":"rust-core","truth_store":"Message.wake_attempt_count","allowed_operations":["record","deliver","exhaust","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"core-snapshot-file","status":"design","owner":"rust-core-daemon","truth_store":"--state path","allowed_operations":["load","replace"],"forbidden_direct_consumers":["cordis","codis","transport"],"pending_reason":"atomic replace and explicit parse failure are not implemented"},
+    {"resource_id":"journal-sequence","status":"pending","owner":"rust-core","truth_store":".agent-collab-v2/journal.jsonl","allowed_operations":["append","replay","snapshot"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
+    {"resource_id":"migration-transaction","status":"pending","owner":"rust-core","truth_store":".agent-collab-v2/migration.json","allowed_operations":["inspect","plan","freeze","verify","resume"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
+    {"resource_id":"daemon-operator-capability","status":"pending","owner":"rust-core-daemon","truth_store":"typed local operator command","allowed_operations":["down","up","status"],"forbidden_direct_consumers":["identity","message","business-payload"]},
+    {"resource_id":"tmux-wake-signal","status":"pending","owner":"tmux-transport","truth_store":"transport result only","allowed_operations":["send_short_wake"],"forbidden_direct_consumers":["business-payload","mailbox-body"]}
+  ],
+  "relations": [
+    {"from":"resource-notice-mailbox","to":"tmux-wake-signal","status":"pending","via":["notification-subscription","wake-attempt-ledger"],"forbid_direct":true},
+    {"from":"task-lifecycle","to":"resource-notice-mailbox","status":"pending","via":["wait-graph","notification-subscription"],"forbid_direct":true},
+    {"from":"journal-sequence","to":"core-snapshot-file","status":"pending","via":["rust-core"],"forbid_direct":true}
   ]
 }
