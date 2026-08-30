@@ -18,3 +18,19 @@ not imported, mutated, or shared by v2.
 The runtime is still a candidate. Canonical AppSDK compile, installation,
 restart, real tmux black-box evidence, review, and freeze are required before
 any production deployment decision.
+
+## Explicit daemon lifecycle
+
+The candidate daemon is controlled only from the exact project cwd:
+
+```sh
+collab up
+collab status
+collab down
+```
+
+`up` owns one deterministic short Unix socket, one PID file, and one lock.
+`down` writes the environment-owned `DOWN` marker before stopping that exact
+PID; ordinary CLI/MCP operations cannot clear it or auto-start a daemon.
+`status` is read-only. A stale socket, PID, or lock is an explicit error and
+is never guessed or replaced by an Agent identity or message.
