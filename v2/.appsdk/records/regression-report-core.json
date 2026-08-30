@@ -1,1 +1,31 @@
-{"regression_report_id":"reg-collab-v2-role-free-governance","module_id":"core","source_commit":"de75b55cec6324cc0384a6cebc012076dff957ac","artifact_hash":"sha256:33eb22542d22b8c0847cb29f94b09724e0b2d347a895addb88346c3f617c31c2","public_api_hash":"sha256:290cf57730157d61d7b94b29c00f1e5320dc4c0b377503b2c2f292e4a122e531","scope_hash":"scope-collab-v2-role-free","input_hash":"sha256:33eb22542d22b8c0847cb29f94b09724e0b2d347a895addb88346c3f617c31c2","suite_id":"core-regression","command":{"program":"npm","args":["test"],"working_directory":"v2"},"test_count":27,"passed":27,"failed":0,"skipped":0,"result":"pass","producer":{"adapter":"npm-test+real-tmux-blackbox","identity":"codex-desktop-single-worker"},"test_characteristics":{"whitebox":true,"blackbox":true},"created_at":"2026-08-30T17:07:00Z"}
+{
+  "regression_report_id": "reg-collab-v2-role-free-governance",
+  "module_id": "core",
+  "source_commit": "665acc7117cdd99793cbe281c8992a52956e8d1c",
+  "artifact_hash": "sha256:33eb22542d22b8c0847cb29f94b09724e0b2d347a895addb88346c3f617c31c2",
+  "public_api_hash": "sha256:290cf57730157d61d7b94b29c00f1e5320dc4c0b377503b2c2f292e4a122e531",
+  "scope_hash": "scope-collab-v2-role-free",
+  "input_hash": "sha256:33eb22542d22b8c0847cb29f94b09724e0b2d347a895addb88346c3f617c31c2",
+  "suite_id": "core-regression",
+  "command": {
+    "program": "npm",
+    "args": [
+      "test"
+    ],
+    "working_directory": "."
+  },
+  "test_count": 27,
+  "passed": 27,
+  "failed": 0,
+  "skipped": 0,
+  "result": "pass",
+  "producer": {
+    "adapter": "npm-test+real-tmux-blackbox",
+    "identity": "codex-desktop-single-worker"
+  },
+  "test_characteristics": {
+    "whitebox": true,
+    "blackbox": true
+  },
+  "created_at": "2026-08-30T17:07:00Z"
+}
