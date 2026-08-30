@@ -16,8 +16,9 @@
     {"id": "peer-identity", "kind": "truth", "owner": "handle_register"},
     {"id": "task-lifecycle", "kind": "truth", "owner": "Server"},
     {"id": "durable-mailbox", "kind": "truth", "owner": "Server"},
+    {"id": "notification-subscription", "kind": "control", "owner": "NotificationSubscription"},
     {"id": "tmux-wake", "kind": "control", "owner": "queue_system_knock"},
-    {"id": "continuation-context", "kind": "projection", "owner": "handle_context"},
+    {"id": "agent-context", "kind": "projection", "owner": "handle_context"},
     {"id": "migration-transaction", "kind": "truth", "owner": "MigrationRecord"}
   ],
   "nodes": [
@@ -26,8 +27,10 @@
     {"id": "resource-wait", "owner_feature": "wait.liveness"},
     {"id": "task-deliver", "owner_feature": "task.self-lifecycle"},
     {"id": "task-close-release", "owner_feature": "resource.p2p-conflict"},
-    {"id": "tmux-wake-attempt", "owner_feature": "continuation.local-wake"},
-    {"id": "context-consume", "owner_feature": "continuation.context"},
+    {"id": "notification-subscribe", "owner_feature": "notification.subscription"},
+    {"id": "subscribed-resource-event", "owner_feature": "notification.subscription"},
+    {"id": "tmux-wake-attempt", "owner_feature": "notification.tmux-wake"},
+    {"id": "notification-query", "owner_feature": "notification.context"},
     {"id": "migration-freeze-verify", "owner_feature": "migration.peer-v1"}
   ],
   "verification_gates": [

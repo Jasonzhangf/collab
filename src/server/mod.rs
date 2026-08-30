@@ -7,8 +7,8 @@ use crate::scope::Scope;
 use crate::server::knock::{append_log, knock_or_log, pane_alive, pane_idle};
 use serde_json::json;
 use state::{
-    now_ms, runtime_for_pane, task_continuation_active, task_resource_active, wait_cycle, Event,
-    Message, MigrationRecord, State, TaskRec, WaitSpec, WorkerRec,
+    now_ms, runtime_for_pane, task_resource_active, wait_cycle, Event, Message, MigrationRecord,
+    NotificationSubscription, State, TaskRec, WaitSpec, WorkerRec, MAX_WAKE_ATTEMPTS,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -200,130 +200,216 @@ pub fn gen_msg_id() -> String {
     format!("m{}-{}", now_ms(), n)
 }
 
-const LONG_BODY_THRESHOLD_CHARS: usize = 200;
-const DELIVERY_SUMMARY_CHARS: usize = 80;
-
-fn message_doc_path(root: &Path, msg_id: &str) -> PathBuf {
-    root.join(".agent-collab")
-        .join("messages")
-        .join(format!("{msg_id}.md"))
+fn notification_text(message_id: &str) -> String {
+    format!("COLLAB_NOTIFY {message_id}")
 }
 
-fn write_message_doc(root: &Path, msg_id: &str, body: &str) -> anyhow::Result<PathBuf> {
-    let path = message_doc_path(root, msg_id);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, body)?;
-    Ok(path)
-}
-
-fn one_line(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).collect()
-}
-
-fn delivery_text(
-    root: &Path,
-    from: &str,
-    mtype: &str,
-    msg_id: &str,
-    body: &str,
-) -> Result<String, String> {
-    let prefix = format!("[MAIL] from={} type={} id={}:", from, mtype, msg_id);
-    let next = if body.starts_with("RESOURCE_") || body.starts_with("TASK_WAIT_TIMEOUT ") {
-        "action=\"query collab context, coordinate only the named resource, then continue your own lifecycle\"".to_string()
-    } else if body.starts_with("CONTINUE_TASK ") {
-        "action=\"query collab context and continue your own next safe lifecycle step\"".to_string()
-    } else {
-        "action=\"query collab context before acting; tmux is wake-only\"".to_string()
-    };
-    if body.chars().count() <= LONG_BODY_THRESHOLD_CHARS {
-        return Ok(format!("{prefix} {} | {next}", one_line(body)));
-    }
-    let path = write_message_doc(root, msg_id, body)
-        .map_err(|e| format!("cannot store long message {}: {e}", msg_id))?;
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|e| format!("cannot make message reference relative: {e}"))?;
-    let summary: String = one_line(body)
-        .chars()
-        .take(DELIVERY_SUMMARY_CHARS)
-        .collect();
-    Ok(format!(
-        "{prefix} summary={}... body-ref={} {next}",
-        summary,
-        relative.display(),
-        next = next,
-    ))
-}
-
-pub(super) fn queue_system_knock(server: &Server, pane: &str, msg_id: &str, body: &str) -> bool {
-    match delivery_text(&server.root, "collab-server", "system", msg_id, body) {
-        Ok(text) => knock_or_log(&server.log_path(), pane, &text),
-        Err(error) => {
-            append_log(
-                &server.log_path(),
-                &format!("system delivery prompt failed id={} err={}", msg_id, error),
-            );
-            false
-        }
-    }
-}
-
-pub(super) fn queue_batch_knock(server: &Server, pane: &str, ids: &[String], body: &str) -> bool {
-    let prompt = format!(
-        "[MAIL] from=collab-server type=system ids={} | {}",
-        ids.join(","),
-        body
-    );
-    knock_or_log(&server.log_path(), pane, &prompt)
-}
-
-fn timeout_prompt(kind: &str, worker_id: &str, timeout_ms: u64) -> String {
-    format!(
-        "Blocking collab {} returned without a message for peer {} after {}ms. Inspect durable context and continue the current run; do not idle or wait for another request.",
-        kind, worker_id, timeout_ms
-    )
-}
-
-fn notify_wait_timeout(server: &Server, kind: &str, worker_id: &str, timeout_ms: u64) {
-    let body = timeout_prompt(kind, worker_id, timeout_ms);
-    let id = gen_msg_id();
-    let msg = Message {
-        id: id.clone(),
-        from: "collab-server".into(),
-        to: worker_id.into(),
-        mtype: "system".into(),
-        body: body.clone(),
-        in_reply_to: None,
-        created_ms: now_ms(),
-        state: "pending".into(),
-        wake_attempt_count: 0,
-        last_wake_attempt_ms: 0,
-    };
-    let pane = server.state.lock().unwrap().worker_pane(worker_id);
-    server.commit(&[
-        Event::Sent { msg },
-        Event::DeliveryMode {
-            msg_id: id.clone(),
-            mode: "immediate".into(),
-        },
-        Event::WakeAttempted {
-            ids: vec![id.clone()],
-            attempted_ms: now_ms(),
-        },
-    ]);
-    if let Some(pane) = pane {
-        if queue_system_knock(server, &pane, &id, &body) {
-            server.commit(&[Event::Delivered { ids: vec![id] }]);
-        }
-    }
+pub(super) fn queue_system_knock(server: &Server, pane: &str, msg_id: &str) -> bool {
+    knock_or_log(&server.log_path(), pane, &notification_text(msg_id))
 }
 
 fn iso(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|d| d.to_rfc3339())
         .unwrap_or_default()
+}
+
+const MAX_NOTIFICATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+const NOTIFICATION_EVENTS: [&str; 4] = [
+    "direct-message",
+    "resource-released",
+    "deadline",
+    "async-result",
+];
+
+fn attempt_notification_with(
+    server: &Server,
+    message_id: &str,
+    subscription_id: &str,
+    is_waiting: &dyn Fn(&str) -> bool,
+    deliver: &dyn Fn(&str, &str) -> bool,
+) -> bool {
+    let (pane, exhausted) = {
+        let state = server.state.lock().unwrap();
+        let Some(message) = state.msgs.get(message_id) else {
+            return false;
+        };
+        let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
+            return false;
+        };
+        let pane_matches = state
+            .workers
+            .get(&subscription.worker_id)
+            .and_then(|worker| worker.pane.as_deref())
+            == Some(subscription.pane.as_str());
+        let valid = message.to == subscription.worker_id
+            && message.state == "pending"
+            && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
+            && subscription.status == "armed"
+            && subscription.expires_ms > now_ms()
+            && pane_matches;
+        if !valid || !is_waiting(&subscription.pane) {
+            return false;
+        }
+        (
+            subscription.pane.clone(),
+            message.wake_attempt_count + 1 >= MAX_WAKE_ATTEMPTS,
+        )
+    };
+
+    server.commit(&[Event::WakeAttempted {
+        ids: vec![message_id.to_string()],
+        attempted_ms: now_ms(),
+    }]);
+    if deliver(&pane, message_id) {
+        server.commit(&[
+            Event::Delivered {
+                ids: vec![message_id.to_string()],
+            },
+            Event::NotificationConsumed {
+                subscription_id: subscription_id.to_string(),
+                message_id: message_id.to_string(),
+                consumed_ms: now_ms(),
+            },
+        ]);
+        true
+    } else {
+        if exhausted {
+            server.commit(&[Event::NotificationStatus {
+                subscription_id: subscription_id.to_string(),
+                status: "attempts-exhausted".into(),
+                updated_ms: now_ms(),
+            }]);
+        }
+        false
+    }
+}
+
+fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str) -> bool {
+    attempt_notification_with(
+        server,
+        message_id,
+        subscription_id,
+        &pane_idle,
+        &|pane, id| queue_system_knock(server, pane, id),
+    )
+}
+
+fn handle_notification_subscribe(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    event: String,
+    subject: Option<String>,
+    trigger_ms: Option<i64>,
+    ttl_seconds: u64,
+) -> Resp {
+    if !NOTIFICATION_EVENTS.contains(&event.as_str()) {
+        return Resp::err(format!(
+            "unsupported notification event {}; expected one of {:?}",
+            event, NOTIFICATION_EVENTS
+        ));
+    }
+    if ttl_seconds == 0 || ttl_seconds > MAX_NOTIFICATION_TTL_SECONDS {
+        return Resp::err(format!(
+            "ttl_seconds must be between 1 and {}",
+            MAX_NOTIFICATION_TTL_SECONDS
+        ));
+    }
+    let exact_subject_required = event != "direct-message";
+    if exact_subject_required != subject.as_deref().is_some_and(|value| !value.is_empty()) {
+        return Resp::err(if exact_subject_required {
+            "this notification event requires a non-empty exact subject"
+        } else {
+            "direct-message subscription must not specify a subject"
+        });
+    }
+    if event == "deadline" && trigger_ms.is_none() {
+        return Resp::err("deadline subscription requires trigger_ms");
+    }
+    if event != "deadline" && trigger_ms.is_some() {
+        return Resp::err("trigger_ms is valid only for deadline subscriptions");
+    }
+    let now = now_ms();
+    let expires_ms = now.saturating_add((ttl_seconds as i64).saturating_mul(1000));
+    if trigger_ms.is_some_and(|trigger| trigger <= now || trigger >= expires_ms) {
+        return Resp::err("deadline trigger_ms must be in the future and before expiry");
+    }
+    let mut state = server.state.lock().unwrap();
+    if let Err(error) = verify(&state, &worker_id, &token) {
+        return error;
+    }
+    let Some(pane) = state.worker_pane(&worker_id) else {
+        return Resp::err("notification subscription requires a registered tmux pane");
+    };
+    if runtime_for_pane(Some(&pane)).is_none() {
+        return Resp::err("notification subscription method tmux is unavailable for this pane");
+    }
+    let id = format!("sub-{}", gen_msg_id());
+    let subscription = NotificationSubscription {
+        id: id.clone(),
+        worker_id,
+        event,
+        subject,
+        pane,
+        method: "tmux".into(),
+        trigger_ms,
+        expires_ms,
+        status: "armed".into(),
+        created_ms: now,
+        updated_ms: now,
+    };
+    server.commit_locked(
+        &mut state,
+        &[Event::NotificationSubscribed {
+            subscription: subscription.clone(),
+        }],
+    );
+    Resp::data(json!({"subscription": subscription, "one_shot": true}))
+}
+
+fn handle_notification_status(server: &Server, worker_id: String, token: String) -> Resp {
+    let state = server.state.lock().unwrap();
+    if let Err(error) = verify(&state, &worker_id, &token) {
+        return error;
+    }
+    let mut subscriptions: Vec<&NotificationSubscription> = state
+        .notification_subscriptions
+        .values()
+        .filter(|subscription| subscription.worker_id == worker_id)
+        .collect();
+    subscriptions.sort_by_key(|subscription| (subscription.created_ms, &subscription.id));
+    Resp::data(json!({"subscriptions": subscriptions}))
+}
+
+fn handle_notification_unsubscribe(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    subscription_id: String,
+) -> Resp {
+    let mut state = server.state.lock().unwrap();
+    if let Err(error) = verify(&state, &worker_id, &token) {
+        return error;
+    }
+    let Some(subscription) = state.notification_subscriptions.get(&subscription_id) else {
+        return Resp::err(format!(
+            "notification subscription {} not found",
+            subscription_id
+        ));
+    };
+    if subscription.worker_id != worker_id {
+        return Resp::err("only the subscription owner may unsubscribe");
+    }
+    server.commit_locked(
+        &mut state,
+        &[Event::NotificationStatus {
+            subscription_id: subscription_id.clone(),
+            status: "cancelled".into(),
+            updated_ms: now_ms(),
+        }],
+    );
+    Resp::data(json!({"subscription_id": subscription_id, "status": "cancelled"}))
 }
 
 // ---------- handlers ----------
@@ -748,8 +834,10 @@ fn handle_send(
             "peer messaging is limited to RESOURCE_OCCUPIED/RESOURCE_RELEASED coordination",
         );
     }
-    if delivery_mode != "immediate" && delivery_mode != "idle" {
-        return Resp::err("delivery must be immediate or idle");
+    if delivery_mode != "immediate" {
+        return Resp::err(
+            "implicit idle delivery is removed; use an explicit notification subscription",
+        );
     }
     if !MSG_TYPES.contains(&mtype.as_str()) {
         return Resp::err(format!(
@@ -810,21 +898,18 @@ fn handle_send(
         return Resp::data(json!({"msg_id": existing.id, "deduplicated": true}));
     }
     let mid = msg.id.clone();
-    let prompt = delivery_text(&server.root, &from, &mtype, &mid, &msg.body);
-    let prompt = match prompt {
-        Ok(text) => text,
-        Err(e) => return Resp::err(e),
-    };
-    let pane = st.worker_pane(&to);
+    let subscription = st
+        .matching_subscription(&to, "direct-message", None, now_ms())
+        .cloned();
     let mut events = vec![Event::Sent { msg }];
     events.push(Event::DeliveryMode {
         msg_id: mid.clone(),
-        mode: delivery_mode.clone(),
+        mode: "explicit-notification".into(),
     });
-    if delivery_mode == "immediate" && pane.is_some() {
-        events.push(Event::WakeAttempted {
-            ids: vec![mid.clone()],
-            attempted_ms: now_ms(),
+    if let Some(subscription) = &subscription {
+        events.push(Event::WakeBound {
+            message_id: mid.clone(),
+            subscription_id: subscription.id.clone(),
         });
     }
     if !superseded_ids.is_empty() {
@@ -834,16 +919,20 @@ fn handle_send(
     }
     server.commit_locked(&mut st, &events);
     drop(st);
-    if delivery_mode == "immediate" {
-        if let Some(p) = pane {
-            if p.starts_with('%') && knock_or_log(&server.log_path(), &p, &prompt) {
-                server.commit(&[Event::Delivered {
-                    ids: vec![mid.clone()],
-                }]);
-            }
+    let notified = subscription
+        .as_ref()
+        .is_some_and(|subscription| attempt_notification(server, &mid, &subscription.id));
+    Resp::data(json!({
+        "msg_id": mid,
+        "durable": true,
+        "notification": if subscription.is_none() {
+            "mailbox-only-no-subscription"
+        } else if notified {
+            "sent"
+        } else {
+            "subscribed-not-sent"
         }
-    }
-    Resp::data(json!({"msg_id": mid}))
+    }))
 }
 
 #[cfg(test)]
@@ -949,66 +1038,8 @@ fn handle_task_register_with_next(
             wait: None,
             created_ms: now,
             updated_ms: now,
-            last_continuation_sent_ms: now,
-            continuation_pending: false,
-            continuation_message_id: None,
         };
-        let body = format!(
-            "RESOURCE_OCCUPIED requested_task={} requester={} held_by_task={} holder={} | coordinate only this resource; durable Server state remains authoritative",
-            task_id, worker_id, existing.id, existing.owner
-        );
-        let requester_notice = Message {
-            id: gen_msg_id(),
-            from: "collab-server".into(),
-            to: worker_id.clone(),
-            mtype: "system".into(),
-            body: body.clone(),
-            in_reply_to: None,
-            created_ms: now_ms(),
-            state: "pending".into(),
-            wake_attempt_count: 0,
-            last_wake_attempt_ms: 0,
-        };
-        let holder_notice = Message {
-            id: gen_msg_id(),
-            from: "collab-server".into(),
-            to: existing.owner.clone(),
-            mtype: "system".into(),
-            body: body.clone(),
-            in_reply_to: None,
-            created_ms: now_ms(),
-            state: "pending".into(),
-            wake_attempt_count: 0,
-            last_wake_attempt_ms: 0,
-        };
-        let holder_pane = st.worker_pane(&existing.owner);
-        let holder_notice_id = holder_notice.id.clone();
-        server.commit_locked(
-            &mut st,
-            &[
-                Event::TaskCreated { task: blocked_task },
-                Event::Sent {
-                    msg: requester_notice,
-                },
-                Event::Sent { msg: holder_notice },
-                Event::DeliveryMode {
-                    msg_id: holder_notice_id.clone(),
-                    mode: "immediate".into(),
-                },
-                Event::WakeAttempted {
-                    ids: vec![holder_notice_id.clone()],
-                    attempted_ms: now_ms(),
-                },
-            ],
-        );
-        drop(st);
-        if let Some(pane) = holder_pane {
-            if queue_system_knock(server, &pane, &holder_notice_id, &body) {
-                server.commit(&[Event::Delivered {
-                    ids: vec![holder_notice_id],
-                }]);
-            }
-        }
+        server.commit_locked(&mut st, &[Event::TaskCreated { task: blocked_task }]);
         return Resp::err_data(
             "TASK_RESOURCE_CONFLICT",
             json!({
@@ -1016,7 +1047,7 @@ fn handle_task_register_with_next(
                 "blocking_task": existing.id,
                 "responsible_actor": existing.owner,
                 "status": "blocked",
-                "durable_notice": true,
+                "notification": "none; use explicit sendmessage when coordination is needed",
             }),
         );
     }
@@ -1035,14 +1066,9 @@ fn handle_task_register_with_next(
         wait: None,
         created_ms: now,
         updated_ms: now,
-        last_continuation_sent_ms: now,
-        continuation_pending: false,
-        continuation_message_id: None,
     };
     server.commit_locked(&mut st, &[Event::TaskCreated { task: task.clone() }]);
-    Resp::data(
-        json!({"task": task.id, "owner": task.owner, "status": task.status, "continuation": "active"}),
-    )
+    Resp::data(json!({"task": task.id, "owner": task.owner, "status": task.status}))
 }
 
 fn handle_task_relocate(
@@ -1177,12 +1203,7 @@ fn handle_task_update(
     if next_step.is_some() {
         task.next_step = next_step;
     }
-    task.continuation_pending = false;
-    task.continuation_message_id = None;
     task.updated_ms = now_ms();
-    if !task_continuation_active(&task.status) {
-        task.continuation_pending = false;
-    }
     server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
     Resp::data(json!({
         "task": task.id,
@@ -1346,8 +1367,6 @@ fn handle_task_deliver(
         "sync latest main, verify the exact candidate, integrate to main, then mark merged"
             .to_string(),
     );
-    task.continuation_pending = false;
-    task.continuation_message_id = None;
     task.updated_ms = now_ms();
     server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
 
@@ -1393,8 +1412,6 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
     closed.status = "closed".to_string();
     closed.wait = None;
     closed.next_step = Some("closed after owner merge and cleanup".to_string());
-    closed.continuation_pending = false;
-    closed.continuation_message_id = None;
     closed.updated_ms = now_ms();
     server.commit_locked(
         &mut st,
@@ -1403,9 +1420,7 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
         }],
     );
 
-    // Closing the lock-holder wakes every durable waiter. The wake is only a
-    // prompt; each waiter must re-query conflicts before resuming.
-    let waiting: Vec<(TaskRec, String)> = st
+    let waiting: Vec<TaskRec> = st
         .tasks
         .values()
         .filter(|candidate| {
@@ -1415,39 +1430,32 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
                     .as_ref()
                     .is_some_and(|wait| wait.waiting_for == closed.id)
         })
-        .filter_map(|candidate| {
-            st.worker_pane(&candidate.owner)
-                .map(|pane| (candidate.clone(), pane))
-        })
+        .cloned()
         .collect();
-    let mut wait_knocks = Vec::new();
-    for (mut waiter_task, pane) in waiting {
+    let mut subscribed_notifications = Vec::new();
+    for mut waiter_task in waiting {
         waiter_task.status = "blocked".into();
         waiter_task.wait = None;
         waiter_task.next_step = Some(format!(
             "RESOURCE_RELEASED={} recheck conflicts, then resume only after Server confirms free",
             closed.id
         ));
-        waiter_task.continuation_pending = false;
-        waiter_task.continuation_message_id = None;
         waiter_task.updated_ms = now_ms();
         let waiter = waiter_task.owner.clone();
-        let wait_id = gen_msg_id();
-        let wait_body = format!(
-            "RESOURCE_RELEASED task={} waiter={} | Re-check collab task conflicts now; claim/resume only after the Server confirms the resource is free",
-            closed.id, waiter
-        );
-        server.commit_locked(
-            &mut st,
-            &[
-                Event::TaskUpdated { task: waiter_task },
+        let subscription = st
+            .matching_subscription(&waiter, "resource-released", Some(&closed.id), now_ms())
+            .cloned();
+        let mut events = vec![Event::TaskUpdated { task: waiter_task }];
+        if let Some(subscription) = subscription {
+            let message_id = gen_msg_id();
+            events.extend([
                 Event::Sent {
                     msg: Message {
-                        id: wait_id.clone(),
+                        id: message_id.clone(),
                         from: "collab-server".into(),
                         to: waiter,
-                        mtype: "system".into(),
-                        body: wait_body.clone(),
+                        mtype: "notification".into(),
+                        body: format!("RESOURCE_RELEASED subject={}", closed.id),
                         in_reply_to: None,
                         created_ms: now_ms(),
                         state: "pending".into(),
@@ -1455,27 +1463,24 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
                         last_wake_attempt_ms: 0,
                     },
                 },
+                Event::WakeBound {
+                    message_id: message_id.clone(),
+                    subscription_id: subscription.id.clone(),
+                },
                 Event::DeliveryMode {
-                    msg_id: wait_id.clone(),
-                    mode: "immediate".into(),
+                    msg_id: message_id.clone(),
+                    mode: "explicit-notification".into(),
                 },
-                Event::WakeAttempted {
-                    ids: vec![wait_id.clone()],
-                    attempted_ms: now_ms(),
-                },
-            ],
-        );
-        wait_knocks.push((pane, wait_id, wait_body));
+            ]);
+            subscribed_notifications.push((message_id, subscription.id));
+        }
+        server.commit_locked(&mut st, &events);
     }
 
     let stale_workers = stale_worker_views(&st, &server.pane_alive_check);
     drop(st);
-    for (pane, prompt_id, prompt) in wait_knocks {
-        if queue_system_knock(server, &pane, &prompt_id, &prompt) {
-            server.commit(&[Event::Delivered {
-                ids: vec![prompt_id],
-            }]);
-        }
+    for (message_id, subscription_id) in subscribed_notifications {
+        attempt_notification(server, &message_id, &subscription_id);
     }
     Resp::data(json!({
         "task": closed.id,
@@ -1487,7 +1492,7 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
             "result": "removed-if-declared-and-safe"
         },
         "stale_workers": stale_workers,
-        "notification": "resource waiters only",
+        "notification": "subscribed resource waiters only",
         "next_action": "lifecycle complete",
     }))
 }
@@ -1505,38 +1510,14 @@ fn task_view(task: &TaskRec) -> serde_json::Value {
         "status": task.status,
         "next_step": task.next_step,
         "wait": task.wait,
-        "continuation": if task_continuation_active(&task.status) { "active" } else { "inactive" },
         "updated_at": iso(task.updated_ms),
     })
 }
 
 fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
-    let mut st = server.state.lock().unwrap();
+    let st = server.state.lock().unwrap();
     if let Err(e) = verify(&st, &worker_id, &token) {
         return e;
-    }
-    if !st.admission_frozen() {
-        let mut events = Vec::new();
-        let mut consumed = Vec::new();
-        for task in st
-            .tasks
-            .values()
-            .filter(|task| task.owner == worker_id && task.continuation_pending)
-        {
-            let mut resumed = task.clone();
-            if let Some(message_id) = resumed.continuation_message_id.take() {
-                consumed.push(message_id);
-            }
-            resumed.continuation_pending = false;
-            resumed.updated_ms = now_ms();
-            events.push(Event::TaskUpdated { task: resumed });
-        }
-        if !consumed.is_empty() {
-            events.push(Event::Acked { ids: consumed });
-        }
-        if !events.is_empty() {
-            server.commit_locked(&mut st, &events);
-        }
     }
     let Some(worker) = st.workers.get(&worker_id) else {
         return Resp::err(format!("worker {} not registered", worker_id));
@@ -1595,7 +1576,6 @@ fn handle_poll(server: &Server, worker_id: String, timeout_ms: u64) -> Resp {
             }));
         }
         if Instant::now() >= deadline {
-            notify_wait_timeout(server, "wait", &worker_id, timeout_ms);
             return Resp::data(json!({"messages": [], "count": 0, "timeout": true}));
         }
         std::thread::sleep(Duration::from_millis(POLL_TICK_MS));
@@ -1678,58 +1658,15 @@ fn handle_task_wait(
         ],
         escalation: "resource_owner_and_waiter_recheck".into(),
     });
-    task.continuation_pending = false;
-    task.continuation_message_id = None;
     task.updated_ms = now_ms();
     server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
-    let body = format!(
-        "RESOURCE_WAITING task={} waiter={} waiting_for={} holder={} | coordinate only this resource; release must be committed through Collab",
-        task.id, worker_id, blocking_task_id, responsible_actor
-    );
-    let mid = gen_msg_id();
-    server.commit_locked(
-        &mut st,
-        &[
-            Event::Sent {
-                msg: Message {
-                    id: mid.clone(),
-                    from: "collab-server".into(),
-                    to: responsible_actor.clone(),
-                    mtype: "system".into(),
-                    body: body.clone(),
-                    in_reply_to: None,
-                    created_ms: now_ms(),
-                    state: "pending".into(),
-                    wake_attempt_count: 0,
-                    last_wake_attempt_ms: 0,
-                },
-            },
-            Event::DeliveryMode {
-                msg_id: mid.clone(),
-                mode: "immediate".into(),
-            },
-            Event::WakeAttempted {
-                ids: vec![mid.clone()],
-                attempted_ms: now_ms(),
-            },
-        ],
-    );
-    let pane = st.worker_pane(&responsible_actor);
-    drop(st);
-    if let Some(pane) = pane {
-        if queue_system_knock(server, &pane, &mid, &body) {
-            server.commit(&[Event::Delivered {
-                ids: vec![mid.clone()],
-            }]);
-        }
-    }
     Resp::data(json!({
         "task": task.id,
         "status": task.status,
         "waiting_for": blocking_task_id,
         "responsible_actor": responsible_actor,
         "deadline_ms": task.wait.as_ref().map(|wait| wait.deadline_ms),
-        "p2p_notification": mid,
+        "notification": "none; subscribe for release/deadline or use explicit sendmessage",
     }))
 }
 
@@ -1738,6 +1675,8 @@ fn handle_task_wait(
 fn mutation_blocked_during_migration(req: &Req) -> bool {
     match req {
         Req::Send { .. }
+        | Req::NotificationSubscribe { .. }
+        | Req::NotificationUnsubscribe { .. }
         | Req::Poll { .. }
         | Req::Ack { .. }
         | Req::TaskRegister { .. }
@@ -1754,6 +1693,8 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::RemoveWorker { .. }
         | Req::ResetBindings { .. } => true,
         Req::Register { .. }
+        | Req::NotificationMethods
+        | Req::NotificationStatus { .. }
         | Req::Inbox { .. }
         | Req::Context { .. }
         | Req::MsgStatus { .. }
@@ -1791,6 +1732,37 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             in_reply_to,
             delivery,
         } => handle_send(server, from, to, mtype, body, in_reply_to, delivery),
+        Req::NotificationMethods => Resp::data(json!({
+            "methods": ["tmux"],
+            "events": NOTIFICATION_EVENTS,
+            "one_shot": true,
+            "max_lifetime_attempts": MAX_WAKE_ATTEMPTS,
+            "max_ttl_seconds": MAX_NOTIFICATION_TTL_SECONDS,
+        })),
+        Req::NotificationSubscribe {
+            worker_id,
+            token,
+            event,
+            subject,
+            trigger_ms,
+            ttl_seconds,
+        } => handle_notification_subscribe(
+            server,
+            worker_id,
+            token,
+            event,
+            subject,
+            trigger_ms,
+            ttl_seconds,
+        ),
+        Req::NotificationStatus { worker_id, token } => {
+            handle_notification_status(server, worker_id, token)
+        }
+        Req::NotificationUnsubscribe {
+            worker_id,
+            token,
+            subscription_id,
+        } => handle_notification_unsubscribe(server, worker_id, token, subscription_id),
         Req::Poll {
             worker_id,
             token,
@@ -1816,32 +1788,11 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 .into_iter()
                 .filter(|id| st.msgs.get(id).map(|m| m.to == worker_id).unwrap_or(false))
                 .collect();
-            let continuation_task_updates: Vec<TaskRec> = owned
-                .iter()
-                .filter_map(|id| st.msgs.get(id))
-                .filter(|m| m.from == "collab-server")
-                .filter_map(|m| {
-                    st.tasks.values().find(|t| {
-                        t.owner == worker_id
-                            && t.continuation_message_id.as_deref() == Some(m.id.as_str())
-                    })
-                })
-                .map(|task| TaskRec {
-                    continuation_pending: false,
-                    continuation_message_id: None,
-                    updated_ms: now_ms(),
-                    ..task.clone()
-                })
-                .collect();
             drop(st);
             if owned.is_empty() {
                 return Resp::err("no ackable messages (must address your own inbox)");
             }
-            let mut events = vec![Event::Acked { ids: owned.clone() }];
-            for task in continuation_task_updates {
-                events.push(Event::TaskUpdated { task });
-            }
-            server.commit(&events);
+            server.commit(&[Event::Acked { ids: owned.clone() }]);
             Resp::data(json!({"acked": owned}))
         }
         Req::Inbox { worker_id, token } => {
@@ -1980,22 +1931,23 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
         }
         Req::Workers => {
             let st = server.state.lock().unwrap();
-            let workers: Vec<serde_json::Value> =
-                st.workers
-                    .values()
-                    .map(|w| {
-                        let active = st.tasks.values().find(|task| {
-                            task.owner == w.id && task_continuation_active(&task.status)
-                        });
-                        json!({
-                            "id": w.id,
-                            "pane": w.pane,
-                            "endpoint_live": w.pane.as_deref().is_some_and(pane_alive),
-                            "active_task": active.map(|task| task.id.as_str()),
-                            "active_status": active.map(|task| task.status.as_str()),
-                        })
+            let workers: Vec<serde_json::Value> = st
+                .workers
+                .values()
+                .map(|w| {
+                    let active = st.tasks.values().find(|task| {
+                        task.owner == w.id
+                            && !matches!(task.status.as_str(), "closed" | "cancelled")
+                    });
+                    json!({
+                        "id": w.id,
+                        "pane": w.pane,
+                        "endpoint_live": w.pane.as_deref().is_some_and(pane_alive),
+                        "active_task": active.map(|task| task.id.as_str()),
+                        "active_status": active.map(|task| task.status.as_str()),
                     })
-                    .collect();
+                })
+                .collect();
             Resp::data(json!({
                 "workers": workers,
                 "count": workers.len()
@@ -2135,7 +2087,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         json!({"pid": std::process::id()}),
     );
 
-    // Background scheduler: bounded waits and local continuation wake.
+    // Background scheduler: bounded waits and explicitly registered notifications.
     let sched = server.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));

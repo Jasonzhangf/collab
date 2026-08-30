@@ -1,5 +1,4 @@
 mod client;
-mod config;
 mod identity;
 mod proto;
 mod scope;
@@ -70,6 +69,7 @@ enum Cmd {
         pane: Option<String>,
     },
     /// Send a message to another worker
+    #[command(alias = "sendmessage")]
     Send {
         #[arg(long)]
         to: String,
@@ -77,10 +77,15 @@ enum Cmd {
         r#type: String,
         #[arg(long)]
         in_reply_to: Option<String>,
-        #[arg(long, default_value = "immediate", value_parser = ["immediate", "idle"])]
+        #[arg(long, default_value = "immediate", hide = true)]
         delivery: String,
         #[arg(trailing_var_arg = true)]
         body: Vec<String>,
+    },
+    /// Discover and explicitly subscribe to finite notifications
+    Notify {
+        #[command(subcommand)]
+        cmd: NotifyCmd,
     },
     /// Block until messages arrive (long-poll)
     Recv {
@@ -95,7 +100,7 @@ enum Cmd {
         #[arg(long)]
         worker: Option<String>,
     },
-    /// Return one authoritative snapshot for continuation after a wake/restart
+    /// Return one read-only authoritative snapshot after a notification/restart
     Context {
         #[arg(long)]
         worker: Option<String>,
@@ -118,12 +123,27 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MigrateCmd,
     },
-    /// Show or update project-local .agent-collab/collab.json
-    Config {
-        /// Local continuation wake interval in minutes
-        #[arg(long, alias = "heartbeat-minutes")]
-        continuation_minutes: Option<i64>,
+}
+
+#[derive(Subcommand)]
+enum NotifyCmd {
+    /// List supported notification methods and events
+    Methods,
+    /// Register one finite, one-shot notification subscription
+    Subscribe {
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long)]
+        trigger_ms: Option<i64>,
+        #[arg(long)]
+        ttl_seconds: u64,
     },
+    /// List the caller's notification subscriptions
+    Status,
+    /// Cancel one caller-owned notification subscription
+    Unsubscribe { subscription_id: String },
 }
 
 #[derive(Subcommand)]
@@ -463,6 +483,46 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&v);
             Ok(())
         }
+        Cmd::Notify { cmd } => {
+            let scope = Scope::resolve()?;
+            let request = match cmd {
+                NotifyCmd::Methods => Req::NotificationMethods,
+                NotifyCmd::Subscribe {
+                    event,
+                    subject,
+                    trigger_ms,
+                    ttl_seconds,
+                } => {
+                    let ident = me(&scope, None)?;
+                    Req::NotificationSubscribe {
+                        worker_id: ident.worker_id,
+                        token: ident.token,
+                        event,
+                        subject,
+                        trigger_ms,
+                        ttl_seconds,
+                    }
+                }
+                NotifyCmd::Status => {
+                    let ident = me(&scope, None)?;
+                    Req::NotificationStatus {
+                        worker_id: ident.worker_id,
+                        token: ident.token,
+                    }
+                }
+                NotifyCmd::Unsubscribe { subscription_id } => {
+                    let ident = me(&scope, None)?;
+                    Req::NotificationUnsubscribe {
+                        worker_id: ident.worker_id,
+                        token: ident.token,
+                        subscription_id,
+                    }
+                }
+            };
+            let value: serde_json::Value = client::call(&scope.sock_path(), &request)?;
+            out(&value);
+            Ok(())
+        }
         Cmd::Recv { timeout, worker } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;
@@ -641,21 +701,6 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             };
             let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
             out(&v);
-            Ok(())
-        }
-        Cmd::Config {
-            continuation_minutes,
-        } => {
-            let scope = Scope::resolve()?;
-            let mut config = config::load(&scope.root)?;
-            if let Some(minutes) = continuation_minutes {
-                config.continuation_minutes = minutes;
-                config::save(&scope.root, &config)?;
-            }
-            out(&json!({
-                "path": scope.root.join(".agent-collab").join("collab.json"),
-                "config": config,
-            }));
             Ok(())
         }
     }

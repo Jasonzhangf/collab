@@ -14,11 +14,11 @@ transaction. tmux is the only live notification channel and is wake-only.
   sync, private worktree, implementation, tests, exact commit, candidate
   verification, short integration lease, main merge/verification/push, and
   cleanup.
-- Peers communicate only for shared-resource occupancy and release. The Server
-  persists the notice before attempting a tmux wake.
-- The daemon may wake a confirmed waiting-agent pane for an actionable local
-  continuation. A shell, offline pane, or Braille-spinner working agent fails
-  closed and is never interrupted.
+- Peers communicate only through an explicit `sendmessage` for shared-resource
+  occupancy/release. The durable body is mailbox truth.
+- The daemon may touch a pane only after that Agent explicitly registers a
+  finite one-shot subscription. No registration, absent, unknown, or working
+  means zero tmux input.
 - `/goal` delegation and interactive task recognition are deferred.
 
 Scoped capabilities replace roles: task owner for one task, resource holder
@@ -104,9 +104,8 @@ inside `./playground/`, and its branch is merged into current main.
 When a registration conflicts on `feature_id` or `worktree_path`, the Server:
 
 1. persists the requested task as `blocked`;
-2. persists `RESOURCE_OCCUPIED` notices for requester and holder;
-3. journals a wake-attempt lease and asks tmux to wake the holder; and
-4. returns structured `TASK_RESOURCE_CONFLICT` data.
+2. returns structured `TASK_RESOURCE_CONFLICT` data, including the holder; and
+3. leaves any peer notification to an explicit `sendmessage` operation.
 
 The blocked owner may record a bounded wait:
 
@@ -118,37 +117,40 @@ Every wait stores waiter, blocking task, blocking owner as responsible actor,
 reason, deadline, resume events, and `resource_owner_and_waiter_recheck`
 escalation. Direct, two-peer, and transitive cycles fail closed. Missing owner,
 missing deadline, unrelated resource, and delivered/terminal waits fail
-closed. Timeout changes the waiter to explicit `blocked`, notifies only waiter
-and holder, and never releases either claim automatically. Holder close moves
-each waiter from `waiting` to `blocked`, clears the obsolete wait edge, and
-persists `RESOURCE_RELEASED` before attempting its wake.
+closed. Timeout changes the waiter to explicit `blocked` and never releases a
+claim. Holder close moves each waiter from `waiting` to `blocked` and clears
+the obsolete wait edge. Notification occurs only for an exact active
+resource-release/deadline subscription.
 
 Manual P2P messages are restricted to `RESOURCE_OCCUPIED ...` and
 `RESOURCE_RELEASED ...`:
 
 ```sh
-collab send --to <peer> --type notify "RESOURCE_OCCUPIED ..."
+collab sendmessage --to <peer> "RESOURCE_OCCUPIED ..."
 ```
 
-Never type peer messages into tmux. The daemon owns literal text plus Enter.
-Only a successful tmux transaction becomes `Delivered`. Failure remains
-pending; the 10-second durable attempt lease prevents concurrent duplicate
-wakes and allows retry when the pane later becomes a confirmed waiting agent.
+Never type peer messages into tmux. Without the recipient's active
+`direct-message` subscription, the message remains mailbox-only.
 
-## Local continuation
+## Explicit notifications
 
 ```sh
-collab config --continuation-minutes 15
+collab notify methods
+collab notify subscribe --event direct-message --ttl-seconds 600
+collab notify subscribe --event resource-released --subject <task-id> --ttl-seconds 3600
+collab notify subscribe --event deadline --subject <timer-id> --trigger-ms <epoch-ms> --ttl-seconds 3600
+collab notify subscribe --event async-result --subject <operation-id> --ttl-seconds 3600
+collab notify status
+collab notify unsubscribe <subscription-id>
 collab context
 collab inbox
 ```
 
-For an active task whose pane is a confirmed waiting agent, the daemon persists
-one `CONTINUE_TASK` record and attempts one tmux wake. A durable pending marker
-and wake-attempt lease deduplicate scheduler races. `collab context` consumes
-the calling peer's local continuation and marks that mailbox record read, so no
-explicit ACK loop is required. Shell, working, and offline panes fail closed;
-a lost wake remains pending and is retried after the pane safely waits.
+Subscriptions are owner-scoped, exact-event, bounded by TTL, and one-shot.
+tmux receives only `COLLAB_NOTIFY <message-id>` in one command sequence; the
+Agent reads the durable body/result through CLI/MCP. Success consumes the
+subscription. Failure has a lifetime hard cap of three attempts. The daemon
+never creates periodic `CONTINUE_TASK` messages.
 
 ## Existing-project migration
 
@@ -168,8 +170,8 @@ collab migrate inspect
 
 Any authenticated peer may acquire the single migration transaction lease.
 Another peer cannot replace an active plan/apply operator. Legacy role fields
-and continuation-field names are accepted during replay but omitted from new
-state. Legacy `available` tasks or waits without a real blocker owner require
+and obsolete heartbeat/continuation fields are ignored during replay and
+omitted from new state. Legacy `available` tasks or waits without a real blocker owner require
 explicit operator resolution; the daemon never fabricates ownership. Malformed
 journal lines fail startup, and a snapshot/count mismatch remains frozen.
 

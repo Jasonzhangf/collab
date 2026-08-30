@@ -46,6 +46,36 @@ fn tools() -> Value {
             &[]
         ),
         tool(
+            "collab_sendmessage",
+            "Persist an explicit resource-coordination message; the recipient is woken only through its own active direct-message subscription.",
+            json!({"to":{"type":"string"},"body":{"type":"string"}}),
+            &["to", "body"]
+        ),
+        tool(
+            "collab_notify_methods",
+            "List supported opt-in notification methods and event types.",
+            json!({}),
+            &[]
+        ),
+        tool(
+            "collab_notify_subscribe",
+            "Register one finite one-shot notification subscription owned by the calling Agent.",
+            json!({"event":{"type":"string","enum":["direct-message","resource-released","deadline","async-result"]},"subject":{"type":"string"},"trigger_ms":{"type":"integer"},"ttl_seconds":{"type":"integer","minimum":1}}),
+            &["event", "ttl_seconds"]
+        ),
+        tool(
+            "collab_notify_status",
+            "List the calling Agent's notification subscriptions.",
+            json!({}),
+            &[]
+        ),
+        tool(
+            "collab_notify_unsubscribe",
+            "Cancel one calling-Agent-owned notification subscription.",
+            json!({"subscription_id":{"type":"string"}}),
+            &["subscription_id"]
+        ),
+        tool(
             "collab_task_status",
             "Read the authoritative task registry.",
             json!({"id":{"type":"string"}}),
@@ -107,7 +137,7 @@ fn tools() -> Value {
         ),
         tool(
             "collab_context",
-            "Return one authoritative continuation snapshot after a wake or restart.",
+            "Return one read-only authoritative snapshot after a notification or restart.",
             json!({}),
             &[]
         ),
@@ -136,6 +166,32 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
         "collab_init" => argv.push("init".into()),
         "collab_whoami" => argv.push("whoami".into()),
         "collab_who" => argv.push("who".into()),
+        "collab_sendmessage" => {
+            argv.extend([
+                "sendmessage".into(),
+                "--to".into(),
+                required(args, "to")?,
+                required(args, "body")?,
+            ]);
+        }
+        "collab_notify_methods" => argv.extend(["notify".into(), "methods".into()]),
+        "collab_notify_subscribe" => {
+            argv.extend([
+                "notify".into(),
+                "subscribe".into(),
+                "--event".into(),
+                required(args, "event")?,
+            ]);
+            optional_flag(&mut argv, args, "subject", "--subject")?;
+            optional_integer_flag(&mut argv, args, "trigger_ms", "--trigger-ms")?;
+            optional_integer_flag(&mut argv, args, "ttl_seconds", "--ttl-seconds")?;
+        }
+        "collab_notify_status" => argv.extend(["notify".into(), "status".into()]),
+        "collab_notify_unsubscribe" => argv.extend([
+            "notify".into(),
+            "unsubscribe".into(),
+            required(args, "subscription_id")?,
+        ]),
         "collab_inbox" => argv.push("inbox".into()),
         "collab_context" => argv.push("context".into()),
         "collab_ack" => {
@@ -230,6 +286,24 @@ fn optional_flag(
                 .as_str()
                 .ok_or_else(|| format!("{key} must be a string"))?
                 .into(),
+        ]);
+    }
+    Ok(())
+}
+
+fn optional_integer_flag(
+    argv: &mut Vec<String>,
+    args: &Value,
+    key: &str,
+    flag: &str,
+) -> Result<(), String> {
+    if let Some(value) = args.get(key) {
+        argv.extend([
+            flag.into(),
+            value
+                .as_i64()
+                .ok_or_else(|| format!("{key} must be an integer"))?
+                .to_string(),
         ]);
     }
     Ok(())

@@ -95,13 +95,14 @@ Task records use a fixed shape:
 ## Common commands
 
 ```sh
-collab config                     # show .agent-collab/collab.json
-collab config --continuation-minutes 45
 collab up                         # clear explicit down and start daemon
 collab down                       # explicit stop; disables auto-restart
 collab who                        # registered peers + local state projection
 collab task status [task-id]      # durable task registry
-collab context                    # one authoritative continuation snapshot
+collab notify methods             # discover opt-in notification methods
+collab notify subscribe --event direct-message --ttl-seconds 600
+collab notify status
+collab context                    # read-only authoritative state snapshot
 collab task register <id> --feature <feature-id> --worktree <path> \
   --branch <branch> --base-commit <sha> --priority p2
 collab task wait <id> --for <blocking-task>
@@ -121,27 +122,22 @@ delegation and interactive task recognition are intentionally deferred.
 
 ## Message handling
 
-On a resource wake, query `collab context` before acting. `collab send` accepts
-only `RESOURCE_OCCUPIED` and `RESOURCE_RELEASED` coordination. Never type peer
-messages with tmux or paste them into a pane; the daemon owns the complete
-text-plus-Enter wake transaction. If the daemon is down, durable state remains
-unchanged and no peer may manually emulate a wake.
+On a notification, query durable state before acting. `collab sendmessage`
+accepts only `RESOURCE_OCCUPIED` and `RESOURCE_RELEASED` coordination. Never
+type peer messages with tmux. The daemon may send only a short notification id
+after the receiving Agent registers a finite one-shot subscription.
 
 `collab inbox` and `collab msg <id>` query the durable local mailbox after a
 tmux pane disappears; mailbox state remains authoritative.
 
-## Continuation and waits
+## Notifications and waits
 
-`.agent-collab/collab.json` configures the local continuation interval. The
-daemon wakes only a confirmed waiting-agent pane with an actionable active
-task. Shell, offline, and Braille-spinner working panes fail closed. Wake
-attempts are journaled and leased to prevent races; failure stays pending and
-only success becomes delivered. `collab context` consumes the caller's local
-continuation without an explicit ACK loop. Every wait stores waiter, blocking
-task owner, reason, deadline, resume events, and P2P escalation. Direct,
-two-peer, and transitive wait cycles fail closed. Timeout wakes only the waiter
-and resource holder and never releases a claim automatically. Holder close
-moves waiters to blocked and clears released wait edges before wake.
+There is no periodic continuation. Agent-owned subscriptions are exact-event,
+exact-subject, finite, and one-shot. No registration, absent, unknown, working,
+expired, cancelled, consumed, or three-attempt-exhausted state produces tmux
+input. Every wait stores waiter, blocking task owner, reason, deadline, resume
+events, and P2P escalation. Timeout changes state without unsolicited messages;
+resource release notifies only an exact active subscriber.
 "#;
 
 /// Scope guard used by every command except init.

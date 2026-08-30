@@ -1,16 +1,14 @@
 use std::path::Path;
 use std::process::Command;
-use std::thread::sleep;
-use std::time::Duration;
 
-/// Live tmux prompt for the recipient pane. Mailbox truth remains the
-/// authoritative delivery record; this knock only wakes the recipient with
-/// the reasoning prompt. Text + carriage return are two distinct `tmux
-/// send-keys` calls. This matches zterm v1: literal text uses `--`, then the
-/// tmux `Enter` key submits the prompt.
-/// Live verification is done by a consumer harness in tests, not by
-/// `capture-pane`, because terminal word-wrap makes visual line capture
-/// unreliable for long prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentState {
+    Absent,
+    Unknown,
+    Working,
+    Waiting,
+}
+
 pub fn pane_alive(pane: &str) -> bool {
     if !pane.starts_with('%') {
         return false;
@@ -30,9 +28,9 @@ pub fn pane_alive(pane: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn pane_idle(pane: &str) -> bool {
+pub fn probe_agent_state(pane: &str) -> AgentState {
     if !pane.starts_with('%') {
-        return false;
+        return AgentState::Absent;
     }
     Command::new("tmux")
         .args([
@@ -45,79 +43,107 @@ pub fn pane_idle(pane: &str) -> bool {
         .output()
         .ok()
         .map(|o| {
+            if !o.status.success() {
+                return AgentState::Absent;
+            }
             let output = String::from_utf8_lossy(&o.stdout);
             let Some((command, title)) = output.trim().split_once('\t') else {
-                return false;
+                return AgentState::Unknown;
             };
-            agent_waiting(command, title)
+            agent_state_from(command, title)
         })
-        .unwrap_or(false)
+        .unwrap_or(AgentState::Unknown)
 }
 
-fn agent_waiting(command: &str, title: &str) -> bool {
+pub fn pane_idle(pane: &str) -> bool {
+    probe_agent_state(pane) == AgentState::Waiting
+}
+
+fn agent_state_from(command: &str, title: &str) -> AgentState {
     if !matches!(command, "node" | "codex" | "claude" | "agy" | "dsh") {
-        return false;
+        return AgentState::Absent;
     }
     let title = title.trim();
     if title.is_empty() {
-        return false;
+        return AgentState::Unknown;
     }
-    !title
+    if title
         .chars()
         .next()
         .is_some_and(|first| ('\u{2800}'..='\u{28ff}').contains(&first))
+    {
+        AgentState::Working
+    } else {
+        AgentState::Waiting
+    }
 }
 
-fn literal_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
-    ["send-keys", "-t", pane, "-l", "--", text]
-}
-
-fn submit_args<'a>(pane: &'a str) -> [&'a str; 4] {
-    ["send-keys", "-t", pane, "Enter"]
+fn wake_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 11] {
+    [
+        "send-keys",
+        "-t",
+        pane,
+        "-l",
+        "--",
+        text,
+        ";",
+        "send-keys",
+        "-t",
+        pane,
+        "Enter",
+    ]
 }
 
 pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if !pane_alive(pane) {
         anyhow::bail!("pane {} not alive", pane);
     }
-    if !pane_idle(pane) {
+    if probe_agent_state(pane) != AgentState::Waiting {
         anyhow::bail!("pane {} is not a waiting agent", pane);
     }
-    const SUBMIT_DELAY_MS: u64 = 2_000;
-    let sent = Command::new("tmux")
-        .args(literal_args(pane, text))
-        .status()?;
+    let sent = Command::new("tmux").args(wake_args(pane, text)).status()?;
     if !sent.success() {
-        anyhow::bail!("tmux text delivery failed for pane {}", pane);
-    }
-    sleep(Duration::from_millis(SUBMIT_DELAY_MS));
-    let submitted = Command::new("tmux").args(submit_args(pane)).status()?;
-    if !submitted.success() {
-        anyhow::bail!("tmux Enter delivery failed for pane {}", pane);
+        anyhow::bail!("tmux notification delivery failed for pane {}", pane);
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_waiting, literal_args, submit_args};
+    use super::{agent_state_from, wake_args, AgentState};
 
     #[test]
-    fn matches_zterm_v1_literal_then_enter() {
+    fn wake_is_one_tmux_command_sequence() {
         assert_eq!(
-            literal_args("%7", "[MAIL] body"),
-            ["send-keys", "-t", "%7", "-l", "--", "[MAIL] body"]
+            wake_args("%7", "COLLAB_NOTIFY message"),
+            [
+                "send-keys",
+                "-t",
+                "%7",
+                "-l",
+                "--",
+                "COLLAB_NOTIFY message",
+                ";",
+                "send-keys",
+                "-t",
+                "%7",
+                "Enter",
+            ]
         );
-        assert_eq!(submit_args("%7"), ["send-keys", "-t", "%7", "Enter"]);
     }
 
     #[test]
-    fn wake_requires_waiting_agent_and_rejects_shell_or_working_agent() {
-        assert!(agent_waiting("node", "routecodex"));
-        assert!(agent_waiting("codex", "collab"));
-        assert!(!agent_waiting("zsh", "Macstudio.local"));
-        assert!(!agent_waiting("node", "⠋ routecodex"));
-        assert!(!agent_waiting("node", ""));
+    fn probe_distinguishes_absent_unknown_working_and_waiting() {
+        assert_eq!(
+            agent_state_from("zsh", "Macstudio.local"),
+            AgentState::Absent
+        );
+        assert_eq!(agent_state_from("node", ""), AgentState::Unknown);
+        assert_eq!(
+            agent_state_from("node", "⠋ routecodex"),
+            AgentState::Working
+        );
+        assert_eq!(agent_state_from("codex", "collab"), AgentState::Waiting);
     }
 }
 
