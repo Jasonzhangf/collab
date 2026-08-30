@@ -34,6 +34,10 @@ pub enum Req {
         worker_id: String,
         token: String,
     },
+    Context {
+        worker_id: String,
+        token: String,
+    },
     MsgStatus {
         msg_id: String,
     },

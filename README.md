@@ -52,6 +52,7 @@ collab status                # server summary
 collab send --to <worker> --type request "can I take build?"  # -> msg_id
 collab recv --timeout 600    # long-poll; returns when mail arrives
 collab inbox                 # unread messages
+collab context               # authoritative continuation snapshot
 collab ack <msg_id>          # mark read (clears nudges)
 collab msg <msg_id>          # delivery state + nudge count for a sent request
 
@@ -96,6 +97,10 @@ identity automatically. Token proves mailbox ownership; `recv`/`ack` require it
 and refuse messages not addressed to you.
 
 Outside tmux you can pass `--worker <id>` to act as a specific identity.
+For existing projects, `collab init` is the migration entrypoint. Do not
+delete `.agent-collab`, edit task/claim/journal JSON, clear mailboxes, copy
+tokens, or start a second daemon; see
+`docs/migration-v1-to-low-intervention.md`.
 
 ## Roles and tasks
 

@@ -95,6 +95,11 @@ enum Cmd {
         #[arg(long)]
         worker: Option<String>,
     },
+    /// Return one authoritative snapshot for continuation after a wake/restart
+    Context {
+        #[arg(long)]
+        worker: Option<String>,
+    },
     /// Mark messages as read
     Ack {
         ids: Vec<String>,
@@ -545,6 +550,19 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let v: serde_json::Value = client::call(
                 &scope.sock_path(),
                 &Req::Inbox {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                },
+            )?;
+            out(&v);
+            Ok(())
+        }
+        Cmd::Context { worker } => {
+            let scope = Scope::resolve()?;
+            let ident = me(&scope, worker)?;
+            let v: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::Context {
                     worker_id: ident.worker_id,
                     token: ident.token,
                 },
