@@ -3,21 +3,6 @@ use std::io::{self, BufRead, Write};
 use std::process::Command;
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
-    let mut properties = properties;
-    if let Some(map) = properties.as_object_mut() {
-        map.entry("pane").or_insert_with(|| {
-            json!({
-                "type":"string",
-                "description":"真实 tmux pane id，例如 %7；不要填 iTerm2 pane 位置"
-            })
-        });
-        map.entry("project_root").or_insert_with(|| {
-            json!({
-                "type":"string",
-                "description":"项目主树绝对路径，必须包含 .agent-collab"
-            })
-        });
-    }
     json!({
         "name": name,
         "description": description,
@@ -251,12 +236,6 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
     }
     let mut command = Command::new(collab_bin());
     command.args(argv);
-    if let Some(pane) = args.get("pane").and_then(Value::as_str) {
-        command.env("TMUX_PANE", pane);
-    }
-    if let Some(root) = args.get("project_root").and_then(Value::as_str) {
-        command.current_dir(root);
-    }
     let output = command.output().map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

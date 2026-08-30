@@ -249,7 +249,7 @@ fn out<T: serde::Serialize>(v: &T) {
 
 /// Register an identity with the server (idempotent for the same token).
 fn register(scope: &Scope, ident: &Identity) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()?.display().to_string();
+    let cwd = scope.root.display().to_string();
     let _: serde_json::Value = client::call(
         &scope.sock_path(),
         &Req::Register {
@@ -280,14 +280,14 @@ fn main() {
 fn run(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Init => {
-            let cwd = std::env::current_dir()?;
+            let project_root = scope::project_root()?;
             let in_tmux = std::env::var_os("TMUX_PANE").is_some();
             if !in_tmux {
                 anyhow::bail!(
                     "collab init requires a live tmux pane; tmux is the only wake channel"
                 );
             }
-            if cwd.ancestors().skip(1).any(|ancestor| {
+            if project_root.ancestors().skip(1).any(|ancestor| {
                 ancestor
                     .file_name()
                     .is_some_and(|name| name == "playground")
@@ -296,9 +296,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     "collab init must run from the project main tree, not a ./playground worktree"
                 );
             }
-            let project_root = scope::find_root(&cwd).unwrap_or_else(|| cwd.clone());
             let _base = scope::init(&project_root)?;
-            let scope = Scope::resolve()?;
+            let scope = Scope { root: project_root };
             let started = !client::alive(&scope.sock_path());
             client::ensure_server(&scope.sock_path())?;
             let ident = me(&scope, None)?;
@@ -306,7 +305,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 client::call(&scope.sock_path(), &Req::TaskStatus { task_id: None })?;
             out(&json!({
                 "ok": true,
-                "root": cwd,
+                "root": scope.root,
                 "worker_id": ident.worker_id,
                 "identity_kind": "peer",
                 "daemon_started": started,
@@ -321,11 +320,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             rt.block_on(server::run(scope))
         }
         Cmd::Up => {
-            let cwd = std::env::current_dir()?;
-            if scope::find_root(&cwd).is_none() {
-                scope::init(&cwd)?;
+            let project_root = scope::project_root()?;
+            if !project_root.join(".agent-collab").is_dir() {
+                scope::init(&project_root)?;
             }
-            let scope = Scope::resolve()?;
+            let scope = Scope { root: project_root };
             std::fs::create_dir_all(scope.server_dir())?;
             std::fs::remove_file(scope.server_dir().join("DOWN")).ok();
             client::record_event(

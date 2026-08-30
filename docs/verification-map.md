@@ -9,6 +9,7 @@
 | notification.subscription | methods/register/status/unsubscribe replay exact owner/event/subject/TTL; success consumes one-shot | invalid event/TTL/subject/owner rejected; expired/cancelled/consumed registration cannot wake |
 | notification.tmux-wake | direct message/resource release/deadline use short id and one tmux sequence; failure stops permanently at three | no registration, absent, unknown, working, expired, mismatched subject, fourth attempt, body injection, periodic continuation all produce zero input |
 | notification.context | inbox/context/status return durable body and control projection | context does not consume or ACK notification; no unrelated peer supervision |
+| daemon.project-scope | inherited `TMUX_PANE` exact pane cwd resolves one local daemon; non-tmux operator uses exact process cwd | MCP/Agent path override absent; invalid pane/path, ancestor capture, and sibling sharing fail closed |
 | migration.peer-v1 | inspect→plan→apply→restart/rebind→verify preserves task/mailbox/journal and removes legacy declared roles | malformed/manual journal, second writer, changed snapshot, missing/inactive/unrelated wait holder fail closed |
 | daemon.operator | controlled down→up uses installed binary and journal replay | mailbox text or peer role cannot authorize maintenance; duplicate daemon rejected |
 

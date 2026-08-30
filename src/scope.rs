@@ -1,24 +1,51 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-/// Resolve project root by walking up from `start` to find `.agent-collab`.
-/// Returns None when absent — commands other than `init` refuse to guess.
-pub fn find_root(start: &Path) -> Option<PathBuf> {
-    let mut cur = Some(start.to_path_buf());
-    while let Some(dir) = cur {
-        // A git worktree lives below the project's reserved `playground`
-        // directory. Ignore an accidentally-created nested state directory so
-        // commands from a worktree still resolve to the project daemon.
-        let nested_worktree = dir.ancestors().skip(1).any(|ancestor| {
-            ancestor
-                .file_name()
-                .is_some_and(|name| name == "playground")
-        });
-        if !nested_worktree && dir.join(".agent-collab").is_dir() {
-            return Some(dir);
-        }
-        cur = dir.parent().map(|p| p.to_path_buf());
+fn validate_project_root(root: PathBuf) -> anyhow::Result<PathBuf> {
+    if !root.is_absolute() || !root.is_dir() {
+        anyhow::bail!(
+            "project root must be an existing absolute directory: {}",
+            root.display()
+        );
     }
-    None
+    Ok(root)
+}
+
+fn project_root_from<F>(pane: Option<&str>, cwd: PathBuf, pane_cwd: F) -> anyhow::Result<PathBuf>
+where
+    F: FnOnce(&str) -> anyhow::Result<PathBuf>,
+{
+    match pane {
+        Some(pane) => {
+            if !pane.starts_with('%') {
+                anyhow::bail!("invalid TMUX_PANE value: {pane}");
+            }
+            validate_project_root(pane_cwd(pane)?)
+        }
+        None => validate_project_root(cwd),
+    }
+}
+
+/// The launching environment owns project scope. A tmux Agent is bound to the
+/// exact current directory of its pane; a non-tmux operator is bound to the
+/// exact process cwd. No caller may select a path and no ancestor is searched.
+pub fn project_root() -> anyhow::Result<PathBuf> {
+    let pane = std::env::var("TMUX_PANE").ok();
+    let cwd = std::env::current_dir()?;
+    project_root_from(pane.as_deref(), cwd, |pane| {
+        let output = Command::new("tmux")
+            .args(["display-message", "-p", "-t", pane, "#{pane_current_path}"])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!("cannot resolve project root for tmux pane {pane}");
+        }
+        let path = String::from_utf8(output.stdout)?;
+        let path = path.trim();
+        if path.is_empty() {
+            anyhow::bail!("tmux pane {pane} returned an empty project root");
+        }
+        Ok(PathBuf::from(path))
+    })
 }
 
 pub fn init(root: &Path) -> std::io::Result<PathBuf> {
@@ -147,13 +174,17 @@ pub struct Scope {
 
 impl Scope {
     pub fn resolve() -> anyhow::Result<Self> {
-        let cwd = std::env::current_dir()?;
-        match find_root(&cwd) {
-            Some(root) => Ok(Scope { root }),
-            None => Err(anyhow::anyhow!(
-                "no .agent-collab found between {} and filesystem root; run `collab init` in the project root first",
-                cwd.display()
-            )),
+        Self::from_project_root(project_root()?)
+    }
+
+    fn from_project_root(root: PathBuf) -> anyhow::Result<Self> {
+        if root.join(".agent-collab").is_dir() {
+            Ok(Scope { root })
+        } else {
+            Err(anyhow::anyhow!(
+                "no .agent-collab found in exact project root {}; run `collab init` there first",
+                root.display()
+            ))
         }
     }
     pub fn server_dir(&self) -> PathBuf {
@@ -168,16 +199,80 @@ impl Scope {
 mod tests {
     use super::*;
 
-    #[test]
-    fn init_releases_collab_doc_only_once() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-scope-init-{}-{}",
+    fn test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "collab-scope-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    #[test]
+    fn tmux_pane_cwd_is_the_exact_project_root() {
+        let process_cwd = test_root("process-cwd");
+        let pane_cwd = test_root("pane-cwd");
+        std::fs::create_dir_all(&process_cwd).unwrap();
+        std::fs::create_dir_all(&pane_cwd).unwrap();
+
+        let resolved = project_root_from(Some("%7"), process_cwd.clone(), |pane| {
+            assert_eq!(pane, "%7");
+            Ok(pane_cwd.clone())
+        })
+        .unwrap();
+        assert_eq!(resolved, pane_cwd);
+
+        std::fs::remove_dir_all(process_cwd).ok();
+        std::fs::remove_dir_all(resolved).ok();
+    }
+
+    #[test]
+    fn non_tmux_operator_uses_exact_process_cwd() {
+        let cwd = test_root("operator-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let resolved = project_root_from(None, cwd.clone(), |_| unreachable!()).unwrap();
+        assert_eq!(resolved, cwd);
+        std::fs::remove_dir_all(resolved).ok();
+    }
+
+    #[test]
+    fn exact_root_never_captures_ancestor_or_sibling_state() {
+        let parent = test_root("exact-scope");
+        let first = parent.join("first");
+        let second = parent.join("second");
+        init(&parent).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        init(&second).unwrap();
+
+        assert!(Scope::from_project_root(first).is_err());
+        assert_eq!(
+            Scope::from_project_root(second.clone()).unwrap().root,
+            second
+        );
+
+        std::fs::remove_dir_all(parent).ok();
+    }
+
+    #[test]
+    fn invalid_tmux_pane_or_path_fails_closed() {
+        let cwd = test_root("invalid-pane");
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert!(project_root_from(Some("pane-7"), cwd.clone(), |_| Ok(cwd.clone())).is_err());
+        assert!(
+            project_root_from(Some("%7"), cwd.clone(), |_| { Ok(cwd.join("missing")) }).is_err()
+        );
+        assert!(project_root_from(Some("%7"), cwd.clone(), |_| {
+            anyhow::bail!("tmux lookup failed")
+        })
+        .is_err());
+        std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[test]
+    fn init_releases_collab_doc_only_once() {
+        let root = test_root("init");
         init(&root).unwrap();
         let path = root.join("docs/collab.md");
         assert!(path.exists());

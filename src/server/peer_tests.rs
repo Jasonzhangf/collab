@@ -863,6 +863,8 @@ fn architecture_source_has_no_live_declared_role_or_dispatch_owner() {
         "\"collab_master\"",
         "\"collab_task_claim\"",
         "\"collab_task_dispatch\"",
+        "\"project_root\"",
+        "args.get(\"pane\")",
     ] {
         assert!(
             !mcp_source.contains(removed_tool),

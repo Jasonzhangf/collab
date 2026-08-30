@@ -2,6 +2,7 @@
   "lifecycle_id": "collab-v1-peer-low-intervention",
   "status": "active",
   "edges": [
+    {"from": "inherited-agent-environment", "to": "project-control-root", "caller": "main", "callee": "scope::project_root", "path": "src/main.rs"},
     {"from": "peer-register", "to": "task-register", "caller": "dispatch", "callee": "handle_task_register_with_next", "path": "src/server/mod.rs"},
     {"from": "task-register", "to": "resource-wait", "caller": "dispatch", "callee": "handle_task_wait", "path": "src/server/mod.rs"},
     {"from": "task-register", "to": "task-deliver", "caller": "dispatch", "callee": "handle_task_deliver", "path": "src/server/mod.rs"},
