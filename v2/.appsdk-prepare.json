@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "preparation_id": "collab-v2-role-free-parity",
+  "status": "confirmed",
+  "objective": "Implement complete role-free, tmux-only, low-intervention v2 parity with Rust as the sole semantic truth owner and canonical AppSDK compile/freeze governance.",
+  "change_kind": "project_refactor",
+  "project_root": ".",
+  "legacy_roots": ["../src", "../.agent-collab"],
+  "new_roots": ["bin", "crates", "protocol", "contracts", "src", "containers", "tests", "docs", "scripts"],
+  "protected_roots": ["protected"],
+  "runtime_forbidden_roots": ["playground", "generated", "active/lib", "../src", "../.agent-collab"],
+  "boundary": {
+    "allowed_paths": ["bin/**", "crates/**", "protocol/**", "contracts/**", "src/**", "containers/**", "tests/**", "docs/**", "scripts/**", "package.json", "package-lock.json", "Cargo.toml", "Cargo.lock"],
+    "forbidden_paths": ["../src/**", "../.agent-collab/**", "playground/**", "generated/**", "active/lib/**", "protected/**"],
+    "payload_control_separation": "confirmed"
+  },
+  "acceptance_criteria": ["Equal peers own their complete task/resource lifecycle", "Rust owns identity, task, resource, wait, message, subscription, wake ledger, journal, replay, and migration truth", "tmux is the only live notification channel and sends only COLLAB_NOTIFY plus message id", "AppSDK verify, compile, freeze, installed blackbox, and AGY Review pass on one exact candidate"],
+  "non_goals": ["Do not parse or delegate /goal", "Do not import v1 runtime truth into v2", "Do not expose v2 to zterm, OneStop, RouteCodex, or dsh-plugins before production admission"],
+  "assumptions": ["Original Cordis Node package remains the plugin lifecycle owner", "Codis remains the process/container lifecycle owner", "Rust core builds from v2/Cargo.toml", "Current verified v1 daemons remain untouched"],
+  "questions": [
+    {"question_id":"scope-kind","question":"Is this a new project, module refactor, project refactor, or debug task?","status":"answered"},
+    {"question_id":"project-root","question":"Which relative directory is the new AppSDK project root?","status":"answered"},
+    {"question_id":"legacy-boundary","question":"Which existing directories remain read-only and outside the new project?","status":"answered"},
+    {"question_id":"new-boundary","question":"Which directories may the new project create or modify?","status":"answered"}
+  ],
+  "confirmed_by": "Jason",
+  "confirmed_at": "2026-08-30T11:45:00Z",
+  "created_at": "2026-08-30T11:45:00Z"
+}

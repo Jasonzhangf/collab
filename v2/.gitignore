@@ -5,5 +5,10 @@ active/lib/
 protected/
 playground/
 .appsdk-control/
-.appsdk/
-.appsdk-prepare.json
+
+# BEGIN APPSDK MANAGED
+.appsdk-control/
+.appsdk/sdk.bin
+/active/lib/
+/generated/
+# END APPSDK MANAGED

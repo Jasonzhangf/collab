@@ -1,0 +1,49 @@
+{
+  "binary_ref": "project-sdk",
+  "bundle_digest": "sha256:ddb43f02b4e23b5b59fb5f047a331a371c1bd55c48aa979620e6fcc9bebd7751",
+  "bundle_manifest_digest": "sha256:cf083c7ff083015d0c7db2e2efd0297555a6c459cc84ed2e9a795081c7a89d48",
+  "bundle_resources": {
+    "contracts": [
+      "contracts/sdk-bundle.manifest.json",
+      "contracts/project.schema.json",
+      "contracts/development-scenarios.manifest.json",
+      "contracts/transitions/zone-transition.manifest.json",
+      "contracts/lifecycle-state-machines.manifest.json",
+      "contracts/records/record-graph.contract.json",
+      "contracts/records/worktree-record.schema.json",
+      "contracts/records/reproduction-record.schema.json",
+      "contracts/records/evidence-record.schema.json",
+      "contracts/records/fix-candidate-record.schema.json",
+      "contracts/records/review-record.schema.json",
+      "contracts/records/effectiveness-record.schema.json",
+      "contracts/records/pre-review-validation-record.schema.json",
+      "contracts/records/collaboration-record.schema.json",
+      "contracts/records/collaboration-index.schema.json",
+      "contracts/records/merge-queue-record.schema.json",
+      "contracts/records/merge-queue-state.schema.json",
+      "contracts/records/integration-record.schema.json",
+      "contracts/records/mainline-receipt-record.schema.json",
+      "contracts/records/merge-record.schema.json",
+      "contracts/records/promotion-record.schema.json",
+      "contracts/records/freeze-record.schema.json",
+      "contracts/records/regression-report.schema.json"
+    ],
+    "docs": [
+      "docs/design/appsdk-project-integration.md",
+      "docs/design/fix-lifecycle-v2.md",
+      "docs/design/development-scenarios.md",
+      "docs/architecture/appsdk-governance-architecture.md"
+    ],
+    "rules": [
+      "skills/appsdk-project-governance/SKILL.md"
+    ],
+    "skills": [
+      "skills/appsdk-project-governance/SKILL.md"
+    ]
+  },
+  "compiler_digest": "sha256:dc1633d7efc27a0a31488a0b3706967b92cebc9c3dd30883fef0fc15afb1355f",
+  "contract_schema": 1,
+  "digest": "sha256:dc1633d7efc27a0a31488a0b3706967b92cebc9c3dd30883fef0fc15afb1355f",
+  "sdk": "appsdk",
+  "version": "0.1.5"
+}
