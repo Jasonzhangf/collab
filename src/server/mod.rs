@@ -1612,11 +1612,14 @@ fn handle_task_wait(
     if !conflict {
         return Resp::err("blocking task does not hold a matching active resource");
     }
+    let Some(master) = st.master_id() else {
+        return Resp::err("WAIT_RESPONSIBLE_ACTOR_MISSING");
+    };
     task.status = "waiting".into();
     task.next_step = Some(format!("WAITING_FOR={}", blocking_task_id));
     task.wait = Some(WaitSpec {
         waiting_for: blocking_task_id.clone(),
-        responsible_actor: st.master_id().unwrap_or_else(|| "unassigned".into()),
+        responsible_actor: master.clone(),
         reason: "resource_conflict".into(),
         deadline_ms: now_ms() + 15 * 60 * 1000,
         resume_on: vec![
@@ -1630,7 +1633,6 @@ fn handle_task_wait(
     task.heartbeat_message_id = None;
     task.updated_ms = now_ms();
     server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
-    let master = st.master_id().unwrap_or_else(|| "unassigned".into());
     let body = format!(
         "RESOURCE_WAITING id={} owner={} waiting_for={}; MASTER_ACTION: resolve priority and keep the waiter paused until the lock is released",
         task.id, worker_id, blocking_task_id
