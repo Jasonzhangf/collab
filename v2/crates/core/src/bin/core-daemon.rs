@@ -1,4 +1,6 @@
-use collab_v2_core::{CoreError, Identity, TaskState};
+use collab_v2_core::{
+    AgentState, CoreError, Identity, NotificationEvent, ResourceNotice, TaskState,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -10,24 +12,58 @@ enum Command {
     Register {
         identity: Identity,
     },
-    CreateTask {
+    RegisterTask {
         actor: String,
         task_id: String,
+        feature_id: String,
+        resource_id: String,
     },
-    Claim {
-        actor: String,
-        task_id: String,
-    },
-    Transition {
+    TransitionTask {
         actor: String,
         task_id: String,
         state: TaskState,
+    },
+    WaitTask {
+        actor: String,
+        task_id: String,
+        blocking_task_id: String,
+        deadline_ms: u64,
+        now_ms: u64,
+    },
+    Subscribe {
+        owner: String,
+        subscription_id: String,
+        event: NotificationEvent,
+        subject: Option<String>,
+        expires_at_ms: u64,
+        now_ms: u64,
+    },
+    SendResourceNotice {
+        message_id: String,
+        from: String,
+        to: String,
+        notice: ResourceNotice,
+        subject: String,
+    },
+    WakeAttempt {
+        message_id: String,
+        agent_state: AgentState,
+        succeeded: bool,
+        now_ms: u64,
     },
     Snapshot,
 }
 
 fn error_value(error: CoreError) -> Value {
     json!({"ok": false, "error": format!("{error:?}")})
+}
+
+fn persist_state(path: Option<&PathBuf>, state: &collab_v2_core::CoreState) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let raw = serde_json::to_string(state).map_err(|error| error.to_string())?;
+    std::fs::write(path, raw).map_err(|error| error.to_string())
 }
 
 fn main() {
@@ -49,31 +85,77 @@ fn main() {
                 break;
             }
         };
-        let response = match serde_json::from_str::<Command>(&line) {
+        let mut response = match serde_json::from_str::<Command>(&line) {
             Ok(Command::Register { identity }) => {
                 state.register(identity).map(|_| json!({"ok": true}))
             }
-            Ok(Command::CreateTask { actor, task_id }) => state
-                .create_task(&actor, task_id)
+            Ok(Command::RegisterTask {
+                actor,
+                task_id,
+                feature_id,
+                resource_id,
+            }) => state
+                .register_task(&actor, task_id, feature_id, resource_id)
                 .map(|_| json!({"ok": true})),
-            Ok(Command::Claim { actor, task_id }) => {
-                state.claim(&actor, &task_id).map(|_| json!({"ok": true}))
-            }
-            Ok(Command::Transition {
+            Ok(Command::TransitionTask {
                 actor,
                 task_id,
                 state: next,
             }) => state
-                .transition(&actor, &task_id, next)
+                .transition_task(&actor, &task_id, next)
                 .map(|_| json!({"ok": true})),
+            Ok(Command::WaitTask {
+                actor,
+                task_id,
+                blocking_task_id,
+                deadline_ms,
+                now_ms,
+            }) => state
+                .wait_task(&actor, &task_id, &blocking_task_id, deadline_ms, now_ms)
+                .map(|_| json!({"ok": true})),
+            Ok(Command::Subscribe {
+                owner,
+                subscription_id,
+                event,
+                subject,
+                expires_at_ms,
+                now_ms,
+            }) => state
+                .subscribe(
+                    &owner,
+                    subscription_id,
+                    event,
+                    subject,
+                    expires_at_ms,
+                    now_ms,
+                )
+                .map(|_| json!({"ok": true})),
+            Ok(Command::SendResourceNotice {
+                message_id,
+                from,
+                to,
+                notice,
+                subject,
+            }) => state
+                .send_resource_notice(message_id, &from, &to, notice, &subject)
+                .map(|_| json!({"ok": true})),
+            Ok(Command::WakeAttempt {
+                message_id,
+                agent_state,
+                succeeded,
+                now_ms,
+            }) => state
+                .record_wake_attempt(&message_id, agent_state, succeeded, now_ms)
+                .map(|disposition| json!({"ok": true, "disposition": disposition})),
             Ok(Command::Snapshot) => Ok(json!({"ok": true, "state": state})),
-            Err(error) => Err(CoreError::InvalidTransition)
-                .map(|_: ()| json!({"ok": true, "parse_error": error.to_string()})),
+            Err(error) => {
+                Ok(json!({"ok": false, "error": "InvalidCommand", "message": error.to_string()}))
+            }
         }
         .unwrap_or_else(error_value);
-        if let Some(path) = state_path.as_ref() {
-            if let Ok(raw) = serde_json::to_string(&state) {
-                let _ = std::fs::write(path, raw);
+        if response.get("ok") == Some(&Value::Bool(true)) {
+            if let Err(error) = persist_state(state_path.as_ref(), &state) {
+                response = json!({"ok": false, "error": "PersistenceFailed", "message": error});
             }
         }
         let mut stdout = io::stdout().lock();
