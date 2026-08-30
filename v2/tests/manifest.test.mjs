@@ -4,7 +4,8 @@ import { readFile } from 'node:fs/promises'
 
 test('runtime manifest keeps control fields outside business payload', async () => {
   const manifest = JSON.parse(await readFile(new URL('../contracts/collab-v2-runtime.manifest.json', import.meta.url)))
-  assert.equal(manifest.plugins.length, 10)
+  assert.equal(manifest.plugins.length, 6)
+  assert.equal(manifest.plugins.some(({ plugin_id }) => /app-server|mailbox|persistence/.test(plugin_id)), false)
   assert.ok(manifest.transport_contract.control_fields_forbidden_in_payload.includes('presence'))
   assert.ok(manifest.transport_contract.control_fields_forbidden_in_payload.includes('retry'))
 })
@@ -19,6 +20,11 @@ test('command and event contracts require typed control side-channel', async () 
   assert.ok(event.required.includes('control'))
   assert.equal(command.properties.business_payload.additionalProperties, false)
   assert.equal(event.properties.business_payload.additionalProperties, false)
+  assert.equal(command.$defs.control.required.includes('role'), false)
+  assert.equal(event.$defs.control.required.includes('role'), false)
+  assert.equal('role' in command.$defs.control.properties, false)
+  assert.equal('role' in event.$defs.control.properties, false)
+  assert.equal(command.$defs.control.properties.identity_kind.const, 'peer')
 })
 
 test('runtime module registry owns every implementation source exactly once', async () => {

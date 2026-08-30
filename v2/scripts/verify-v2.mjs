@@ -8,7 +8,7 @@ const functionMap = JSON.parse(await readFile(new URL('../docs/function-map.json
 const callMap = JSON.parse(await readFile(new URL('../docs/mainline-call-map.json', import.meta.url), 'utf8'))
 if (codis.orchestrator !== 'codis' || codis.owns.join(',') !== 'process_lifecycle,health_wiring') throw new Error('invalid Codis ownership boundary')
 if (manifest.lifecycle_id !== 'collab-v2-runtime') throw new Error('invalid lifecycle_id')
-if (!Array.isArray(manifest.plugins) || manifest.plugins.length !== 10) throw new Error('plugin registry must contain ten plugins')
+if (!Array.isArray(manifest.plugins) || manifest.plugins.length === 0) throw new Error('plugin registry is required')
 for (const plugin of manifest.plugins) {
   if (!plugin.plugin_id || !plugin.owner || !plugin.truth) throw new Error(`incomplete plugin record: ${plugin.plugin_id}`)
   await access(new URL(`../${plugin.owner}`, import.meta.url))

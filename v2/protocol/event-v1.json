@@ -16,6 +16,6 @@
     "control": {"$ref": "#/$defs/control"},
     "business_payload": {"type": "object", "additionalProperties": false}
   },
-  "$defs": {"control": {"type":"object","required":["identity","session_id","role","capability","audience","nonce","expires_at","plugin_instance_id","route_epoch"],"properties":{"identity":{"type":"string","minLength":1},"session_id":{"type":"string","minLength":1},"role":{"enum":["master","worker","plugin"]},"capability":{"type":"string","minLength":1},"audience":{"type":"string","minLength":1},"nonce":{"type":"string","minLength":1},"expires_at":{"type":"string","format":"date-time"},"plugin_instance_id":{"type":"string","minLength":1},"route_epoch":{"type":"integer","minimum":0}},"additionalProperties":false}},
+  "$defs": {"control": {"type":"object","required":["identity","session_id","identity_kind","capability","audience","nonce","expires_at","plugin_instance_id","route_epoch"],"properties":{"identity":{"type":"string","minLength":1},"session_id":{"type":"string","minLength":1},"identity_kind":{"const":"peer"},"capability":{"type":"string","minLength":1},"audience":{"type":"string","minLength":1},"nonce":{"type":"string","minLength":1},"expires_at":{"type":"string","format":"date-time"},"plugin_instance_id":{"type":"string","minLength":1},"route_epoch":{"type":"integer","minimum":0}},"additionalProperties":false}},
   "additionalProperties": false
 }

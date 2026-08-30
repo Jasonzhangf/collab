@@ -7,7 +7,6 @@
   "files": ["bin", "src", "contracts", "docs", "scripts", "package.json", "package-lock.json"],
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "test:live": "node tests/live-app-server-smoke.mjs",
     "build": "node scripts/verify-v2.mjs && node --check src/index.mjs"
   },
   "dependencies": {

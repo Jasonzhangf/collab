@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -21,22 +21,26 @@ test('profile config selects and persists the active profile', async () => {
 })
 
 test('standalone CLI initializes and reports registered worker', async () => {
-  const child = spawn(process.execPath, ['bin/collab-v2.mjs', '--cwd', '/tmp/project'], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const cwd = await mkdtemp(join(tmpdir(), 'collab-v2-stdio-'))
+  const child = spawn(process.execPath, [join(packageRoot, 'bin/collab-v2.mjs')], { cwd, env: { ...process.env, COLLAB_V2_CORE_BINARY: join(packageRoot, 'target/debug/core-daemon') }, stdio: ['pipe', 'pipe', 'pipe'] })
   const lines = []
   child.stdout.setEncoding('utf8')
   child.stdout.on('data', (chunk) => lines.push(...chunk.trim().split('\n').filter(Boolean)))
-  child.stdin.write(`${JSON.stringify({ op: 'register', worker: { agentId: 'cli-a', kind: 'generic', cwd: '/tmp/project', panelId: 'cli-panel', capabilities: [], endpoints: [] } })}\n`)
+  child.stdin.write(`${JSON.stringify({ op: 'register', identity: { id: 'cli-a', sessionId: 'cli-session', pane: '%1' } })}\n`)
   child.stdin.write(`${JSON.stringify({ op: 'snapshot' })}\n`)
   child.stdin.write('{"op":"stop"}\n')
   const exitCode = await new Promise((resolve) => child.on('close', resolve))
   assert.equal(exitCode, 0)
-  assert.equal(JSON.parse(lines[0]).role, 'master')
-  assert.equal(JSON.parse(lines[1]).workers[0].agentId, 'cli-a')
+  assert.equal(JSON.parse(lines[0]).ok, true)
+  assert.equal(JSON.parse(lines[1]).identities[0].id, 'cli-a')
+  assert.equal('role' in JSON.parse(lines[1]).identities[0], false)
 })
 
-test('whoami and test report required registration without crashing', async () => {
+test('non-tmux who uses exact process cwd and reports registration required', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'collab-v2-unregistered-'))
-  const child = spawn(process.execPath, [join(packageRoot, 'bin/collab.mjs'), 'whoami'], { cwd, env: { ...process.env, TMUX_PANE: '%unregistered' }, stdio: ['ignore', 'pipe', 'pipe'] })
+  const env = { ...process.env, COLLAB_V2_CORE_BINARY: join(packageRoot, 'target/debug/core-daemon') }
+  delete env.TMUX_PANE
+  const child = spawn(process.execPath, [join(packageRoot, 'bin/collab.mjs'), 'who'], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })
   let stdout = ''
   let stderr = ''
   child.stdout.on('data', (chunk) => { stdout += chunk })
@@ -46,5 +50,27 @@ test('whoami and test report required registration without crashing', async () =
   const result = JSON.parse(stdout)
   assert.equal(result.registration, 'required')
   assert.equal(result.identity, null)
-  assert.equal(result.panelId, '%unregistered')
+  assert.equal(result.project_root, await realpath(cwd))
+})
+
+test('MCP exposes only role-free environment-owned tools', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'collab-v2-mcp-'))
+  const env = { ...process.env, COLLAB_V2_CORE_BINARY: join(packageRoot, 'target/debug/core-daemon') }
+  delete env.TMUX_PANE
+  const child = spawn(process.execPath, [join(packageRoot, 'bin/collab-mcp.mjs')], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })}\n`)
+  const response = await new Promise((resolveResponse, reject) => {
+    let buffer = ''
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk
+      if (buffer.includes('\n')) resolveResponse(JSON.parse(buffer.slice(0, buffer.indexOf('\n'))))
+    })
+    child.on('error', reject)
+  })
+  const names = response.result.tools.map(({ name }) => name)
+  assert.deepEqual(names, ['collab_register', 'collab_context', 'collab_task_register', 'collab_task_update', 'collab_task_wait', 'collab_send_resource_notice', 'collab_notify_methods', 'collab_notify_subscribe', 'collab_notify_status'])
+  assert.equal(names.some((name) => /master|claim|presence/.test(name)), false)
+  assert.equal(JSON.stringify(response.result.tools).includes('projectRoot'), false)
+  child.kill('SIGTERM')
+  await new Promise((resolveExit) => child.on('close', resolveExit))
 })
