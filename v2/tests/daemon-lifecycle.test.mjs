@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process'
 
 const packageRoot = resolve('.')
 const cli = join(packageRoot, 'bin/collab.mjs')
-const core = join(packageRoot, 'target/debug/core-daemon')
+const core = join(packageRoot, 'generated/modules/core/lib/core-daemon')
 
 function run(cwd, args) {
   return new Promise((resolveResult) => {
