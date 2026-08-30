@@ -148,7 +148,7 @@
         "suite_id": "core-regression"
       },
       "source_owner": "core",
-      "stage": "architecture_stable"
+      "stage": "frozen"
     }
   ],
   "project_id": "collab-v2",
