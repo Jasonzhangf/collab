@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createCollabV2 } from '../src/index.mjs'
@@ -11,17 +13,71 @@ if (argv.some((value) => ['--cwd', '--pane', '--panel-id', '--tmux-target'].incl
 const { projectRoot: cwd, pane: inheritedPane, sessionId } = resolveProjectEnvironment()
 const controlDir = resolve(cwd, '.agent-collab-v2')
 mkdirSync(controlDir, { recursive: true })
+const statePath = resolve(controlDir, 'state.json')
+const socketId = createHash('sha256').update(cwd).digest('hex').slice(0, 20)
+const socketPath = resolve('/tmp', `collab-v2-${socketId}.sock`)
+const lockPath = resolve(controlDir, 'daemon.lock')
+const daemonScript = fileURLToPath(new URL('../src/daemon.mjs', import.meta.url))
+const coreBinary = process.env.COLLAB_V2_CORE_BINARY ?? fileURLToPath(new URL('../generated/modules/core/lib/core-daemon', import.meta.url))
+const pidPath = resolve(controlDir, 'daemon.pid')
+const pidIsAlive = (pid) => {
+  try { process.kill(pid, 0); return true } catch (error) { return error.code === 'EPERM' }
+}
+const daemonPid = () => {
+  if (!existsSync(pidPath)) return null
+  const pid = Number(readFileSync(pidPath, 'utf8').trim())
+  return Number.isInteger(pid) && pid > 1 ? pid : null
+}
+const daemonState = () => ({ down: existsSync(resolve(controlDir, 'DOWN')), pid: daemonPid(), socket: socketPath, running: Boolean(daemonPid() && pidIsAlive(daemonPid()) && existsSync(socketPath)) })
+const waitFor = (predicate, limit = 100) => new Promise((resolveWait) => {
+  let remaining = limit
+  const check = () => {
+    if (predicate() || remaining-- <= 0) return resolveWait(predicate())
+    setTimeout(check, 50)
+  }
+  check()
+})
+const handleDaemonCommand = async (command) => {
+  if (command === 'status') {
+    output(daemonState())
+    return
+  }
+  if (command === 'up') {
+    try { unlinkSync(resolve(controlDir, 'DOWN')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+    if (!daemonState().running) {
+      if (daemonPid() && !pidIsAlive(daemonPid())) {
+        try { unlinkSync(pidPath) } catch (error) { if (error.code !== 'ENOENT') throw error }
+      }
+      const child = spawn(process.execPath, [daemonScript, '--socket', socketPath, '--state', statePath, '--core', coreBinary, '--lock', lockPath, '--pid', pidPath], { cwd, detached: true, stdio: 'ignore', env: process.env })
+      child.unref()
+      if (!(await waitFor(() => daemonState().running))) throw new Error('daemon failed to start')
+    }
+    output({ ...daemonState(), started: true })
+    return
+  }
+  const serverPid = daemonPid()
+  writeFileSync(resolve(controlDir, 'DOWN'), 'explicitly stopped\n')
+  if (serverPid && pidIsAlive(serverPid)) process.kill(serverPid, 'SIGTERM')
+  if (!(await waitFor(() => !daemonState().running && !existsSync(socketPath)))) throw new Error('daemon failed to stop')
+  output({ ...daemonState(), down: true, stopped: true })
+}
+const [earlyCommand] = argv
+const output = (result) => process.stdout.write(`${JSON.stringify(result)}\n`)
+if (['up', 'down', 'status'].includes(earlyCommand)) {
+  await handleDaemonCommand(earlyCommand)
+  process.exit(0)
+}
 const runtime = await createCollabV2({
   cwd,
-  rustCoreBinary: process.env.COLLAB_V2_CORE_BINARY ?? fileURLToPath(new URL('../generated/modules/core/lib/core-daemon', import.meta.url)),
-  rustCoreState: resolve(controlDir, 'state.json'),
+  rustCoreBinary: coreBinary,
+  rustCoreState: statePath,
+  rustCoreSocket: socketPath,
   tmuxTransport: createTmuxTransport(),
 })
 const value = (name) => {
   const index = argv.indexOf(name)
   return index >= 0 ? argv[index + 1] : null
 }
-const output = (result) => process.stdout.write(`${JSON.stringify(result)}\n`)
 const snapshot = () => runtime.collab.snapshot()
 const identity = () => sessionId ? snapshot().identities.find((entry) => entry.session_id === sessionId) ?? null : null
 

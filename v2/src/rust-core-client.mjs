@@ -1,15 +1,24 @@
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { createHash } from 'node:crypto'
 
 export function createRustCoreClient(config = {}) {
   const binary = config.rustCoreBinary ?? resolve(config.cwd ?? process.cwd(), 'generated/modules/core/lib/core-daemon')
   const state = config.rustCoreState ?? resolve(config.cwd ?? process.cwd(), '.collab-v2-core-state.json')
+  const socket = config.rustCoreSocket ?? resolve('/tmp', `collab-v2-${createHash('sha256').update(config.cwd ?? process.cwd()).digest('hex').slice(0, 20)}.sock`)
+  const down = config.rustCoreDown ?? resolve(dirname(state), 'DOWN')
+  const daemonClient = fileURLToPath(new URL('./daemon-client.mjs', import.meta.url))
   mkdirSync(dirname(state), { recursive: true })
   const invoke = (command, commandId = randomUUID()) => {
-    const result = spawnSync(binary, ['--state', state], { input: `${JSON.stringify({ ...command, command_id: commandId })}\n`, encoding: 'utf8' })
+    if (existsSync(down) && !existsSync(socket)) throw new Error('daemon is explicitly down')
+    const request = JSON.stringify({ ...command, command_id: commandId })
+    const result = existsSync(socket)
+      ? spawnSync(process.execPath, [daemonClient, socket, request], { encoding: 'utf8' })
+      : spawnSync(binary, ['--state', state], { input: `${request}\n`, encoding: 'utf8' })
     if (result.error) throw result.error
     if (result.status !== 0) throw new Error(`rust core exited ${result.status}: ${result.stderr.trim()}`)
     const output = result.stdout.trim()
@@ -38,7 +47,10 @@ export function createRustCoreClient(config = {}) {
     publishSubscriptionEvent: ({ messageId, subscriptionId, event, subject, nowMs }) => invoke({ op: 'publish_subscription_event', message_id: messageId, subscription_id: subscriptionId, event, subject, now_ms: nowMs }),
     expireWaits: ({ nowMs }) => invoke({ op: 'expire_waits', now_ms: nowMs }),
     snapshot: () => {
-      const result = spawnSync(binary, ['--state', state], { input: '{"op":"snapshot"}\n', encoding: 'utf8' })
+      if (existsSync(down) && !existsSync(socket)) throw new Error('daemon is explicitly down')
+      const result = existsSync(socket)
+        ? spawnSync(process.execPath, [daemonClient, socket, '{"op":"snapshot"}'], { encoding: 'utf8' })
+        : spawnSync(binary, ['--state', state], { input: '{"op":"snapshot"}\n', encoding: 'utf8' })
       if (result.error) throw result.error
       if (result.status !== 0) throw new Error(`rust core exited ${result.status}: ${result.stderr.trim()}`)
       const output = result.stdout.trim()
