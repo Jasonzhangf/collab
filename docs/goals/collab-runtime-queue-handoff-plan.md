@@ -1,68 +1,122 @@
-# Collab runtime queue and handoff implementation plan
+# Collab v1 peer low-intervention implementation plan
 
-## 目标与验收标准
+## Objective
 
-完善 v1 Collab 的运行时感知、heartbeat、消息队列和 handoff 闭环：tmux/Herdr 只能在各自 runtime 内通信；daemon 只在目标 agent idle 时 heartbeat 或 idle 投递；重复积压消息合并后一次投递；worker deliver 后能继续选择任务；master 收到 deliver 后得到 merge 与任务列表更新提醒。
+Keep tmux as the only live wake channel while removing declared roles, central
+dispatch, normal peer reporting, heartbeat/ACK noise, and silent two-way waits.
+Each peer owns its complete task/resource/worktree/integration/cleanup
+lifecycle. The daemon owns durable state, bounded waits, P2P conflict/release
+notices, local continuation wake, and existing-project migration.
 
-验收必须包括：代码、单元测试、真实 tmux session、真实 Herdr workspace、主分支合并、运行版本与源码一致、全局安装后的命令验证。
+`/goal` delegation and interactive task recognition are a later milestone.
 
-## 范围与边界
+## Architecture
 
-In scope：`/Users/fanzhang/code/collab` v1 Rust binary、runtime registration、tmux/Herdr input delivery、message journal/state、heartbeat、task deliver/dispatch/handoff、docs/README、全局 cargo 安装。
+### Identity
 
-Out of scope：App Server、lock 修复、v2 Cordis、wrai.th、跨 cwd 通信、跨 runtime fallback、修改无关项目业务代码。
+- Registration requires a live tmux pane.
+- tmux session is stable identity; pane is current wake endpoint.
+- There is no persisted `role` field and no master promotion/transfer/recovery.
+- Legacy role fields are accepted only during replay and discarded.
 
-## 设计原则
+### Task owner lifecycle
 
-- mailbox/journal 是唯一消息真源，控制语义不进入业务 payload。
-- runtime 是项目注册边界：首个 worker 固定 tmux 或 Herdr，之后不允许混用。
-- immediate 与 idle 是显式投递策略；不允许静默降级。
-- dedupe 只合并相同目标、方向、类型和业务正文的未投递消息；不同消息不得丢失。
-- heartbeat 只能投递给已注册且可确认 idle 的 pane；working、blocked、unknown、missing 均不发送。
-- deliver、merge、close、claim 必须遵守现有角色权限和任务状态机。
-- master 转移、stale worker 清理、任务 handoff 都必须写 journal，可重启恢复。
+```text
+latest main
+→ private declared worktree/branch
+→ self-register working task
+→ implement/test/exact commit
+→ sync and verify against latest main
+→ short integration lease
+→ reviewed → successful delivery evidence
+→ exact merge/main verify/push
+→ merged
+→ owner close/cleanup
+```
 
-## 技术方案与文件清单
+Only owner mutates, delivers, merges, or closes. Delivery is local durable
+evidence and sends no notification. No task offer, claim, available queue,
+automatic assignment, or normal block/progress/close report exists.
 
-- `src/server/state.rs`：消息投递模式/队列索引、去重和 journal event。
-- `src/proto.rs`、`src/main.rs`：`--delivery immediate|idle`、状态查询与 handoff 输出。
-- `src/server/knock.rs`：tmux/Herdr pane alive/idle 检查及输入投递。
-- `src/server/timers.rs`：idle-only heartbeat、idle queue flush、正反状态判断。
-- `src/server/mod.rs`：发送策略、合并投递、Delivered 收口、master merge/task-list 提醒。
-- `src/scope.rs`、`README.md`、`docs/collab.md`：生命周期、runtime、队列和 handoff 规则。
+### Resource coordination
 
-## 风险与规避
+- Registration conflict persists blocked requester plus durable occupancy
+  notices for requester and holder before wake.
+- Wait records waiter, blocker task, blocker owner, reason, deadline, resume
+  events, and P2P escalation.
+- Direct/transitive cycles, missing owner/deadline/resume path, unrelated
+  resources, and terminal waits fail closed.
+- Holder close moves each waiter to `blocked`, clears the obsolete wait edge,
+  persists release truth, then attempts the wake. Failed wake stays pending.
 
-- tmux/Herdr 状态误判：使用真实 pane/session smoke，并覆盖 unknown/working/blocked/idle。
-- 并发重复发送：使用 daemon mutex + journal event 原子提交；不得靠客户端去重。
-- 重启丢队列：队列模式必须进入 journal，重放后仍可 flush。
-- Herdr session/pane 变化：注册时保存 socket 和 pane，发送前重新查询；失败显式记录，不投递到默认 session。
-- handoff 误关闭任务：只有合法状态转换才允许 close/merge；任务列表必须由 daemon 真状态生成。
+### Continuation
 
-## 测试计划
+- Daemon distinguishes a confirmed waiting agent from shell, offline, and
+  Braille-spinner working panes; ambiguous state fails closed.
+- A waiting owner with an actionable active task receives one durable
+  `CONTINUE_TASK` wake per pending revision/interval.
+- Every attempt is journaled before tmux input. A 10-second attempt lease
+  deduplicates immediate/timer races; only success becomes `Delivered`.
+- Failed wakes stay pending and retry only after the pane safely waits.
+- `collab context` consumes the local continuation; no explicit ACK loop.
 
-- 单元：runtime 隔离、消息 dedupe、immediate/idle、queue flush、idle heartbeat、非 idle 反向拒绝、deliver/claim/merge/close 状态机。
-- 构建：`cargo fmt --check`、`cargo test`、release build。
-- tmux smoke：独立 session，两个 pane，验证注册、immediate、idle、heartbeat 和 master transfer。
-- Herdr smoke：独立 named session/workspace，两个 pane，验证 agent 状态、输入投递、idle queue 和同 runtime 通信。
-- 反向 smoke：跨 runtime 注册/发送、无 pane 注册、working heartbeat、重复消息都必须失败或只投递一次。
-- 安装：`cargo install --path /Users/fanzhang/code/collab --force`，确认 `command -v collab` 和 `collab --version`。
+### Migration and maintenance
 
-## 实施步骤
+```text
+inspect → plan/lease → freeze → snapshot → down/install/up
+→ replay/normalize → tmux rebind → verify → resume
+```
 
-1. 读取现有 resource/function/mainline/verification 文档和当前 run notes，建立本次 change set。
-2. 实现消息投递模式、journal queue、去重和 idle flush。
-3. 接入 tmux/Herdr idle 检测与 runtime-specific 输入投递。
-4. 修改 heartbeat，仅允许 idle 目标，并补正反测试。
-5. 完善 worker deliver 返回 available task list 和 master merge/update 提醒。
-6. 同步文档，运行单元测试、构建和真实 tmux/Herdr smoke。
-7. 在主 tree 复验安装和在线命令；通过 AGY Review MCP 后再提交。
-8. 只提交本 change set，合并到 `main`，确认 HEAD 与运行 binary 一致，再执行全局安装和最终 smoke。
+Migration lease is transaction-scoped to one authenticated peer. Daemon
+operator is one explicit maintenance invocation, not a role. Malformed journal,
+snapshot mismatch, second writer, legacy available task, or unresolved wait
+remains frozen and requires explicit evidence; no owner is fabricated.
 
-## 完成定义（DoD）
+## Files and owners
 
-- 所有测试和两种 runtime 的真实 smoke 通过，正反向证据齐全。
-- 没有 App Server 或 v2 运行路径。
-- queue、heartbeat、handoff 状态可重启恢复且无重复投递。
-- AGY Review PASS；只提交声明路径；已合并 `main`。
-- `/Users/fanzhang/.cargo/bin/collab` 来自最新 main，版本和源码一致。
+- `src/server/state.rs`: journaled identity/task/wait/migration contracts.
+- `src/server/mod.rs`: peer registration, self lifecycle, conflict/wait/release,
+  context, migration, admission freeze, replay.
+- `src/server/timers.rs`: deadline and local continuation wake.
+- `src/server/knock.rs`: tmux-only literal text plus Enter.
+- `src/identity.rs`: tmux-session identity; no outside-tmux declaration.
+- `src/proto.rs`, `src/main.rs`, `src/bin/collab-mcp.rs`: typed CLI/MCP surface
+  and explicit deprecation errors.
+- `src/scope.rs`, `README.md`, migration/maps/global skill: operational truth.
+
+## Verification
+
+1. Unit/state-machine:
+   - first/later peers; legacy role removal;
+   - owner-only full lifecycle and cleanup;
+   - conflict occupancy and release;
+   - legal wait, direct/two/three-peer cycles, missing owner, terminal wait;
+   - deadline timeout, waiter exits waiting on release, correct P2P targets;
+   - shell/working/offline not interrupted; wake failure remains pending;
+   - lost-wake retry, attempt lease, one successful wake/one `Delivered`;
+   - context consumes local continuation without an explicit ACK loop;
+   - inspect/plan/apply/verify, lease conflict, snapshot mismatch, malformed
+     journal, legacy field normalization and state preservation.
+2. Static gates: maps agree with source; no live master/dispatch/offer/report,
+   Herdr, `/goal`, or business-payload control leakage.
+3. `cargo fmt --check`, `cargo test`, release build.
+4. Isolated real tmux blackbox with two peers, independent tasks/worktrees,
+   P2P conflict/wait/release, lost wake recovery, owner merge/close/cleanup,
+   controlled migration restart, and journal replay.
+5. AGY Review only after all source/runtime gates pass.
+6. Exact commit/merge to latest main; main verification; global install; hash
+   match; current daemon remains down until reviewed binary is installed.
+7. Official `collab up`, one-instance check, identity rebind, migration verify,
+   and post-restart lifecycle replay.
+
+## Completion evidence
+
+- reviewed commit/tree and exact file list;
+- test/build/gate/tmux blackbox/AGY PASS;
+- migration record and preservation evidence;
+- release/global binary hashes;
+- daemon down/up receipts and old/new PID;
+- one socket writer;
+- post-restart peer/context/task/wait/inbox/journal replay;
+- no declared role, central dispatch, normal report, heartbeat/ACK loop, or
+  `/goal` runtime path.

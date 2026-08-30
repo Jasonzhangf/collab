@@ -105,6 +105,22 @@ pub enum Req {
         feature_id: Option<String>,
         worktree_path: Option<String>,
     },
+    MigrationInspect {
+        worker_id: String,
+        token: String,
+    },
+    MigrationPlan {
+        worker_id: String,
+        token: String,
+    },
+    MigrationApply {
+        worker_id: String,
+        token: String,
+    },
+    MigrationVerify {
+        worker_id: String,
+        token: String,
+    },
     Role {
         worker_id: String,
     },
@@ -131,7 +147,7 @@ pub enum Req {
         confirm: bool,
     },
     Shutdown {
-        worker_id: String,
+        operator: bool,
     },
     Ping,
 }
@@ -168,6 +184,16 @@ impl Resp {
             ok: false,
             error: Some(m),
             data: serde_json::Value::Null,
+        }
+    }
+
+    pub fn err_data(msg: impl Into<String>, data: serde_json::Value) -> Self {
+        let m = msg.into();
+        eprintln!("collab: error: {}", m);
+        Resp {
+            ok: false,
+            error: Some(m),
+            data,
         }
     }
 }

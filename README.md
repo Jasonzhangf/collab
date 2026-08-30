@@ -1,242 +1,197 @@
 # collab
 
-## Runtime boundary
+Project-local coordination for independent coding agents. One Rust daemon owns
+the append-only journal, durable mailbox, task/resource state, and migration
+transaction. tmux is the only live notification channel and is wake-only.
 
-Workers must register from tmux. Herdr registration is disabled for the
-rebuilt profile. The durable mailbox is shared only within the project; tmux
-wake-ups are read-only signals.
+## Model
 
-Project-local coordination daemon + CLI for multi-agent work inside one working
-tree. Rust, single static binary, no network — a unix socket under
-`.agent-collab/` is the whole transport.
+- Every registered identity is an equal peer. Declared `master`/`worker` roles
+  are removed.
+- There is no central task dispatch, idle-worker assignment, progress report,
+  heartbeat, or ACK loop.
+- Each peer self-registers and owns its complete task lifecycle: latest-main
+  sync, private worktree, implementation, tests, exact commit, candidate
+  verification, short integration lease, main merge/verification/push, and
+  cleanup.
+- Peers communicate only for shared-resource occupancy and release. The Server
+  persists the notice before attempting a tmux wake.
+- The daemon may wake a confirmed waiting-agent pane for an actionable local
+  continuation. A shell, offline pane, or Braille-spinner working agent fails
+  closed and is never interrupted.
+- `/goal` delegation and interactive task recognition are deferred.
 
-## Why
-
-Multiple LLM agents (each an LLM reasoning loop) work in the same repo. Every
-wake-up costs tokens, so coordination must be event-driven, not polled by the
-agents. `collab` gives them:
-
-- a mailbox with long-poll `recv` (wait costs zero tokens)
-- task registry: one active owner per task; feature/worktree conflicts are
-  checked at registration
-- tmux knock: when a message lands, the server types `[MAIL] ...` into the
-  target worker's tmux pane, waking the agent immediately
-- wake-ups are read-only signals; all task state transitions are journaled by
-  the daemon and can be recovered from `collab init`, `collab task status`, and
-  `collab inbox` after a master restart
-- server-side timers: task-scoped heartbeats (45 minutes by default) and request
-  escalation, all journaled
-- request filtering: one live request per sender/recipient direction during a
-  5-minute cooldown; duplicate replies are superseded so only the newest one is
-  delivered
+Scoped capabilities replace roles: task owner for one task, resource holder
+for one resource, integration lease for one main merge, and daemon operator for
+one maintenance action.
 
 ## Install
 
 ```sh
 cargo install --path . --force
-which collab
-# The same install also provides the stdio MCP adaptor:
-which collab-mcp
+command -v collab
+command -v collab-mcp
 ```
 
-## Usage
+## Start and identity
 
 ```sh
-cd <project-root>
-collab init                  # create .agent-collab skeleton
-                             # also writes docs/collab.md when absent
-collab up                    # start daemon (idempotent)
-collab whoami                # print your identity (auto-announces your tmux pane)
-collab status                # server summary
-
-collab send --to <worker> --type request "can I take build?"  # -> msg_id
-collab recv --timeout 600    # long-poll; returns when mail arrives
-collab inbox                 # unread messages
-collab context               # authoritative continuation snapshot
-collab ack <msg_id>          # mark read (clears nudges)
-collab msg <msg_id>          # delivery state + nudge count for a sent request
-
-collab role                  # master if first registered, otherwise worker
-collab master recover        # current tmux session reclaims stale master role
-collab worker recover        # refresh this worker's tmux pane/session identity
-collab remove-worker <worker-id>             # master: remove confirmed stale worker
-collab remove-worker <worker-id> --force     # master: requeue active claims, then remove
-collab config                # show .agent-collab/collab.json
-collab config --heartbeat-minutes 45
-
-# Master creates a dispatchable task. It stays owned by master and available.
-collab task register my-task \
-  --feature zterm.feature-id \
-  --worktree ./playground/my-task-0828 \
-  --branch codex/my-task \
-  --base-commit <sha> \
-  --priority p1              # p0 highest through p4 lowest; defaults to p2
-
-# A worker claims it without asking permission. Claim atomically transfers
-# ownership to the worker and starts the task.
-collab task claim my-task
-
-# Master can register another registered worker as owner.
-collab task register peer-task --owner pane-552 --feature other.feature-id
-
-collab task status [task-id]
-collab task update my-task --status verifying --next "run integration gate"
-collab task deliver my-task --evidence "commit=<sha>; gates=pass" # worker completion
-collab task block my-task --next "blocked: waiting for upstream schema decision" # worker blocker
-collab task update my-task --status merged      # master only
-collab task dispatch                            # master only: offer board to idle workers
-collab task close my-task                       # master closes merged work and cleans resources
+cd <project-main-tree>
+collab init
+collab up
+collab whoami
+collab who
+collab context
 ```
 
-## Identity
+Identity creation requires a live tmux pane. Commands outside tmux fail before
+writing an identity declaration. A tmux session is the stable peer identity;
+its current pane is only the wake endpoint. Token proves access to that peer's
+mailbox and lifecycle.
 
-Identity is keyed to your tmux pane: the first `collab whoami` in a pane
-creates `.agent-collab/runs/by-pane/<pane>.json` and registers worker
-`pane-<pane>` with a secret token. Later calls in the same pane reuse the same
-identity automatically. Token proves mailbox ownership; `recv`/`ack` require it
-and refuse messages not addressed to you.
+`collab role`, `collab master`, `collab transfer-master`, `collab task claim`,
+`collab task dispatch`, `collab remove-worker`, and `collab reset` are
+deprecated and fail explicitly.
 
-Outside tmux you can pass `--worker <id>` to act as a specific identity.
-For existing projects, `collab init` is the migration entrypoint. Do not
-delete `.agent-collab`, edit task/claim/journal JSON, clear mailboxes, copy
-tokens, or start a second daemon; see
-`docs/migration-v1-to-low-intervention.md`.
+## Independent task lifecycle
 
-## Roles and tasks
+```text
+read latest main
+→ declare private worktree/branch
+→ register own task
+→ sync latest main into own branch
+→ implement/test
+→ commit exact change set
+→ sync latest main again
+→ verify candidate against latest main
+→ acquire short integration lease
+→ merge exact commit to main
+→ verify/push main
+→ mark merged
+→ close and clean own worktree/branch
+```
 
-- The first registered identity becomes `master`; every later identity becomes
-  `worker`. There is never an automatic second master or automatic takeover.
-- Master owns progress decisions, merge authority, rework/close/cancel, and
-  final worktree cleanup. A worker owns one task, including implementation,
-  tests, evidence, review, delivery report, and bounded safe continuation when
-  master is temporarily unavailable.
-- Only master may register tasks. A worker must claim an existing `available`
-  task; registration by a worker is rejected.
-- Work completed outside a dispatch is not implicitly a task. The worker sends
-  one request with scope, worktree, branch, base commit, and evidence; master
-  validates it and registers with `--owner <worker-id>`. The worker then
-  consumes that returned claim and delivers normally. Master still reviews,
-  merges, and closes it.
-- The fixed task record is `id / owner / feature_id / worktree_path / branch /
-  base_commit / priority / status`. Valid statuses are exactly `available`,
-  `working`, `blocked`, `verifying`, `reviewed`, `delivered`, `rework`,
-  `merged`, `closed`, and `cancelled`.
-- Available tasks are returned in priority order (`p0` through `p4`), then by
-  creation time.
-- An `available` task is held by master as a dispatch placeholder. Worker claim
-  atomically transfers ownership, sets status to `working`, and starts its
-  heartbeat. A worker cannot hold more than one active task.
-- A registered task is the resource owner. Registration fails when another
-  active task already owns the same `feature_id` or `worktree_path`. Inspect
-  `collab task status` before choosing independent parallel work.
-- Worker lifecycle: claim turns `available` into `working`; the worker may move
-  its own claim through `working -> verifying -> reviewed`; `collab task
-  deliver <id> --evidence ...` atomically sets `delivered`, writes a durable
-  master notification, wakes master, and returns structured master/worker
-  actions plus the current `available_tasks` board. The board is informational:
-  the worker claim remains held and no second claim is allowed until master
-  merge and `task close`.
-- If execution is blocked, the worker calls `collab task block <id> --next
-  "<evidence and next condition>"`. The Server records `blocked`, writes a
-  durable `TASK_BLOCKED` notification to master, wakes master, and keeps the
-  claim held; the worker must not release or rewrite the task locally.
-- Master rejection is sent as one message; after the worker consumes it, it
-  moves the same task back to `working`. `delivered` stops heartbeat but keeps
-  resource conflict until master closes it.
-- After reviewing and merging, master runs `collab task close <id>`. Close
-  refuses a worker, an unclaimed/available task, or a task not in
-  `delivered|merged`. It verifies the branch is merged into HEAD, removes a
-  clean declared worktree under `./playground/`, safe-deletes the merged branch
-  with Git's own safety checks, marks the task `closed`, and notifies the former
-  owner. Close then reconciles the board in the same state transaction:
-  available tasks are offered in priority order (`p0` first) to each idle
-  worker with no active claim; an offer writes a mailbox message and submits a
-  tmux prompt but leaves status/owner unchanged until that worker claims one.
-  When all workers are busy, the board stays `available`. Any dirty, missing,
-  outside-playground, or unmerged resource
-  fails closed before state mutation.
-- Master can also run `collab task dispatch` after registering a new batch. It
-  performs the same available-board offer without waiting for another
-  close, so the merge → decompose → register → dispatch loop is immediate.
-- Only master may set `merged`, `cancelled`, or `closed`.
-- Task heartbeat runs every 45 minutes only while status is
-  `working/verifying/reviewed`. A worker with no active claim receives no
-  heartbeat. Each heartbeat tells the worker that it has an active claim and to
-  run `collab role` and `collab task status <task-id>` before continuing. It
-  sends once per interval and does not resend while pending. Any owner/master
-  task update clears pending state; `delivered`, `merged`, `cancelled`, or
-  `closed` unregisters it.
-- Project configuration lives at `.agent-collab/collab.json`. Read it with
-  `collab config`; update it with `collab config --heartbeat-minutes 45`.
-  The daemon reads this file on each scheduler tick, so changes take effect
-  without a rebuild or restart. Values must be whole minutes >= 1.
-- Heartbeat asks the owner to inspect state and continue. It never asks for an
-  ACK. Report to master only for a state change, blocker, ETA change, decision,
-  verification result, or handoff. `collab who` exposes each worker's active
-  task/status so master can distinguish working workers from available workers
-  without messaging them.
-- Workers remain registered after task closure and can receive another task.
-- Master's post-merge workflow is deterministic: after each merge, run
-  `collab task close <id>`, then immediately register the next decomposed
-  tasks with `--next`, then run `collab task dispatch`. If a worker is idle,
-  dispatch offers the available board to that worker. If every
-  worker is busy, leave the new tasks `available`; workers claim them from the
-  returned board.
-- Master task registration is the task decomposition contract: every task must
-  carry a stable `id`, `feature_id`, worktree path, branch, base commit,
-  priority, and next-step text. The daemon uses that fixed format in the
-  offer prompt.
-- After `task close` returns the board, a worker checks the returned available
-  tasks and claims one through Collab without asking permission. Rework on a previously delivered
-  task takes precedence over the interrupted task, especially when it blocks
-  another worker or merge. For a new dispatch during active work, finish the
-  current task unless the new task has explicitly higher priority or blocks the
-  critical path.
-## Protocol / invariants
+```sh
+collab task register <id> \
+  --feature <feature-id> \
+  --worktree ./playground/<short-slug> \
+  --branch codex/<branch> \
+  --base-commit <sha> \
+  --priority p2 \
+  --next "implement and verify"
 
-- Single writer: all shared state lives inside the daemon. Agents never write
-  each other's directories.
-- Journal: every mutation is an append-only event (`server/journal.jsonl`);
-  restart = replay. Atomicity of reads is guaranteed by the daemon.
-- Messaging: `notify` (read and continue silently when no action is needed),
-  `request` (exactly one substantive reply expected), `reply`
-  (`--in-reply-to`, send only when meaningful). New requests from the same sender to the same
-  recipient are rejected during a 5-minute cooldown while an earlier request is
-  still unanswered. The recipient receives one nudge after 5 minutes; the
-  sender receives an escalation notice after 15 minutes. If multiple replies
-  are sent, earlier ones are marked `superseded` and only the newest is
-  delivered.
-- Every send, including the five-minute wait-timeout continuation reminder,
-  commits to the mailbox, then submits a tmux notification using the
-  verified zterm v1 sequence: literal text first
-  (`tmux send-keys -t <pane> -l -- <text>`), then exactly one tmux Enter key
-  (`tmux send-keys -t <pane> Enter`). Short content (up to 500 characters) is
-  sent once inline. Longer content is stored under
-  `.agent-collab/messages/<message-id>.md`, while tmux receives only a short
-  `body-ref=<path>` reference. A timed-out blocking `recv` also produces one
-  submitted timeout reminder. Knock failures are logged when panes no longer
-  exist; mailbox state remains authoritative.
-- A tmux delivery is a reasoning prompt carrying `from`, the full short body or
-  actionable long-body reference, and a continuation anchor. Bare ACK/mailbox-
-  ID prompts are invalid for real messages. System notices, nudges, and
-  wait-timeout reminders use the same full prompt path.
-- On `[MAIL]`, read the referenced mailbox body first, decide whether to
-  collaborate, defer, or reject. Send one substantive result/evidence/next-step
-  reply only when required; for an informational notify/reply with no action,
-  continue silently without ACK-only noise. Then execute the current run's
-  next product/verification step. A reply is work input, not a reason to idle;
-  if no next step is recorded, derive one from the active task and
-  execute it.
-- Receive state machine: `MAIL_RECEIVED -> READ_BODY -> DECIDE ->
-  REPLY_IF_REQUESTED -> ACK -> RESUME_OWN_TASK -> REPORT`. `ACK` is not a
-  terminal state. "Received", "unread 0", "monitor", and "await next request"
-  are not substantive completion reports. If the pane is busy, consume the
-  pending prompt at the next turn before unrelated work.
-- Blocking waits are bounded at five minutes for foreground work. On timeout,
-  inspect the current run/task next step and continue immediately if a safe
-  action exists; report blocked with evidence only if no safe action remains.
+collab task update <id> --status verifying --next "run gates"
+collab task update <id> --status reviewed --next "record delivery"
+collab task deliver <id> --evidence "commit=<sha>; gates=pass" \
+  --worktree ./playground/<short-slug>
+collab task update <id> --status merged --next "main verified and pushed"
+collab task close <id>
+```
 
-## Out of scope (explicit)
+Normal states are `working`, `blocked`, `waiting`, `verifying`, `reviewed`,
+`delivered`, `rework`, `merged`, `closed`, and `cancelled`. `waiting` must be
+entered through `collab task wait`; `delivered` through `task deliver`; and
+`closed` through `task close`. `reviewed` cannot transition directly to
+`merged`: successful delivery evidence is mandatory. Only the task owner may
+mutate or close it.
 
-- Cross-directory/cross-host coordination (one server per `.agent-collab`).
-- Auto-takeover of high-risk resources; escalation is always to a human/controller.
+Delivery is a local durable milestone. It sends no peer message. Close fails
+before mutation unless the task is merged, its declared worktree is clean and
+inside `./playground/`, and its branch is merged into current main.
+
+## Resource conflicts and waits
+
+When a registration conflicts on `feature_id` or `worktree_path`, the Server:
+
+1. persists the requested task as `blocked`;
+2. persists `RESOURCE_OCCUPIED` notices for requester and holder;
+3. journals a wake-attempt lease and asks tmux to wake the holder; and
+4. returns structured `TASK_RESOURCE_CONFLICT` data.
+
+The blocked owner may record a bounded wait:
+
+```sh
+collab task wait <task-id> --for <blocking-task-id>
+```
+
+Every wait stores waiter, blocking task, blocking owner as responsible actor,
+reason, deadline, resume events, and `resource_owner_and_waiter_recheck`
+escalation. Direct, two-peer, and transitive cycles fail closed. Missing owner,
+missing deadline, unrelated resource, and delivered/terminal waits fail
+closed. Timeout changes the waiter to explicit `blocked`, notifies only waiter
+and holder, and never releases either claim automatically. Holder close moves
+each waiter from `waiting` to `blocked`, clears the obsolete wait edge, and
+persists `RESOURCE_RELEASED` before attempting its wake.
+
+Manual P2P messages are restricted to `RESOURCE_OCCUPIED ...` and
+`RESOURCE_RELEASED ...`:
+
+```sh
+collab send --to <peer> --type notify "RESOURCE_OCCUPIED ..."
+```
+
+Never type peer messages into tmux. The daemon owns literal text plus Enter.
+Only a successful tmux transaction becomes `Delivered`. Failure remains
+pending; the 10-second durable attempt lease prevents concurrent duplicate
+wakes and allows retry when the pane later becomes a confirmed waiting agent.
+
+## Local continuation
+
+```sh
+collab config --continuation-minutes 15
+collab context
+collab inbox
+```
+
+For an active task whose pane is a confirmed waiting agent, the daemon persists
+one `CONTINUE_TASK` record and attempts one tmux wake. A durable pending marker
+and wake-attempt lease deduplicate scheduler races. `collab context` consumes
+the calling peer's local continuation and marks that mailbox record read, so no
+explicit ACK loop is required. Shell, working, and offline panes fail closed;
+a lost wake remains pending and is retried after the pane safely waits.
+
+## Existing-project migration
+
+Never delete/rebuild `.agent-collab`, edit task/claim/journal JSON, clear the
+mailbox, copy tokens, start a second daemon, or invent an owner. Use:
+
+```text
+collab migrate inspect
+→ collab migrate plan
+→ collab migrate apply          # admission freeze + deterministic snapshot
+→ cargo install reviewed binary
+→ collab down
+→ collab up
+→ collab worker recover         # each live tmux peer
+→ collab migrate verify         # verify and resume
+```
+
+Any authenticated peer may acquire the single migration transaction lease.
+Another peer cannot replace an active plan/apply operator. Legacy role fields
+and continuation-field names are accepted during replay but omitted from new
+state. Legacy `available` tasks or waits without a real blocker owner require
+explicit operator resolution; the daemon never fabricates ownership. Malformed
+journal lines fail startup, and a snapshot/count mismatch remains frozen.
+
+See [docs/migration-v1-to-low-intervention.md](docs/migration-v1-to-low-intervention.md).
+The active lifecycle contract is
+[docs/collab-v1-lifecycle.manifest.json](docs/collab-v1-lifecycle.manifest.json),
+with source-bound adjacent edges in
+[docs/mainline-call-map.json](docs/mainline-call-map.json).
+
+## Daemon maintenance
+
+`collab down` is an explicit, one-invocation daemon-operator capability; it is
+not derived from an agent role or mailbox text. It writes `DOWN`, records the
+request, and stops only the PID holding the project socket. `collab up` clears
+the marker and starts one daemon. A second live socket writer is rejected.
+
+## Core invariants
+
+- One Server writer; append-only journal; deterministic replay.
+- tmux is wake-only; no control truth is inferred from terminal text.
+- No fallback, silent strip, automatic ownership, automatic claim release, or
+  success projection from failed wake/cleanup/migration.
+- No uncommitted product edits in main as an intermediate test step.
+- One task owner, one declared worktree, one resource holder, and one migration
+  transaction operator at a time.

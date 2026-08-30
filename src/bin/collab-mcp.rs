@@ -5,14 +5,18 @@ use std::process::Command;
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     let mut properties = properties;
     if let Some(map) = properties.as_object_mut() {
-        map.entry("pane").or_insert_with(|| json!({
-            "type":"string",
-            "description":"真实 tmux pane id，例如 %7；不要填 iTerm2 pane 位置"
-        }));
-        map.entry("project_root").or_insert_with(|| json!({
-            "type":"string",
-            "description":"项目主树绝对路径，必须包含 .agent-collab"
-        }));
+        map.entry("pane").or_insert_with(|| {
+            json!({
+                "type":"string",
+                "description":"真实 tmux pane id，例如 %7；不要填 iTerm2 pane 位置"
+            })
+        });
+        map.entry("project_root").or_insert_with(|| {
+            json!({
+                "type":"string",
+                "description":"项目主树绝对路径，必须包含 .agent-collab"
+            })
+        });
     }
     json!({
         "name": name,
@@ -36,34 +40,28 @@ fn tools() -> Value {
             &[]
         ),
         tool(
-            "collab_role",
-            "Return the authenticated role.",
-            json!({}),
-            &[]
-        ),
-        tool(
             "collab_who",
             "List registered workers and active tasks.",
             json!({}),
             &[]
         ),
         tool(
-            "collab_master",
-            "Return the current master identity.",
-            json!({}),
-            &[]
-        ),
-        tool(
             "collab_task_status",
-            "Read the authoritative task board.",
+            "Read the authoritative task registry.",
             json!({"id":{"type":"string"}}),
             &[]
         ),
         tool(
-            "collab_task_claim",
-            "Claim one available task through the Server.",
-            json!({"id":{"type":"string"}}),
+            "collab_task_register",
+            "Register a task owned by the calling peer; /goal delegation is deferred.",
+            json!({"id":{"type":"string"},"feature":{"type":"string"},"worktree":{"type":"string"},"branch":{"type":"string"},"base_commit":{"type":"string"},"priority":{"type":"string"},"next":{"type":"string"}}),
             &["id"]
+        ),
+        tool(
+            "collab_task_wait",
+            "Record a bounded resource wait against the blocking task owner.",
+            json!({"id":{"type":"string"},"blocking_task":{"type":"string"}}),
+            &["id", "blocking_task"]
         ),
         tool(
             "collab_task_deliver",
@@ -73,13 +71,13 @@ fn tools() -> Value {
         ),
         tool(
             "collab_task_relocate",
-            "Relocate an existing task to a short ./playground worktree (master only).",
+            "Relocate the calling peer's task to a short ./playground worktree.",
             json!({"id":{"type":"string"},"worktree":{"type":"string"},"branch":{"type":"string"},"base_commit":{"type":"string"}}),
             &["id", "worktree"]
         ),
         tool(
             "collab_task_block",
-            "Mark an owned task blocked and notify master through the Server.",
+            "Mark an owned task blocked without notifying unrelated peers.",
             json!({"id":{"type":"string"},"next":{"type":"string"}}),
             &["id"]
         ),
@@ -91,15 +89,15 @@ fn tools() -> Value {
         ),
         tool(
             "collab_task_close",
-            "Close a merged task through the Server and reconcile dispatch.",
+            "Close the owner's merged task and safely clean its declared resources.",
             json!({"id":{"type":"string"}}),
             &["id"]
         ),
         tool(
-            "collab_task_dispatch",
-            "Dispatch available tasks to idle workers through the Server.",
-            json!({}),
-            &[]
+            "collab_migrate",
+            "Run peer-authorized migration inspect, plan, apply, or verify.",
+            json!({"action":{"type":"string","enum":["inspect","plan","apply","verify"]}}),
+            &["action"]
         ),
         tool(
             "collab_inbox",
@@ -137,9 +135,7 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
     match name {
         "collab_init" => argv.push("init".into()),
         "collab_whoami" => argv.push("whoami".into()),
-        "collab_role" => argv.push("role".into()),
         "collab_who" => argv.push("who".into()),
-        "collab_master" => argv.push("master".into()),
         "collab_inbox" => argv.push("inbox".into()),
         "collab_context" => argv.push("context".into()),
         "collab_ack" => {
@@ -158,7 +154,19 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
                 argv.push(id.into());
             }
         }
-        "collab_task_claim" => argv.extend(["task".into(), "claim".into(), required(args, "id")?]),
+        "collab_task_register" => {
+            argv.extend(["task".into(), "register".into(), required(args, "id")?]);
+            optional_flag(&mut argv, args, "feature", "--feature")?;
+            optional_flag(&mut argv, args, "worktree", "--worktree")?;
+            optional_flag(&mut argv, args, "branch", "--branch")?;
+            optional_flag(&mut argv, args, "base_commit", "--base-commit")?;
+            optional_flag(&mut argv, args, "priority", "--priority")?;
+            optional_flag(&mut argv, args, "next", "--next")?;
+        }
+        "collab_task_wait" => {
+            argv.extend(["task".into(), "wait".into(), required(args, "id")?]);
+            argv.extend(["--for".into(), required(args, "blocking_task")?]);
+        }
         "collab_task_deliver" => {
             argv.extend(["task".into(), "deliver".into(), required(args, "id")?]);
             argv.extend(["--evidence".into(), required(args, "evidence")?]);
@@ -180,7 +188,9 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
             optional_flag(&mut argv, args, "next", "--next")?;
         }
         "collab_task_close" => argv.extend(["task".into(), "close".into(), required(args, "id")?]),
-        "collab_task_dispatch" => argv.extend(["task".into(), "dispatch".into()]),
+        "collab_migrate" => {
+            argv.extend(["migrate".into(), required(args, "action")?]);
+        }
         _ => return Err(format!("unknown tool {name}")),
     }
     let mut command = Command::new(collab_bin());
@@ -191,9 +201,7 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
     if let Some(root) = args.get("project_root").and_then(Value::as_str) {
         command.current_dir(root);
     }
-    let output = command
-        .output()
-        .map_err(|e| e.to_string())?;
+    let output = command.output().map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() {

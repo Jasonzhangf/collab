@@ -35,11 +35,11 @@ enum Cmd {
     Down,
     /// Show server summary
     Status,
-    /// Show your current role (master if first registered, otherwise worker)
+    /// Deprecated: declared roles were removed
     Role,
-    /// List all registered workers with roles; shows who is master
+    /// List registered peers and their local activity projection
     Who,
-    /// Show the current master worker id, or recover it from this tmux session
+    /// Deprecated: permanent master role was removed
     Master {
         #[command(subcommand)]
         cmd: Option<MasterCmd>,
@@ -49,15 +49,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: WorkerCmd,
     },
-    /// Transfer master role to another registered worker
+    /// Deprecated: permanent master role was removed
     TransferMaster { target: String },
-    /// Remove a stale registered worker (master only); --force requeues its active tasks
+    /// Deprecated: use explicit lifecycle cleanup or daemon migration tooling
     RemoveWorker {
         target: String,
         #[arg(long)]
         force: bool,
     },
-    /// Clear all runtime worker/master bindings and requeue active tasks
+    /// Deprecated: destructive binding reset was removed
     Reset {
         #[arg(long)]
         force: bool,
@@ -106,24 +106,29 @@ enum Cmd {
         #[arg(long)]
         worker: Option<String>,
     },
-    /// Query message status (nudges, answered)
+    /// Query message status (wake attempts, answered)
     Msg { msg_id: String },
     /// Task registration and lifecycle (task owner owns feature/worktree)
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// Inspect, plan, apply, and verify an existing-project migration
+    Migrate {
+        #[command(subcommand)]
+        cmd: MigrateCmd,
+    },
     /// Show or update project-local .agent-collab/collab.json
     Config {
-        /// New heartbeat interval in minutes
-        #[arg(long)]
-        heartbeat_minutes: Option<i64>,
+        /// Local continuation wake interval in minutes
+        #[arg(long, alias = "heartbeat-minutes")]
+        continuation_minutes: Option<i64>,
     },
 }
 
 #[derive(Subcommand)]
 enum TaskCmd {
-    /// Register a task; the caller becomes owner unless master passes --owner
+    /// Register a task owned by the calling peer
     Register {
         id: String,
         #[arg(long)]
@@ -136,17 +141,17 @@ enum TaskCmd {
         branch: Option<String>,
         #[arg(long)]
         base_commit: Option<String>,
-        /// Dispatch priority: p0 (highest) through p4
+        /// Owner-local priority: p0 (highest) through p4
         #[arg(long)]
         priority: Option<String>,
-        /// Next step hint for the assigned worker
+        /// Next lifecycle step for the task owner
         #[arg(long)]
         next: Option<String>,
         /// Complete /goal prompt; must begin with /goal and contains no wrapper text
         #[arg(long)]
         goal: Option<String>,
     },
-    /// Relocate an existing task to a short playground worktree (master only)
+    /// Relocate the caller's task to a short playground worktree
     Relocate {
         id: String,
         #[arg(long)]
@@ -156,7 +161,7 @@ enum TaskCmd {
         #[arg(long)]
         base_commit: Option<String>,
     },
-    /// Update task status/next step by the task owner or master
+    /// Update task status/next step by its owner
     Update {
         id: String,
         #[arg(long)]
@@ -164,7 +169,7 @@ enum TaskCmd {
         #[arg(long)]
         next: Option<String>,
     },
-    /// Claim an available task as the calling agent (transfers ownership)
+    /// Deprecated: peers self-register tasks; no central available queue
     Claim { id: String },
     /// Put an owned task into resource-waiting state until another task releases
     Wait {
@@ -172,7 +177,7 @@ enum TaskCmd {
         #[arg(long = "for")]
         blocking_task: String,
     },
-    /// Complete a claim atomically and notify master; close releases the claim
+    /// Record owner-local delivery evidence before integration
     Deliver {
         id: String,
         #[arg(long)]
@@ -180,7 +185,7 @@ enum TaskCmd {
         #[arg(long)]
         worktree: String,
     },
-    /// Mark a claim blocked and notify master through the Server
+    /// Mark the caller's task blocked without notifying unrelated peers
     Block {
         id: String,
         #[arg(long)]
@@ -188,7 +193,7 @@ enum TaskCmd {
     },
     /// Close a merged task and clean up its declared worktree/branch
     Close { id: String },
-    /// Dispatch available tasks to idle workers in priority order (master only)
+    /// Deprecated: peers self-register tasks; no central dispatch
     Dispatch,
     /// Show task registry
     Status { id: Option<String> },
@@ -196,7 +201,7 @@ enum TaskCmd {
 
 #[derive(Subcommand)]
 enum MasterCmd {
-    /// Transfer master to this pane after the previous master endpoint is stale
+    /// Deprecated: permanent master recovery was removed
     Recover,
 }
 
@@ -204,6 +209,18 @@ enum MasterCmd {
 enum WorkerCmd {
     /// Re-register the current tmux pane without changing task ownership
     Recover,
+}
+
+#[derive(Subcommand)]
+enum MigrateCmd {
+    /// Inspect current durable state and migration blockers
+    Inspect,
+    /// Create a migration plan; does not freeze admission
+    Plan,
+    /// Freeze task admission and persist a deterministic snapshot
+    Apply,
+    /// Verify replayed state and resume task admission
+    Verify,
 }
 
 fn out<T: serde::Serialize>(v: &T) {
@@ -246,7 +263,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let cwd = std::env::current_dir()?;
             let in_tmux = std::env::var_os("TMUX_PANE").is_some();
             if !in_tmux {
-                anyhow::bail!("collab init requires a live tmux pane (Herdr runtime is disabled)");
+                anyhow::bail!(
+                    "collab init requires a live tmux pane; tmux is the only wake channel"
+                );
             }
             if cwd.ancestors().skip(1).any(|ancestor| {
                 ancestor
@@ -263,22 +282,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let started = !client::alive(&scope.sock_path());
             client::ensure_server(&scope.sock_path())?;
             let ident = me(&scope, None)?;
-            let role_resp: serde_json::Value = client::call(
-                &scope.sock_path(),
-                &Req::Role {
-                    worker_id: ident.worker_id.clone(),
-                },
-            )?;
             let task_board: serde_json::Value =
                 client::call(&scope.sock_path(), &Req::TaskStatus { task_id: None })?;
             out(&json!({
                 "ok": true,
                 "root": cwd,
                 "worker_id": ident.worker_id,
-                "role": role_resp["role"],
+                "identity_kind": "peer",
                 "daemon_started": started,
                 "task_board": task_board["tasks"],
-                "recovery_action": "inspect task_board and collab inbox; master reviews delivered tasks, workers claim available tasks"
+                "recovery_action": "inspect your own tasks, conflicts, and inbox through collab context"
             }));
             Ok(())
         }
@@ -308,19 +321,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Down => {
             let scope = Scope::resolve()?;
-            if std::env::var_os("TMUX_PANE").is_some() {
-                if !client::alive(&scope.sock_path()) {
-                    anyhow::bail!(
-                        "collab down from a tmux pane requires a live daemon and authenticated master"
-                    );
-                }
-                let ident = me(&scope, None)?;
-                let _: serde_json::Value = client::call(
-                    &scope.sock_path(),
-                    &Req::Shutdown {
-                        worker_id: ident.worker_id,
-                    },
-                )?;
+            if client::alive(&scope.sock_path()) {
+                let _: serde_json::Value =
+                    client::call(&scope.sock_path(), &Req::Shutdown { operator: true })?;
             }
             let server_dir = scope.server_dir();
             std::fs::create_dir_all(&server_dir)?;
@@ -383,16 +386,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Role => {
-            let scope = Scope::resolve()?;
-            let ident = me(&scope, None)?;
-            let v: serde_json::Value = client::call(
-                &scope.sock_path(),
-                &Req::Role {
-                    worker_id: ident.worker_id,
-                },
-            )?;
-            out(&v);
-            Ok(())
+            anyhow::bail!("collab role is deprecated; declared roles were removed")
         }
         Cmd::Who => {
             let scope = Scope::resolve()?;
@@ -401,100 +395,39 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Master { cmd } => {
-            let scope = Scope::resolve()?;
-            let v: serde_json::Value = match cmd {
-                None => client::call(&scope.sock_path(), &Req::MasterId)?,
-                Some(MasterCmd::Recover) => {
-                    let ident = me(&scope, None)?;
-                    let pane = ident
-                        .pane
-                        .as_deref()
-                        .filter(|p| p.starts_with('%'))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("collab master recover requires a tmux pane")
-                        })?;
-                    let session = std::process::Command::new("tmux")
-                        .args(["display-message", "-p", "-t", pane, "#S"])
-                        .output()?;
-                    if !session.status.success() {
-                        anyhow::bail!("cannot resolve tmux session for pane {}", pane);
-                    }
-                    let session = String::from_utf8_lossy(&session.stdout).trim().to_string();
-                    if session.is_empty() {
-                        anyhow::bail!("tmux returned an empty session name for pane {}", pane);
-                    }
-                    client::call(
-                        &scope.sock_path(),
-                        &Req::MasterRecover {
-                            worker_id: ident.worker_id,
-                            token: ident.token,
-                            session,
-                        },
-                    )?
-                }
-            };
-            out(&v);
-            Ok(())
+            let _ = cmd;
+            anyhow::bail!("collab master is deprecated; all registered identities are peers")
         }
         Cmd::Worker {
             cmd: WorkerCmd::Recover,
         } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, None)?;
-            let v: serde_json::Value = client::call(
-                &scope.sock_path(),
-                &Req::Role {
-                    worker_id: ident.worker_id.clone(),
-                },
-            )?;
             out(&json!({
                 "recovered": true,
                 "worker_id": ident.worker_id,
                 "pane": ident.pane,
                 "session": ident.session,
-                "role": v["role"],
+                "identity_kind": "peer",
                 "next": "run collab who and collab task status; task ownership is unchanged"
             }));
             Ok(())
         }
         Cmd::TransferMaster { target } => {
-            let scope = Scope::resolve()?;
-            let ident = me(&scope, None)?;
-            let v: serde_json::Value = client::call(
-                &scope.sock_path(),
-                &Req::TransferMaster {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
-                    target_id: target,
-                },
-            )?;
-            out(&v);
-            Ok(())
+            let _ = target;
+            anyhow::bail!("collab transfer-master is deprecated; peer authority is task-scoped")
         }
         Cmd::RemoveWorker { target, force } => {
-            let scope = Scope::resolve()?;
-            let ident = me(&scope, None)?;
-            let v: serde_json::Value = client::call(
-                &scope.sock_path(),
-                &Req::RemoveWorker {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
-                    target_id: target,
-                    force,
-                },
-            )?;
-            out(&v);
-            Ok(())
+            let _ = (target, force);
+            anyhow::bail!(
+                "collab remove-worker is deprecated; use owner cleanup and migration verify"
+            )
         }
         Cmd::Reset { force } => {
-            if !force {
-                anyhow::bail!("collab reset requires --force (clears worker/master bindings)");
-            }
-            let scope = Scope::resolve()?;
-            let v: serde_json::Value =
-                client::call(&scope.sock_path(), &Req::ResetBindings { confirm: true })?;
-            out(&v);
-            Ok(())
+            let _ = force;
+            anyhow::bail!(
+                "collab reset is deprecated; preserve journal/mailbox and use migration rebind"
+            )
         }
         Cmd::Whoami { worker, pane } => {
             let scope = Scope::resolve()?;
@@ -685,11 +618,38 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&v);
             Ok(())
         }
-        Cmd::Config { heartbeat_minutes } => {
+        Cmd::Migrate { cmd } => {
+            let scope = Scope::resolve()?;
+            let ident = me(&scope, None)?;
+            let req = match cmd {
+                MigrateCmd::Inspect => Req::MigrationInspect {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                },
+                MigrateCmd::Plan => Req::MigrationPlan {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                },
+                MigrateCmd::Apply => Req::MigrationApply {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                },
+                MigrateCmd::Verify => Req::MigrationVerify {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                },
+            };
+            let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
+            out(&v);
+            Ok(())
+        }
+        Cmd::Config {
+            continuation_minutes,
+        } => {
             let scope = Scope::resolve()?;
             let mut config = config::load(&scope.root)?;
-            if let Some(minutes) = heartbeat_minutes {
-                config.heartbeat_minutes = minutes;
+            if let Some(minutes) = continuation_minutes {
+                config.continuation_minutes = minutes;
                 config::save(&scope.root, &config)?;
             }
             out(&json!({
