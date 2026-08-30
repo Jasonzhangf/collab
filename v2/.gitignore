@@ -5,6 +5,7 @@ active/lib/
 protected/
 playground/
 .appsdk-control/
+.agent-collab-v2/
 
 # BEGIN APPSDK MANAGED
 .appsdk-control/
