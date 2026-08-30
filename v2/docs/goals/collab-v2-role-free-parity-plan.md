@@ -13,8 +13,8 @@ The change is accepted only when v2 has no declared or inferred
 `master`/`worker` role, no central dispatch/offer/claim path, no normal peer
 progress/heartbeat/ACK traffic, and no App Server notification path. Every peer
 must own its complete task, worktree, verification, integration, push, and
-cleanup lifecycle. Durable resource coordination, bounded waits, safe local
-continuation, deterministic replay, formal migration, AppSDK governance,
+cleanup lifecycle. Durable resource coordination, bounded waits, explicit
+finite notification subscriptions, deterministic replay, formal migration, AppSDK governance,
 installed-runtime black-box validation, and AGY Review must all pass on the
 same candidate artifact.
 
@@ -45,8 +45,8 @@ The implementation gap is structural:
 | Coordination | General peer send, heartbeat, ACK, assignment and transfer | Durable P2P only for `RESOURCE_OCCUPIED` and `RESOURCE_RELEASED`; no routine reports |
 | Waits | No durable wait graph | Waiter, blocker, responsible actor, reason, deadline, resume events, escalation, cycle rejection, and release cleanup |
 | Wake | tmux sends arbitrary payload directly; App Server can also start turns | tmux-only literal short wake after durable commit; shell/offline/working panes fail closed |
-| Retry | No durable wake-attempt lease or lost-wake recovery | Journaled attempt time, short lease, pending retry, one successful delivery, deterministic replay |
-| Continuation | Mailbox receive/ACK lifecycle | Calling peer consumes its own continuation through context; no explicit ACK loop |
+| Retry | No durable wake-attempt lease or lost-wake recovery | Journaled attempt time, immutable lifetime cap of three, replay that cannot reset the count, and terminal consume/expiry/exhaustion |
+| Continuation | Mailbox receive/ACK lifecycle | No inferred or periodic continuation; after an opt-in short wake the caller explicitly reads durable context/mailbox without an ACK loop |
 | Truth owner | Node maps duplicate workers/tasks/messages while Rust has a smaller second state | Rust owns all semantic state and transitions; Node/Cordis are typed projections/adapters only |
 | Persistence | Node snapshot plus Rust JSON file; no contiguous journal contract | One Rust journal/reducer, deterministic snapshot/replay, idempotency, contiguous sequence checks |
 | Migration | `--upgrade` creates a side-by-side control plane and reports a role | Formal role-based-v2-beta migration transaction with freeze, snapshot, rebind, verify, and resume |
@@ -86,6 +86,9 @@ and must not copy, reset, clean, merge, or overwrite another peer's changes.
   existing role-based v2 beta state in place.
 - Replacing or stopping the verified production v1 daemon before the isolated
   v2 artifact passes every gate and an explicit deployment step is reached.
+- Starting, attaching, installing, or exposing a v2 daemon to zterm, OneStop,
+  RouteCodex, or dsh-plugins before full v2 production admission. Those four
+  projects remain v1-only throughout this milestone.
 - Editing v1 `src/**`, v1 `.agent-collab/**`, another peer's worktree, or
   protected/frozen AppSDK artifacts by hand.
 - Adding a second notification channel or using App Server as a tmux fallback.
@@ -105,10 +108,12 @@ and must not copy, reset, clean, merge, or overwrite another peer's changes.
    state commits before a tmux wake is attempted.
 6. A wait edge is a typed Rust resource with finite responsibility and cannot
    be inferred from idle/presence observations.
-7. tmux carries literal short wake text plus Enter only. Mailbox and journal
-   content are never pasted into panes.
-8. Wake attempts have persisted timestamps and leases. Replay never reads the
-   current clock to reconstruct past state.
+7. tmux carries only `COLLAB_NOTIFY <message-id>` plus Enter in one command
+   sequence. Mailbox and journal content are never pasted into panes.
+8. Wake authority is opt-in: an Agent registers an owner-scoped, exact-event,
+   exact-subject, finite-TTL, one-shot subscription. Absent, unknown, and
+   working panes produce zero attempts. A message has at most three lifetime
+   attempts, and replay or re-registration cannot reset that count.
 9. Errors stay on the typed error/control chain. No fallback, silent strip,
    duplicate writer, or success projection from failure is permitted.
 10. Migration is a journaled transaction, not startup compatibility logic.
@@ -122,8 +127,8 @@ The resource registry must make these Rust-owned truth resources explicit:
 - `resource-lease`
 - `wait-graph`
 - `message-mailbox`
+- `notification-subscription`
 - `wake-attempt-ledger`
-- `continuation`
 - `journal-sequence`
 - `migration-transaction`
 - `daemon-operator-capability`
@@ -152,8 +157,9 @@ escalation
 The reducer must reject self-wait, missing or inactive blocker, unrelated
 resource, terminal/delivered wait, missing deadline/resume path, and direct or
 transitive cycles. Holder close/rework/cancel must clear the obsolete wait
-edge, move the waiter to explicit `blocked`, persist `RESOURCE_RELEASED`, and
-only then schedule a wake.
+edge, move the waiter to explicit `blocked`, and persist release truth. It may
+create and schedule a `RESOURCE_RELEASED` notification only for an exact live
+subscription; otherwise it creates no message and no wake.
 
 ## Implementation units and expected files
 
@@ -245,11 +251,13 @@ Migration requirements:
   terminal cleanup.
 - Success, failure, still-running, and already-terminal resource/wake cases.
 - Shell/offline/working-pane rejection; confirmed waiting-agent acceptance.
-- Failed tmux wake remains pending; timer retry succeeds once; immediate/timer
-  race produces one delivered wake.
+- No subscription produces zero wake attempts. Failed tmux wake remains
+  pending only while the exact subscription is armed; attempts stop forever at
+  three. Immediate/timer races produce at most one delivered wake.
 - Attempt time is persisted; restart replay is clock-independent and snapshot
   hashes are stable.
-- `context` consumes only the caller's local continuation without ACK traffic.
+- Successful delivery consumes the one-shot subscription. `context` is
+  read-only and never infers, consumes, acknowledges, or schedules work.
 - App Server cannot become a live wake route; tmux failure has no fallback.
 
 ### Migration and runtime black-box
@@ -261,7 +269,8 @@ Migration requirements:
   runtime first.
 - Run a real multi-pane tmux black-box covering two equal peers, independent
   task lifecycles, resource conflict/release, bounded wait, lost wake,
-  continuation consumption, migration restart, and deterministic replay.
+  subscription consumption/exhaustion, explicit context query, migration
+  restart, and deterministic replay.
 - After isolated success, merge the reviewed candidate into latest main,
   repeat affected gates and installed-runtime smoke, then deploy v2 only at the
   explicit deployment stage. Keep the verified v1 daemon untouched until then.
@@ -297,11 +306,12 @@ review and affected evidence.
    edits.
 3. Replace Rust role/claim/available semantics with equal peer identity,
    owner-created task lifecycle, scoped operator/resource capabilities, wait
-   graph, wake ledger, continuation, and formal migration.
+   graph, notification subscriptions, wake ledger, and formal migration.
 4. Reduce Node/Cordis state to typed commands and projections; remove duplicate
    task/identity/message truth and master override behavior.
-5. Restrict communication to durable resource notices and local continuation.
-   Make tmux the only live wake transport with waiting-agent gating and lease.
+5. Restrict cross-peer communication to explicit durable resource notices.
+   Make tmux the only live wake transport, gated by exact finite subscriptions,
+   confirmed waiting state, persisted leases, and the three-attempt hard cap.
 6. Update CLI/MCP/init/migration surfaces and make obsolete role/dispatch/
    claim/ACK commands fail fast.
 7. Run unit, state-machine, contract, architecture, replay, migration, and
@@ -329,15 +339,17 @@ review and affected evidence.
   tests reject active role semantics.
 - tmux command execution in shell panes: require confirmed waiting-agent
   evidence; shell and working panes fail closed.
-- Lost or duplicate wake: durable pending state, persisted attempt lease, and
-  one delivered transition after successful literal text plus Enter.
+- Lost or duplicate wake: durable pending state, persisted attempt lease,
+  immutable three-attempt lifetime cap, and one delivered transition after a
+  successful single-command `COLLAB_NOTIFY <message-id>` plus Enter.
 - AppSDK Protected staging contamination: use canonical transaction ownership,
   compile, and freeze operations; never delete arbitrary archives or patch
   hashes by hand.
 - Active v2 worktree conflict: wait or coordinate using durable resource
   occupancy/release; never reset, stash, copy, or clean another peer's files.
 - Production regression: v2 remains isolated until exact-artifact black-box and
-  review pass; production v1 is unchanged before explicit v2 deployment.
+  review pass; zterm, OneStop, RouteCodex, and dsh-plugins remain on verified
+  v1, and no persistent v2 process may exist before explicit v2 deployment.
 
 ## Definition of done
 
@@ -347,10 +359,10 @@ review and affected evidence.
 - Each peer owns the complete task/worktree/verification/integration/push/
   cleanup lifecycle and cannot mutate another peer's task.
 - Only durable resource occupancy/release crosses peers; tmux is the sole live
-  wake channel and local continuation cannot enter a two-way silent wait.
-- Wait graph, deadline, release, escalation, attempt lease, deterministic
-  replay, and formal v2 beta migration are Rust-owned and verified positively
-  and negatively.
+  wake channel; no inferred or periodic continuation exists.
+- Wait graph, deadline, release, escalation, finite notification subscription,
+  three-attempt lease, deterministic replay, and formal v2 beta migration are
+  Rust-owned and verified positively and negatively.
 - Maps, manifests, docs, CLI, MCP, tests, AppSDK compile/freeze records, and the
   global Collab skill describe the same active semantics.
 - Unit/build/governance gates, real tmux black-box, migration restart,
