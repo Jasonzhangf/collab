@@ -1,9 +1,15 @@
-# Collab verification map
+# Collab v1 verification map
 
 | feature_id | positive gate | negative gate |
 |---|---|---|
-| identity.registration | repeated commands in one tmux session+pane reuse identity | another tmux pane does not collide |
-| runtime.queue | immediate/idle delivery reaches same-runtime pane | cross-runtime delivery and non-idle heartbeat are rejected |
-| task.lifecycle | deliver holds claim; master close releases it and returns available tasks | worker cannot claim another task before close or mutate delivered/closed directly |
-| task.wait-liveness | bounded wait records ownership/deadline and expires to blocker | direct/transitive cycles and terminal waits are rejected; expiry never fabricates success |
-| continuation.context | one context query returns identity, liveness, tasks, inbox, next actions | lost tmux wake still recovers from journal/mailbox |
+| identity.peer-register | first and later tmux sessions register as equal peers | no `master` role, promotion, transfer, or inferred authority appears |
+| task.self-lifecycle | one peer completes register→working→verifying→reviewed→delivered→merged→closed and cleanup | reviewed cannot bypass successful delivery; another peer cannot mutate/close; no central dispatch/offer |
+| resource.p2p-conflict | conflict creates durable holder/waiter notice; release changes waiter to blocked, clears wait, then wakes | no normal progress/report messages; failed tmux wake stays pending and does not change task truth |
+| wait.liveness | wait records waiter, blocker owner, deadline, resume, escalation and release | direct/two-peer/three-peer cycle, missing owner/deadline, terminal wait rejected |
+| continuation.local-wake | confirmed waiting agent receives one literal-text-plus-Enter wake; one attempt lease and one `Delivered`; lost wake retries | shell/offline/Braille-spinner working panes are not interrupted; immediate/timer race cannot duplicate delivery |
+| continuation.context | one query consumes own continuation and returns lifecycle/conflict/inbox/next action | no explicit continuation ACK loop, central board management, or unrelated peer supervision data |
+| migration.peer-v1 | inspect→plan→apply→restart/rebind→verify preserves task/mailbox/journal and removes legacy declared roles | malformed/manual journal, second writer, changed snapshot, missing/inactive/unrelated wait holder fail closed |
+| daemon.operator | controlled down→up uses installed binary and journal replay | mailbox text or peer role cannot authorize maintenance; duplicate daemon rejected |
+
+Required integration gate: real isolated tmux peers complete independent
+worktrees and p2p conflict/release/restart continuation without `/goal`.

@@ -50,114 +50,98 @@ This project uses the local `collab` daemon for multi-agent coordination.
 The binary lives in `~/code/collab`; the installed command is
 `~/.cargo/bin/collab`.
 
-The daemon is detached and automatically restarted by normal commands when
-its socket is unavailable. `collab init` creates/migrates the local
+The daemon is detached. Normal commands may start it when no explicit `DOWN`
+marker exists. `collab init` creates the local
 `.agent-collab/server` skeleton, so old projects need no manual repair. Use
 `collab down` only for an explicit stop; use `collab up` to clear that stop and
 start it again. Never start a second daemon.
-Existing projects must migrate through `collab init` and server queries;
+Existing projects migrate through `collab migrate inspect`, `plan`, `apply`,
+controlled daemon upgrade/restart, identity rebind, and `verify`;
 deleting `.agent-collab`, editing JSON state, clearing mailboxes, copying
 tokens, mixed runtime writes, and guessing pane identity are deprecated.
 
 ## Runtime boundary
 
-- Every registration must come from a live tmux pane or a live Herdr pane.
-- The first registered pane fixes the project runtime (`tmux` or `herdr`).
-- Later workers must use the same runtime; mixed tmux/Herdr projects are
-  rejected, as are messages across runtimes.
+- Every peer registration must come from a live tmux pane.
+- tmux is the only live notification channel and remains wake-only.
+- Server state, journal, and mailbox are durable truth; a failed wake cannot
+  roll back state or fabricate success.
 - The runtime is part of the worker identity boundary, not a task preference.
-
-The current master may migrate ownership before a restart:
-`collab transfer-master <worker-id>`. To remove an old registration, use
-`collab remove-worker <worker-id>`; active task owners must deliver or release
-their task first. The master cannot remove itself.
 
 ## Roles
 
-- First registered pane becomes `master`; every later pane becomes `worker`.
-- Master creates tasks, reviews deliveries, merges, closes tasks, and cleans
-  declared worktrees after merge. Master may claim an available task as its
-  own owner and then follows the same deliver flow as a worker.
-- Workers claim `available` tasks and work independently. They do not request
-  claim approval and do not register tasks.
-- Check identity with `collab role`, `collab who`, or `collab master`.
-- If a message names a different role or owner, confirm identity first and
-  return the owner contact; do not act outside your role.
+- Every registered identity is an equal `peer`; there is no permanent master.
+- Each peer self-registers one task and owns its full worktree, test,
+  integration, main verification, push, cleanup, and resource lifecycle.
+- Task owner, resource holder, integration lease, and daemon operator are
+  scoped capabilities, never durable identity roles.
+- Peers send no normal progress reports. P2P communication is limited to
+  durable resource occupancy and release coordination.
 
 ## Task lifecycle
 
 ```
-available -> working -> verifying -> reviewed -> delivered
-          -> master merge -> close/cleanup -> closed
-          -> rework -> working
+working -> verifying -> reviewed -> delivered
+        -> owner sync/verify/integrate -> merged -> close/cleanup -> closed
+        -> rework -> working
+blocked -> bounded waiting -> resource release/timeout -> owner recheck
 ```
 
 Task records use a fixed shape:
 `id / owner / feature_id / worktree_path / branch / base_commit / priority /
- status`. Valid statuses are `available`, `working`, `blocked`, `verifying`,
+ status`. Normal statuses are `working`, `blocked`, `waiting`, `verifying`,
  `reviewed`, `delivered`, `rework`, `merged`, `closed`, and `cancelled`.
 
 ## Common commands
 
 ```sh
 collab config                     # show .agent-collab/collab.json
-collab config --heartbeat-minutes 45
+collab config --continuation-minutes 45
 collab up                         # clear explicit down and start daemon
 collab down                       # explicit stop; disables auto-restart
-collab who                        # workers + active task status
-collab task status [task-id]      # board or one task
+collab who                        # registered peers + local state projection
+collab task status [task-id]      # durable task registry
 collab context                    # one authoritative continuation snapshot
 collab task register <id> --feature <feature-id> --worktree <path> \
   --branch <branch> --base-commit <sha> --priority p2
- collab task claim <id>            # worker self-service
- collab task deliver <id> --evidence "commit=<sha>; gates=pass"
- collab task block <id> --next "blocked: <evidence and next condition>"
- collab task update <id> --status merged
-collab task close <id>            # master; verifies merged/clean, releases claim
+collab task wait <id> --for <blocking-task>
+collab task deliver <id> --evidence "commit=<sha>; gates=pass" --worktree <path>
+collab task block <id> --next "blocked: <evidence and next condition>"
+collab task update <id> --status merged
+collab task close <id>            # owner; verifies merged/clean, releases claim
 ```
 
-Master owns the fixed task contract and the project board. After merging a
-delivered worker branch, run `collab task close <id>` to verify the merge,
-remove the clean declared `./playground/` worktree, remove the merged branch,
-and dispatch registered available tasks to idle workers. Then register the
-next decomposed tasks from the new main commit and run `collab task dispatch`.
-After every close, master re-analyzes the goal: publish and dispatch the next
-tasks only when the goal is incomplete; publish nothing when it is complete.
-Workers never share worktrees: claim one task, work in its declared clean
-worktree, test, commit, and deliver; delivery keeps the claim held until the
-master merges and runs `collab task close`. Only that close response releases
-the claim and returns the available board for the worker's next claim only
-after master close. A
-worker remains registered after task closure.
+Peers never share worktrees. Each task owner starts from latest main in one
+declared clean `./playground/` worktree, implements and tests, commits the exact
+change set, syncs latest main again, verifies the candidate, acquires a short
+integration lease, merges the exact commit to main, verifies and pushes main,
+then closes the task to remove only its clean merged worktree/branch. Delivery
+is an owner-local durable milestone and sends no peer notification. `/goal`
+delegation and interactive task recognition are intentionally deferred.
 
 ## Message handling
 
-On `[MAIL]`, read the body or `body-ref` first, confirm identity and task
-ownership, decide collaborate/defer/reject/continue, and execute the required
-state action. Send any substantive reply only through `collab send` or the
-Collab MCP send operation; never type a message with tmux or paste it into a
-pane. The daemon owns the complete text-plus-Enter transaction. If the daemon
-is down, do not send a partial message or manually add Enter; restore the
-daemon through the authorized path, then retry the same send. A notify does
-not require a reply. A request requires one substantive reply. A reply from a
-peer is work input, not a stop signal.
+On a resource wake, query `collab context` before acting. `collab send` accepts
+only `RESOURCE_OCCUPIED` and `RESOURCE_RELEASED` coordination. Never type peer
+messages with tmux or paste them into a pane; the daemon owns the complete
+text-plus-Enter wake transaction. If the daemon is down, durable state remains
+unchanged and no peer may manually emulate a wake.
 
 `collab inbox` and `collab msg <id>` query the durable local mailbox after a
 tmux pane disappears; mailbox state remains authoritative.
 
-## Heartbeat and dispatch
+## Continuation and waits
 
-Only workers with an active claim receive heartbeats. `collab who` exposes
-`active_task` and `active_status` for every worker, so master can dispatch to
-idle workers without messaging busy ones.
-
-`.agent-collab/collab.json` configures the heartbeat interval. The daemon
-reloads it without a restart; invalid values fail closed to the default. Only
-workers with an active claim receive heartbeat prompts. When working, ignore a
-heartbeat and continue. When intentionally waiting at a safe breakpoint, use
-`collab recv --timeout 300`; on timeout inspect the task next step and continue
-without waiting. The tmux heartbeat uses literal text, waits two seconds, then
-sends an explicit Enter.
+`.agent-collab/collab.json` configures the local continuation interval. The
+daemon wakes only a confirmed waiting-agent pane with an actionable active
+task. Shell, offline, and Braille-spinner working panes fail closed. Wake
+attempts are journaled and leased to prevent races; failure stays pending and
+only success becomes delivered. `collab context` consumes the caller's local
+continuation without an explicit ACK loop. Every wait stores waiter, blocking
+task owner, reason, deadline, resume events, and P2P escalation. Direct,
+two-peer, and transitive wait cycles fail closed. Timeout wakes only the waiter
+and resource holder and never releases a claim automatically. Holder close
+moves waiters to blocked and clears released wait edges before wake.
 "#;
 
 /// Scope guard used by every command except init.

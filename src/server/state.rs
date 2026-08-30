@@ -5,10 +5,6 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-pub fn default_role() -> String {
-    "worker".into()
-}
-
 pub fn default_task_status() -> String {
     "working".into()
 }
@@ -19,6 +15,8 @@ pub fn default_priority() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaitSpec {
+    #[serde(default)]
+    pub waiter: String,
     pub waiting_for: String,
     pub responsible_actor: String,
     pub reason: String,
@@ -27,14 +25,29 @@ pub struct WaitSpec {
     pub escalation: String,
 }
 
-/// Runtime is encoded in the registered pane handle. A worker without a
-/// tmux or Herdr pane is not eligible for project communication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationRecord {
+    pub id: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub phase: String,
+    pub admission_frozen: bool,
+    pub snapshot_hash: Option<String>,
+    pub worker_count: usize,
+    pub task_count: usize,
+    pub message_count: usize,
+    pub operator: String,
+    pub issues: Vec<String>,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
+/// Runtime is encoded in the registered pane handle. tmux is the only live
+/// notification channel.
 pub fn runtime_for_pane(pane: Option<&str>) -> Option<&'static str> {
     let pane = pane?;
     if pane.starts_with('%') {
         Some("tmux")
-    } else if pane.starts_with("herdr:") {
-        Some("herdr")
     } else {
         None
     }
@@ -47,8 +60,6 @@ pub struct WorkerRec {
     pub pane: Option<String>,
     pub cwd: String,
     pub registered_ms: i64,
-    #[serde(default = "default_role")]
-    pub role: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,8 +74,10 @@ pub struct Message {
     pub created_ms: i64,
     /// pending -> delivered -> read; replies may also become superseded.
     pub state: String,
-    pub nudge_count: u32,
-    pub last_nudge_ms: i64,
+    #[serde(default, alias = "nudge_count")]
+    pub wake_attempt_count: u32,
+    #[serde(default, alias = "last_nudge_ms")]
+    pub last_wake_attempt_ms: i64,
 }
 
 pub const REQUEST_COOLDOWN_MS: i64 = 5 * 60 * 1000;
@@ -89,21 +102,18 @@ pub struct TaskRec {
     #[serde(default)]
     pub next_step: Option<String>,
     #[serde(default)]
-    pub goal_prompt: Option<String>,
-    #[serde(default)]
-    pub goal_busy: bool,
-    #[serde(default)]
     pub wait: Option<WaitSpec>,
     pub created_ms: i64,
     pub updated_ms: i64,
-    pub last_heartbeat_sent_ms: i64,
-    pub heartbeat_pending: bool,
-    #[serde(default)]
-    pub heartbeat_message_id: Option<String>,
-    pub heartbeat_stale_notified: bool,
+    #[serde(default, alias = "last_heartbeat_sent_ms")]
+    pub last_continuation_sent_ms: i64,
+    #[serde(default, alias = "heartbeat_pending")]
+    pub continuation_pending: bool,
+    #[serde(default, alias = "heartbeat_message_id")]
+    pub continuation_message_id: Option<String>,
 }
 
-pub fn task_heartbeat_active(status: &str) -> bool {
+pub fn task_continuation_active(status: &str) -> bool {
     !matches!(
         status,
         "available" | "waiting" | "delivered" | "merged" | "closed" | "cancelled"
@@ -137,17 +147,52 @@ pub fn wait_cycle(tasks: &HashMap<String, TaskRec>, task_id: &str, waiting_for: 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ev")]
 pub enum Event {
-    Registered { worker: WorkerRec },
-    WorkerRemoved { worker_id: String },
-    MasterTransferred { from: String, to: String },
-    Sent { msg: Message },
-    DeliveryMode { msg_id: String, mode: String },
-    Delivered { ids: Vec<String> },
-    Acked { ids: Vec<String> },
-    Nudged { msg_id: String },
-    Superseded { ids: Vec<String> },
-    TaskCreated { task: TaskRec },
-    TaskUpdated { task: TaskRec },
+    Registered {
+        worker: WorkerRec,
+    },
+    #[serde(rename = "WorkerRemoved")]
+    LegacyWorkerRemoved {
+        worker_id: String,
+    },
+    #[serde(rename = "MasterTransferred")]
+    LegacyMasterTransferred {
+        from: String,
+        to: String,
+    },
+    Sent {
+        msg: Message,
+    },
+    DeliveryMode {
+        msg_id: String,
+        mode: String,
+    },
+    WakeAttempted {
+        ids: Vec<String>,
+        #[serde(default)]
+        attempted_ms: i64,
+    },
+    Delivered {
+        ids: Vec<String>,
+    },
+    Acked {
+        ids: Vec<String>,
+    },
+    #[serde(rename = "Nudged")]
+    LegacyNudged {
+        msg_id: String,
+    },
+    Superseded {
+        ids: Vec<String>,
+    },
+    TaskCreated {
+        task: TaskRec,
+    },
+    TaskUpdated {
+        task: TaskRec,
+    },
+    MigrationUpdated {
+        migration: MigrationRecord,
+    },
 }
 
 #[derive(Default)]
@@ -156,50 +201,32 @@ pub struct State {
     pub msgs: HashMap<String, Message>,
     pub tasks: HashMap<String, TaskRec>,
     pub delivery_modes: HashMap<String, String>,
+    pub migration: Option<MigrationRecord>,
 }
 
 impl State {
     pub fn apply(&mut self, ev: &Event) {
         match ev {
             Event::Registered { worker } => {
-                let existing = self.workers.get(&worker.id);
-                let role = match existing {
-                    Some(prev) => prev.role.clone(),
-                    None if self.workers.is_empty() => "master".to_string(),
-                    None => worker.role.clone(),
-                };
-                let role = if role == "master"
-                    && self
-                        .workers
-                        .values()
-                        .any(|w| w.id != worker.id && w.role == "master")
-                {
-                    "worker".to_string()
-                } else {
-                    role
-                };
-                let worker = WorkerRec {
-                    role: role.clone(),
-                    ..worker.clone()
-                };
-                self.workers.insert(worker.id.clone(), worker);
+                self.workers.insert(worker.id.clone(), worker.clone());
             }
-            Event::WorkerRemoved { worker_id } => {
+            Event::LegacyWorkerRemoved { worker_id } => {
                 self.workers.remove(worker_id);
             }
-            Event::MasterTransferred { from, to } => {
-                if let Some(worker) = self.workers.get_mut(from) {
-                    worker.role = "worker".into();
-                }
-                if let Some(worker) = self.workers.get_mut(to) {
-                    worker.role = "master".into();
-                }
-            }
+            Event::LegacyMasterTransferred { .. } => {}
             Event::Sent { msg } => {
                 self.msgs.insert(msg.id.clone(), msg.clone());
             }
             Event::DeliveryMode { msg_id, mode } => {
                 self.delivery_modes.insert(msg_id.clone(), mode.clone());
+            }
+            Event::WakeAttempted { ids, attempted_ms } => {
+                for id in ids {
+                    if let Some(message) = self.msgs.get_mut(id) {
+                        message.wake_attempt_count = message.wake_attempt_count.saturating_add(1);
+                        message.last_wake_attempt_ms = *attempted_ms;
+                    }
+                }
             }
             Event::Delivered { ids } => {
                 for id in ids {
@@ -224,27 +251,25 @@ impl State {
                     }
                 }
             }
-            Event::Nudged { msg_id } => {
+            Event::LegacyNudged { msg_id } => {
                 if let Some(m) = self.msgs.get_mut(msg_id) {
-                    m.nudge_count += 1;
-                    m.last_nudge_ms = now_ms();
+                    m.wake_attempt_count = m.wake_attempt_count.saturating_add(1);
+                    m.last_wake_attempt_ms = 0;
                 }
             }
             Event::TaskCreated { task } | Event::TaskUpdated { task } => {
                 self.tasks.insert(task.id.clone(), task.clone());
             }
+            Event::MigrationUpdated { migration } => {
+                self.migration = Some(migration.clone());
+            }
         }
     }
 
-    pub fn has_master(&self) -> bool {
-        self.workers.values().any(|w| w.role == "master")
-    }
-
-    pub fn master_id(&self) -> Option<String> {
-        self.workers
-            .values()
-            .find(|w| w.role == "master")
-            .map(|w| w.id.clone())
+    pub fn admission_frozen(&self) -> bool {
+        self.migration
+            .as_ref()
+            .is_some_and(|migration| migration.admission_frozen)
     }
 
     /// Unread (not yet acked) inbox of a worker, oldest first.
@@ -318,7 +343,7 @@ mod tests {
     #[test]
     fn runtime_is_derived_from_pane_namespace() {
         assert_eq!(runtime_for_pane(Some("%7")), Some("tmux"));
-        assert_eq!(runtime_for_pane(Some("herdr:w4:p1")), Some("herdr"));
+        assert_eq!(runtime_for_pane(Some("herdr:w4:p1")), None);
         assert_eq!(runtime_for_pane(None), None);
         assert_eq!(runtime_for_pane(Some("w4:p1")), None);
     }
@@ -333,8 +358,8 @@ mod tests {
             in_reply_to: None,
             created_ms: 1,
             state: "pending".into(),
-            nudge_count: 0,
-            last_nudge_ms: 0,
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
         }
     }
 
@@ -361,29 +386,34 @@ mod tests {
     }
 
     #[test]
-    fn first_master_survives_duplicate_master_registration() {
-        let mut st = State::default();
-        let first = WorkerRec {
-            id: "first".into(),
-            token: "t1".into(),
-            pane: None,
-            cwd: "/tmp".into(),
-            registered_ms: 1,
-            role: "master".into(),
-        };
-        let second = WorkerRec {
-            id: "second".into(),
-            token: "t2".into(),
-            pane: None,
-            cwd: "/tmp".into(),
-            registered_ms: 2,
-            role: "master".into(),
-        };
-        st.apply(&Event::Registered { worker: first });
-        st.apply(&Event::Registered { worker: second });
+    fn legacy_wake_attempt_replay_is_clock_independent() {
+        let event: Event = serde_json::from_str(r#"{"ev":"WakeAttempted","ids":["m1"]}"#).unwrap();
+        let mut first = State::default();
+        let mut second = State::default();
+        for state in [&mut first, &mut second] {
+            state.apply(&Event::Sent {
+                msg: msg("m1", "worker", "system"),
+            });
+            state.apply(&event);
+        }
+        assert_eq!(first.msgs["m1"].wake_attempt_count, 1);
+        assert_eq!(first.msgs["m1"].last_wake_attempt_ms, 0);
+        assert_eq!(
+            serde_json::to_value(&first.msgs["m1"]).unwrap(),
+            serde_json::to_value(&second.msgs["m1"]).unwrap()
+        );
+    }
 
-        assert_eq!(st.workers["first"].role, "master");
-        assert_eq!(st.workers["second"].role, "worker");
+    #[test]
+    fn legacy_role_field_is_ignored_on_replay() {
+        let mut st = State::default();
+        let event: Event = serde_json::from_str(
+            r#"{"ev":"Registered","worker":{"id":"legacy","token":"t","pane":"%1","cwd":"/tmp","registered_ms":1,"role":"master"}}"#,
+        )
+        .unwrap();
+        st.apply(&event);
+        let worker = serde_json::to_value(&st.workers["legacy"]).unwrap();
+        assert!(worker.get("role").is_none());
     }
 
     #[test]
@@ -421,7 +451,7 @@ mod tests {
         let base = |id: &str| TaskRec {
             id: id.into(),
             owner: "worker".into(),
-            created_by: "master".into(),
+            created_by: "worker".into(),
             feature_id: None,
             worktree_path: None,
             branch: None,
@@ -429,25 +459,23 @@ mod tests {
             priority: "p2".into(),
             status: "waiting".into(),
             next_step: None,
-            goal_prompt: None,
-            goal_busy: false,
             wait: None,
             created_ms: 0,
             updated_ms: 0,
-            last_heartbeat_sent_ms: 0,
-            heartbeat_pending: false,
-            heartbeat_message_id: None,
-            heartbeat_stale_notified: false,
+            last_continuation_sent_ms: 0,
+            continuation_pending: false,
+            continuation_message_id: None,
         };
         let mut tasks = HashMap::new();
         let mut a = base("a");
         a.wait = Some(WaitSpec {
+            waiter: "a".into(),
             waiting_for: "b".into(),
-            responsible_actor: "master".into(),
+            responsible_actor: "worker".into(),
             reason: "resource_conflict".into(),
             deadline_ms: 1,
             resume_on: vec!["resource_released".into()],
-            escalation: "master_review".into(),
+            escalation: "resource_owner_and_waiter_recheck".into(),
         });
         tasks.insert("a".into(), a);
         assert!(wait_cycle(&tasks, "b", "a"));

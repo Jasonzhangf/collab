@@ -12,13 +12,8 @@ use std::time::Duration;
 /// `capture-pane`, because terminal word-wrap makes visual line capture
 /// unreliable for long prompts.
 pub fn pane_alive(pane: &str) -> bool {
-    if let Some((socket, pane_id)) = pane.strip_prefix("herdr:").and_then(|v| v.split_once('|')) {
-        return Command::new("herdr")
-            .env("HERDR_SOCKET_PATH", socket)
-            .args(["pane", "get", pane_id])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+    if !pane.starts_with('%') {
+        return false;
     }
     // `tmux display-message -t <pane>` exits 0 even when the pane does not
     // exist, so enumerate all panes and compare pane ids exactly.
@@ -36,22 +31,8 @@ pub fn pane_alive(pane: &str) -> bool {
 }
 
 pub fn pane_idle(pane: &str) -> bool {
-    if cfg!(test) && pane.starts_with('%') {
-        return true;
-    }
-    if let Some((socket, pane_id)) = pane.strip_prefix("herdr:").and_then(|v| v.split_once('|')) {
-        return Command::new("herdr")
-            .env("HERDR_SOCKET_PATH", socket)
-            .args(["pane", "get", pane_id])
-            .output()
-            .ok()
-            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-            .and_then(|v| {
-                v.pointer("/result/pane/agent_status")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s == "idle")
-            })
-            .unwrap_or(false);
+    if !pane.starts_with('%') {
+        return false;
     }
     Command::new("tmux")
         .args([
@@ -59,32 +40,32 @@ pub fn pane_idle(pane: &str) -> bool {
             "-p",
             "-t",
             pane,
-            "#{pane_current_command}",
+            "#{pane_current_command}\t#{pane_title}",
         ])
         .output()
         .ok()
         .map(|o| {
-            matches!(
-                String::from_utf8_lossy(&o.stdout).trim(),
-                "zsh" | "bash" | "fish" | "sh"
-            )
+            let output = String::from_utf8_lossy(&o.stdout);
+            let Some((command, title)) = output.trim().split_once('\t') else {
+                return false;
+            };
+            agent_waiting(command, title)
         })
         .unwrap_or(false)
 }
 
-fn herdr_accepting_input(socket: &str, pane_id: &str) -> bool {
-    Command::new("herdr")
-        .env("HERDR_SOCKET_PATH", socket)
-        .args(["pane", "get", pane_id])
-        .output()
-        .ok()
-        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-        .and_then(|v| {
-            v.pointer("/result/pane/agent_status")
-                .and_then(|s| s.as_str())
-                .map(|status| matches!(status, "idle" | "working"))
-        })
-        .unwrap_or(false)
+fn agent_waiting(command: &str, title: &str) -> bool {
+    if !matches!(command, "node" | "codex" | "claude" | "agy" | "dsh") {
+        return false;
+    }
+    let title = title.trim();
+    if title.is_empty() {
+        return false;
+    }
+    !title
+        .chars()
+        .next()
+        .is_some_and(|first| ('\u{2800}'..='\u{28ff}').contains(&first))
 }
 
 fn literal_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
@@ -96,60 +77,18 @@ fn submit_args<'a>(pane: &'a str) -> [&'a str; 4] {
 }
 
 pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
-    if let Some((socket, pane_id)) = pane.strip_prefix("herdr:").and_then(|v| v.split_once('|')) {
-        if !pane_alive(pane) {
-            anyhow::bail!("Herdr pane {} not alive", pane_id);
-        }
-        if !herdr_accepting_input(socket, pane_id) {
-            anyhow::bail!("Herdr pane {} agent is not accepting input", pane_id);
-        }
-        let sent = Command::new("herdr")
-            .env("HERDR_SOCKET_PATH", socket)
-            .args(["pane", "send-text", pane_id, text])
-            .status()?;
-        if !sent.success() {
-            anyhow::bail!("Herdr text delivery failed for pane {}", pane_id);
-        }
-        sleep(Duration::from_millis(2_000));
-        let submitted = Command::new("herdr")
-            .env("HERDR_SOCKET_PATH", socket)
-            .args(["pane", "send-keys", pane_id, "Enter"])
-            .status()?;
-        if !submitted.success() {
-            anyhow::bail!("Herdr Enter delivery failed for pane {}", pane_id);
-        }
-        return Ok(());
-    }
     if !pane_alive(pane) {
         anyhow::bail!("pane {} not alive", pane);
     }
-    // `/goal` is a slash command: tmux must receive its five-byte prefix as
-    // individual key events. Pasting the prefix does not activate Codex's
-    // slash-command parser; the remainder stays literal for efficiency.
+    if !pane_idle(pane) {
+        anyhow::bail!("pane {} is not a waiting agent", pane);
+    }
     const SUBMIT_DELAY_MS: u64 = 2_000;
-    if text.starts_with("/goal") {
-        for ch in "/goal".chars() {
-            let key = ch.to_string();
-            let sent = Command::new("tmux")
-                .args(literal_args(pane, &key))
-                .status()?;
-            if !sent.success() {
-                anyhow::bail!("tmux goal prefix delivery failed for pane {}", pane);
-            }
-        }
-        let sent = Command::new("tmux")
-            .args(literal_args(pane, &text[5..]))
-            .status()?;
-        if !sent.success() {
-            anyhow::bail!("tmux goal body delivery failed for pane {}", pane);
-        }
-    } else {
-        let sent = Command::new("tmux")
-            .args(literal_args(pane, text))
-            .status()?;
-        if !sent.success() {
-            anyhow::bail!("tmux text delivery failed for pane {}", pane);
-        }
+    let sent = Command::new("tmux")
+        .args(literal_args(pane, text))
+        .status()?;
+    if !sent.success() {
+        anyhow::bail!("tmux text delivery failed for pane {}", pane);
     }
     sleep(Duration::from_millis(SUBMIT_DELAY_MS));
     let submitted = Command::new("tmux").args(submit_args(pane)).status()?;
@@ -161,7 +100,7 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{literal_args, submit_args};
+    use super::{agent_waiting, literal_args, submit_args};
 
     #[test]
     fn matches_zterm_v1_literal_then_enter() {
@@ -171,11 +110,23 @@ mod tests {
         );
         assert_eq!(submit_args("%7"), ["send-keys", "-t", "%7", "Enter"]);
     }
+
+    #[test]
+    fn wake_requires_waiting_agent_and_rejects_shell_or_working_agent() {
+        assert!(agent_waiting("node", "routecodex"));
+        assert!(agent_waiting("codex", "collab"));
+        assert!(!agent_waiting("zsh", "Macstudio.local"));
+        assert!(!agent_waiting("node", "⠋ routecodex"));
+        assert!(!agent_waiting("node", ""));
+    }
 }
 
-pub fn knock_or_log(log: &Path, pane: &str, text: &str) {
+pub fn knock_or_log(log: &Path, pane: &str, text: &str) -> bool {
     if let Err(e) = knock(pane, text) {
         append_log(log, &format!("knock failed pane={} err={}", pane, e));
+        false
+    } else {
+        true
     }
 }
 

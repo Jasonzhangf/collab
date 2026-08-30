@@ -8,13 +8,14 @@ pub fn config_path(root: &Path) -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub heartbeat_minutes: i64,
+    #[serde(alias = "heartbeat_minutes")]
+    pub continuation_minutes: i64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            heartbeat_minutes: 15,
+            continuation_minutes: 15,
         }
     }
 }
@@ -48,8 +49,8 @@ pub fn save(root: &Path, config: &Config) -> anyhow::Result<()> {
 }
 
 fn validate(config: &Config) -> anyhow::Result<()> {
-    if config.heartbeat_minutes < 1 {
-        anyhow::bail!("heartbeat_minutes must be >= 1");
+    if config.continuation_minutes < 1 {
+        anyhow::bail!("continuation_minutes must be >= 1");
     }
     Ok(())
 }
@@ -61,7 +62,7 @@ mod tests {
     #[test]
     fn missing_config_uses_default() {
         let root = std::env::temp_dir();
-        assert_eq!(load(&root).unwrap().heartbeat_minutes, 15);
+        assert_eq!(load(&root).unwrap().continuation_minutes, 15);
     }
 
     #[test]
@@ -76,18 +77,24 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
         let config = Config {
-            heartbeat_minutes: 90,
+            continuation_minutes: 90,
         };
         save(&root, &config).unwrap();
-        assert_eq!(load(&root).unwrap().heartbeat_minutes, 90);
+        assert_eq!(load(&root).unwrap().continuation_minutes, 90);
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn invalid_heartbeat_is_rejected() {
+    fn invalid_continuation_interval_is_rejected() {
         let config = Config {
-            heartbeat_minutes: 0,
+            continuation_minutes: 0,
         };
         assert!(save(std::path::Path::new("/tmp"), &config).is_err());
+    }
+
+    #[test]
+    fn legacy_heartbeat_field_migrates_to_continuation() {
+        let config: Config = serde_json::from_str(r#"{"heartbeat_minutes":7}"#).unwrap();
+        assert_eq!(config.continuation_minutes, 7);
     }
 }
