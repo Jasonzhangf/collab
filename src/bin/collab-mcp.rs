@@ -108,6 +108,12 @@ fn tools() -> Value {
             &[]
         ),
         tool(
+            "collab_context",
+            "Return one authoritative continuation snapshot after a wake or restart.",
+            json!({}),
+            &[]
+        ),
+        tool(
             "collab_ack",
             "Acknowledge owned mailbox messages.",
             json!({"ids":{"type":"array","items":{"type":"string"}}}),
@@ -135,6 +141,7 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
         "collab_who" => argv.push("who".into()),
         "collab_master" => argv.push("master".into()),
         "collab_inbox" => argv.push("inbox".into()),
+        "collab_context" => argv.push("context".into()),
         "collab_ack" => {
             argv.push("ack".into());
             for id in args
