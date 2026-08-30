@@ -12,10 +12,10 @@
     {"resource_id":"journal-sequence","status":"pending","owner":"rust-core","truth_store":".agent-collab-v2/journal.jsonl","allowed_operations":["append","replay","snapshot"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
     {"resource_id":"migration-transaction","status":"pending","owner":"rust-core","truth_store":".agent-collab-v2/migration.json","allowed_operations":["inspect","plan","freeze","verify","resume"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
     {"resource_id":"daemon-operator-capability","status":"pending","owner":"rust-core-daemon","truth_store":"typed local operator command","allowed_operations":["down","up","status"],"forbidden_direct_consumers":["identity","message","business-payload"]},
-    {"resource_id":"tmux-wake-signal","status":"pending","owner":"tmux-transport","truth_store":"transport result only","allowed_operations":["send_short_wake"],"forbidden_direct_consumers":["business-payload","mailbox-body"]}
+    {"resource_id":"tmux-wake-signal","status":"active","owner":"tmux-transport","truth_store":"transport result only","allowed_operations":["send_short_wake"],"forbidden_direct_consumers":["business-payload","mailbox-body"]}
   ],
   "relations": [
-    {"from":"resource-notice-mailbox","to":"tmux-wake-signal","status":"pending","via":["notification-subscription","wake-attempt-ledger"],"forbid_direct":true},
+    {"from":"resource-notice-mailbox","to":"tmux-wake-signal","status":"active","via":["notification-subscription","wake-attempt-ledger"],"forbid_direct":true},
     {"from":"task-lifecycle","to":"resource-notice-mailbox","status":"pending","via":["wait-graph","notification-subscription"],"forbid_direct":true},
     {"from":"journal-sequence","to":"core-snapshot-file","status":"pending","via":["rust-core"],"forbid_direct":true}
   ]

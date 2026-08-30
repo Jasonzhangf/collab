@@ -115,7 +115,7 @@ pub struct Message {
     pub to: String,
     pub notice: ResourceNotice,
     pub subject: String,
-    pub subscription_id: String,
+    pub subscription_id: Option<String>,
     pub wake_attempt_count: u8,
     pub last_wake_attempt_ms: Option<u64>,
     pub delivered: bool,
@@ -147,6 +147,7 @@ pub enum CoreError {
     WaitCycle,
     InvalidSubscription,
     UnknownMessage,
+    DuplicateMessage,
     WakeExhausted,
 }
 
@@ -387,22 +388,25 @@ impl CoreState {
         if !self.has_identity(from) || !self.has_identity(to) || subject.is_empty() {
             return Err(CoreError::UnknownIdentity);
         }
-        let subscription = self
-            .subscriptions
-            .iter()
-            .find(|subscription| {
-                subscription.owner == to
-                    && subscription.state == SubscriptionState::Armed
-                    && subscription.event == NotificationEvent::DirectMessage
-            })
-            .ok_or(CoreError::InvalidSubscription)?;
+        let id = id.into();
+        if self.messages.iter().any(|message| message.id == id) {
+            return Err(CoreError::DuplicateMessage);
+        }
+        let subscription = self.subscriptions.iter().find(|subscription| {
+            subscription.owner == to
+                && subscription.state == SubscriptionState::Armed
+                && (subscription.event == NotificationEvent::DirectMessage
+                    || (notice == ResourceNotice::Released
+                        && subscription.event == NotificationEvent::ResourceReleased
+                        && subscription.subject.as_deref() == Some(subject)))
+        });
         self.messages.push(Message {
-            id: id.into(),
+            id,
             from: from.to_owned(),
             to: to.to_owned(),
             notice,
             subject: subject.to_owned(),
-            subscription_id: subscription.id.clone(),
+            subscription_id: subscription.map(|subscription| subscription.id.clone()),
             wake_attempt_count: 0,
             last_wake_attempt_ms: None,
             delivered: false,
@@ -425,13 +429,16 @@ impl CoreState {
             .iter_mut()
             .find(|message| message.id == message_id)
             .ok_or(CoreError::UnknownMessage)?;
+        let Some(subscription_id) = message.subscription_id.as_ref() else {
+            return Ok(WakeDisposition::Skipped);
+        };
         if message.wake_attempt_count >= 3 {
             return Err(CoreError::WakeExhausted);
         }
         let subscription = self
             .subscriptions
             .iter_mut()
-            .find(|subscription| subscription.id == message.subscription_id)
+            .find(|subscription| subscription.id == *subscription_id)
             .ok_or(CoreError::InvalidSubscription)?;
         if subscription.state != SubscriptionState::Armed || subscription.expires_at_ms <= now_ms {
             subscription.state = SubscriptionState::Expired;
@@ -563,5 +570,22 @@ mod tests {
             Err(CoreError::WakeExhausted)
         );
         assert_eq!(state.messages[0].wake_attempt_count, 3);
+    }
+
+    #[test]
+    fn resource_notice_is_durable_without_wake_subscription() {
+        let mut state = CoreState::default();
+        state.register(peer("a", "session-a")).unwrap();
+        state.register(peer("b", "session-b")).unwrap();
+        state
+            .send_resource_notice("message", "a", "b", ResourceNotice::Released, "resource")
+            .unwrap();
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].wake_attempt_count, 0);
+        assert_eq!(
+            state.record_wake_attempt("message", AgentState::Waiting, false, 110),
+            Ok(WakeDisposition::Skipped)
+        );
+        assert_eq!(state.messages[0].wake_attempt_count, 0);
     }
 }

@@ -7,9 +7,9 @@ import { createCollabV2 } from '../src/index.mjs'
 
 const binary = resolve('target/debug/core-daemon')
 
-async function runtime() {
+async function runtime(options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'collab-v2-core-'))
-  return createCollabV2({ cwd: '/tmp/project', rustCoreBinary: binary, rustCoreState: join(root, 'state.json') })
+  return createCollabV2({ cwd: '/tmp/project', rustCoreBinary: binary, rustCoreState: join(root, 'state.json'), ...options })
 }
 
 test('Node adapter registers equal peers without role or permission projection', async () => {
@@ -48,4 +48,37 @@ test('restart projection comes from persisted Rust state rather than Node maps',
   assert.equal(second.collab.snapshot().identities[0].id, 'a')
   assert.equal(second.collab.snapshot().tasks[0].id, 'task-1')
   await second.dispose()
+})
+
+test('resource notice commits durably without subscription and produces no implicit wake', async () => {
+  const calls = []
+  const instance = await runtime({ tmuxTransport: { deliver: async (input) => calls.push(input) } })
+  instance.collab.register({ id: 'a', sessionId: 'session-a', pane: '%1' })
+  instance.collab.register({ id: 'b', sessionId: 'session-b', pane: '%2' })
+  instance.communication.send({ messageId: 'message-1', from: 'a', to: 'b', notice: 'occupied', subject: 'resource' })
+  assert.equal(instance.collab.snapshot().messages[0].id, 'message-1')
+  assert.equal(instance.collab.snapshot().messages[0].subscription_id, null)
+  assert.deepEqual(calls, [])
+  await instance.dispose()
+})
+
+test('explicit subscribed wake uses tmux once and unknown state fails closed', async () => {
+  const calls = []
+  const states = new Map([['b', 'waiting'], ['c', 'unknown']])
+  const instance = await runtime({
+    tmuxTransport: { deliver: async (input) => { calls.push(input); return { ok: true } } },
+    agentStateProbe: async ({ id }) => states.get(id),
+  })
+  for (const [id, pane] of [['a', '%1'], ['b', '%2'], ['c', '%3']]) instance.collab.register({ id, sessionId: `session-${id}`, pane })
+  instance.collab.subscribe({ owner: 'b', subscriptionId: 'sub-b', event: 'direct-message', expiresAtMs: 200, nowMs: 100 })
+  instance.collab.subscribe({ owner: 'c', subscriptionId: 'sub-c', event: 'direct-message', expiresAtMs: 200, nowMs: 100 })
+  instance.communication.send({ messageId: 'message-b', from: 'a', to: 'b', notice: 'released', subject: 'resource' })
+  instance.communication.send({ messageId: 'message-c', from: 'a', to: 'c', notice: 'released', subject: 'resource' })
+  await instance.communication.wake({ messageId: 'message-b', nowMs: 110 })
+  await instance.communication.wake({ messageId: 'message-c', nowMs: 110 })
+  assert.deepEqual(calls, [{ target: '%2', messageId: 'message-b' }])
+  const snapshot = instance.collab.snapshot()
+  assert.equal(snapshot.messages.find(({ id }) => id === 'message-b').wake_attempt_count, 1)
+  assert.equal(snapshot.messages.find(({ id }) => id === 'message-c').wake_attempt_count, 0)
+  await instance.dispose()
 })

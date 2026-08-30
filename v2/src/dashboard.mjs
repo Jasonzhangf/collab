@@ -3,11 +3,7 @@ export const DashboardProjection = (ctx) => {
     snapshot() {
       return Object.freeze({
         scope: ctx.collab.scope,
-        projectState: ctx.collab.projectState(),
-        workers: ctx.collab.listWorkers(),
-        tasks: ctx.collab.listTasks(),
-        messages: ctx.collab.listMessages(),
-        deliveries: ctx.communication.listDeliveries(),
+        state: ctx.collab.snapshot(),
       })
     },
   }
