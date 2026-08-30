@@ -17,6 +17,16 @@ pub fn default_priority() -> String {
     "p2".into()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitSpec {
+    pub waiting_for: String,
+    pub responsible_actor: String,
+    pub reason: String,
+    pub deadline_ms: i64,
+    pub resume_on: Vec<String>,
+    pub escalation: String,
+}
+
 /// Runtime is encoded in the registered pane handle. A worker without a
 /// tmux or Herdr pane is not eligible for project communication.
 pub fn runtime_for_pane(pane: Option<&str>) -> Option<&'static str> {
@@ -82,6 +92,8 @@ pub struct TaskRec {
     pub goal_prompt: Option<String>,
     #[serde(default)]
     pub goal_busy: bool,
+    #[serde(default)]
+    pub wait: Option<WaitSpec>,
     pub created_ms: i64,
     pub updated_ms: i64,
     pub last_heartbeat_sent_ms: i64,
@@ -100,6 +112,24 @@ pub fn task_heartbeat_active(status: &str) -> bool {
 
 pub fn task_resource_active(status: &str) -> bool {
     !matches!(status, "waiting" | "merged" | "closed" | "cancelled")
+}
+
+pub fn wait_cycle(tasks: &HashMap<String, TaskRec>, task_id: &str, waiting_for: &str) -> bool {
+    let mut current = waiting_for;
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(current.to_string()) {
+        if current == task_id {
+            return true;
+        }
+        let Some(task) = tasks.get(current) else {
+            return false;
+        };
+        let Some(wait) = task.wait.as_ref() else {
+            return false;
+        };
+        current = &wait.waiting_for;
+    }
+    true
 }
 
 /// Journal events. Every mutation is an event: live path applies + appends,
@@ -384,6 +414,44 @@ mod tests {
         assert!(st
             .recent_live_request("w1", "w2", 500 + REQUEST_COOLDOWN_MS)
             .is_none());
+    }
+
+    #[test]
+    fn wait_cycle_rejects_direct_and_transitive_cycles() {
+        let base = |id: &str| TaskRec {
+            id: id.into(),
+            owner: "worker".into(),
+            created_by: "master".into(),
+            feature_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            priority: "p2".into(),
+            status: "waiting".into(),
+            next_step: None,
+            goal_prompt: None,
+            goal_busy: false,
+            wait: None,
+            created_ms: 0,
+            updated_ms: 0,
+            last_heartbeat_sent_ms: 0,
+            heartbeat_pending: false,
+            heartbeat_message_id: None,
+            heartbeat_stale_notified: false,
+        };
+        let mut tasks = HashMap::new();
+        let mut a = base("a");
+        a.wait = Some(WaitSpec {
+            waiting_for: "b".into(),
+            responsible_actor: "master".into(),
+            reason: "resource_conflict".into(),
+            deadline_ms: 1,
+            resume_on: vec!["resource_released".into()],
+            escalation: "master_review".into(),
+        });
+        tasks.insert("a".into(), a);
+        assert!(wait_cycle(&tasks, "b", "a"));
+        assert!(!wait_cycle(&tasks, "c", "a"));
     }
 
     #[test]

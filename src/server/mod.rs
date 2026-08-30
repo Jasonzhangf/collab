@@ -8,8 +8,8 @@ use crate::scope::Scope;
 use crate::server::knock::{append_log, knock_or_log, pane_alive, pane_idle};
 use serde_json::json;
 use state::{
-    default_role, now_ms, runtime_for_pane, task_heartbeat_active, task_resource_active, Event,
-    Message, State, TaskRec, WorkerRec,
+    default_role, now_ms, runtime_for_pane, task_heartbeat_active, task_resource_active,
+    wait_cycle, Event, Message, State, TaskRec, WaitSpec, WorkerRec,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -244,7 +244,10 @@ fn delivery_text(
     let relative = path
         .strip_prefix(root)
         .map_err(|e| format!("cannot make message reference relative: {e}"))?;
-    let summary: String = one_line(body).chars().take(DELIVERY_SUMMARY_CHARS).collect();
+    let summary: String = one_line(body)
+        .chars()
+        .take(DELIVERY_SUMMARY_CHARS)
+        .collect();
     Ok(format!(
         "{prefix} summary={}... body-ref={} {next}",
         summary,
@@ -681,6 +684,7 @@ fn handle_task_register_with_next(
         next_step,
         goal_busy: goal_prompt.is_some(),
         goal_prompt,
+        wait: None,
         created_ms: now,
         updated_ms: now,
         last_heartbeat_sent_ms: now,
@@ -871,7 +875,10 @@ fn handle_task_update(
         if !is_owner && !master_management {
             return Resp::err("only the task owner may update its work state; master may rework");
         }
-        task.status = new_status;
+        task.status = new_status.clone();
+        if new_status != "waiting" {
+            task.wait = None;
+        }
     }
     if next_step.is_some() {
         task.next_step = next_step;
@@ -1274,6 +1281,7 @@ fn handle_task_deliver(
     };
 
     task.status = "delivered".to_string();
+    task.wait = None;
     task.next_step = Some("master review and merge".to_string());
     task.heartbeat_pending = false;
     task.heartbeat_message_id = None;
@@ -1349,6 +1357,7 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
     }
     let mut closed = task;
     closed.status = "closed".to_string();
+    closed.wait = None;
     closed.next_step = Some("closed after master merge and cleanup".to_string());
     closed.heartbeat_pending = false;
     closed.heartbeat_message_id = None;
@@ -1477,9 +1486,46 @@ fn task_view(task: &TaskRec) -> serde_json::Value {
         "next_step": task.next_step,
         "goal_busy": task.goal_busy,
         "goal_prompt": task.goal_prompt,
+        "wait": task.wait,
         "heartbeat": if task_heartbeat_active(&task.status) { "active" } else { "unregistered" },
         "updated_at": iso(task.updated_ms),
     })
+}
+
+fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
+    let st = server.state.lock().unwrap();
+    if let Err(e) = verify(&st, &worker_id, &token) {
+        return e;
+    }
+    let Some(worker) = st.workers.get(&worker_id) else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    let tasks: Vec<serde_json::Value> = st
+        .tasks
+        .values()
+        .filter(|task| task.owner == worker_id || task.status == "available")
+        .map(task_view)
+        .collect();
+    let unread: Vec<&Message> = st.inbox_of(&worker_id);
+    let next_actions: Vec<String> = tasks
+        .iter()
+        .filter_map(|task| {
+            task.get("next_step")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    Resp::data(json!({
+        "identity": {"worker_id": worker.id, "role": worker.role, "pane": worker.pane},
+        "liveness": {
+            "pane_alive": worker.pane.as_deref().is_some_and(pane_alive),
+            "pane_idle": worker.pane.as_deref().is_some_and(pane_idle),
+        },
+        "tasks": tasks,
+        "inbox": {"unread": unread.len()},
+        "next_actions": next_actions,
+        "truth": "server journal and mailbox; tmux is wake-only",
+    }))
 }
 
 fn handle_poll(server: &Server, worker_id: String, timeout_ms: u64) -> Resp {
@@ -1557,6 +1603,9 @@ fn handle_task_wait(
     let Some(blocking) = st.tasks.get(&blocking_task_id).cloned() else {
         return Resp::err(format!("blocking task {} not found", blocking_task_id));
     };
+    if task.id == blocking_task_id || wait_cycle(&st.tasks, &task.id, &blocking_task_id) {
+        return Resp::err("WAIT_CYCLE_DETECTED");
+    }
     let conflict = task_resource_active(&blocking.status)
         && ((task.feature_id.is_some() && task.feature_id == blocking.feature_id)
             || (task.worktree_path.is_some() && task.worktree_path == blocking.worktree_path));
@@ -1565,6 +1614,18 @@ fn handle_task_wait(
     }
     task.status = "waiting".into();
     task.next_step = Some(format!("WAITING_FOR={}", blocking_task_id));
+    task.wait = Some(WaitSpec {
+        waiting_for: blocking_task_id.clone(),
+        responsible_actor: st.master_id().unwrap_or_else(|| "unassigned".into()),
+        reason: "resource_conflict".into(),
+        deadline_ms: now_ms() + 15 * 60 * 1000,
+        resume_on: vec![
+            "resource_released".into(),
+            "rework".into(),
+            "cancelled".into(),
+        ],
+        escalation: "master_review".into(),
+    });
     task.heartbeat_pending = false;
     task.heartbeat_message_id = None;
     task.updated_ms = now_ms();
@@ -1934,6 +1995,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 .collect();
             Resp::data(json!({"unread": items.len(), "messages": items}))
         }
+        Req::Context { worker_id, token } => handle_context(server, worker_id, token),
         Req::MsgStatus { msg_id } => {
             let st = server.state.lock().unwrap();
             match st.msgs.get(&msg_id) {

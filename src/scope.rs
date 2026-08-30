@@ -55,6 +55,9 @@ its socket is unavailable. `collab init` creates/migrates the local
 `.agent-collab/server` skeleton, so old projects need no manual repair. Use
 `collab down` only for an explicit stop; use `collab up` to clear that stop and
 start it again. Never start a second daemon.
+Existing projects must migrate through `collab init` and server queries;
+deleting `.agent-collab`, editing JSON state, clearing mailboxes, copying
+tokens, mixed runtime writes, and guessing pane identity are deprecated.
 
 ## Runtime boundary
 
@@ -103,6 +106,7 @@ collab up                         # clear explicit down and start daemon
 collab down                       # explicit stop; disables auto-restart
 collab who                        # workers + active task status
 collab task status [task-id]      # board or one task
+collab context                    # one authoritative continuation snapshot
 collab task register <id> --feature <feature-id> --worktree <path> \
   --branch <branch> --base-commit <sha> --priority p2
  collab task claim <id>            # worker self-service

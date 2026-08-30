@@ -72,6 +72,43 @@ pub fn tick(server: &Arc<Server>) {
     {
         let st = server.state.lock().unwrap();
 
+        // A wait always has a finite liveness boundary. Expiry becomes an
+        // explicit blocker for master resolution; it never silently resumes
+        // or releases the waiting claim.
+        for task in st.tasks.values() {
+            let Some(wait) = task.wait.as_ref() else {
+                continue;
+            };
+            if task.status != "waiting" || wait.deadline_ms > now {
+                continue;
+            }
+            let mut expired = task.clone();
+            expired.status = "blocked".into();
+            expired.next_step = Some(format!(
+                "WAIT_TIMEOUT waiting_for={} responsible_actor={} escalation={}",
+                wait.waiting_for, wait.responsible_actor, wait.escalation
+            ));
+            expired.wait = None;
+            expired.updated_ms = now;
+            expired.heartbeat_pending = false;
+            expired.heartbeat_message_id = None;
+            evs.push(Event::TaskUpdated { task: expired });
+            let master = st.master_id().unwrap_or_else(|| "unassigned".into());
+            let (event, msg_id, body) = sent_system(
+                &master,
+                format!(
+                    "TASK_WAIT_TIMEOUT id={} waiting_for={} responsible_actor={}; MASTER_ACTION: resolve the expired wait through Collab",
+                    task.id, wait.waiting_for, wait.responsible_actor
+                ),
+            );
+            evs.push(event);
+            if let Some(pane) = st.worker_pane(&master) {
+                if idle_panes.contains(&pane) {
+                    knocks.push((pane, msg_id, body));
+                }
+            }
+        }
+
         // 0) task-scoped heartbeat: only active tasks, one pending per task
         for task in st.tasks.values() {
             if matches!(
@@ -407,6 +444,7 @@ mod tests {
                 heartbeat_stale_notified: false,
                 goal_prompt: None,
                 goal_busy: false,
+                wait: None,
             },
         }]);
     }
