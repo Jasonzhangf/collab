@@ -3,18 +3,18 @@
 Collab v2 is an isolated redesign. The v1 source tree and runtime state are
 not imported, mutated, or shared by v2.
 
-## Frozen boundary
+## Candidate boundary
 
-- Rust owns identity, authorization, journal/replay, task/claim lifecycle,
-  resource truth, mailbox state, and the single reducer.
-- Cordis (original Node.js package) owns plugin activation, dependency
-  wiring, event subscriptions, disposal, and hot replacement.
-- Codis/container orchestration owns process/container lifecycle and health;
-  it never writes Collab state directly.
-- `Arc` is process-local shared read state. Cross-process communication uses
-  versioned commands/events.
-- Tmux text delivery has one Rust transport owner; agents never send raw
-  tmux input.
+- Rust owns equal-peer identity, owner task lifecycle, bounded waits, exact
+  subscriptions, durable notices, wake leases, journal/replay, migration, and
+  the single reducer.
+- Node/Cordis is a typed command adapter and read-only projection. It does not
+  retain semantic maps or write journal truth.
+- tmux is the only live notification channel. It sends only a short message id
+  after an Agent explicitly subscribes and the target is observed `waiting`.
+- `unknown`, `absent`, and `working` produce zero tmux input; no timer or
+  restart infers continuation. v2 remains isolated and is not production.
 
-The design is frozen as `v2-design-freeze-1`. Changes to these boundaries or
-protocols require a new freeze revision before implementation continues.
+The runtime is still a candidate. Canonical AppSDK compile, installation,
+restart, real tmux black-box evidence, review, and freeze are required before
+any production deployment decision.

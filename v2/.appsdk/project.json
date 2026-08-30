@@ -1,26 +1,162 @@
 {
-  "schema_version": 1,
-  "project_id": "collab-v2",
-  "sdk": {"name": "appsdk", "version": "0.1.5", "bundle_manifest": ".appsdk/contracts/sdk-bundle.manifest.json", "resource_record": ".appsdk/sdk-resources.json"},
-  "lifecycle": {"stage": "draft"},
-  "access": {"protected_paths": [".appsdk/**", "generated/**", "protected/source/**"]},
-  "development_scenarios": {"manifest": ".appsdk/contracts/development-scenarios.manifest.json", "enabled": []},
-  "governance": {
-    "playground_root": "playground/experiments/**",
-    "active_root": "active/lib/**",
-    "protected_root": "protected/**",
-    "generated_root": "generated/**",
-    "active_kind": "immutable_consumable_library",
-    "protected_kinds": ["source", "contracts", "history"],
-    "generated_kinds": ["compiler_output", "indexes"],
-    "freeze_requirements": ["git_clean", "source_commit_or_tag", "library_hash", "public_api_hash", "review_pass", "previous_active_immutable"],
-    "promotion_requires": ["experiment_evidence", "architecture_review_pass", "unique_owner", "required_gates"],
-    "runtime_forbidden_roots": ["playground/**", "generated/**", "active/lib/**", "protected/**"],
-    "record_contracts": ["contracts/records/worktree-record.schema.json", "contracts/records/reproduction-record.schema.json", "contracts/records/evidence-record.schema.json", "contracts/records/fix-candidate-record.schema.json", "contracts/records/goal-clarification-record.schema.json", "contracts/records/review-record.schema.json", "contracts/records/effectiveness-record.schema.json", "contracts/records/pre-review-validation-record.schema.json", "contracts/records/collaboration-record.schema.json", "contracts/records/collaboration-index.schema.json", "contracts/records/merge-queue-record.schema.json", "contracts/records/merge-queue-state.schema.json", "contracts/records/integration-record.schema.json", "contracts/records/mainline-receipt-record.schema.json", "contracts/records/merge-record.schema.json", "contracts/records/promotion-record.schema.json", "contracts/records/regression-report.schema.json", "contracts/records/freeze-record.schema.json", "contracts/records/record-graph.contract.json"],
-    "zone_transition_contract": "contracts/transitions/zone-transition-manifest.json",
-    "playground_retention": "archive_then_remove",
-    "debug_merge_comment_required": true
+  "access": {
+    "protected_paths": [
+      ".appsdk/**",
+      "generated/**",
+      "protected/source/**"
+    ]
   },
-  "lifecycles": {"issue": "open", "library": "draft", "source_snapshot": "mutable", "artifact": "generated"},
-  "modules": [{"module_id":"core","stage":"source_implemented","owned_paths":["bin/**","crates/**","protocol/**","contracts/**","src/**","containers/**","tests/**","docs/**","scripts/**","package.json","package-lock.json","Cargo.toml","Cargo.lock"],"source_owner":"core","active_artifact":"active/lib/core/**","generated_outputs":["generated/**"],"contract_paths":["contracts/**","protocol/**"],"dependency_modules":[],"build":{"program":"sh","args":["-c","cargo build --release && mkdir -p generated/modules/core/lib && cp target/release/core-daemon generated/modules/core/lib/core-daemon"],"working_directory":"."},"artifact_paths":["core-daemon"],"regression":{"required_before_freeze":true,"suite_id":"core-regression","command":{"program":"npm","args":["test"],"working_directory":"."},"input_paths":["bin/**","crates/**","protocol/**","contracts/**","src/**","containers/**","tests/**"],"minimum_test_count":1,"allow_skipped":false,"ordinary_mode_after_freeze":"disabled","reenable_on":["source_change","contract_change","public_api_change","artifact_change","dependency_change"]}}]
+  "development_scenarios": {
+    "enabled": [],
+    "manifest": ".appsdk/contracts/development-scenarios.manifest.json"
+  },
+  "governance": {
+    "active_kind": "immutable_consumable_library",
+    "active_root": "active/lib/**",
+    "debug_merge_comment_required": true,
+    "freeze_requirements": [
+      "git_clean",
+      "source_commit_or_tag",
+      "library_hash",
+      "public_api_hash",
+      "review_pass",
+      "previous_active_immutable"
+    ],
+    "generated_kinds": [
+      "compiler_output",
+      "indexes"
+    ],
+    "generated_root": "generated/**",
+    "playground_retention": "archive_then_remove",
+    "playground_root": "playground/experiments/**",
+    "promotion_requires": [
+      "experiment_evidence",
+      "architecture_review_pass",
+      "unique_owner",
+      "required_gates"
+    ],
+    "protected_kinds": [
+      "source",
+      "contracts",
+      "history"
+    ],
+    "protected_root": "protected/**",
+    "record_contracts": [
+      "contracts/records/worktree-record.schema.json",
+      "contracts/records/reproduction-record.schema.json",
+      "contracts/records/evidence-record.schema.json",
+      "contracts/records/fix-candidate-record.schema.json",
+      "contracts/records/goal-clarification-record.schema.json",
+      "contracts/records/review-record.schema.json",
+      "contracts/records/effectiveness-record.schema.json",
+      "contracts/records/pre-review-validation-record.schema.json",
+      "contracts/records/collaboration-record.schema.json",
+      "contracts/records/collaboration-index.schema.json",
+      "contracts/records/merge-queue-record.schema.json",
+      "contracts/records/merge-queue-state.schema.json",
+      "contracts/records/integration-record.schema.json",
+      "contracts/records/mainline-receipt-record.schema.json",
+      "contracts/records/merge-record.schema.json",
+      "contracts/records/promotion-record.schema.json",
+      "contracts/records/regression-report.schema.json",
+      "contracts/records/freeze-record.schema.json",
+      "contracts/records/record-graph.contract.json"
+    ],
+    "runtime_forbidden_roots": [
+      "playground/**",
+      "generated/**",
+      "active/lib/**",
+      "protected/**"
+    ],
+    "zone_transition_contract": "contracts/transitions/zone-transition-manifest.json"
+  },
+  "lifecycle": {
+    "stage": "contract_bound"
+  },
+  "lifecycles": {
+    "artifact": "generated",
+    "issue": "open",
+    "library": "draft",
+    "source_snapshot": "mutable"
+  },
+  "modules": [
+    {
+      "active_artifact": "active/lib/core/**",
+      "artifact_paths": [
+        "core-daemon"
+      ],
+      "build": {
+        "args": [
+          "-c",
+          "cargo build --release && mkdir -p generated/modules/core/lib && cp target/release/core-daemon generated/modules/core/lib/core-daemon"
+        ],
+        "program": "sh",
+        "working_directory": "."
+      },
+      "contract_paths": [
+        "contracts/**",
+        "protocol/**"
+      ],
+      "dependency_modules": [],
+      "generated_outputs": [
+        "generated/**"
+      ],
+      "module_id": "core",
+      "owned_paths": [
+        "bin/**",
+        "crates/**",
+        "protocol/**",
+        "contracts/**",
+        "src/**",
+        "containers/**",
+        "tests/**",
+        "docs/**",
+        "scripts/**",
+        "package.json",
+        "package-lock.json",
+        "Cargo.toml",
+        "Cargo.lock"
+      ],
+      "regression": {
+        "allow_skipped": false,
+        "command": {
+          "args": [
+            "test"
+          ],
+          "program": "npm",
+          "working_directory": "."
+        },
+        "input_paths": [
+          "bin/**",
+          "crates/**",
+          "protocol/**",
+          "contracts/**",
+          "src/**",
+          "containers/**",
+          "tests/**"
+        ],
+        "minimum_test_count": 1,
+        "ordinary_mode_after_freeze": "disabled",
+        "reenable_on": [
+          "source_change",
+          "contract_change",
+          "public_api_change",
+          "artifact_change",
+          "dependency_change"
+        ],
+        "required_before_freeze": true,
+        "suite_id": "core-regression"
+      },
+      "source_owner": "core",
+      "stage": "source_implemented"
+    }
+  ],
+  "project_id": "collab-v2",
+  "schema_version": 1,
+  "sdk": {
+    "bundle_manifest": ".appsdk/contracts/sdk-bundle.manifest.json",
+    "name": "appsdk",
+    "resource_record": ".appsdk/sdk-resources.json",
+    "version": "0.1.5"
+  }
 }

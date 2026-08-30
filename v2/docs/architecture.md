@@ -1,4 +1,4 @@
-# v2 architecture — design-baseline-draft
+# v2 architecture — role-free runtime
 
 ```text
 Codis containers -> Cordis orchestrator -> versioned IPC/events -> Rust Core
@@ -8,31 +8,32 @@ Codis containers -> Cordis orchestrator -> versioned IPC/events -> Rust Core
 
 ## Immutable core
 
-`collab-core` is the only owner of identity/session mapping, role
-authorization, task/claim transitions, resource ownership, journal replay,
-mailbox truth, event ordering, idempotency, and restart recovery.
+Rust `CoreState` is the only owner of equal-peer identity/session mapping,
+owner-scoped task transitions, resource notices, bounded waits, exact
+subscriptions, wake leases, journal replay, mailbox truth, idempotency, and
+restart recovery. There is no role, dispatch, claim, heartbeat, ACK, or
+inferred continuation state.
 
 ## Replaceable extensions
 
-Transport, terminal probes, heartbeat/scheduler policy, resource policy,
-MCP/CLI projections, and observability are plugins. They submit typed
-commands or events; they do not mutate core state or journal files.
+The Node/Cordis layer is a typed adapter and read-only projection. The tmux
+adapter is the only live notification channel and emits only
+`COLLAB_NOTIFY <message-id>` plus `Enter`. Agent state is probed before an
+explicit wake; absent, unknown, and working state produce zero input.
 
 ## Hot replacement
 
-`discover -> validate -> start -> ready -> route switch -> drain -> dispose`.
-An old plugin remains the active implementation until the replacement is
-ready. A failed replacement is explicit and does not change core truth. Every
-command/event carries an authenticated control context plus `plugin_instance_id`
-and `route_epoch`; the core rejects stale instances after route switch.
+Daemon lifecycle is explicit and operator-owned. No agent identity, message,
+subscription, timer, or peer event may start or restart it. A stopped marker
+must remain effective until the operator explicitly clears it.
 
 ## Commit and replay contract
 
 The core reducer is the only sequence allocator. It checks `command_id`
-idempotency before reducing, appends the committed event durably before
-publishing it, and replays only contiguous sequences. Snapshots bind
-`last_applied_sequence` and `schema_version`; gaps, duplicates, stale epochs,
-and unauthorized control contexts fail explicitly.
+idempotency before reducing, appends the command durably before returning, and
+replays only contiguous sequences. Wake leases have an expiry and require an
+explicit recovery command; recovery never sends tmux, increments attempts, or
+resets the immutable three-attempt lifetime cap.
 
-Runtime health is control truth owned by Codis/Cordis. It may produce a typed
-observation, but only an authorized core command may change business truth.
+Runtime observations are control-side inputs only. They cannot mutate business
+truth and are never copied into business payloads.

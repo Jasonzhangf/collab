@@ -1,12 +1,13 @@
-# v2 container map — design-baseline-draft
+# v2 container map — role-free runtime
 
 | container | implementation | responsibility | forbidden |
 |---|---|---|---|
-| `collab-core` | Rust | reducer, journal, identity, authorization, task/claim | plugin hot policy, direct tmux |
-| `collab-extensions` | Rust | transport, probe, scheduler, resource policy | direct journal/task mutation |
-| `cordis-orchestrator` | Node.js/TypeScript | plugin lifecycle and event wiring | task/claim truth |
+| `rust-core` | Rust | equal peers, owner task lifecycle, waits, subscriptions, notices, wake leases, journal/replay/migration | roles, dispatch, transport, process lifecycle |
+| `rust-core-daemon` | Rust | one state/journal writer and typed stdio command boundary | business payload repair, transport selection, implicit wake |
+| `node-adapter` | Node.js | environment-owned CLI/MCP bridge and read-only projection | semantic truth, journal writes, role inference, daemon restart |
+| `tmux-transport` | Node.js | one literal short wake sequence after explicit lease | message body, retries, task continuation |
 
-Codis starts, stops, connects, and health-checks these containers. Codis health
-observations stay in the runtime-control plane and cannot mutate business
-truth. Cordis freezes routes while Rust replays after restart; only an
-authorized typed command can resume business transitions.
+The v2 candidate is isolated from production v1. Operator lifecycle remains an
+explicit local control action; an agent cannot start, restart, or stop the
+daemon through identity or message data. Health and process observations stay
+in the control plane and cannot mutate business truth.

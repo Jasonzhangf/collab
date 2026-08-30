@@ -1,24 +1,23 @@
-# v2 event registry — design-baseline-draft
+# v2 event registry — role-free control side-channel
 
-All cross-module and cross-container control flows use versioned envelopes.
+All cross-module control flows use typed commands/results. Durable message
+bodies stay in Rust mailbox truth; tmux carries only the message id.
 
 Required envelope fields:
 
 ```text
-event_id, sequence, schema_version, producer, timestamp,
-correlation_id, causation_id, event_type, control, business_payload
+command_id, sequence, operation, typed_control, typed_result, typed_error
 ```
 
 Initial event families:
 
 ```text
-IdentityRegistered, IdentityRecovered, ClaimCreated, ClaimReclaimed,
-TaskBlocked, TaskDelivered, TaskMerged, TaskClosed,
-ResourceConflictDetected, ResourceReleased, WorkerStateObserved,
-WakeRequested, DeliverySucceeded, DeliveryFailed, PluginHealthChanged
+Register, RegisterTask, TransitionTask, WaitTask, Subscribe,
+SendResourceNotice, BeginWakeAttempt, CompleteWakeAttempt,
+RecoverWakeAttempt, PublishSubscriptionEvent, ExpireSubscriptions,
+ExpireWaits, and the migration commands.
 ```
 
-`control` contains authenticated identity, audience, nonce, expiry,
-plugin_instance_id, and route_epoch. Routing, retry, provider, debug, health,
-snapshot, wake, and stop semantics remain in that side channel and never enter
-`business_payload`.
+Process, agent-state, retry, lease, wake, snapshot, and stop semantics remain
+typed control-side data and never enter a business payload. There is no generic
+event transport or fallback channel.
