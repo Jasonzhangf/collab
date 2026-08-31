@@ -61,14 +61,14 @@ Ignore:
 
 项目中的手动合同（例如 `project.json`、records、maps）由 AI/开发者维护，SDK 只校验 schema、引用、owner、scope 和生命周期关系。`.appsdk/sdk-resources.json` 是自动生成文件，只能由 SDK 重建；`verify` 会校验资源文件摘要和 Bundle digest，发现手工改写立即 fail-fast。
 
-`contracts/sdk-bundle.manifest.json` 声明当前 Bundle 的资源集合和安装位置；初始化后项目内的机器真源位于 `.appsdk/contracts/sdk-bundle.manifest.json`。它和 binary 同版本发布；`pin-lock` 把 binary digest、Bundle digest、manifest digest 和资源集合一起写入锁。
+`contracts/sdk-bundle.manifest.json` 声明当前 Bundle 的资源集合和安装位置；初始化后项目内的机器真源位于 `.appsdk/contracts/sdk-bundle.manifest.json`。它和 binary 同版本发布；`pin-lock` 把 binary digest、Bundle digest、manifest digest 和资源集合一起写入锁。执行 `pin-lock` 的 binary 必须与 `--binary` 指向的文件字节一致，防止旧 CLI 把新 binary 与旧 embedded Bundle 拼成伪锁。
 
 `.appsdk/sdk.lock` binds the project to the external implementation:
 
 ```json
 {
   "sdk": "appsdk",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "digest": "sha256:replace-with-compiled-sdk-digest",
   "compiler_digest": "sha256:replace-with-compiler-digest",
   "bundle_digest": "sha256:replace-with-sdk-bundle-digest",
@@ -79,7 +79,7 @@ Ignore:
 }
 ```
 
-The lock is committed. A template may retain the two documented `replace-with-*` values while the project is `draft`; compile, promotion, and freeze reject those values with `SDK_LOCK_NOT_PINNED`. The external SDK is replaceable only through an explicit versioned migration; runtime does not scan or infer a different SDK.
+The lock is committed. A template may retain the two documented `replace-with-*` values while the project is `draft`; compile, promotion, and freeze reject those values with `SDK_LOCK_NOT_PINNED`. Running AppSDK 0.1.6 `pin-lock` is the explicit supported migration from project SDK 0.1.5 to 0.1.6. Before replacing live canonical maps, it validates the 0.1.5 map set and every frozen ReviewRecord binding, persists one immutable `.appsdk/migrations/0.1.5-to-0.1.6/` snapshot/record, then installs the 0.1.6 Bundle and canonical maps, writes the lock, and advances `.appsdk/project.json`. A partially completed 0.1.6 pin may resume only through that exact migration record or an exact 0.1.5 source map set. Historical frozen reviews resolve their old hashes only through this snapshot; current reviews must bind live maps. Missing, mixed, drifted, or ambiguous migration truth fails closed. Other source versions fail with `UNSUPPORTED_SDK_MIGRATION`; runtime does not scan or infer a different SDK.
 
 ## Runtime boundary
 

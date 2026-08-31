@@ -184,6 +184,7 @@ pub enum CoreError {
     InvalidWait,
     WaitCycle,
     InvalidSubscription,
+    InvalidMessageId,
     UnknownMessage,
     DuplicateMessage,
     WakeExhausted,
@@ -195,6 +196,23 @@ pub enum CoreError {
     MigrationBlocked,
     InvalidMigrationState,
     UnknownSubscription,
+}
+
+const MAX_MESSAGE_ID_LEN: usize = 128;
+
+fn validate_message_id(message_id: &str) -> Result<(), CoreError> {
+    let bytes = message_id.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_MESSAGE_ID_LEN {
+        return Err(CoreError::InvalidMessageId);
+    }
+    if !bytes[0].is_ascii_alphanumeric()
+        || !bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(CoreError::InvalidMessageId);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -862,6 +880,7 @@ impl CoreState {
         subject: &str,
         now_ms: u64,
     ) -> Result<(), CoreError> {
+        validate_message_id(message_id)?;
         if event == NotificationEvent::DirectMessage
             || subject.is_empty()
             || self.messages.iter().any(|message| message.id == message_id)
@@ -922,10 +941,11 @@ impl CoreState {
         notice: ResourceNotice,
         subject: &str,
     ) -> Result<(), CoreError> {
+        let id = id.into();
+        validate_message_id(&id)?;
         if !self.has_identity(from) || !self.has_identity(to) || subject.is_empty() {
             return Err(CoreError::UnknownIdentity);
         }
-        let id = id.into();
         if self.messages.iter().any(|message| message.id == id) {
             return Err(CoreError::DuplicateMessage);
         }
@@ -964,6 +984,7 @@ impl CoreState {
         agent_state: AgentState,
         now_ms: u64,
     ) -> Result<WakeDisposition, CoreError> {
+        validate_message_id(message_id)?;
         if !matches!(agent_state, AgentState::Waiting) {
             return Ok(WakeDisposition::Skipped);
         }
@@ -1003,6 +1024,7 @@ impl CoreState {
         attempt: u8,
         succeeded: bool,
     ) -> Result<WakeDisposition, CoreError> {
+        validate_message_id(message_id)?;
         let message = self
             .messages
             .iter_mut()
@@ -1040,6 +1062,7 @@ impl CoreState {
         message_id: &str,
         now_ms: u64,
     ) -> Result<WakeDisposition, CoreError> {
+        validate_message_id(message_id)?;
         let message = self
             .messages
             .iter_mut()
@@ -1207,6 +1230,102 @@ mod tests {
             Ok(WakeDisposition::Skipped)
         );
         assert_eq!(state.messages[0].wake_attempt_count, 0);
+    }
+
+    #[test]
+    fn message_ids_are_canonical_before_any_message_state_mutation() {
+        let mut state = CoreState::default();
+        state.register(peer("a", "session-a")).unwrap();
+        state.register(peer("b", "session-b")).unwrap();
+        state
+            .subscribe(
+                "b",
+                "direct",
+                NotificationEvent::DirectMessage,
+                None,
+                200,
+                100,
+            )
+            .unwrap();
+        state
+            .subscribe(
+                "b",
+                "deadline",
+                NotificationEvent::Deadline,
+                Some("timer".into()),
+                200,
+                100,
+            )
+            .unwrap();
+
+        for invalid in [
+            "",
+            "-leading",
+            "contains space",
+            "contains/slash",
+            "contains\nnewline",
+            "contains\rcarriage-return",
+            "contains\0nul",
+            "contains\ttab",
+            "contains\u{1b}escape",
+            "contains\u{7f}delete",
+            "non-ascii-é",
+        ] {
+            let before = state.clone();
+            assert_eq!(
+                state.send_resource_notice(invalid, "a", "b", ResourceNotice::Occupied, "resource"),
+                Err(CoreError::InvalidMessageId),
+                "invalid id: {invalid:?}"
+            );
+            assert_eq!(state, before, "invalid id mutated state: {invalid:?}");
+        }
+
+        let too_long = format!("a{}", "b".repeat(128));
+        let before = state.clone();
+        assert_eq!(
+            state.send_resource_notice(too_long, "a", "b", ResourceNotice::Occupied, "resource"),
+            Err(CoreError::InvalidMessageId)
+        );
+        assert_eq!(state, before);
+
+        let before = state.clone();
+        assert_eq!(
+            state.begin_wake_attempt("bad\nSECOND_COMMAND", AgentState::Unknown, 110),
+            Err(CoreError::InvalidMessageId)
+        );
+        assert_eq!(
+            state.complete_wake_attempt("bad\nSECOND_COMMAND", 1, false),
+            Err(CoreError::InvalidMessageId)
+        );
+        assert_eq!(
+            state.recover_wake_attempt("bad\nSECOND_COMMAND", 110),
+            Err(CoreError::InvalidMessageId)
+        );
+        assert_eq!(state, before);
+
+        let before = state.clone();
+        assert_eq!(
+            state.publish_subscription_event(
+                "bad\nSECOND_COMMAND",
+                "deadline",
+                NotificationEvent::Deadline,
+                "timer",
+                110,
+            ),
+            Err(CoreError::InvalidMessageId)
+        );
+        assert_eq!(state, before);
+
+        state
+            .send_resource_notice(
+                "m1788111351758-4:retry_1.ok",
+                "a",
+                "b",
+                ResourceNotice::Occupied,
+                "resource",
+            )
+            .unwrap();
+        assert_eq!(state.messages.len(), 1);
     }
 
     #[test]

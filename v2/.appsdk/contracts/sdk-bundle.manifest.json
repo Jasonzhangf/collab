@@ -1,13 +1,22 @@
 {
   "schema_version": 1,
   "sdk": "appsdk",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "runtime_entrypoint": "rust-binary",
   "resources": {
     "contracts": [
       "contracts/sdk-bundle.manifest.json",
       "contracts/project.schema.json",
       "contracts/development-scenarios.manifest.json",
+      "contracts/maps/resource-map.json",
+      "contracts/maps/function-map.json",
+      "contracts/maps/mainline-call-map.json",
+      "contracts/maps/verification-map.json",
+      "contracts/migrations/sdk-0.1.5-to-0.1.6.json",
+      "contracts/migrations/0.1.5/governance-maps/resource-map.json",
+      "contracts/migrations/0.1.5/governance-maps/function-map.json",
+      "contracts/migrations/0.1.5/governance-maps/mainline-call-map.json",
+      "contracts/migrations/0.1.5/governance-maps/verification-map.json",
       "contracts/transitions/zone-transition.manifest.json",
       "contracts/lifecycle-state-machines.manifest.json",
       "contracts/records/record-graph.contract.json",

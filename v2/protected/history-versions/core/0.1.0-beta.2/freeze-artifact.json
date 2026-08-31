@@ -1,0 +1,27 @@
+{
+  "artifact_hash": "sha256:33eb22542d22b8c0847cb29f94b09724e0b2d347a895addb88346c3f617c31c2",
+  "artifact_paths": [
+    "core-daemon"
+  ],
+  "artifact_schema": 1,
+  "artifacts": [
+    {
+      "hash": "sha256:18f68a2ca267892b6008cc707d6fea168ca5c4a6a91ce0d1c72a3db3c5031ba8",
+      "path": "core-daemon"
+    }
+  ],
+  "build": {
+    "args": [
+      "-c",
+      "cargo build --release && mkdir -p generated/modules/core/lib && cp target/release/core-daemon generated/modules/core/lib/core-daemon"
+    ],
+    "program": "sh",
+    "working_directory": "."
+  },
+  "contract_hash": "sha256:6f39b6cd5b65da1dbcdae96c74f9a85ce00a66a27f3dcf8d3276c0c6976f438d",
+  "dependency_hashes": [],
+  "module_id": "core",
+  "public_api_hash": "sha256:290cf57730157d61d7b94b29c00f1e5320dc4c0b377503b2c2f292e4a122e531",
+  "source_hash": "sha256:feeeb47c9eefcae0c2d58f801fda88be8c6c3391c10d33756d908a4a57d5ece2",
+  "stage": "frozen"
+}

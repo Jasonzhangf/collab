@@ -15,3 +15,12 @@ test('tmux rejects body injection and missing endpoint', async () => {
   await assert.rejects(() => transport.deliver({ target: 'session:1.0', messageId: 'message-1', payload: { text: 'body' } }), /payload is forbidden/)
   await assert.rejects(() => transport.deliver({ messageId: 'message-1' }), /target is required/)
 })
+
+test('tmux rejects terminal control characters before process invocation', async () => {
+  const calls = []
+  const transport = createTmuxTransport({ run: async (...args) => calls.push(args) })
+  for (const messageId of ['bad\nline', 'bad\rline', 'bad\0line', 'bad\tline', `bad${String.fromCharCode(0x1b)}line`, `bad${String.fromCharCode(0x7f)}line`, `bad${String.fromCharCode(0x85)}line`]) {
+    await assert.rejects(() => transport.deliver({ target: 'session:1.0', messageId }), /terminal control/)
+  }
+  assert.deepEqual(calls, [])
+})

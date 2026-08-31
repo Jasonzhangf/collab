@@ -1,0 +1,15 @@
+{
+  "name": "collab-v2-cordis",
+  "version": "0.1.0-beta.2",
+  "private": true,
+  "type": "module",
+  "bin": {"collab": "bin/collab.mjs", "collab-mcp": "bin/collab-mcp.mjs"},
+  "files": ["bin", "src", "contracts", "docs", "scripts", "package.json", "package-lock.json"],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "build": "node scripts/verify-v2.mjs && node --check src/index.mjs"
+  },
+  "dependencies": {
+    "cordis": "4.0.0-rc.8"
+  }
+}

@@ -70,6 +70,23 @@ test('journal gap fails replay without rewriting truth', async () => {
   assert.equal(await readFile(join(root, 'journal.jsonl'), 'utf8'), `${JSON.stringify(entry)}\n`)
 })
 
+test('invalid message id is a typed error with zero journal or state mutation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'collab-v2-message-id-'))
+  const statePath = join(root, 'state.json')
+  const process = client(['--state', statePath])
+  assert.equal((await process.send({ op: 'register', command_id: 'register-a', identity: { id: 'a', session_id: 'session-a', pane: '%1' } })).ok, true)
+  assert.equal((await process.send({ op: 'register', command_id: 'register-b', identity: { id: 'b', session_id: 'session-b', pane: '%2' } })).ok, true)
+  const before = await process.send({ op: 'snapshot' })
+  const response = await process.send({ op: 'send_resource_notice', command_id: 'invalid-message', message_id: 'bad\nSECOND_COMMAND', from: 'a', to: 'b', notice: 'occupied', subject: 'resource' })
+  const after = await process.send({ op: 'snapshot' })
+  process.child.stdin.end()
+  await once(process.child, 'exit')
+
+  assert.deepEqual(response, { ok: false, error: 'InvalidMessageId' })
+  assert.deepEqual(after, before)
+  assert.equal((await readFile(join(root, 'journal.jsonl'), 'utf8')).trim().split('\n').length, 2)
+})
+
 test('role-based beta migration inspects freezes rebinds verifies and resumes', async () => {
   const root = await mkdtemp(join(tmpdir(), 'collab-v2-migration-'))
   const statePath = join(root, 'state.json')

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "collab://v2/protocol/health-v1",
+  "title": "CollabPluginHealthV1",
+  "type": "object",
+  "required": ["plugin_id", "version", "state", "observed_at"],
+  "properties": {
+    "plugin_id": {"type": "string", "minLength": 1},
+    "version": {"type": "string", "minLength": 1},
+    "state": {"enum": ["starting", "ready", "active", "draining", "disposed", "failed"]},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "reason": {"type": ["string", "null"]}
+  },
+  "additionalProperties": false
+}

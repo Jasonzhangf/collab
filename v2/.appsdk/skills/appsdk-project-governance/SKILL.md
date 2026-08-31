@@ -73,6 +73,16 @@ appsdk init <workspace> --project-root <relative-path>
 
 For a frozen module change, run `appsdk begin-version <project> --module <id> --from <current> --to <new>` before formal source edits. The command must bind and preserve the current Active artifact, Protected archive, and record graph; direct edits to the old Active or Protected version are forbidden.
 
+When migrating a 0.1.5 project to AppSDK 0.1.6, run the 0.1.6 binary's `pin-lock` once. Do not copy new maps or edit ReviewRecord hashes. The command validates and snapshots the old canonical maps/frozen review bindings, installs the new Bundle and live maps, and records the only historical hash resolution path. If an earlier 0.1.6 pin stopped after updating project/lock, rerun the same command; exact source maps or the existing migration record are required, and mixed/drifted state fails closed.
+
+`rehydrate-frozen` is transactionally resumable. Never delete its partial generated/Protected/Active outputs by hand. Rerun the command: it resumes only an exact marker-owned module/version/artifact projection, or idempotently verifies a fully complete exact projection. Unowned partial Active state and any hash mismatch remain hard failures.
+
+In a clean checkout, ignored generated and Active projections may be absent. Never copy them from another worktree or hand-build their records. Ensure the current Protected archive is not ignored, then run `appsdk rehydrate-frozen <project> --module <id>`. AppSDK derives the current version from FreezeRecord, rebuilds with the declared build command, requires the rebuilt artifact hash to match the immutable freeze/promotion graph, reconstructs Protected and Active projections, and runs full verification. Committed source drift, an ignored Protected archive, hash mismatch, or missing previous version history fails closed. Only after rehydrate passes may `begin-version` open the next version.
+
+When the project is pinned to AppSDK 0.1.5, execute the target 0.1.6 binary itself and pass that exact file to `pin-lock` before rehydrate. This is the only supported 0.1.5 → 0.1.6 migration; it advances Bundle resources, lock, and project version together. Never hand-edit version fields or run an older CLI against a newer `--binary`. Unsupported source versions and byte-mismatched binaries fail closed.
+
+A clean worktree may no longer contain the local issue branch named by an immutable MergeRecord. AppSDK resolves that recorded name only when the exact ref exists or exactly one remote-tracking ref has the same branch name. Missing or ambiguous matches fail closed; never create a local branch or choose a remote to make verification pass.
+
 ## Debug flow
 
 Clarify goal first. Then use evidence-first debugging: baseline, first divergence, positive intervention, negative intervention, and unique owner. The physical checkout is a clean isolated Git worktree; the logical mutable phase is Playground. Formal order is immutable: reproduce → fix candidate → development whitebox → build/install/restart → deployed-entrypoint blackbox → pre-review validation PASS → architecture review PASS → unchanged-source effectiveness replay → verified mainline merge → promotion/compile/freeze. Review or delivery-commit admission before both whitebox and deployed blackbox PASS is forbidden.

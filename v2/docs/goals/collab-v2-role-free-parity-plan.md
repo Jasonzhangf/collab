@@ -258,6 +258,13 @@ Migration requirements:
   hashes are stable.
 - Successful delivery consumes the one-shot subscription. `context` is
   read-only and never infers, consumes, acknowledges, or schedules work.
+- Rust accepts message ids only when they are 1..=128 ASCII bytes, start with
+  an alphanumeric byte, and continue with alphanumeric, `-`, `_`, `.`, or `:`.
+  Empty, overlong, control-character, non-ASCII, and non-canonical ids return
+  typed `InvalidMessageId` before message, journal, or snapshot mutation.
+- The tmux adapter independently rejects terminal C0/C1 and DEL framing
+  controls before process invocation. A valid id produces exactly one
+  `tmux send-keys -t <pane> -- "COLLAB_NOTIFY <id>" Enter` invocation.
 - App Server cannot become a live wake route; tmux failure has no fallback.
 
 ### Migration and runtime black-box
