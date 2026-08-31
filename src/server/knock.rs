@@ -78,20 +78,8 @@ fn agent_state_from(command: &str, title: &str) -> AgentState {
     }
 }
 
-fn wake_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 11] {
-    [
-        "send-keys",
-        "-t",
-        pane,
-        "-l",
-        "--",
-        text,
-        ";",
-        "send-keys",
-        "-t",
-        pane,
-        "Enter",
-    ]
+fn wake_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
+    ["send-keys", "-t", pane, "--", text, "Enter"]
 }
 
 pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
@@ -113,22 +101,17 @@ mod tests {
     use super::{agent_state_from, wake_args, AgentState};
 
     #[test]
-    fn wake_is_one_tmux_command_sequence() {
+    fn wake_is_one_atomic_tmux_send_keys_subcommand() {
         assert_eq!(
-            wake_args("%7", "COLLAB_NOTIFY message"),
-            [
+            &wake_args("%7", "COLLAB_NOTIFY message")[..],
+            &[
                 "send-keys",
                 "-t",
                 "%7",
-                "-l",
                 "--",
                 "COLLAB_NOTIFY message",
-                ";",
-                "send-keys",
-                "-t",
-                "%7",
                 "Enter",
-            ]
+            ][..]
         );
     }
 
