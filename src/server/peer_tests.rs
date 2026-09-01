@@ -432,6 +432,28 @@ fn migration_transaction_lease_rejects_second_peer() {
         second.error.as_deref(),
         Some("MIGRATION_TRANSACTION_HELD_BY_ANOTHER_PEER")
     );
+    assert_eq!(second.data["holder"], "peer-a");
+    assert_eq!(second.data["requester"], "peer-b");
+    assert_eq!(second.data["retry_allowed"], false);
+    assert!(second.data["next"]
+        .as_str()
+        .unwrap()
+        .contains("do not retry"));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn migration_verify_rejection_exposes_current_state_and_stops_retry() {
+    let (server, root) = test_server();
+    register(&server, "peer", "%peer");
+    let response = handle_migration_verify(&server, "peer".into(), "token-peer".into());
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_deref(),
+        Some("no migration record to verify")
+    );
+    assert_eq!(response.data["retry_allowed"], false);
+    assert!(response.data["next"].as_str().unwrap().contains("inspect"));
     std::fs::remove_dir_all(root).ok();
 }
 

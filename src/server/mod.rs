@@ -544,12 +544,34 @@ fn migration_peer(state: &State, worker_id: &str, token: &str) -> Result<WorkerR
 }
 
 fn verify_migration_lease(state: &State, worker_id: &str) -> Result<(), Resp> {
-    if state.migration.as_ref().is_some_and(|migration| {
+    if let Some(migration) = state.migration.as_ref().filter(|migration| {
         migration.operator != worker_id && matches!(migration.phase.as_str(), "planned" | "applied")
     }) {
-        return Err(Resp::err("MIGRATION_TRANSACTION_HELD_BY_ANOTHER_PEER"));
+        return Err(Resp::err_data(
+            "MIGRATION_TRANSACTION_HELD_BY_ANOTHER_PEER",
+            json!({
+                "migration": migration,
+                "holder": migration.operator,
+                "requester": worker_id,
+                "admission_frozen": state.admission_frozen(),
+                "retry_allowed": false,
+                "next": "do not retry plan/apply/verify; query collab migrate inspect, then let the holder complete the current migration or coordinate ownership transfer",
+            }),
+        ));
     }
     Ok(())
+}
+
+fn migration_state_rejection(state: &State, message: &str) -> Resp {
+    Resp::err_data(
+        message,
+        json!({
+            "migration": state.migration,
+            "admission_frozen": state.admission_frozen(),
+            "retry_allowed": false,
+            "next": "run collab migrate inspect; do not create a new migration until the current record is resolved",
+        }),
+    )
 }
 
 fn migration_view(state: &State, issues: Vec<String>) -> serde_json::Value {
@@ -684,10 +706,13 @@ fn handle_migration_verify(server: &Server, worker_id: String, token: String) ->
         return error;
     }
     let Some(mut migration) = state.migration.clone() else {
-        return Resp::err("no migration record to verify");
+        return migration_state_rejection(&state, "no migration record to verify");
     };
     if migration.phase != "applied" || !migration.admission_frozen {
-        return Resp::err("migration must be applied and frozen before verify");
+        return migration_state_rejection(
+            &state,
+            "migration must be applied and frozen before verify",
+        );
     }
     let mut issues = migration_issues(server, &state);
     let current_hash = snapshot_hash(&state);
