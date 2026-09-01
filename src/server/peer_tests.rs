@@ -417,6 +417,15 @@ fn peer_migration_freezes_snapshot_and_resumes_after_verify() {
     assert!(verified.ok);
     assert!(verified.data["verified"].as_bool().unwrap());
     assert!(!server.state.lock().unwrap().admission_frozen());
+    let repeated = handle_migration_verify(&server, "peer".into(), "token-peer".into());
+    assert!(repeated.ok);
+    assert_eq!(repeated.data["verified"], true);
+    assert_eq!(repeated.data["idempotent"], true);
+    assert_eq!(repeated.data["resumed"], false);
+    assert!(repeated.data["next"]
+        .as_str()
+        .unwrap()
+        .contains("do not rerun"));
     std::fs::remove_dir_all(root).ok();
 }
 

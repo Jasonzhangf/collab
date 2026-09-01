@@ -708,6 +708,18 @@ fn handle_migration_verify(server: &Server, worker_id: String, token: String) ->
     let Some(mut migration) = state.migration.clone() else {
         return migration_state_rejection(&state, "no migration record to verify");
     };
+    if migration.phase == "verified" && !migration.admission_frozen {
+        let current_snapshot_hash = snapshot_hash(&state);
+        return Resp::data(json!({
+            "migration": migration,
+            "verified": true,
+            "resumed": false,
+            "idempotent": true,
+            "issues": [],
+            "current_snapshot_hash": current_snapshot_hash,
+            "next": "migration already verified; continue task lifecycle; do not rerun plan or apply",
+        }));
+    }
     if migration.phase != "applied" || !migration.admission_frozen {
         return migration_state_rejection(
             &state,
