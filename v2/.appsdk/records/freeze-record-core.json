@@ -1,0 +1,38 @@
+{
+  "active_version": "0.1.0-beta.2",
+  "artifact_record_id": "evidence-collab-v2-role-free-governance",
+  "clean_scope": {
+    "base_commit": "4402059a9e5b23f0e748799193beddac48b40009",
+    "changed_paths": [
+      "v2/**"
+    ],
+    "generated_policy": "excluded_from_source_clean",
+    "ignored_paths": [
+      "v2/.appsdk-control/**",
+      "v2/generated/**",
+      "v2/target/**",
+      "v2/node_modules/**"
+    ]
+  },
+  "created_at": "2026-08-30T17:31:00Z",
+  "freeze_id": "freeze-collab-v2-role-free-governance",
+  "git_clean": true,
+  "issue_id": "collab-v2-role-free-governance",
+  "library_hash": "sha256:33eb22542d22b8c0847cb29f94b09724e0b2d347a895addb88346c3f617c31c2",
+  "module_id": "core",
+  "owners": {
+    "api_extractor": "appsdk",
+    "artifact_registry": "appsdk",
+    "compiler": "appsdk",
+    "review": "agy-review",
+    "vcs": "git"
+  },
+  "previous_active_immutable": false,
+  "promotion_id": "promote-collab-v2-role-free-governance",
+  "promotion_record_hash": "sha256:3ffd1869a8fe1287534a57f4447d4f91cfd96e11149699973581dc705f353736",
+  "public_api_hash": "sha256:290cf57730157d61d7b94b29c00f1e532dc4c0b377503b2c2f292e4a122e531",
+  "regression_report_hash": "sha256:7d5fa17025b260fc72400a428223d4dfac52b517f0174d5c4568c7111ea2916c",
+  "regression_report_id": "reg-collab-v2-role-free-governance",
+  "review_id": "collab-v2-role-free-parity-final",
+  "source_commit_or_tag": "665acc7117cdd99793cbe281c8992a52956e8d1c"
+}

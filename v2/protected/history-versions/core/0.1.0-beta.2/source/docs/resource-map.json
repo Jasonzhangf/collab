@@ -1,0 +1,23 @@
+{
+  "schema_version": 2,
+  "lifecycle_id": "collab-v2-runtime",
+  "resources": [
+    {"resource_id":"peer-identity","status":"active","owner":"rust-core","truth_store":"CoreState.identities","allowed_operations":["register","rebind","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"task-lifecycle","status":"active","owner":"rust-core","truth_store":"CoreState.tasks","allowed_operations":["register","transition","wait","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"wait-graph","status":"active","owner":"rust-core","truth_store":"Task.wait","allowed_operations":["create","validate","release","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"notification-subscription","status":"active","owner":"rust-core","truth_store":"CoreState.subscriptions","allowed_operations":["subscribe","consume","expire","cancel","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"resource-notice-mailbox","status":"active","owner":"rust-core","truth_store":"CoreState.messages","allowed_operations":["commit","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"wake-attempt-ledger","status":"active","owner":"rust-core","truth_store":"Message.wake_attempt_count + wake_lease_expires_at_ms","allowed_operations":["begin","complete","recover_expired","deliver","exhaust","project"],"forbidden_direct_consumers":["transport","cordis","codis"]},
+    {"resource_id":"core-snapshot-file","status":"active","owner":"rust-core-daemon","truth_store":".agent-collab-v2/state.json","allowed_operations":["atomic_replace","verify_hash"],"forbidden_direct_consumers":["cordis","codis","transport"]},
+    {"resource_id":"journal-sequence","status":"active","owner":"rust-core","truth_store":".agent-collab-v2/journal.jsonl","allowed_operations":["append","replay","snapshot"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
+    {"resource_id":"migration-transaction","status":"active","owner":"rust-core","truth_store":"CoreState.migration","allowed_operations":["inspect","plan","freeze","verify","resume"],"forbidden_direct_consumers":["node-adapter","cordis","codis","transport"]},
+    {"resource_id":"daemon-operator-capability","status":"active","owner":"operator-surface","truth_store":"environment-owned CLI plus daemon PID/socket/lock/DOWN files","allowed_operations":["down","up","status"],"forbidden_direct_consumers":["identity","message","business-payload"]},
+    {"resource_id":"core-daemon-socket","status":"active","owner":"operator-surface","truth_store":".agent-collab-v2/daemon.sock","allowed_operations":["typed_command_forward"],"forbidden_direct_consumers":["business-payload","tmux-transport"]},
+    {"resource_id":"tmux-wake-signal","status":"active","owner":"tmux-transport","truth_store":"transport result only","allowed_operations":["send_short_wake"],"forbidden_direct_consumers":["business-payload","mailbox-body"]}
+  ],
+  "relations": [
+    {"from":"resource-notice-mailbox","to":"tmux-wake-signal","status":"active","via":["notification-subscription","wake-attempt-ledger"],"forbid_direct":true},
+    {"from":"task-lifecycle","to":"resource-notice-mailbox","status":"pending","via":["wait-graph","notification-subscription"],"forbid_direct":true},
+    {"from":"journal-sequence","to":"core-snapshot-file","status":"active","via":["rust-core"],"forbid_direct":true}
+  ]
+}

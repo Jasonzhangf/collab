@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "modules": [{
+    "module_id": "core",
+    "status": "active",
+    "owner": "core",
+    "owned_paths": ["bin/**", "crates/**", "protocol/**", "contracts/**", "src/**", "containers/**", "tests/**", "docs/**", "scripts/**", "package.json", "package-lock.json", "Cargo.toml", "Cargo.lock"],
+    "forbidden_paths": ["active/lib/**", "protected/**", "generated/**"],
+    "verification_gates": ["contract_valid", "sdk_pinned", "fix_lifecycle_graph", "mainline_merge_identity"]
+  }]
+}

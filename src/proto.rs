@@ -19,6 +19,24 @@ pub enum Req {
         #[serde(default = "default_delivery_mode")]
         delivery: String,
     },
+    NotificationMethods,
+    NotificationSubscribe {
+        worker_id: String,
+        token: String,
+        event: String,
+        subject: Option<String>,
+        trigger_ms: Option<i64>,
+        ttl_seconds: u64,
+    },
+    NotificationStatus {
+        worker_id: String,
+        token: String,
+    },
+    NotificationUnsubscribe {
+        worker_id: String,
+        token: String,
+        subscription_id: String,
+    },
     Poll {
         worker_id: String,
         token: String,

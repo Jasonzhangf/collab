@@ -1,0 +1,31 @@
+{
+  "ai_confidence": 0.95,
+  "confidence_rationale": "AGY controller completed architecture review on the exact candidate commit with no P0/P1 findings.",
+  "created_at": "2026-08-31T03:39:45Z",
+  "evidence_ids": [
+    "ev-whitebox-v2-role-free-beta3",
+    "ev-install-v2-role-free-beta3",
+    "ev-restart-v2-role-free-beta3",
+    "ev-blackbox-v2-role-free-beta3"
+  ],
+  "fix_candidate_id": "fc-collab-v2-role-free-governance-beta3",
+  "function_map_hash": "sha256:19be986ab3ec2f56ee8efd4b2a6256c69f70a6adab801725d02d9264a5948dcd",
+  "issue_id": "collab-v2-role-free-governance",
+  "mainline_call_map_hash": "sha256:1650f58333fa49fcd80a24b0d6f0b50d1c7aa5825c68d0aaaee493f18c7275d9",
+  "pre_review_validation_id": "prv-collab-v2-role-free-governance-beta3",
+  "promotion_id": "promote-collab-v2-role-free-governance",
+  "resource_map_hash": "sha256:f6acff041c1826b3108e51bd0327074edec380e72f9a0c5aa217bdf7321663b0",
+  "review_id": "collab-v2-beta3-canonical-message-id-20260831",
+  "review_kind": "architecture",
+  "reviewed_artifact_hash": "sha256:40c1f471dd9177a1643f3045925d7dd163dd800df77f54974bfea914169e9ea8",
+  "reviewed_commit": "791f91197b9a314a4b5072b28c354ddad243ba93",
+  "reviewed_diff_hash": "20f03d71157301bdf066e26c72091c368875131e59f34abc2c53dc4e9b8d6e08",
+  "reviewed_scope_hash": "scope-collab-v2-role-free",
+  "reviewed_tree_hash": "e6d83bc45725392a897f0c49921fd4002f8c58f5",
+  "reviewer": {
+    "adapter": "agy-review",
+    "identity": "collab-v2-role-free-parity-final"
+  },
+  "verdict": "pass",
+  "verification_map_hash": "sha256:1ca6da5f74a8537b20fe089e3d98d3ad131352b56b216a9e428e9773678c423b"
+}

@@ -56,8 +56,8 @@ mailbox all remain valid.
 
 - Serialized `master`/`worker` role fields are accepted and discarded. New
   state has no declared role field.
-- Legacy `heartbeat_*` configuration/task fields are accepted as aliases and
-  emitted as `continuation_*` fields.
+- Legacy `heartbeat_*` and `continuation_*` configuration/task fields are
+  ignored during replay and are never emitted into new runtime state.
 - Legacy master transfer, recovery, central `available` queue, task claim,
   dispatch, remove-worker, reset, and `/goal` task registration paths fail
   explicitly.
@@ -83,16 +83,14 @@ Every current `waiting` task must contain:
 - non-empty `resume_on`; and
 - `resource_owner_and_waiter_recheck` escalation.
 
-The wait graph must be acyclic. Deadline expiry becomes explicit `blocked`,
-writes durable notices to waiter and holder, and does not release a claim.
-Resource release first changes the waiter to `blocked`, clears the obsolete
-wait edge, and writes durable `RESOURCE_RELEASED`. Each wake attempt is
-journaled with its attempt time and a short deduplication lease; replay never
-reconstructs attempt time from the current clock. Only success becomes
-`Delivered`.
-Shell, working, and offline panes fail closed. Failed/lost wakes stay pending
-and retry when the pane becomes a confirmed waiting agent; `collab context`
-consumes local continuation without an explicit ACK loop.
+The wait graph must be acyclic. Deadline expiry becomes explicit `blocked` and
+does not release a claim or send an unsolicited message. Resource release first
+changes the waiter to `blocked` and clears the obsolete wait edge. Only an
+exact, finite, Agent-owned subscription creates a notification. Each wake
+attempt is journaled; replay never resets the immutable lifetime cap of three.
+tmux receives only a short message id in one command sequence. No registration,
+shell/absent, unknown, working, expired, cancelled, consumed, or exhausted
+subscriptions fail closed with zero input. `collab context` is read-only.
 
 ## Fail-closed conditions
 
@@ -122,6 +120,8 @@ Unsupported and fail-fast:
 - direct `kill`, `pkill`, or `killall` instead of `collab down`;
 - restore master/worker roles, central dispatch, available queue, task offer,
   progress report, heartbeat, or ACK loops;
+- restore periodic `CONTINUE_TASK`, implicit idle delivery, inferred wake
+  registration, body/prompt injection, or unbounded retry;
 - mix tmux and another runtime;
 - manually type a wake into a peer pane.
 
@@ -135,4 +135,4 @@ Record:
 - one-socket/one-process evidence;
 - peer/session/pane rebinds;
 - task, wait, mailbox, journal, evidence, worktree, and branch preservation;
-- real post-restart continuation and resource occupancy/release replay.
+- real post-restart explicit sendmessage and subscribed resource/deadline replay.

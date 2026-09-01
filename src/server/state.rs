@@ -62,6 +62,34 @@ pub struct WorkerRec {
     pub registered_ms: i64,
 }
 
+pub const MAX_WAKE_ATTEMPTS: u32 = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSubscription {
+    pub id: String,
+    pub worker_id: String,
+    pub event: String,
+    pub subject: Option<String>,
+    pub pane: String,
+    pub method: String,
+    pub trigger_ms: Option<i64>,
+    pub expires_ms: i64,
+    pub status: String,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
+impl NotificationSubscription {
+    pub fn matches(&self, worker_id: &str, event: &str, subject: Option<&str>, now: i64) -> bool {
+        self.worker_id == worker_id
+            && self.event == event
+            && self.subject.as_deref() == subject
+            && self.method == "tmux"
+            && self.status == "armed"
+            && self.expires_ms > now
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
@@ -105,12 +133,6 @@ pub struct TaskRec {
     pub wait: Option<WaitSpec>,
     pub created_ms: i64,
     pub updated_ms: i64,
-    #[serde(default, alias = "last_heartbeat_sent_ms")]
-    pub last_continuation_sent_ms: i64,
-    #[serde(default, alias = "heartbeat_pending")]
-    pub continuation_pending: bool,
-    #[serde(default, alias = "heartbeat_message_id")]
-    pub continuation_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,13 +142,6 @@ pub struct CleanupReceipt {
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
     pub verified_ms: i64,
-}
-
-pub fn task_continuation_active(status: &str) -> bool {
-    !matches!(
-        status,
-        "available" | "waiting" | "delivered" | "merged" | "closed" | "cancelled"
-    )
 }
 
 pub fn task_resource_active(status: &str) -> bool {
@@ -180,6 +195,23 @@ pub enum Event {
         #[serde(default)]
         attempted_ms: i64,
     },
+    NotificationSubscribed {
+        subscription: NotificationSubscription,
+    },
+    NotificationStatus {
+        subscription_id: String,
+        status: String,
+        updated_ms: i64,
+    },
+    NotificationConsumed {
+        subscription_id: String,
+        message_id: String,
+        consumed_ms: i64,
+    },
+    WakeBound {
+        message_id: String,
+        subscription_id: String,
+    },
     Delivered {
         ids: Vec<String>,
     },
@@ -214,6 +246,8 @@ pub struct State {
     pub tasks: HashMap<String, TaskRec>,
     pub cleanup_receipts: HashMap<String, CleanupReceipt>,
     pub delivery_modes: HashMap<String, String>,
+    pub notification_subscriptions: HashMap<String, NotificationSubscription>,
+    pub wake_bindings: HashMap<String, String>,
     pub migration: Option<MigrationRecord>,
 }
 
@@ -240,6 +274,39 @@ impl State {
                         message.last_wake_attempt_ms = *attempted_ms;
                     }
                 }
+            }
+            Event::NotificationSubscribed { subscription } => {
+                self.notification_subscriptions
+                    .insert(subscription.id.clone(), subscription.clone());
+            }
+            Event::NotificationStatus {
+                subscription_id,
+                status,
+                updated_ms,
+            } => {
+                if let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id)
+                {
+                    subscription.status = status.clone();
+                    subscription.updated_ms = *updated_ms;
+                }
+            }
+            Event::NotificationConsumed {
+                subscription_id,
+                message_id: _,
+                consumed_ms,
+            } => {
+                if let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id)
+                {
+                    subscription.status = "consumed".into();
+                    subscription.updated_ms = *consumed_ms;
+                }
+            }
+            Event::WakeBound {
+                message_id,
+                subscription_id,
+            } => {
+                self.wake_bindings
+                    .insert(message_id.clone(), subscription_id.clone());
             }
             Event::Delivered { ids } => {
                 for id in ids {
@@ -350,6 +417,19 @@ impl State {
 
     pub fn worker_pane(&self, worker_id: &str) -> Option<String> {
         self.workers.get(worker_id)?.pane.clone()
+    }
+
+    pub fn matching_subscription(
+        &self,
+        worker_id: &str,
+        event: &str,
+        subject: Option<&str>,
+        now: i64,
+    ) -> Option<&NotificationSubscription> {
+        self.notification_subscriptions
+            .values()
+            .filter(|subscription| subscription.matches(worker_id, event, subject, now))
+            .min_by_key(|subscription| (subscription.created_ms, subscription.id.as_str()))
     }
 }
 
@@ -479,9 +559,6 @@ mod tests {
             wait: None,
             created_ms: 0,
             updated_ms: 0,
-            last_continuation_sent_ms: 0,
-            continuation_pending: false,
-            continuation_message_id: None,
         };
         let mut tasks = HashMap::new();
         let mut a = base("a");
@@ -529,5 +606,62 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["reply-2"]
         );
+    }
+
+    #[test]
+    fn notification_subscription_is_explicit_exact_and_one_shot() {
+        let mut state = State::default();
+        state.apply(&Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: "sub-release".into(),
+                worker_id: "waiter".into(),
+                event: "resource-released".into(),
+                subject: Some("holder-task".into()),
+                pane: "%7".into(),
+                method: "tmux".into(),
+                trigger_ms: None,
+                expires_ms: 10_000,
+                status: "armed".into(),
+                created_ms: 1,
+                updated_ms: 1,
+            },
+        });
+
+        assert!(state
+            .matching_subscription("waiter", "resource-released", Some("holder-task"), 9_999)
+            .is_some());
+        assert!(state
+            .matching_subscription("waiter", "resource-released", Some("other-task"), 9_999)
+            .is_none());
+        assert!(state
+            .matching_subscription("waiter", "resource-released", Some("holder-task"), 10_000)
+            .is_none());
+
+        state.apply(&Event::NotificationConsumed {
+            subscription_id: "sub-release".into(),
+            message_id: "message".into(),
+            consumed_ms: 8_000,
+        });
+        assert!(state
+            .matching_subscription("waiter", "resource-released", Some("holder-task"), 8_001)
+            .is_none());
+    }
+
+    #[test]
+    fn wake_binding_is_control_state_not_message_payload() {
+        let mut state = State::default();
+        state.apply(&Event::Sent {
+            msg: msg("message", "waiter", "notify"),
+        });
+        state.apply(&Event::WakeBound {
+            message_id: "message".into(),
+            subscription_id: "subscription".into(),
+        });
+
+        assert_eq!(state.wake_bindings["message"], "subscription");
+        assert!(serde_json::to_value(&state.msgs["message"])
+            .unwrap()
+            .get("subscription_id")
+            .is_none());
     }
 }

@@ -1,0 +1,70 @@
+{
+  "active_artifact": "active/lib/core/**",
+  "artifact_paths": [
+    "core-daemon"
+  ],
+  "build": {
+    "args": [
+      "-c",
+      "cargo build --release && mkdir -p generated/modules/core/lib && cp target/release/core-daemon generated/modules/core/lib/core-daemon"
+    ],
+    "program": "sh",
+    "working_directory": "."
+  },
+  "contract_paths": [
+    "contracts/**",
+    "protocol/**"
+  ],
+  "dependency_modules": [],
+  "generated_outputs": [
+    "generated/**"
+  ],
+  "module_id": "core",
+  "owned_paths": [
+    "bin/**",
+    "crates/**",
+    "protocol/**",
+    "contracts/**",
+    "src/**",
+    "containers/**",
+    "tests/**",
+    "docs/**",
+    "scripts/**",
+    "package.json",
+    "package-lock.json",
+    "Cargo.toml",
+    "Cargo.lock"
+  ],
+  "regression": {
+    "allow_skipped": false,
+    "command": {
+      "args": [
+        "test"
+      ],
+      "program": "npm",
+      "working_directory": "."
+    },
+    "input_paths": [
+      "bin/**",
+      "crates/**",
+      "protocol/**",
+      "contracts/**",
+      "src/**",
+      "containers/**",
+      "tests/**"
+    ],
+    "minimum_test_count": 1,
+    "ordinary_mode_after_freeze": "disabled",
+    "reenable_on": [
+      "source_change",
+      "contract_change",
+      "public_api_change",
+      "artifact_change",
+      "dependency_change"
+    ],
+    "required_before_freeze": true,
+    "suite_id": "core-regression"
+  },
+  "source_owner": "core",
+  "stage": "frozen"
+}

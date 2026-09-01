@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "lifecycle_id": "collab-v2-runtime",
+  "source_roots": ["bin", "containers", "crates/core/src", "protocol", "scripts", "src", "tests"],
+  "modules": [
+    {"module_id":"rust-core","status":"active","owner":"rust-core","owned_paths":["crates/core/src/lib.rs"],"forbidden_responsibilities":["terminal-framing","transport","process-lifecycle","plugin-lifecycle"]},
+    {"module_id":"rust-core-daemon","status":"active","owner":"rust-core-daemon","owned_paths":["crates/core/src/bin/core-daemon.rs"],"forbidden_responsibilities":["business-payload-repair","transport-selection"]},
+    {"module_id":"node-adapter","status":"active","owner":"node-adapter","owned_paths":["src/collab-core.mjs","src/communication.mjs","src/contracts.mjs","src/dashboard.mjs","src/project-environment.mjs","src/rust-core-client.mjs"],"forbidden_responsibilities":["semantic-truth","journal-write","role-inference"]},
+    {"module_id":"cordis-composition","status":"design","owner":"cordis","owned_paths":["src/appsdk-integration.mjs","src/appsdk-plugin.mjs","src/index.mjs"],"forbidden_responsibilities":["semantic-truth","process-lifecycle"]},
+    {"module_id":"operator-surface","status":"active","owner":"operator-cli-mcp","owned_paths":["bin/collab-mcp.mjs","bin/collab-v2-init.mjs","bin/collab-v2.mjs","bin/collab.mjs","src/profile-config.mjs","src/daemon.mjs","src/daemon-client.mjs"],"forbidden_responsibilities":["agent-selected-project-root","agent-selected-pane","semantic-truth"]},
+    {"module_id":"tmux-transport","status":"pending","owner":"tmux-transport","owned_paths":["src/transports/tmux.mjs"],"forbidden_responsibilities":["canonical-message-id-semantics","message-body-injection","retry-truth","semantic-truth"]},
+    {"module_id":"typed-protocol","status":"design","owner":"typed-protocol","owned_paths":["protocol/command-v1.json","protocol/event-v1.json","protocol/health-v1.json"],"forbidden_responsibilities":["control-in-business-payload","role-field"]},
+    {"module_id":"codis-container","status":"active","owner":"codis","owned_paths":["containers/codis/runtime.json"],"forbidden_responsibilities":["semantic-truth","task-lifecycle"]},
+    {"module_id":"verification","status":"active","owner":"verification","owned_paths":["scripts/verify-v2.mjs","tests/cli.test.mjs","tests/codis-container.test.mjs","tests/collab-core.test.mjs","tests/cordis-smoke.test.mjs","tests/daemon-lifecycle.test.mjs","tests/init.test.mjs","tests/manifest.test.mjs","tests/rust-core-protocol.test.mjs","tests/transports.test.mjs"],"forbidden_responsibilities":["runtime-truth"]}
+  ]
+}

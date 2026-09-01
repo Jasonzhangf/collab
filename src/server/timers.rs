@@ -1,30 +1,12 @@
-use crate::config;
 use crate::server::knock::pane_idle;
-use crate::server::state::{now_ms, task_continuation_active, Event, Message, TaskRec};
+use crate::server::state::{now_ms, Event, Message, MAX_WAKE_ATTEMPTS};
 use crate::server::Server;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 const WAKE_ATTEMPT_LEASE_MS: i64 = 10_000;
 
-fn continuation_interval_ms(server: &Server) -> i64 {
-    config::load_or_default(&server.root)
-        .continuation_minutes
-        .saturating_mul(60 * 1000)
-}
-
-fn continuation_body(task: &TaskRec) -> String {
-    format!(
-        "CONTINUE_TASK task={} owner={} status={} next={} | query collab context, verify durable state, then continue the next safe lifecycle step",
-        task.id,
-        task.owner,
-        task.status,
-        task.next_step.as_deref().unwrap_or("inspect own task state")
-    )
-}
-
-/// Server-side watchdog. Runs every 5s; emits journal events only, all
-/// mutations go through the same commit path as client ops.
+/// Server-side scheduler for finite subscriptions and bounded waits. It never
+/// creates task continuations or infers that ordinary work needs a wake.
 pub fn tick(server: &Arc<Server>) {
     tick_with_idle(server, &pane_idle);
 }
@@ -34,24 +16,19 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
         return;
     }
     let now = now_ms();
-    let mut evs: Vec<Event> = Vec::new();
-    let mut knocks: Vec<(String, Vec<String>, String)> = Vec::new();
-
-    let idle_panes: HashSet<String> = {
-        let st = server.state.lock().unwrap();
-        st.workers
-            .values()
-            .filter_map(|worker| worker.pane.clone())
-            .filter(|pane| is_idle(pane))
-            .collect()
-    };
+    let mut lifecycle_events = Vec::new();
     {
-        let st = server.state.lock().unwrap();
-
-        // A wait always has a finite liveness boundary. Expiry becomes an
-        // explicit blocker. Both peers receive durable truth; tmux remains a
-        // best-effort wake and never decides the transition.
-        for task in st.tasks.values() {
+        let state = server.state.lock().unwrap();
+        for subscription in state.notification_subscriptions.values() {
+            if subscription.status == "armed" && subscription.expires_ms <= now {
+                lifecycle_events.push(Event::NotificationStatus {
+                    subscription_id: subscription.id.clone(),
+                    status: "expired".into(),
+                    updated_ms: now,
+                });
+            }
+        }
+        for task in state.tasks.values() {
             let Some(wait) = task.wait.as_ref() else {
                 continue;
             };
@@ -66,167 +43,102 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
             ));
             expired.wait = None;
             expired.updated_ms = now;
-            expired.continuation_pending = false;
-            expired.continuation_message_id = None;
-            evs.push(Event::TaskUpdated { task: expired });
-            for recipient in [&wait.waiter, &wait.responsible_actor] {
-                let (event, msg_id, body) = sent_system(
-                    recipient,
-                    format!(
-                        "TASK_WAIT_TIMEOUT task={} waiter={} waiting_for={} responsible_actor={} | recheck the resource through Collab; no claim was released",
-                        task.id, wait.waiter, wait.waiting_for, wait.responsible_actor
-                    ),
-                );
-                evs.push(event);
-                evs.push(Event::DeliveryMode {
-                    msg_id: msg_id.clone(),
-                    mode: "immediate".into(),
-                });
-                if let Some(pane) = st.worker_pane(recipient) {
-                    if idle_panes.contains(&pane) {
-                        knocks.push((pane, vec![msg_id], body));
-                    }
-                }
-            }
+            lifecycle_events.push(Event::TaskUpdated { task: expired });
         }
+    }
+    if !lifecycle_events.is_empty() {
+        server.commit(&lifecycle_events);
+    }
 
-        // Local continuation is task-scoped and deduped by the durable pending
-        // marker. A working pane is never interrupted.
-        for task in st.tasks.values() {
-            if !task_continuation_active(&task.status) || task.continuation_pending {
+    let mut due_events = Vec::new();
+    {
+        let state = server.state.lock().unwrap();
+        for subscription in state.notification_subscriptions.values() {
+            if subscription.status != "armed"
+                || subscription.event != "deadline"
+                || subscription.trigger_ms.is_none_or(|trigger| trigger > now)
+                || state
+                    .wake_bindings
+                    .values()
+                    .any(|bound| bound == &subscription.id)
+            {
                 continue;
             }
-            if now - task.last_continuation_sent_ms < continuation_interval_ms(server) {
-                continue;
-            }
-            let Some(pane) = st.worker_pane(&task.owner) else {
-                continue;
-            };
-            if !idle_panes.contains(&pane) {
-                continue;
-            }
-            let body = continuation_body(task);
-            let sid = super::gen_msg_id();
-            let msg = Message {
-                id: sid.clone(),
-                from: "collab-server".into(),
-                to: task.owner.clone(),
-                mtype: "system".into(),
-                body: body.clone(),
-                in_reply_to: None,
-                created_ms: now,
-                state: "pending".into(),
-                wake_attempt_count: 0,
-                last_wake_attempt_ms: 0,
-            };
-            evs.push(Event::Sent { msg });
-            evs.push(Event::DeliveryMode {
-                msg_id: sid.clone(),
-                mode: "immediate".into(),
-            });
-            evs.push(Event::TaskUpdated {
-                task: TaskRec {
-                    last_continuation_sent_ms: now,
-                    continuation_pending: true,
-                    continuation_message_id: Some(sid.clone()),
-                    ..task.clone()
+            let message_id = super::gen_msg_id();
+            due_events.extend([
+                Event::Sent {
+                    msg: Message {
+                        id: message_id.clone(),
+                        from: "collab-server".into(),
+                        to: subscription.worker_id.clone(),
+                        mtype: "notification".into(),
+                        body: format!(
+                            "DEADLINE_REACHED subject={}",
+                            subscription.subject.as_deref().unwrap_or_default()
+                        ),
+                        in_reply_to: None,
+                        created_ms: now,
+                        state: "pending".into(),
+                        wake_attempt_count: 0,
+                        last_wake_attempt_ms: 0,
+                    },
                 },
-            });
-            knocks.push((pane, vec![sid], body));
-        }
-
-        for worker in st.workers.values() {
-            let Some(pane) = worker.pane.as_deref() else {
-                continue;
-            };
-            if !idle_panes.contains(pane) {
-                continue;
-            }
-            let pending: Vec<&Message> = st
-                .msgs
-                .values()
-                .filter(|m| {
-                    m.to == worker.id
-                        && m.state == "pending"
-                        && now - m.last_wake_attempt_ms >= WAKE_ATTEMPT_LEASE_MS
-                        && st
-                            .delivery_modes
-                            .get(&m.id)
-                            .is_some_and(|mode| matches!(mode.as_str(), "immediate" | "idle"))
-                })
-                .collect();
-            if pending.is_empty() {
-                continue;
-            }
-            let ids = pending.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
-            let body = pending
-                .iter()
-                .map(|m| format!("[{}] {}", m.mtype, m.body))
-                .collect::<Vec<_>>()
-                .join("; ");
-            let prompt = format!(
-                "[COLLAB QUEUE] {}; Process these messages now through Collab, execute the required task actions, and continue; do not reply without executing an action. message_ids={}",
-                body,
-                ids.join(",")
-            );
-            knocks.push((pane.to_string(), ids, prompt));
+                Event::WakeBound {
+                    message_id: message_id.clone(),
+                    subscription_id: subscription.id.clone(),
+                },
+                Event::DeliveryMode {
+                    msg_id: message_id,
+                    mode: "explicit-notification".into(),
+                },
+            ]);
         }
     }
+    if !due_events.is_empty() {
+        server.commit(&due_events);
+    }
 
-    if evs.is_empty() && knocks.is_empty() {
-        return;
+    let candidates: Vec<(String, String)> = {
+        let state = server.state.lock().unwrap();
+        state
+            .wake_bindings
+            .iter()
+            .filter_map(|(message_id, subscription_id)| {
+                let message = state.msgs.get(message_id)?;
+                let subscription = state.notification_subscriptions.get(subscription_id)?;
+                (message.state == "pending"
+                    && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
+                    && now - message.last_wake_attempt_ms >= WAKE_ATTEMPT_LEASE_MS
+                    && subscription.status == "armed"
+                    && subscription.expires_ms > now)
+                    .then(|| (message_id.clone(), subscription_id.clone()))
+            })
+            .collect()
+    };
+    for (message_id, subscription_id) in candidates {
+        super::attempt_notification_with(
+            server,
+            &message_id,
+            &subscription_id,
+            is_idle,
+            &|pane, id| super::queue_system_knock(server, pane, id),
+        );
     }
-    if !evs.is_empty() {
-        server.commit(&evs);
-    }
-    for (pane, ids, body) in knocks {
-        server.commit(&[Event::WakeAttempted {
-            ids: ids.clone(),
-            attempted_ms: now_ms(),
-        }]);
-        let delivered = if ids.len() > 1 {
-            super::queue_batch_knock(server, &pane, &ids, &body)
-        } else {
-            super::queue_system_knock(server, &pane, &ids[0], &body)
-        };
-        if delivered {
-            server.commit(&[Event::Delivered { ids }]);
-        }
-    }
-}
-
-fn sent_system(to: &str, body: String) -> (Event, String, String) {
-    let id = super::gen_msg_id();
-    (
-        Event::Sent {
-            msg: Message {
-                id: id.clone(),
-                from: "collab-server".into(),
-                to: to.into(),
-                mtype: "system".into(),
-                body: body.clone(),
-                in_reply_to: None,
-                created_ms: now_ms(),
-                state: "pending".into(),
-                wake_attempt_count: 0,
-                last_wake_attempt_ms: 0,
-            },
-        },
-        id,
-        body,
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::state::{State, WaitSpec, WorkerRec};
+    use crate::server::state::{NotificationSubscription, State, TaskRec, WaitSpec, WorkerRec};
     use std::sync::Mutex;
 
     fn test_server() -> (Arc<Server>, std::path::PathBuf) {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("collab-timer-{}-{n}", std::process::id()));
+        let sequence = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "collab-notification-timer-{}-{sequence}",
+            std::process::id()
+        ));
         let server_dir = root.join(".agent-collab/server");
         std::fs::create_dir_all(&server_dir).unwrap();
         let journal = std::fs::OpenOptions::new()
@@ -245,218 +157,54 @@ mod tests {
         )
     }
 
-    fn register(server: &Server, id: &str) {
+    fn register(server: &Server, worker_id: &str) {
         server.commit(&[Event::Registered {
             worker: WorkerRec {
-                id: id.into(),
-                token: format!("token-{id}"),
-                pane: Some(format!("%test-{id}")),
+                id: worker_id.into(),
+                token: format!("token-{worker_id}"),
+                pane: Some(format!("%test-{worker_id}")),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
             },
         }]);
     }
 
-    fn task(server: &Server, id: &str, owner: &str, status: &str, last_continuation: i64) {
-        let now = now_ms();
-        server.commit(&[Event::TaskCreated {
-            task: TaskRec {
-                id: id.into(),
-                owner: owner.into(),
-                created_by: owner.into(),
-                feature_id: Some("feature".into()),
-                worktree_path: Some("/tmp/wt".into()),
-                branch: None,
-                base_commit: None,
-                priority: "p2".into(),
-                status: status.into(),
-                next_step: Some("continue".into()),
-                created_ms: now,
-                updated_ms: now,
-                last_continuation_sent_ms: last_continuation,
-                continuation_pending: false,
-                continuation_message_id: None,
-                wait: None,
-            },
-        }]);
-    }
-
-    #[test]
-    fn continuation_wake_is_durable_and_deduped() {
-        let (server, root) = test_server();
-        register(&server, "peer-a");
-        register(&server, "owner");
-        task(
-            &server,
-            "t1",
-            "owner",
-            "working",
-            now_ms() - continuation_interval_ms(&server) - 1000,
-        );
-
-        tick_with_idle(&server, &|_| true);
-        {
-            let st = server.state.lock().unwrap();
-            assert!(st.msgs.len() >= 1);
-            assert!(st.tasks["t1"].continuation_pending);
-            let hb_id = st.tasks["t1"].continuation_message_id.clone().unwrap();
-            assert!(st.msgs[&hb_id].body.starts_with("CONTINUE_TASK "));
-        }
-
-        tick_with_idle(&server, &|_| true);
-        {
-            let st = server.state.lock().unwrap();
-            let continuation_wakes = st
-                .msgs
-                .values()
-                .filter(|m| m.body.starts_with("CONTINUE_TASK "))
-                .count();
-            assert_eq!(continuation_wakes, 1, "pending wake must not be resent");
-        }
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn delivered_task_stops_continuation_wake() {
-        let (server, root) = test_server();
-        register(&server, "peer-a");
-        register(&server, "owner");
-        task(&server, "t1", "owner", "delivered", 0);
-
-        tick(&server);
-        let st = server.state.lock().unwrap();
-        assert!(st
-            .msgs
-            .values()
-            .all(|message| !message.body.starts_with("CONTINUE_TASK ")));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn working_or_offline_owner_is_not_interrupted() {
-        let (server, root) = test_server();
-        register(&server, "owner");
-        task(
-            &server,
-            "t1",
-            "owner",
-            "working",
-            now_ms() - continuation_interval_ms(&server) - 1000,
-        );
-
-        tick_with_idle(&server, &|_| false);
-        let state = server.state.lock().unwrap();
-        assert!(state.msgs.is_empty());
-        assert!(!state.tasks["t1"].continuation_pending);
-        drop(state);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn expired_wait_blocks_and_notifies_waiter_and_holder_once() {
-        let (server, root) = test_server();
-        register(&server, "waiter");
-        register(&server, "holder");
-        task(&server, "waiting", "waiter", "waiting", now_ms());
-        task(&server, "held", "holder", "working", now_ms());
-        let mut waiting = server.state.lock().unwrap().tasks["waiting"].clone();
-        waiting.wait = Some(WaitSpec {
-            waiter: "waiter".into(),
-            waiting_for: "held".into(),
-            responsible_actor: "holder".into(),
-            reason: "resource_conflict".into(),
-            deadline_ms: now_ms() - 1,
-            resume_on: vec!["resource_released".into()],
-            escalation: "resource_owner_and_waiter_recheck".into(),
-        });
-        server.commit(&[Event::TaskUpdated { task: waiting }]);
-
-        tick_with_idle(&server, &|_| false);
-        tick_with_idle(&server, &|_| false);
-        let state = server.state.lock().unwrap();
-        assert_eq!(state.tasks["waiting"].status, "blocked");
-        let timeout_messages: Vec<&Message> = state
-            .msgs
-            .values()
-            .filter(|message| message.body.starts_with("TASK_WAIT_TIMEOUT "))
-            .collect();
-        assert_eq!(timeout_messages.len(), 2);
-        assert!(timeout_messages
-            .iter()
-            .any(|message| message.to == "waiter"));
-        assert!(timeout_messages
-            .iter()
-            .any(|message| message.to == "holder"));
-        drop(state);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn continuation_interval_reads_project_config_from_server_root() {
-        let (server, root) = test_server();
-        config::save(
-            &root,
-            &config::Config {
-                continuation_minutes: 2,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(continuation_interval_ms(&server), 2 * 60 * 1000);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn migration_freeze_stops_timer_mutations() {
-        let (server, root) = test_server();
-        register(&server, "owner");
-        task(
-            &server,
-            "task",
-            "owner",
-            "working",
-            now_ms() - continuation_interval_ms(&server) - 1000,
-        );
-        {
-            let mut state = server.state.lock().unwrap();
-            state.migration = Some(crate::server::state::MigrationRecord {
-                id: "migration".into(),
-                from_version: "v1-legacy".into(),
-                to_version: "v1-low-intervention".into(),
-                phase: "applied".into(),
-                admission_frozen: true,
-                snapshot_hash: Some("snapshot".into()),
-                worker_count: 1,
-                task_count: 1,
-                message_count: 0,
-                operator: "owner".into(),
-                issues: Vec::new(),
+    fn subscribe(
+        server: &Server,
+        worker_id: &str,
+        event: &str,
+        subject: Option<&str>,
+        trigger_ms: Option<i64>,
+    ) -> String {
+        let id = format!("sub-{worker_id}-{event}");
+        server.commit(&[Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: id.clone(),
+                worker_id: worker_id.into(),
+                event: event.into(),
+                subject: subject.map(str::to_owned),
+                pane: format!("%test-{worker_id}"),
+                method: "tmux".into(),
+                trigger_ms,
+                expires_ms: now_ms() + 60_000,
+                status: "armed".into(),
                 created_ms: now_ms(),
                 updated_ms: now_ms(),
-            });
-        }
-
-        tick_with_idle(&server, &|_| true);
-        let state = server.state.lock().unwrap();
-        assert!(state.msgs.is_empty());
-        assert!(!state.tasks["task"].continuation_pending);
-        drop(state);
-        std::fs::remove_dir_all(root).ok();
+            },
+        }]);
+        id
     }
 
-    #[test]
-    fn pending_wake_retries_without_new_state_and_failed_retry_stays_pending() {
-        let (server, root) = test_server();
-        register(&server, "owner");
-        let id = "pending-resource".to_string();
+    fn bind_message(server: &Server, worker_id: &str, subscription_id: &str) -> String {
+        let message_id = format!("message-{worker_id}");
         server.commit(&[
             Event::Sent {
                 msg: Message {
-                    id: id.clone(),
-                    from: "collab-server".into(),
-                    to: "owner".into(),
-                    mtype: "system".into(),
-                    body: "RESOURCE_OCCUPIED feature=shared".into(),
+                    id: message_id.clone(),
+                    from: "peer".into(),
+                    to: worker_id.into(),
+                    mtype: "notify".into(),
+                    body: "RESOURCE_RELEASED task=held".into(),
                     in_reply_to: None,
                     created_ms: now_ms(),
                     state: "pending".into(),
@@ -464,20 +212,224 @@ mod tests {
                     last_wake_attempt_ms: 0,
                 },
             },
-            Event::DeliveryMode {
-                msg_id: id.clone(),
-                mode: "immediate".into(),
+            Event::WakeBound {
+                message_id: message_id.clone(),
+                subscription_id: subscription_id.into(),
             },
         ]);
+        message_id
+    }
 
+    fn working_task(server: &Server, worker_id: &str) {
+        let now = now_ms();
+        server.commit(&[Event::TaskCreated {
+            task: TaskRec {
+                id: "task".into(),
+                owner: worker_id.into(),
+                created_by: worker_id.into(),
+                feature_id: Some("feature".into()),
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: "p2".into(),
+                status: "working".into(),
+                next_step: Some("keep working".into()),
+                wait: None,
+                created_ms: now,
+                updated_ms: now,
+            },
+        }]);
+    }
+
+    #[test]
+    fn ordinary_work_never_generates_periodic_continuation() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        working_task(&server, "owner");
         tick_with_idle(&server, &|_| true);
+        assert!(server.state.lock().unwrap().msgs.is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn no_subscription_means_zero_wake_attempts() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        server.commit(&[Event::Sent {
+            msg: Message {
+                id: "message".into(),
+                from: "peer".into(),
+                to: "owner".into(),
+                mtype: "notify".into(),
+                body: "RESOURCE_RELEASED task=held".into(),
+                in_reply_to: None,
+                created_ms: now_ms(),
+                state: "pending".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        }]);
         tick_with_idle(&server, &|_| true);
+        assert_eq!(
+            server.state.lock().unwrap().msgs["message"].wake_attempt_count,
+            0
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn failed_notification_has_hard_three_attempt_lifetime_cap() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
+        let message_id = bind_message(&server, "owner", &subscription_id);
+        for _ in 0..4 {
+            super::super::attempt_notification_with(
+                &server,
+                &message_id,
+                &subscription_id,
+                &|_| true,
+                &|_, _| false,
+            );
+        }
         let state = server.state.lock().unwrap();
-        assert_eq!(state.msgs[&id].state, "pending");
-        assert_eq!(state.msgs[&id].wake_attempt_count, 1);
+        assert_eq!(
+            state.msgs[&message_id].wake_attempt_count,
+            MAX_WAKE_ATTEMPTS
+        );
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].status,
+            "attempts-exhausted"
+        );
         drop(state);
-        let log = std::fs::read_to_string(server.log_path()).unwrap();
-        assert_eq!(log.matches("knock failed pane=%test-owner").count(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn restart_does_not_reset_exhausted_notification_attempts() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
+        let message_id = bind_message(&server, "owner", &subscription_id);
+        for _ in 0..MAX_WAKE_ATTEMPTS {
+            super::super::attempt_notification_with(
+                &server,
+                &message_id,
+                &subscription_id,
+                &|_| true,
+                &|_, _| false,
+            );
+        }
+        drop(server);
+
+        let replayed = super::super::replay(&root).unwrap();
+        let journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap();
+        let restarted = Server {
+            root: root.clone(),
+            state: Mutex::new(replayed),
+            journal: Mutex::new(journal),
+            pane_alive_check: |_| true,
+        };
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        assert!(!super::super::attempt_notification_with(
+            &restarted,
+            &message_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| {
+                sent.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            },
+        ));
+        let state = restarted.state.lock().unwrap();
+        assert!(!sent.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            state.msgs[&message_id].wake_attempt_count,
+            MAX_WAKE_ATTEMPTS
+        );
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].status,
+            "attempts-exhausted"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn successful_notification_consumes_one_shot_subscription() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
+        let message_id = bind_message(&server, "owner", &subscription_id);
+        assert!(super::super::attempt_notification_with(
+            &server,
+            &message_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| true,
+        ));
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs[&message_id].state, "delivered");
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].status,
+            "consumed"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn deadline_subscription_emits_once_only_after_trigger() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let subscription_id = subscribe(
+            &server,
+            "owner",
+            "deadline",
+            Some("timer"),
+            Some(now_ms() - 1),
+        );
+        tick_with_idle(&server, &|_| false);
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .wake_bindings
+                .values()
+                .filter(|bound| *bound == &subscription_id)
+                .count(),
+            1
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wait_expiry_changes_task_without_unsolicited_messages() {
+        let (server, root) = test_server();
+        register(&server, "waiter");
+        working_task(&server, "waiter");
+        let now = now_ms();
+        let mut task = server.state.lock().unwrap().tasks["task"].clone();
+        task.status = "waiting".into();
+        task.wait = Some(WaitSpec {
+            waiter: "waiter".into(),
+            waiting_for: "holder".into(),
+            responsible_actor: "holder-owner".into(),
+            reason: "resource_conflict".into(),
+            deadline_ms: now - 1,
+            resume_on: vec!["resource_released".into()],
+            escalation: "resource_owner_and_waiter_recheck".into(),
+        });
+        server.commit(&[Event::TaskUpdated { task }]);
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.tasks["task"].status, "blocked");
+        assert!(state.msgs.is_empty());
+        drop(state);
         std::fs::remove_dir_all(root).ok();
     }
 }

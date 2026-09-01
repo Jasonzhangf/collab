@@ -1,0 +1,10 @@
+{
+  "container_id": "collab-v2-runtime",
+  "orchestrator": "codis",
+  "owns": ["process_lifecycle", "health_wiring"],
+  "forbidden": ["task_truth", "claim_truth", "journal_truth", "business_payload"],
+  "services": [
+    {"id":"cordis", "entry":"src/appsdk-plugin.mjs", "depends_on":["rust-core"]},
+    {"id":"rust-core", "entry":"target/debug/core-daemon", "protocol":"stdio-json-v1"}
+  ]
+}

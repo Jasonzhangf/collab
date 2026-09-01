@@ -185,9 +185,6 @@ fn worktree_claim_requires_cleanup_and_cannot_cancel() {
             wait: None,
             created_ms: now,
             updated_ms: now,
-            last_continuation_sent_ms: now,
-            continuation_pending: false,
-            continuation_message_id: None,
         },
     }]);
     let cancelled = handle_task_update(
@@ -227,9 +224,6 @@ fn merged_worktree_without_cleanup_receipt_fails_audit() {
             wait: None,
             created_ms: now,
             updated_ms: now,
-            last_continuation_sent_ms: now,
-            continuation_pending: false,
-            continuation_message_id: None,
         },
     }]);
     let issues = migration_issues(&server, &server.state.lock().unwrap());
@@ -249,7 +243,11 @@ fn conflict_is_durable_and_wait_targets_resource_holder() {
     assert!(!conflict.ok);
     assert_eq!(conflict.error.as_deref(), Some("TASK_RESOURCE_CONFLICT"));
     assert_eq!(conflict.data["responsible_actor"], "holder");
-    assert_eq!(server.state.lock().unwrap().msgs.len(), 2);
+    assert_eq!(server.state.lock().unwrap().msgs.len(), 0);
+    assert_eq!(
+        conflict.data["notification"],
+        "none; use explicit sendmessage when coordination is needed"
+    );
 
     let waiting = handle_task_wait(
         &server,
@@ -284,6 +282,18 @@ fn holder_close_persists_release_only_for_waiter() {
             "token-waiter".into(),
             "waiting".into(),
             "held".into(),
+        )
+        .ok
+    );
+    assert!(
+        handle_notification_subscribe(
+            &server,
+            "waiter".into(),
+            "token-waiter".into(),
+            "resource-released".into(),
+            Some("held".into()),
+            None,
+            60,
         )
         .ok
     );
@@ -400,9 +410,6 @@ fn direct_two_peer_and_three_peer_wait_cycles_fail_closed() {
         }),
         created_ms: now,
         updated_ms: now,
-        last_continuation_sent_ms: now,
-        continuation_pending: false,
-        continuation_message_id: None,
     };
     server.commit(&[
         Event::TaskUpdated {
@@ -479,6 +486,15 @@ fn peer_migration_freezes_snapshot_and_resumes_after_verify() {
     assert!(verified.ok);
     assert!(verified.data["verified"].as_bool().unwrap());
     assert!(!server.state.lock().unwrap().admission_frozen());
+    let repeated = handle_migration_verify(&server, "peer".into(), "token-peer".into());
+    assert!(repeated.ok);
+    assert_eq!(repeated.data["verified"], true);
+    assert_eq!(repeated.data["idempotent"], true);
+    assert_eq!(repeated.data["resumed"], false);
+    assert!(repeated.data["next"]
+        .as_str()
+        .unwrap()
+        .contains("do not rerun"));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -494,6 +510,28 @@ fn migration_transaction_lease_rejects_second_peer() {
         second.error.as_deref(),
         Some("MIGRATION_TRANSACTION_HELD_BY_ANOTHER_PEER")
     );
+    assert_eq!(second.data["holder"], "peer-a");
+    assert_eq!(second.data["requester"], "peer-b");
+    assert_eq!(second.data["retry_allowed"], false);
+    assert!(second.data["next"]
+        .as_str()
+        .unwrap()
+        .contains("do not retry"));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn migration_verify_rejection_exposes_current_state_and_stops_retry() {
+    let (server, root) = test_server();
+    register(&server, "peer", "%peer");
+    let response = handle_migration_verify(&server, "peer".into(), "token-peer".into());
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_deref(),
+        Some("no migration record to verify")
+    );
+    assert_eq!(response.data["retry_allowed"], false);
+    assert!(response.data["next"].as_str().unwrap().contains("inspect"));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -560,9 +598,6 @@ fn changed_migration_snapshot_remains_frozen() {
             wait: None,
             created_ms: now,
             updated_ms: now,
-            last_continuation_sent_ms: now,
-            continuation_pending: false,
-            continuation_message_id: None,
         },
     }]);
     let verified = handle_migration_verify(&server, "peer".into(), "token-peer".into());
@@ -727,28 +762,15 @@ fn worktree_path_budget_accepts_short_slug_and_rejects_escape() {
 }
 
 #[test]
-fn delivery_is_bounded_and_long_body_uses_durable_reference() {
-    let (_server, root) = test_server();
-    let short_body = "x".repeat(150);
-    let short = delivery_text(&root, "peer", "notify", "short", &short_body).unwrap();
-    assert!(short.contains(&short_body));
-    assert!(short.chars().count() <= 850);
-    assert!(!short.contains('\n'));
-    assert!(!message_doc_path(&root, "short").exists());
-
-    let long_body = "long message\n".repeat(100);
-    let long = delivery_text(&root, "peer", "notify", "long", &long_body).unwrap();
-    assert!(long.chars().count() <= 300);
-    assert!(long.contains("body-ref=.agent-collab/messages/long.md"));
-    assert_eq!(
-        std::fs::read_to_string(message_doc_path(&root, "long")).unwrap(),
-        long_body
-    );
-    std::fs::remove_dir_all(root).ok();
+fn tmux_notification_is_short_and_contains_no_mailbox_body() {
+    let text = notification_text("message-id");
+    assert_eq!(text, "COLLAB_NOTIFY message-id");
+    assert!(!text.contains("RESOURCE_"));
+    assert!(!text.contains("CONTINUE_TASK"));
 }
 
 #[test]
-fn failed_tmux_wake_keeps_durable_message_and_deduplicates_retry() {
+fn send_without_subscription_is_mailbox_only_and_deduplicated() {
     let (server, root) = test_server();
     register(&server, "sender", "%collab-missing-sender");
     register(&server, "recipient", "%collab-missing-recipient");
@@ -768,9 +790,12 @@ fn failed_tmux_wake_keeps_durable_message_and_deduplicates_retry() {
         .join(".agent-collab/mailbox")
         .join(format!("{message_id}.json"))
         .exists());
-    assert!(std::fs::read_to_string(server.log_path())
-        .unwrap()
-        .contains("knock failed pane=%collab-missing-recipient"));
+    assert_eq!(first.data["notification"], "mailbox-only-no-subscription");
+    assert_eq!(
+        server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
+        0
+    );
+    assert!(!server.log_path().exists());
 
     let duplicate = handle_send(
         &server,
@@ -880,39 +905,31 @@ fn lifecycle_cannot_bypass_review_or_delivery() {
 }
 
 #[test]
-fn context_consumes_local_continuation_without_explicit_ack_loop() {
+fn context_is_read_only_and_does_not_consume_notifications() {
     let (server, root) = test_server();
     register(&server, "peer", "%peer");
     assert!(create_task(&server, "peer", "task", "feature").ok);
-    let message_id = "continuation".to_string();
-    let mut task = server.state.lock().unwrap().tasks["task"].clone();
-    task.continuation_pending = true;
-    task.continuation_message_id = Some(message_id.clone());
-    server.commit(&[
-        Event::Sent {
-            msg: Message {
-                id: message_id.clone(),
-                from: "collab-server".into(),
-                to: "peer".into(),
-                mtype: "system".into(),
-                body: "CONTINUE_TASK task=task".into(),
-                in_reply_to: None,
-                created_ms: now_ms(),
-                state: "delivered".into(),
-                wake_attempt_count: 1,
-                last_wake_attempt_ms: now_ms(),
-            },
+    let message_id = "notification".to_string();
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: message_id.clone(),
+            from: "peer-two".into(),
+            to: "peer".into(),
+            mtype: "notify".into(),
+            body: "RESOURCE_RELEASED task=task".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
         },
-        Event::TaskUpdated { task },
-    ]);
+    }]);
 
     let context = handle_context(&server, "peer".into(), "token-peer".into());
     assert!(context.ok);
-    assert_eq!(context.data["inbox"]["unread"], 0);
+    assert_eq!(context.data["inbox"]["unread"], 1);
     let state = server.state.lock().unwrap();
-    assert!(!state.tasks["task"].continuation_pending);
-    assert!(state.tasks["task"].continuation_message_id.is_none());
-    assert_eq!(state.msgs[&message_id].state, "read");
+    assert_eq!(state.msgs[&message_id].state, "pending");
     drop(state);
     std::fs::remove_dir_all(root).ok();
 }
@@ -946,6 +963,8 @@ fn architecture_source_has_no_live_declared_role_or_dispatch_owner() {
         "\"collab_master\"",
         "\"collab_task_claim\"",
         "\"collab_task_dispatch\"",
+        "\"project_root\"",
+        "args.get(\"pane\")",
     ] {
         assert!(
             !mcp_source.contains(removed_tool),

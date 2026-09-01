@@ -2,12 +2,15 @@
   "lifecycle_id": "collab-v1-peer-low-intervention",
   "status": "active",
   "edges": [
+    {"from": "inherited-agent-environment", "to": "project-control-root", "caller": "main", "callee": "scope::project_root", "path": "src/main.rs"},
     {"from": "peer-register", "to": "task-register", "caller": "dispatch", "callee": "handle_task_register_with_next", "path": "src/server/mod.rs"},
     {"from": "task-register", "to": "resource-wait", "caller": "dispatch", "callee": "handle_task_wait", "path": "src/server/mod.rs"},
     {"from": "task-register", "to": "task-deliver", "caller": "dispatch", "callee": "handle_task_deliver", "path": "src/server/mod.rs"},
     {"from": "task-deliver", "to": "task-close-release", "caller": "dispatch", "callee": "handle_task_close", "path": "src/server/mod.rs"},
-    {"from": "task-close-release", "to": "tmux-wake-attempt", "caller": "handle_task_close", "callee": "queue_system_knock", "path": "src/server/mod.rs"},
-    {"from": "tmux-wake-attempt", "to": "context-consume", "caller": "dispatch", "callee": "handle_context", "path": "src/server/mod.rs"},
+    {"from": "peer-register", "to": "notification-subscribe", "caller": "dispatch", "callee": "handle_notification_subscribe", "path": "src/server/mod.rs"},
+    {"from": "notification-subscribe", "to": "tmux-wake-attempt", "caller": "attempt_notification", "callee": "queue_system_knock", "path": "src/server/mod.rs"},
+    {"from": "task-close-release", "to": "subscribed-resource-event", "caller": "handle_task_close", "callee": "matching_subscription", "path": "src/server/mod.rs"},
+    {"from": "tmux-wake-attempt", "to": "notification-query", "caller": "dispatch", "callee": "handle_context", "path": "src/server/mod.rs"},
     {"from": "peer-register", "to": "migration-freeze-verify", "caller": "dispatch", "callee": "handle_migration_verify", "path": "src/server/mod.rs"}
   ]
 }

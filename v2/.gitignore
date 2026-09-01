@@ -2,8 +2,13 @@ node_modules/
 target/
 generated/
 active/lib/
-protected/
 playground/
 .appsdk-control/
-.appsdk/
-.appsdk-prepare.json
+.agent-collab-v2/
+
+# BEGIN APPSDK MANAGED
+.appsdk-control/
+.appsdk/sdk.bin
+/active/lib/
+/generated/
+# END APPSDK MANAGED
