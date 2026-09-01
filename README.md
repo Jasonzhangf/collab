@@ -68,7 +68,7 @@ read latest main
 → merge exact commit to main
 → verify/push main
 → mark merged
-→ close and clean own worktree/branch
+→ close performs mandatory cleanup and persists a cleanup receipt
 ```
 
 ```sh
@@ -95,9 +95,13 @@ entered through `collab task wait`; `delivered` through `task deliver`; and
 `merged`: successful delivery evidence is mandatory. Only the task owner may
 mutate or close it.
 
-Delivery is a local durable milestone. It sends no peer message. Close fails
-before mutation unless the task is merged, its declared worktree is clean and
-inside `./playground/`, and its branch is merged into current main.
+Delivery is a local durable milestone. It sends no peer message. Every task
+with a declared worktree carries a cleanup obligation. Close fails before
+mutation unless the task is merged, its declared worktree is clean and inside
+`./playground/`, and its branch is merged into current main. Close removes the
+exact worktree/branch, verifies absence, persists a durable cleanup receipt,
+and only then marks the task closed. A terminal task with a missing receipt or
+an existing declared worktree fails audit; cancellation cannot bypass cleanup.
 
 ## Resource conflicts and waits
 

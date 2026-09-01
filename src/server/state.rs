@@ -113,6 +113,15 @@ pub struct TaskRec {
     pub continuation_message_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub worktree_path: Option<String>,
+    pub branch: Option<String>,
+    pub verified_ms: i64,
+}
+
 pub fn task_continuation_active(status: &str) -> bool {
     !matches!(
         status,
@@ -190,6 +199,9 @@ pub enum Event {
     TaskUpdated {
         task: TaskRec,
     },
+    CleanupVerified {
+        receipt: CleanupReceipt,
+    },
     MigrationUpdated {
         migration: MigrationRecord,
     },
@@ -200,6 +212,7 @@ pub struct State {
     pub workers: HashMap<String, WorkerRec>,
     pub msgs: HashMap<String, Message>,
     pub tasks: HashMap<String, TaskRec>,
+    pub cleanup_receipts: HashMap<String, CleanupReceipt>,
     pub delivery_modes: HashMap<String, String>,
     pub migration: Option<MigrationRecord>,
 }
@@ -259,6 +272,10 @@ impl State {
             }
             Event::TaskCreated { task } | Event::TaskUpdated { task } => {
                 self.tasks.insert(task.id.clone(), task.clone());
+            }
+            Event::CleanupVerified { receipt } => {
+                self.cleanup_receipts
+                    .insert(receipt.task_id.clone(), receipt.clone());
             }
             Event::MigrationUpdated { migration } => {
                 self.migration = Some(migration.clone());

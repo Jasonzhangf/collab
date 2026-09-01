@@ -7,8 +7,8 @@ use crate::scope::Scope;
 use crate::server::knock::{append_log, knock_or_log, pane_alive, pane_idle};
 use serde_json::json;
 use state::{
-    now_ms, runtime_for_pane, task_continuation_active, task_resource_active, wait_cycle, Event,
-    Message, MigrationRecord, State, TaskRec, WaitSpec, WorkerRec,
+    now_ms, runtime_for_pane, task_continuation_active, task_resource_active, wait_cycle,
+    CleanupReceipt, Event, Message, MigrationRecord, State, TaskRec, WaitSpec, WorkerRec,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -351,6 +351,37 @@ fn migration_issues(server: &Server, state: &State) -> Vec<String> {
         }
     }
     for task in state.tasks.values() {
+        if task.worktree_path.is_some()
+            && matches!(task.status.as_str(), "merged" | "closed" | "cancelled")
+            && !state.cleanup_receipts.contains_key(&task.id)
+        {
+            issues.push(format!(
+                "TASK_CLEANUP_INCOMPLETE:{}:{}",
+                task.id,
+                task.worktree_path.as_deref().unwrap_or("unknown")
+            ));
+        }
+        if let Some(receipt) = state.cleanup_receipts.get(&task.id) {
+            if receipt.task_id != task.id
+                || receipt.worktree_path != task.worktree_path
+                || receipt.branch != task.branch
+            {
+                issues.push(format!("TASK_CLEANUP_RECEIPT_MISMATCH:{}", task.id));
+            }
+            if let Some(path) = task.worktree_path.as_deref() {
+                let worktree = Path::new(path);
+                let worktree = if worktree.is_absolute() {
+                    worktree.to_path_buf()
+                } else {
+                    server
+                        .root
+                        .join(worktree.strip_prefix("./").unwrap_or(worktree))
+                };
+                if worktree.exists() {
+                    issues.push(format!("TASK_CLEANUP_INCOMPLETE:{}:{}", task.id, path));
+                }
+            }
+        }
         if task.status == "available" {
             issues.push(format!(
                 "task {} uses deprecated available/dispatch state and needs an explicit owner decision",
@@ -1040,9 +1071,13 @@ fn handle_task_register_with_next(
         continuation_message_id: None,
     };
     server.commit_locked(&mut st, &[Event::TaskCreated { task: task.clone() }]);
-    Resp::data(
-        json!({"task": task.id, "owner": task.owner, "status": task.status, "continuation": "active"}),
-    )
+    Resp::data(json!({
+        "task": task.id,
+        "owner": task.owner,
+        "status": task.status,
+        "continuation": "active",
+        "cleanup": if task.worktree_path.is_some() { "pending" } else { "not_required" },
+    }))
 }
 
 fn handle_task_relocate(
@@ -1162,6 +1197,11 @@ fn handle_task_update(
         }
         if new_status == "waiting" {
             return Resp::err("use collab task wait so responsibility and deadline are durable");
+        }
+        if new_status == "cancelled" && task.worktree_path.is_some() {
+            return Resp::err(
+                "CLEANUP_REQUIRED_BEFORE_CANCEL: task owns a worktree; close only after merged cleanup",
+            );
         }
         if !task_transition_allowed(&task.status, &new_status) {
             return Resp::err(format!(
@@ -1302,6 +1342,31 @@ fn close_task_resources(
     Ok(())
 }
 
+fn cleanup_receipt_is_reusable(root: &Path, receipt: &CleanupReceipt) -> bool {
+    if let Some(path) = receipt.worktree_path.as_deref() {
+        let worktree = Path::new(path);
+        let worktree = if worktree.is_absolute() {
+            worktree.to_path_buf()
+        } else {
+            root.join(worktree.strip_prefix("./").unwrap_or(worktree))
+        };
+        if worktree.exists() {
+            return false;
+        }
+    }
+    if let Some(branch) = receipt.branch.as_deref() {
+        let branch_exists = Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "--verify", branch])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if branch_exists {
+            return false;
+        }
+    }
+    true
+}
+
 fn handle_task_deliver(
     server: &Server,
     worker_id: String,
@@ -1382,12 +1447,23 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
             task_id, task.status
         ));
     }
-    if let Err(e) = close_task_resources(
-        &server.root,
-        task.worktree_path.as_deref(),
-        task.branch.as_deref(),
-    ) {
-        return Resp::err(e);
+    let receipt_reusable = st
+        .cleanup_receipts
+        .get(&task.id)
+        .filter(|receipt| {
+            receipt.task_id == task.id
+                && receipt.worktree_path == task.worktree_path
+                && receipt.branch == task.branch
+        })
+        .is_some_and(|receipt| cleanup_receipt_is_reusable(&server.root, receipt));
+    if !receipt_reusable {
+        if let Err(e) = close_task_resources(
+            &server.root,
+            task.worktree_path.as_deref(),
+            task.branch.as_deref(),
+        ) {
+            return Resp::err(e);
+        }
     }
     let mut closed = task;
     closed.status = "closed".to_string();
@@ -1396,11 +1472,23 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
     closed.continuation_pending = false;
     closed.continuation_message_id = None;
     closed.updated_ms = now_ms();
+    let receipt = CleanupReceipt {
+        id: format!("cleanup-{}-{}", closed.id, closed.updated_ms),
+        task_id: closed.id.clone(),
+        worktree_path: closed.worktree_path.clone(),
+        branch: closed.branch.clone(),
+        verified_ms: closed.updated_ms,
+    };
     server.commit_locked(
         &mut st,
-        &[Event::TaskUpdated {
-            task: closed.clone(),
-        }],
+        &[
+            Event::CleanupVerified {
+                receipt: receipt.clone(),
+            },
+            Event::TaskUpdated {
+                task: closed.clone(),
+            },
+        ],
     );
 
     // Closing the lock-holder wakes every durable waiter. The wake is only a
@@ -1484,7 +1572,8 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
         "cleanup": {
             "worktree": closed.worktree_path,
             "branch": closed.branch,
-            "result": "removed-if-declared-and-safe"
+            "result": "verified",
+            "receipt_id": receipt.id,
         },
         "stale_workers": stale_workers,
         "notification": "resource waiters only",
@@ -1492,7 +1581,9 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
     }))
 }
 
-fn task_view(task: &TaskRec) -> serde_json::Value {
+fn task_view(state: &State, task: &TaskRec) -> serde_json::Value {
+    let cleanup_required = task.worktree_path.is_some();
+    let cleanup_receipt = state.cleanup_receipts.get(&task.id);
     json!({
         "id": task.id,
         "owner": task.owner,
@@ -1505,6 +1596,17 @@ fn task_view(task: &TaskRec) -> serde_json::Value {
         "status": task.status,
         "next_step": task.next_step,
         "wait": task.wait,
+        "cleanup": {
+            "required": cleanup_required,
+            "status": if !cleanup_required {
+                "not_required"
+            } else if cleanup_receipt.is_some() {
+                "verified"
+            } else {
+                "pending"
+            },
+            "receipt_id": cleanup_receipt.map(|receipt| receipt.id.clone()),
+        },
         "continuation": if task_continuation_active(&task.status) { "active" } else { "inactive" },
         "updated_at": iso(task.updated_ms),
     })
@@ -1545,7 +1647,7 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         .tasks
         .values()
         .filter(|task| task.owner == worker_id)
-        .map(task_view)
+        .map(|task| task_view(&st, task))
         .collect();
     let unread: Vec<&Message> = st.inbox_of(&worker_id);
     let next_actions: Vec<String> = tasks
@@ -1616,7 +1718,7 @@ fn task_conflicts(
                 && ((feature_id.is_some() && task.feature_id == feature_id)
                     || (worktree_path.is_some() && task.worktree_path == worktree_path))
         })
-        .map(task_view)
+        .map(|task| task_view(&st, task))
         .collect();
     Resp::data(json!({"conflicts": conflicts}))
 }
@@ -1953,11 +2055,11 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 Some(id) => st
                     .tasks
                     .get(&id)
-                    .map(task_view)
+                    .map(|task| task_view(&st, task))
                     .map(Resp::data)
                     .unwrap_or_else(|| Resp::err(format!("task {} not found", id))),
                 None => Resp::data(
-                    json!({"tasks": st.tasks.values().map(task_view).collect::<Vec<_>>()}),
+                    json!({"tasks": st.tasks.values().map(|task| task_view(&st, task)).collect::<Vec<_>>()}),
                 ),
             }
         }

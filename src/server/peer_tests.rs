@@ -156,11 +156,86 @@ fn owner_completes_local_lifecycle_without_peer_reports() {
     assert!(closed.ok);
     let state = server.state.lock().unwrap();
     assert_eq!(state.tasks["task"].status, "closed");
+    assert_eq!(state.cleanup_receipts["task"].task_id, "task");
     assert!(
         state.msgs.is_empty(),
         "normal lifecycle must not report to peers"
     );
     drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn worktree_claim_requires_cleanup_and_cannot_cancel() {
+    let (server, root) = test_server();
+    register(&server, "peer", "%peer");
+    let now = now_ms();
+    server.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "task".into(),
+            owner: "peer".into(),
+            created_by: "peer".into(),
+            feature_id: Some("feature".into()),
+            worktree_path: Some("playground/task-wt".into()),
+            branch: Some("codex/task-wt".into()),
+            base_commit: Some("base".into()),
+            priority: default_priority(),
+            status: "working".into(),
+            next_step: None,
+            wait: None,
+            created_ms: now,
+            updated_ms: now,
+            last_continuation_sent_ms: now,
+            continuation_pending: false,
+            continuation_message_id: None,
+        },
+    }]);
+    let cancelled = handle_task_update(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "task".into(),
+        Some("cancelled".into()),
+        None,
+    );
+    assert!(!cancelled.ok);
+    assert_eq!(
+        cancelled.error.as_deref(),
+        Some(
+            "CLEANUP_REQUIRED_BEFORE_CANCEL: task owns a worktree; close only after merged cleanup"
+        )
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn merged_worktree_without_cleanup_receipt_fails_audit() {
+    let (server, root) = test_server();
+    let now = now_ms();
+    server.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "merged-task".into(),
+            owner: "peer".into(),
+            created_by: "peer".into(),
+            feature_id: None,
+            worktree_path: Some("playground/merged-wt".into()),
+            branch: Some("codex/merged-wt".into()),
+            base_commit: None,
+            priority: default_priority(),
+            status: "merged".into(),
+            next_step: None,
+            wait: None,
+            created_ms: now,
+            updated_ms: now,
+            last_continuation_sent_ms: now,
+            continuation_pending: false,
+            continuation_message_id: None,
+        },
+    }]);
+    let issues = migration_issues(&server, &server.state.lock().unwrap());
+    assert!(issues
+        .iter()
+        .any(|issue| issue.starts_with("TASK_CLEANUP_INCOMPLETE:merged-task:")));
     std::fs::remove_dir_all(root).ok();
 }
 

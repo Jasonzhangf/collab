@@ -82,7 +82,8 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
 
 ```
 working -> verifying -> reviewed -> delivered
-        -> owner sync/verify/integrate -> merged -> close/cleanup -> closed
+        -> owner sync/verify/integrate -> merged -> cleanup_pending
+        -> cleanup_verified -> closed
         -> rework -> working
 blocked -> bounded waiting -> resource release/timeout -> owner recheck
 ```
@@ -115,8 +116,11 @@ Peers never share worktrees. Each task owner starts from latest main in one
 declared clean `./playground/` worktree, implements and tests, commits the exact
 change set, syncs latest main again, verifies the candidate, acquires a short
 integration lease, merges the exact commit to main, verifies and pushes main,
-then closes the task to remove only its clean merged worktree/branch. Delivery
-is an owner-local durable milestone and sends no peer notification. `/goal`
+then closes the task to remove only its clean merged worktree/branch and persist
+a cleanup receipt. A bound worktree is a mandatory cleanup obligation;
+`delivered`/`merged` are not cleanup completion, and a task with a pending or
+unproven cleanup cannot become closed or pass audit. Delivery is an owner-local
+durable milestone and sends no peer notification. `/goal`
 delegation and interactive task recognition are intentionally deferred.
 
 ## Message handling
