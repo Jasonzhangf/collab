@@ -814,6 +814,36 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
 }
 
 #[test]
+fn explicit_peer_notification_accepts_arbitrary_durable_body() {
+    let (server, root) = test_server();
+    register(&server, "sender", "%sender");
+    register(&server, "recipient", "%recipient");
+    let response = handle_send(
+        &server,
+        "sender".into(),
+        "recipient".into(),
+        "notify".into(),
+        "The candidate is ready for your review.".into(),
+        None,
+        "immediate".into(),
+    );
+    assert!(response.ok);
+    let message_id = response.data["msg_id"].as_str().unwrap();
+    let state = server.state.lock().unwrap();
+    assert_eq!(
+        state.msgs[message_id].body,
+        "The candidate is ready for your review."
+    );
+    assert_eq!(state.msgs[message_id].wake_attempt_count, 0);
+    assert_eq!(
+        response.data["notification"],
+        "mailbox-only-no-subscription"
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn removed_role_and_dispatch_commands_fail_fast() {
     let (server, root) = test_server();
     register(&server, "peer", "%peer");

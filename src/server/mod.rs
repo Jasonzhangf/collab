@@ -896,12 +896,8 @@ fn handle_send(
     in_reply_to: Option<String>,
     delivery_mode: String,
 ) -> Resp {
-    if mtype != "notify"
-        || !(body.starts_with("RESOURCE_OCCUPIED ") || body.starts_with("RESOURCE_RELEASED "))
-    {
-        return Resp::err(
-            "peer messaging is limited to RESOURCE_OCCUPIED/RESOURCE_RELEASED coordination",
-        );
+    if mtype != "notify" {
+        return Resp::err("peer messaging requires type notify");
     }
     if delivery_mode != "immediate" {
         return Resp::err(

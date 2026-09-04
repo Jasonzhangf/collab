@@ -32,7 +32,7 @@ fn tools() -> Value {
         ),
         tool(
             "collab_sendmessage",
-            "Persist an explicit resource-coordination message; the recipient is woken only through its own active direct-message subscription.",
+            "Persist an explicit peer notification; the recipient is woken only through its own active direct-message subscription.",
             json!({"to":{"type":"string"},"body":{"type":"string"}}),
             &["to", "body"]
         ),
