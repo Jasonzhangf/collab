@@ -73,6 +73,9 @@ enum Cmd {
     Send {
         #[arg(long)]
         to: String,
+        /// Short topic shown in the tmux notification preview
+        #[arg(long)]
+        subject: String,
         #[arg(long, default_value = "notify")]
         r#type: String,
         #[arg(long)]
@@ -457,6 +460,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Send {
             to,
+            subject,
             r#type,
             in_reply_to,
             delivery,
@@ -474,6 +478,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     from: ident.worker_id,
                     to,
                     mtype: r#type,
+                    subject: Some(subject),
                     body,
                     in_reply_to,
                     delivery,

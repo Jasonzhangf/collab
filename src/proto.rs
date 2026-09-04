@@ -14,6 +14,8 @@ pub enum Req {
         to: String,
         #[serde(rename = "type")]
         mtype: String,
+        #[serde(default)]
+        subject: Option<String>,
         body: String,
         in_reply_to: Option<String>,
         #[serde(default = "default_delivery_mode")]

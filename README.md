@@ -2,7 +2,8 @@
 
 Project-local coordination for independent coding agents. One Rust daemon owns
 the append-only journal, durable mailbox, task/resource state, and migration
-transaction. tmux is the only live notification channel and is wake-only.
+transaction. tmux is the only live notification channel. Each subscribed wake
+is a bounded preview; the durable mailbox remains authoritative.
 
 ## Model
 
@@ -14,7 +15,8 @@ transaction. tmux is the only live notification channel and is wake-only.
   sync, private worktree, implementation, tests, exact commit, candidate
   verification, short integration lease, main merge/verification/push, and
   cleanup.
-- Peers communicate through an explicit `sendmessage` with a durable body. Use
+- Peers communicate through an explicit `sendmessage` with a required short
+  subject and durable body. Use
   it for resource occupancy/release or a direct peer notice; it never creates
   an inferred task, progress, ACK, or continuation loop.
 - Registration creates one finite `direct-message` subscription for the peer.
@@ -128,17 +130,19 @@ claim. Holder close moves each waiter from `waiting` to `blocked` and clears
 the obsolete wait edge. Notification occurs only for an exact active
 resource-release/deadline subscription.
 
-Manual P2P messages use `notify` and may carry any non-empty durable body:
+Manual P2P messages use `notify` and require a short subject plus a non-empty
+durable body:
 
 ```sh
-collab sendmessage --to <peer> "RESOURCE_OCCUPIED ..."
-collab sendmessage --to <peer> "The result is ready; query the mailbox."
+collab sendmessage --to <peer> --subject resource-busy "RESOURCE_OCCUPIED ..."
+collab sendmessage --to <peer> --subject result-ready "The result is ready; query the mailbox."
 ```
 
 Never type peer messages into tmux. Without the recipient's active
 `direct-message` subscription, the message remains mailbox-only. Registration
 normally creates this subscription automatically; tmux receives only the short
-message id and `Enter`.
+message id, abbreviated subject, safe one-line original body preview, and a
+final `C-m` submit key in one command.
 
 ## Explicit notifications
 
@@ -155,10 +159,12 @@ collab inbox
 ```
 
 Subscriptions are owner-scoped, exact-event, bounded by TTL, and one-shot.
-tmux receives only `COLLAB_NOTIFY <message-id>` in one command sequence; the
-Agent reads the durable body/result through CLI/MCP. Success consumes the
-subscription. Failure has a lifetime hard cap of three attempts. The daemon
-never creates periodic `CONTINUE_TASK` messages.
+tmux receives `COLLAB_NOTIFY <message-id> [<subject>] <original-body-preview>`
+and a final `C-m` in one command sequence. The Agent first weighs the id and
+subject against current work, then queries the durable body/result through
+CLI/MCP when it decides to act. Success consumes the subscription. Failure has
+a lifetime hard cap of three attempts. The daemon never creates periodic
+`CONTINUE_TASK` messages.
 
 ## Existing-project migration
 

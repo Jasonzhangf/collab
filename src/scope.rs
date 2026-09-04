@@ -90,7 +90,7 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
 ## Runtime boundary
 
 - Every peer registration must come from a live tmux pane.
-- tmux is the only live notification channel and remains wake-only.
+- tmux is the only live notification channel and carries one bounded preview.
 - Server state, journal, and mailbox are durable truth; a failed wake cannot
   roll back state or fabricate success.
 - The runtime is part of the worker identity boundary, not a task preference.
@@ -153,10 +153,13 @@ delegation and interactive task recognition are intentionally deferred.
 
 ## Message handling
 
-On a notification, query durable state before acting. `collab sendmessage`
-accepts only `RESOURCE_OCCUPIED` and `RESOURCE_RELEASED` coordination. Never
-type peer messages with tmux. The daemon may send only a short notification id
-after the receiving Agent registers a finite one-shot subscription.
+On a notification, use its id and abbreviated subject to weigh urgency against
+the current task. Query durable state before acting when the notice is relevant.
+`collab sendmessage` requires `--subject` and accepts only explicit coordination
+or asynchronous-result notices. Never type peer messages with tmux. After the
+receiving Agent registers a finite one-shot subscription, the daemon may send
+one id, abbreviated subject, safe one-line original body preview, and final
+submit key as a single tmux operation.
 
 `collab inbox` and `collab msg <id>` query the durable local mailbox after a
 tmux pane disappears; mailbox state remains authoritative.

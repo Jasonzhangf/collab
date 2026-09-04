@@ -32,9 +32,9 @@ fn tools() -> Value {
         ),
         tool(
             "collab_sendmessage",
-            "Persist an explicit peer notification; the recipient is woken only through its own active direct-message subscription.",
-            json!({"to":{"type":"string"},"body":{"type":"string"}}),
-            &["to", "body"]
+            "Persist an explicit peer notification with a required short subject and original body preview; the recipient is woken only through its own active direct-message subscription.",
+            json!({"to":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}}),
+            &["to", "subject", "body"]
         ),
         tool(
             "collab_notify_methods",
@@ -156,6 +156,8 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
                 "sendmessage".into(),
                 "--to".into(),
                 required(args, "to")?,
+                "--subject".into(),
+                required(args, "subject")?,
                 required(args, "body")?,
             ]);
         }
@@ -334,5 +336,26 @@ fn main() {
         };
         let _ = writeln!(out, "{}", result);
         let _ = out.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sendmessage_schema_requires_subject_and_body() {
+        let definitions = tools();
+        let send = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "collab_sendmessage")
+            .unwrap();
+        assert_eq!(
+            send["inputSchema"]["required"],
+            json!(["to", "subject", "body"])
+        );
+        assert!(send["inputSchema"]["properties"]["subject"].is_object());
     }
 }

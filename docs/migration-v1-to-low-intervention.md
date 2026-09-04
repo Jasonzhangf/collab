@@ -88,8 +88,9 @@ does not release a claim or send an unsolicited message. Resource release first
 changes the waiter to `blocked` and clears the obsolete wait edge. Only an
 exact, finite, Agent-owned subscription creates a notification. Each wake
 attempt is journaled; replay never resets the immutable lifetime cap of three.
-tmux receives only a short message id in one command sequence. No registration,
-shell/absent, unknown, working, expired, cancelled, consumed, or exhausted
+tmux receives one message id, abbreviated subject, safe original-body preview,
+and final submit key in one command sequence. No registration, shell/absent,
+unknown, working, expired, cancelled, consumed, or exhausted
 subscriptions fail closed with zero input. `collab context` is read-only.
 
 ## Fail-closed conditions
@@ -121,7 +122,7 @@ Unsupported and fail-fast:
 - restore master/worker roles, central dispatch, available queue, task offer,
   progress report, heartbeat, or ACK loops;
 - restore periodic `CONTINUE_TASK`, implicit idle delivery, inferred wake
-  registration, body/prompt injection, or unbounded retry;
+  registration, missing subjects, terminal control injection, or unbounded retry;
 - mix tmux and another runtime;
 - manually type a wake into a peer pane.
 

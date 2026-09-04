@@ -79,7 +79,7 @@ fn agent_state_from(command: &str, title: &str) -> AgentState {
 }
 
 fn wake_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
-    ["send-keys", "-t", pane, "--", text, "Enter"]
+    ["send-keys", "-t", pane, "--", text, "C-m"]
 }
 
 pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
@@ -110,7 +110,7 @@ mod tests {
                 "%7",
                 "--",
                 "COLLAB_NOTIFY message",
-                "Enter",
+                "C-m",
             ][..]
         );
     }

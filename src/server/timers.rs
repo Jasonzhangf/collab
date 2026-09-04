@@ -72,6 +72,10 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
                         from: "collab-server".into(),
                         to: subscription.worker_id.clone(),
                         mtype: "notification".into(),
+                        subject: subscription
+                            .subject
+                            .as_ref()
+                            .map(|subject| format!("deadline:{subject}")),
                         body: format!(
                             "DEADLINE_REACHED subject={}",
                             subscription.subject.as_deref().unwrap_or_default()
@@ -204,6 +208,7 @@ mod tests {
                     from: "peer".into(),
                     to: worker_id.into(),
                     mtype: "notify".into(),
+                    subject: Some("released:held".into()),
                     body: "RESOURCE_RELEASED task=held".into(),
                     in_reply_to: None,
                     created_ms: now_ms(),
@@ -261,6 +266,7 @@ mod tests {
                 from: "peer".into(),
                 to: "owner".into(),
                 mtype: "notify".into(),
+                subject: Some("released:held".into()),
                 body: "RESOURCE_RELEASED task=held".into(),
                 in_reply_to: None,
                 created_ms: now_ms(),

@@ -201,12 +201,54 @@ pub fn gen_msg_id() -> String {
     format!("m{}-{}", now_ms(), n)
 }
 
-fn notification_text(message_id: &str) -> String {
-    format!("COLLAB_NOTIFY {message_id}")
+const MAX_NOTIFICATION_SUBJECT_CHARS: usize = 48;
+
+fn abbreviated_subject(subject: &str) -> Option<String> {
+    let normalized = subject.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() <= MAX_NOTIFICATION_SUBJECT_CHARS {
+        return Some(normalized);
+    }
+    let mut abbreviated = normalized
+        .chars()
+        .take(MAX_NOTIFICATION_SUBJECT_CHARS - 1)
+        .collect::<String>();
+    abbreviated.push('…');
+    Some(abbreviated)
+}
+
+fn visible_body(body: &str) -> String {
+    let mut visible = String::with_capacity(body.len());
+    for ch in body.chars() {
+        match ch {
+            '\n' => visible.push_str("\\n"),
+            '\r' => visible.push_str("\\r"),
+            '\t' => visible.push_str("\\t"),
+            ch if ch.is_control() => visible.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            ch => visible.push(ch),
+        }
+    }
+    visible
+}
+
+fn notification_text(message: &Message) -> Option<String> {
+    let subject = abbreviated_subject(message.subject.as_deref()?)?;
+    Some(format!(
+        "COLLAB_NOTIFY {} [{}] {}",
+        message.id,
+        subject,
+        visible_body(&message.body)
+    ))
 }
 
 pub(super) fn queue_system_knock(server: &Server, pane: &str, msg_id: &str) -> bool {
-    knock_or_log(&server.log_path(), pane, &notification_text(msg_id))
+    let text = {
+        let state = server.state.lock().unwrap();
+        state.msgs.get(msg_id).and_then(notification_text)
+    };
+    text.is_some_and(|text| knock_or_log(&server.log_path(), pane, &text))
 }
 
 fn iso(ms: i64) -> String {
@@ -286,6 +328,10 @@ fn attempt_notification_with(
             == Some(subscription.pane.as_str());
         let valid = message.to == subscription.worker_id
             && message.state == "pending"
+            && message
+                .subject
+                .as_deref()
+                .is_some_and(|subject| !subject.trim().is_empty())
             && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
             && subscription.status == "armed"
             && subscription.expires_ms > now_ms()
@@ -960,6 +1006,7 @@ fn handle_send(
     from: String,
     to: String,
     mtype: String,
+    subject: Option<String>,
     body: String,
     in_reply_to: Option<String>,
     delivery_mode: String,
@@ -972,6 +1019,9 @@ fn handle_send(
             "implicit idle delivery is removed; use an explicit notification subscription",
         );
     }
+    let Some(subject) = subject.filter(|subject| !subject.trim().is_empty()) else {
+        return Resp::err("MESSAGE_SUBJECT_REQUIRED: sendmessage requires --subject");
+    };
     if !MSG_TYPES.contains(&mtype.as_str()) {
         return Resp::err(format!(
             "invalid type {}; must be one of {:?}",
@@ -1014,6 +1064,7 @@ fn handle_send(
         from: from.clone(),
         to: to.clone(),
         mtype: mtype.clone(),
+        subject: Some(subject),
         body,
         in_reply_to,
         created_ms: now_ms(),
@@ -1025,6 +1076,7 @@ fn handle_send(
         m.from == from
             && m.to == to
             && m.mtype == mtype
+            && m.subject == msg.subject
             && m.body == msg.body
             && m.state == "pending"
     }) {
@@ -1646,6 +1698,7 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
                         from: "collab-server".into(),
                         to: waiter,
                         mtype: "notification".into(),
+                        subject: Some(format!("released:{}", closed.id)),
                         body: format!("RESOURCE_RELEASED subject={}", closed.id),
                         in_reply_to: None,
                         created_ms: now_ms(),
@@ -1933,10 +1986,20 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             from,
             to,
             mtype,
+            subject,
             body,
             in_reply_to,
             delivery,
-        } => handle_send(server, from, to, mtype, body, in_reply_to, delivery),
+        } => handle_send(
+            server,
+            from,
+            to,
+            mtype,
+            subject,
+            body,
+            in_reply_to,
+            delivery,
+        ),
         Req::NotificationMethods => Resp::data(json!({
             "methods": ["tmux"],
             "events": NOTIFICATION_EVENTS,
@@ -2011,6 +2074,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 .map(|m| {
                     json!({
                         "id": m.id, "from": m.from, "type": m.mtype,
+                        "subject": m.subject,
                         "state": m.state, "created_at": iso(m.created_ms),
                         "body": m.body,
                     })
@@ -2024,6 +2088,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             match st.msgs.get(&msg_id) {
                 Some(m) => Resp::data(json!({
                     "id": m.id, "from": m.from, "to": m.to, "type": m.mtype,
+                    "subject": m.subject,
                     "state": m.state, "wake_attempts": m.wake_attempt_count,
                     "created_at": iso(m.created_ms), "answered": st.answered(&msg_id),
                 })),

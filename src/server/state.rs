@@ -97,6 +97,8 @@ pub struct Message {
     pub to: String,
     #[serde(rename = "type")]
     pub mtype: String,
+    #[serde(default)]
+    pub subject: Option<String>,
     pub body: String,
     pub in_reply_to: Option<String>,
     pub created_ms: i64,
@@ -451,6 +453,7 @@ mod tests {
             from: "a".into(),
             to: to.into(),
             mtype: mtype.into(),
+            subject: Some("test".into()),
             body: "b".into(),
             in_reply_to: None,
             created_ms: 1,

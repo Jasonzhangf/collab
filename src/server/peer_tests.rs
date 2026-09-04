@@ -646,6 +646,7 @@ fn migration_freeze_rejects_mutations_but_allows_rebind_and_reads() {
             from: "peer".into(),
             to: "peer".into(),
             mtype: "notify".into(),
+            subject: Some("release".into()),
             body: "RESOURCE_RELEASED feature".into(),
             in_reply_to: None,
             delivery: "immediate".into(),
@@ -782,11 +783,72 @@ fn worktree_path_budget_accepts_short_slug_and_rejects_escape() {
 }
 
 #[test]
-fn tmux_notification_is_short_and_contains_no_mailbox_body() {
-    let text = notification_text("message-id");
-    assert_eq!(text, "COLLAB_NOTIFY message-id");
-    assert!(!text.contains("RESOURCE_"));
+fn tmux_notification_contains_id_subject_and_original_body() {
+    let text = notification_text(&Message {
+        id: "message-id".into(),
+        from: "sender".into(),
+        to: "recipient".into(),
+        mtype: "notify".into(),
+        subject: Some("release".into()),
+        body: "RESOURCE_RELEASED feature=shared".into(),
+        in_reply_to: None,
+        created_ms: now_ms(),
+        state: "pending".into(),
+        wake_attempt_count: 0,
+        last_wake_attempt_ms: 0,
+    })
+    .unwrap();
+    assert_eq!(
+        text,
+        "COLLAB_NOTIFY message-id [release] RESOURCE_RELEASED feature=shared"
+    );
     assert!(!text.contains("CONTINUE_TASK"));
+}
+
+#[test]
+fn tmux_notification_abbreviates_subject_and_escapes_body_controls() {
+    let text = notification_text(&Message {
+        id: "message-id".into(),
+        from: "sender".into(),
+        to: "recipient".into(),
+        mtype: "notify".into(),
+        subject: Some(
+            "this subject is deliberately longer than forty eight visible characters".into(),
+        ),
+        body: "line one\nline two\t中文".into(),
+        in_reply_to: None,
+        created_ms: now_ms(),
+        state: "pending".into(),
+        wake_attempt_count: 0,
+        last_wake_attempt_ms: 0,
+    })
+    .unwrap();
+    assert_eq!(
+        text,
+        "COLLAB_NOTIFY message-id [this subject is deliberately longer than forty …] line one\\nline two\\t中文"
+    );
+}
+
+#[test]
+fn sendmessage_requires_subject_before_state_mutation() {
+    let (server, root) = test_server();
+    let response = handle_send(
+        &server,
+        "sender".into(),
+        "recipient".into(),
+        "notify".into(),
+        None,
+        "The candidate is ready.".into(),
+        None,
+        "immediate".into(),
+    );
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_deref(),
+        Some("MESSAGE_SUBJECT_REQUIRED: sendmessage requires --subject")
+    );
+    assert!(server.state.lock().unwrap().msgs.is_empty());
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -814,6 +876,7 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
         "sender".into(),
         "recipient".into(),
         "notify".into(),
+        Some("occupied".into()),
         "RESOURCE_OCCUPIED feature=shared".into(),
         None,
         "immediate".into(),
@@ -837,6 +900,7 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
         "sender".into(),
         "recipient".into(),
         "notify".into(),
+        Some("occupied".into()),
         "RESOURCE_OCCUPIED feature=shared".into(),
         None,
         "immediate".into(),
@@ -858,6 +922,7 @@ fn explicit_peer_notification_accepts_arbitrary_durable_body() {
         "sender".into(),
         "recipient".into(),
         "notify".into(),
+        Some("review".into()),
         "The candidate is ready for your review.".into(),
         None,
         "immediate".into(),
@@ -869,6 +934,7 @@ fn explicit_peer_notification_accepts_arbitrary_durable_body() {
         state.msgs[message_id].body,
         "The candidate is ready for your review."
     );
+    assert_eq!(state.msgs[message_id].subject.as_deref(), Some("review"));
     assert_eq!(state.msgs[message_id].wake_attempt_count, 0);
     assert_eq!(response.data["notification"], "subscribed-not-sent");
     drop(state);
@@ -978,6 +1044,7 @@ fn context_is_read_only_and_does_not_consume_notifications() {
             from: "peer-two".into(),
             to: "peer".into(),
             mtype: "notify".into(),
+            subject: Some("released:task".into()),
             body: "RESOURCE_RELEASED task=task".into(),
             in_reply_to: None,
             created_ms: now_ms(),
