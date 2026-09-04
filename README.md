@@ -14,8 +14,9 @@ transaction. tmux is the only live notification channel and is wake-only.
   sync, private worktree, implementation, tests, exact commit, candidate
   verification, short integration lease, main merge/verification/push, and
   cleanup.
-- Peers communicate only through an explicit `sendmessage` for shared-resource
-  occupancy/release. The durable body is mailbox truth.
+- Peers communicate through an explicit `sendmessage` with a durable body. Use
+  it for resource occupancy/release or a direct peer notice; it never creates
+  an inferred task, progress, ACK, or continuation loop.
 - The daemon may touch a pane only after that Agent explicitly registers a
   finite one-shot subscription. No registration, absent, unknown, or working
   means zero tmux input.
@@ -122,15 +123,16 @@ claim. Holder close moves each waiter from `waiting` to `blocked` and clears
 the obsolete wait edge. Notification occurs only for an exact active
 resource-release/deadline subscription.
 
-Manual P2P messages are restricted to `RESOURCE_OCCUPIED ...` and
-`RESOURCE_RELEASED ...`:
+Manual P2P messages use `notify` and may carry any non-empty durable body:
 
 ```sh
 collab sendmessage --to <peer> "RESOURCE_OCCUPIED ..."
+collab sendmessage --to <peer> "The result is ready; query the mailbox."
 ```
 
 Never type peer messages into tmux. Without the recipient's active
-`direct-message` subscription, the message remains mailbox-only.
+`direct-message` subscription, the message remains mailbox-only. With a
+subscription, tmux receives only the short message id and `Enter`.
 
 ## Explicit notifications
 
