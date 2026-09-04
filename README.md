@@ -17,9 +17,10 @@ transaction. tmux is the only live notification channel and is wake-only.
 - Peers communicate through an explicit `sendmessage` with a durable body. Use
   it for resource occupancy/release or a direct peer notice; it never creates
   an inferred task, progress, ACK, or continuation loop.
-- The daemon may touch a pane only after that Agent explicitly registers a
-  finite one-shot subscription. No registration, absent, unknown, or working
-  means zero tmux input.
+- Registration creates one finite `direct-message` subscription for the peer.
+  Explicit subscriptions remain available for exact resources, deadlines, and
+  async results. No registration, absent, unknown, or working means zero tmux
+  input.
 - `/goal` delegation and interactive task recognition are deferred.
 
 Scoped capabilities replace roles: task owner for one task, resource holder
@@ -135,8 +136,9 @@ collab sendmessage --to <peer> "The result is ready; query the mailbox."
 ```
 
 Never type peer messages into tmux. Without the recipient's active
-`direct-message` subscription, the message remains mailbox-only. With a
-subscription, tmux receives only the short message id and `Enter`.
+`direct-message` subscription, the message remains mailbox-only. Registration
+normally creates this subscription automatically; tmux receives only the short
+message id and `Enter`.
 
 ## Explicit notifications
 
