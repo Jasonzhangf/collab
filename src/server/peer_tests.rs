@@ -68,6 +68,26 @@ fn first_and_later_registration_are_equal_peers() {
 }
 
 #[test]
+fn registration_creates_one_finite_default_direct_message_subscription() {
+    let (server, root) = test_server();
+    assert!(register(&server, "peer", "%peer").ok);
+    assert!(register(&server, "peer", "%peer").ok);
+    let state = server.state.lock().unwrap();
+    let subscriptions: Vec<_> = state
+        .notification_subscriptions
+        .values()
+        .filter(|subscription| subscription.worker_id == "peer")
+        .collect();
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(subscriptions[0].event, "direct-message");
+    assert_eq!(subscriptions[0].method, "tmux");
+    assert_eq!(subscriptions[0].status, "armed");
+    assert!(subscriptions[0].expires_ms > now_ms());
+    drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn replay_removes_legacy_declared_roles() {
     let mut state = State::default();
     for (id, role) in [("legacy-master", "master"), ("legacy-worker", "worker")] {
@@ -774,6 +794,21 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
     let (server, root) = test_server();
     register(&server, "sender", "%collab-missing-sender");
     register(&server, "recipient", "%collab-missing-recipient");
+    let subscription_id = server
+        .state
+        .lock()
+        .unwrap()
+        .notification_subscriptions
+        .values()
+        .find(|subscription| subscription.worker_id == "recipient")
+        .unwrap()
+        .id
+        .clone();
+    server.commit(&[Event::NotificationStatus {
+        subscription_id,
+        status: "cancelled".into(),
+        updated_ms: now_ms(),
+    }]);
     let first = handle_send(
         &server,
         "sender".into(),
@@ -835,10 +870,7 @@ fn explicit_peer_notification_accepts_arbitrary_durable_body() {
         "The candidate is ready for your review."
     );
     assert_eq!(state.msgs[message_id].wake_attempt_count, 0);
-    assert_eq!(
-        response.data["notification"],
-        "mailbox-only-no-subscription"
-    );
+    assert_eq!(response.data["notification"], "subscribed-not-sent");
     drop(state);
     std::fs::remove_dir_all(root).ok();
 }

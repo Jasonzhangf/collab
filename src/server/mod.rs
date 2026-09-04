@@ -222,6 +222,47 @@ const NOTIFICATION_EVENTS: [&str; 4] = [
     "deadline",
     "async-result",
 ];
+const DEFAULT_DIRECT_MESSAGE_TTL_SECONDS: u64 = 600;
+
+fn default_direct_message_events(
+    state: &State,
+    worker_id: &str,
+    pane: &str,
+    now: i64,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for subscription in state.notification_subscriptions.values().filter(|sub| {
+        sub.worker_id == worker_id
+            && sub.event == "direct-message"
+            && sub.status == "armed"
+            && sub.expires_ms > now
+    }) {
+        if subscription.pane == pane {
+            return events;
+        }
+        events.push(Event::NotificationStatus {
+            subscription_id: subscription.id.clone(),
+            status: "rebound".into(),
+            updated_ms: now,
+        });
+    }
+    events.push(Event::NotificationSubscribed {
+        subscription: NotificationSubscription {
+            id: format!("sub-{}", gen_msg_id()),
+            worker_id: worker_id.into(),
+            event: "direct-message".into(),
+            subject: None,
+            pane: pane.into(),
+            method: "tmux".into(),
+            trigger_ms: None,
+            expires_ms: now.saturating_add(DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000),
+            status: "armed".into(),
+            created_ms: now,
+            updated_ms: now,
+        },
+    });
+    events
+}
 
 fn attempt_notification_with(
     server: &Server,
@@ -824,6 +865,7 @@ fn handle_register(
                     .and_then(tmux_session_for_pane)
                     .is_some_and(|session| session == worker_id);
             if same_session {
+                let refreshed_pane = pane.clone();
                 let refreshed = WorkerRec {
                     id: worker_id.clone(),
                     token,
@@ -831,7 +873,16 @@ fn handle_register(
                     cwd,
                     registered_ms: existing.registered_ms,
                 };
-                server.commit_locked(&mut st, &[Event::Registered { worker: refreshed }]);
+                let mut events = vec![Event::Registered { worker: refreshed }];
+                if let Some(pane) = refreshed_pane.as_deref() {
+                    events.extend(default_direct_message_events(
+                        &st,
+                        &worker_id,
+                        pane,
+                        now_ms(),
+                    ));
+                }
+                server.commit_locked(&mut st, &events);
                 return Resp::data(json!({
                     "worker_id": worker_id,
                     "identity_kind": "peer",
@@ -861,7 +912,18 @@ fn handle_register(
             cwd,
             registered_ms: existing.registered_ms,
         };
-        server.commit_locked(&mut st, &[Event::Registered { worker: refreshed }]);
+        let mut events = vec![Event::Registered {
+            worker: refreshed.clone(),
+        }];
+        if let Some(pane) = refreshed.pane.as_deref() {
+            events.extend(default_direct_message_events(
+                &st,
+                &worker_id,
+                pane,
+                now_ms(),
+            ));
+        }
+        server.commit_locked(&mut st, &events);
         return Resp::data(
             json!({"worker_id": worker_id, "identity_kind": "peer", "runtime": runtime, "reused": true}),
         );
@@ -873,12 +935,18 @@ fn handle_register(
         cwd,
         registered_ms: now_ms(),
     };
-    server.commit_locked(
-        &mut st,
-        &[Event::Registered {
-            worker: rec.clone(),
-        }],
-    );
+    let mut events = vec![Event::Registered {
+        worker: rec.clone(),
+    }];
+    if let Some(pane) = rec.pane.as_deref() {
+        events.extend(default_direct_message_events(
+            &st,
+            &worker_id,
+            pane,
+            now_ms(),
+        ));
+    }
+    server.commit_locked(&mut st, &events);
     Resp::data(json!({
         "worker_id": worker_id,
         "identity_kind": "peer",
