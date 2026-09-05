@@ -88,6 +88,67 @@ fn registration_creates_one_finite_default_direct_message_subscription() {
 }
 
 #[test]
+fn registration_adds_default_lease_when_only_short_direct_message_lease_exists() {
+    let mut state = State::default();
+    let now = 10_000;
+    state.apply(&Event::NotificationSubscribed {
+        subscription: NotificationSubscription {
+            id: "sub-short".into(),
+            worker_id: "peer".into(),
+            event: "direct-message".into(),
+            subject: None,
+            pane: "%peer".into(),
+            method: "tmux".into(),
+            trigger_ms: None,
+            expires_ms: now + 600_000,
+            status: "armed".into(),
+            created_ms: now,
+            updated_ms: now,
+        },
+    });
+
+    let events = default_direct_message_events(&state, "peer", "%peer", now);
+    let default = events
+        .iter()
+        .find_map(|event| match event {
+            Event::NotificationSubscribed { subscription } => Some(subscription),
+            _ => None,
+        })
+        .expect("a short explicit lease must not suppress the default peer lease");
+    assert_eq!(default.id, "sub-default-direct-message-peer");
+    assert_eq!(
+        default.expires_ms,
+        now + DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000
+    );
+
+    state.apply(&events[0]);
+    assert!(default_direct_message_events(&state, "peer", "%peer", now + 1).is_empty());
+}
+
+#[test]
+fn daemon_replay_restores_default_lease_for_registered_peer() {
+    let mut state = State::default();
+    state.apply(&Event::Registered {
+        worker: WorkerRec {
+            id: "peer".into(),
+            token: "token-peer".into(),
+            pane: Some("%peer".into()),
+            cwd: "/tmp".into(),
+            registered_ms: 1,
+        },
+    });
+
+    let events = registered_peer_default_events(&state, 10_000, &|worker, pane| {
+        worker == "peer" && pane == "%peer"
+    });
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::NotificationSubscribed { subscription }
+            if subscription.id == "sub-default-direct-message-peer"
+    )));
+}
+
+#[test]
 fn replay_removes_legacy_declared_roles() {
     let mut state = State::default();
     for (id, role) in [("legacy-master", "master"), ("legacy-worker", "worker")] {
