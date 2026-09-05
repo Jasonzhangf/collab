@@ -267,6 +267,10 @@ const NOTIFICATION_EVENTS: [&str; 4] = [
 ];
 const DEFAULT_DIRECT_MESSAGE_TTL_SECONDS: u64 = MAX_NOTIFICATION_TTL_SECONDS;
 
+fn default_direct_message_id(worker_id: &str) -> String {
+    format!("sub-default-direct-message-{worker_id}")
+}
+
 fn default_direct_message_events(
     state: &State,
     worker_id: &str,
@@ -274,24 +278,31 @@ fn default_direct_message_events(
     now: i64,
 ) -> Vec<Event> {
     let mut events = Vec::new();
+    let default_id = default_direct_message_id(worker_id);
+    let refresh_after_ms = DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000 / 2;
     for subscription in state.notification_subscriptions.values().filter(|sub| {
         sub.worker_id == worker_id
             && sub.event == "direct-message"
             && sub.status == "armed"
             && sub.expires_ms > now
     }) {
-        if subscription.pane == pane {
+        if subscription.id == default_id
+            && subscription.pane == pane
+            && subscription.expires_ms - now >= refresh_after_ms
+        {
             return events;
         }
-        events.push(Event::NotificationStatus {
-            subscription_id: subscription.id.clone(),
-            status: "rebound".into(),
-            updated_ms: now,
-        });
+        if subscription.id == default_id || subscription.pane != pane {
+            events.push(Event::NotificationStatus {
+                subscription_id: subscription.id.clone(),
+                status: "rebound".into(),
+                updated_ms: now,
+            });
+        }
     }
     events.push(Event::NotificationSubscribed {
         subscription: NotificationSubscription {
-            id: format!("sub-{}", gen_msg_id()),
+            id: default_id,
             worker_id: worker_id.into(),
             event: "direct-message".into(),
             subject: None,
@@ -305,6 +316,35 @@ fn default_direct_message_events(
         },
     });
     events
+}
+
+fn registered_peer_default_events(
+    state: &State,
+    now: i64,
+    owns_pane: &dyn Fn(&str, &str) -> bool,
+) -> Vec<Event> {
+    let mut workers = state.workers.values().collect::<Vec<_>>();
+    workers.sort_by_key(|worker| worker.id.as_str());
+    workers
+        .into_iter()
+        .filter_map(|worker| {
+            let pane = worker.pane.as_deref()?;
+            owns_pane(&worker.id, pane).then_some((worker.id.as_str(), pane))
+        })
+        .flat_map(|(worker_id, pane)| default_direct_message_events(state, worker_id, pane, now))
+        .collect()
+}
+
+fn restore_registered_peer_default_leases(server: &Server) {
+    let events = {
+        let state = server.state.lock().unwrap();
+        registered_peer_default_events(&state, now_ms(), &|worker_id, pane| {
+            tmux_session_for_pane(pane).as_deref() == Some(worker_id)
+        })
+    };
+    if !events.is_empty() {
+        server.commit(&events);
+    }
 }
 
 fn attempt_notification_with(
@@ -2360,6 +2400,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         journal: Mutex::new(journal_file),
         pane_alive_check: pane_alive,
     });
+    restore_registered_peer_default_leases(&server);
     let listener = UnixListener::bind(&sock_path)?;
     std::fs::write(
         server_dir.join("server.pid"),

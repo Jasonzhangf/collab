@@ -90,6 +90,9 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
 ## Runtime boundary
 
 - Every peer registration must come from a live tmux pane.
+- Registration owns one deterministic seven-day default direct-message lease;
+  daemon restart restores it only while the registered tmux session still
+  matches the peer identity. A shorter explicit lease cannot suppress it.
 - tmux is the only live notification channel and carries one bounded preview.
 - Server state, journal, and mailbox are durable truth; a failed wake cannot
   roll back state or fabricate success.
