@@ -165,8 +165,9 @@ Subscriptions are owner-scoped, exact-event, and bounded by TTL. The default
 deadline, and async-result subscriptions remain one-shot.
 tmux receives `COLLAB_NOTIFY <message-id> [<subject>] <original-body-preview>`
 through bracketed paste and a final `C-m` in one command queue. The Agent first weighs the id and
-subject against current work, then queries the durable body/result through
-CLI/MCP when it decides to act. Direct-message delivery is serialized; each
+subject against current work. When it selects the notice, it runs
+`collab msg <message-id>`, reads durable detail, and executes actionable
+in-scope work; it must not stop at ACK or waiting. Direct-message delivery is serialized; each
 message has a lifetime hard cap of three attempts. The daemon never creates periodic
 `CONTINUE_TASK` messages.
 

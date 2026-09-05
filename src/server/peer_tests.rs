@@ -861,9 +861,10 @@ fn tmux_notification_contains_id_subject_and_original_body() {
     .unwrap();
     assert_eq!(
         text,
-        "COLLAB_NOTIFY message-id [release] RESOURCE_RELEASED feature=shared"
+        "COLLAB_NOTIFY message-id [release] RESOURCE_RELEASED feature=shared | ACTION: weigh priority from the ID and subject. When selected, run collab msg message-id, then execute the actionable in-scope request; do not stop at ACK or waiting."
     );
-    assert!(!text.contains("CONTINUE_TASK"));
+    assert!(text.contains("execute the actionable in-scope request"));
+    assert!(text.contains("do not stop at ACK or waiting"));
 }
 
 #[test]
@@ -886,7 +887,7 @@ fn tmux_notification_abbreviates_subject_and_escapes_body_controls() {
     .unwrap();
     assert_eq!(
         text,
-        "COLLAB_NOTIFY message-id [this subject is deliberately longer than forty …] line one\\nline two\\t中文"
+        "COLLAB_NOTIFY message-id [this subject is deliberately longer than forty …] line one\\nline two\\t中文 | ACTION: weigh priority from the ID and subject. When selected, run collab msg message-id, then execute the actionable in-scope request; do not stop at ACK or waiting."
     );
 }
 

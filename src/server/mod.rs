@@ -237,10 +237,11 @@ fn visible_body(body: &str) -> String {
 fn notification_text(message: &Message) -> Option<String> {
     let subject = abbreviated_subject(message.subject.as_deref()?)?;
     Some(format!(
-        "COLLAB_NOTIFY {} [{}] {}",
+        "COLLAB_NOTIFY {} [{}] {} | ACTION: weigh priority from the ID and subject. When selected, run collab msg {}, then execute the actionable in-scope request; do not stop at ACK or waiting.",
         message.id,
         subject,
-        visible_body(&message.body)
+        visible_body(&message.body),
+        message.id
     ))
 }
 
