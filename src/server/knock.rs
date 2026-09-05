@@ -1,5 +1,8 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static WAKE_BUFFER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
@@ -78,8 +81,26 @@ fn agent_state_from(command: &str, title: &str) -> AgentState {
     }
 }
 
-fn wake_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
-    ["send-keys", "-t", pane, "--", text, "C-m"]
+fn wake_args<'a>(pane: &'a str, text: &'a str, buffer: &'a str) -> Vec<&'a str> {
+    vec![
+        "set-buffer",
+        "-b",
+        buffer,
+        text,
+        ";",
+        "paste-buffer",
+        "-p",
+        "-d",
+        "-b",
+        buffer,
+        "-t",
+        pane,
+        ";",
+        "send-keys",
+        "-t",
+        pane,
+        "C-m",
+    ]
 }
 
 pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
@@ -89,7 +110,11 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if probe_agent_state(pane) != AgentState::Waiting {
         anyhow::bail!("pane {} is not a waiting agent", pane);
     }
-    let sent = Command::new("tmux").args(wake_args(pane, text)).status()?;
+    let sequence = WAKE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let buffer = format!("collab-wake-{}-{sequence}", std::process::id());
+    let sent = Command::new("tmux")
+        .args(wake_args(pane, text, &buffer))
+        .status()?;
     if !sent.success() {
         anyhow::bail!("tmux notification delivery failed for pane {}", pane);
     }
@@ -101,15 +126,26 @@ mod tests {
     use super::{agent_state_from, wake_args, AgentState};
 
     #[test]
-    fn wake_is_one_atomic_tmux_send_keys_subcommand() {
+    fn wake_is_one_tmux_command_queue_with_bracketed_paste_and_submit() {
         assert_eq!(
-            &wake_args("%7", "COLLAB_NOTIFY message")[..],
+            &wake_args("%7", "COLLAB_NOTIFY message", "collab-wake-test")[..],
             &[
+                "set-buffer",
+                "-b",
+                "collab-wake-test",
+                "COLLAB_NOTIFY message",
+                ";",
+                "paste-buffer",
+                "-p",
+                "-d",
+                "-b",
+                "collab-wake-test",
+                "-t",
+                "%7",
+                ";",
                 "send-keys",
                 "-t",
                 "%7",
-                "--",
-                "COLLAB_NOTIFY message",
                 "C-m",
             ][..]
         );

@@ -132,7 +132,7 @@ enum Cmd {
 enum NotifyCmd {
     /// List supported notification methods and events
     Methods,
-    /// Register one finite, one-shot notification subscription
+    /// Register one finite notification subscription (direct-message is reusable)
     Subscribe {
         #[arg(long)]
         event: String,

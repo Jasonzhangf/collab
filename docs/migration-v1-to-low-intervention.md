@@ -89,9 +89,10 @@ changes the waiter to `blocked` and clears the obsolete wait edge. Only an
 exact, finite, Agent-owned subscription creates a notification. Each wake
 attempt is journaled; replay never resets the immutable lifetime cap of three.
 tmux receives one message id, abbreviated subject, safe original-body preview,
-and final submit key in one command sequence. No registration, shell/absent,
-unknown, working, expired, cancelled, consumed, or exhausted
-subscriptions fail closed with zero input. `collab context` is read-only.
+and final submit key through one bracketed-paste command queue. Direct-message
+leases remain reusable until expiry; other event subscriptions are one-shot.
+No registration, shell/absent, unknown, working, expired, cancelled, consumed,
+or exhausted message produces input. `collab context` is read-only.
 
 ## Fail-closed conditions
 
