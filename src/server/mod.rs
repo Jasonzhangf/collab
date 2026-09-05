@@ -202,6 +202,7 @@ pub fn gen_msg_id() -> String {
 }
 
 const MAX_NOTIFICATION_SUBJECT_CHARS: usize = 48;
+const DIRECT_MESSAGE_WAKE_COOLDOWN_MS: i64 = 1_000;
 
 fn abbreviated_subject(subject: &str) -> Option<String> {
     let normalized = subject.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -264,7 +265,7 @@ const NOTIFICATION_EVENTS: [&str; 4] = [
     "deadline",
     "async-result",
 ];
-const DEFAULT_DIRECT_MESSAGE_TTL_SECONDS: u64 = 600;
+const DEFAULT_DIRECT_MESSAGE_TTL_SECONDS: u64 = MAX_NOTIFICATION_TTL_SECONDS;
 
 fn default_direct_message_events(
     state: &State,
@@ -313,7 +314,8 @@ fn attempt_notification_with(
     is_waiting: &dyn Fn(&str) -> bool,
     deliver: &dyn Fn(&str, &str) -> bool,
 ) -> bool {
-    let (pane, exhausted) = {
+    let attempt_ms = now_ms();
+    let (pane, exhausted, reusable, subscription_created_ms) = {
         let state = server.state.lock().unwrap();
         let Some(message) = state.msgs.get(message_id) else {
             return false;
@@ -334,7 +336,10 @@ fn attempt_notification_with(
                 .is_some_and(|subject| !subject.trim().is_empty())
             && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
             && subscription.status == "armed"
-            && subscription.expires_ms > now_ms()
+            && subscription.expires_ms > attempt_ms
+            && (subscription.event != "direct-message"
+                || subscription.updated_ms <= subscription.created_ms
+                || attempt_ms - subscription.updated_ms >= DIRECT_MESSAGE_WAKE_COOLDOWN_MS)
             && pane_matches;
         if !valid || !is_waiting(&subscription.pane) {
             return false;
@@ -342,27 +347,36 @@ fn attempt_notification_with(
         (
             subscription.pane.clone(),
             message.wake_attempt_count + 1 >= MAX_WAKE_ATTEMPTS,
+            subscription.event == "direct-message",
+            subscription.created_ms,
         )
     };
 
     server.commit(&[Event::WakeAttempted {
         ids: vec![message_id.to_string()],
-        attempted_ms: now_ms(),
+        attempted_ms: attempt_ms,
     }]);
     if deliver(&pane, message_id) {
-        server.commit(&[
-            Event::Delivered {
-                ids: vec![message_id.to_string()],
-            },
+        let mut events = vec![Event::Delivered {
+            ids: vec![message_id.to_string()],
+        }];
+        events.push(if reusable {
+            Event::NotificationStatus {
+                subscription_id: subscription_id.to_string(),
+                status: "armed".into(),
+                updated_ms: now_ms().max(subscription_created_ms.saturating_add(1)),
+            }
+        } else {
             Event::NotificationConsumed {
                 subscription_id: subscription_id.to_string(),
                 message_id: message_id.to_string(),
                 consumed_ms: now_ms(),
-            },
-        ]);
+            }
+        });
+        server.commit(&events);
         true
     } else {
-        if exhausted {
+        if exhausted && !reusable {
             server.commit(&[Event::NotificationStatus {
                 subscription_id: subscription_id.to_string(),
                 status: "attempts-exhausted".into(),

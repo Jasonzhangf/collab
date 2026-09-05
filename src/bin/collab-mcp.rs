@@ -44,7 +44,7 @@ fn tools() -> Value {
         ),
         tool(
             "collab_notify_subscribe",
-            "Register one finite one-shot notification subscription owned by the calling Agent.",
+            "Register one finite notification subscription owned by the calling Agent; direct-message is reusable until expiry and other event subscriptions are one-shot.",
             json!({"event":{"type":"string","enum":["direct-message","resource-released","deadline","async-result"]},"subject":{"type":"string"},"trigger_ms":{"type":"integer"},"ttl_seconds":{"type":"integer","minimum":1}}),
             &["event", "ttl_seconds"]
         ),

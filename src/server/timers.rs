@@ -284,10 +284,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_notification_has_hard_three_attempt_lifetime_cap() {
+    fn failed_one_shot_notification_has_hard_three_attempt_lifetime_cap() {
         let (server, root) = test_server();
         register(&server, "owner");
-        let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
+        let subscription_id = subscribe(&server, "owner", "resource-released", Some("held"), None);
         let message_id = bind_message(&server, "owner", &subscription_id);
         for _ in 0..4 {
             super::super::attempt_notification_with(
@@ -312,7 +312,35 @@ mod tests {
     }
 
     #[test]
-    fn restart_does_not_reset_exhausted_notification_attempts() {
+    fn failed_direct_message_exhausts_only_the_message() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
+        let message_id = bind_message(&server, "owner", &subscription_id);
+        for _ in 0..MAX_WAKE_ATTEMPTS {
+            super::super::attempt_notification_with(
+                &server,
+                &message_id,
+                &subscription_id,
+                &|_| true,
+                &|_, _| false,
+            );
+        }
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.msgs[&message_id].wake_attempt_count,
+            MAX_WAKE_ATTEMPTS
+        );
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].status,
+            "armed"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn restart_does_not_reset_exhausted_direct_message_attempts() {
         let (server, root) = test_server();
         register(&server, "owner");
         let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
@@ -358,17 +386,17 @@ mod tests {
         );
         assert_eq!(
             state.notification_subscriptions[&subscription_id].status,
-            "attempts-exhausted"
+            "armed"
         );
         drop(state);
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn successful_notification_consumes_one_shot_subscription() {
+    fn successful_event_notification_consumes_one_shot_subscription() {
         let (server, root) = test_server();
         register(&server, "owner");
-        let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
+        let subscription_id = subscribe(&server, "owner", "resource-released", Some("held"), None);
         let message_id = bind_message(&server, "owner", &subscription_id);
         assert!(super::super::attempt_notification_with(
             &server,
@@ -382,6 +410,77 @@ mod tests {
         assert_eq!(
             state.notification_subscriptions[&subscription_id].status,
             "consumed"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn successful_direct_messages_reuse_subscription_without_a_burst() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
+        let first_id = bind_message(&server, "owner", &subscription_id);
+        assert!(super::super::attempt_notification_with(
+            &server,
+            &first_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| true,
+        ));
+
+        let second_id = "message-owner-second".to_string();
+        server.commit(&[
+            Event::Sent {
+                msg: Message {
+                    id: second_id.clone(),
+                    from: "peer".into(),
+                    to: "owner".into(),
+                    mtype: "notify".into(),
+                    subject: Some("second".into()),
+                    body: "SECOND_NOTICE".into(),
+                    in_reply_to: None,
+                    created_ms: now_ms(),
+                    state: "pending".into(),
+                    wake_attempt_count: 0,
+                    last_wake_attempt_ms: 0,
+                },
+            },
+            Event::WakeBound {
+                message_id: second_id.clone(),
+                subscription_id: subscription_id.clone(),
+            },
+        ]);
+        assert!(!super::super::attempt_notification_with(
+            &server,
+            &second_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| true,
+        ));
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&second_id].wake_attempt_count,
+            0
+        );
+
+        server.commit(&[Event::NotificationStatus {
+            subscription_id: subscription_id.clone(),
+            status: "armed".into(),
+            updated_ms: now_ms() - super::super::DIRECT_MESSAGE_WAKE_COOLDOWN_MS - 1,
+        }]);
+        assert!(super::super::attempt_notification_with(
+            &server,
+            &second_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| true,
+        ));
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs[&first_id].state, "delivered");
+        assert_eq!(state.msgs[&second_id].state, "delivered");
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].status,
+            "armed"
         );
         drop(state);
         std::fs::remove_dir_all(root).ok();

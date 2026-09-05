@@ -19,7 +19,8 @@ is a bounded preview; the durable mailbox remains authoritative.
   subject and durable body. Use
   it for resource occupancy/release or a direct peer notice; it never creates
   an inferred task, progress, ACK, or continuation loop.
-- Registration creates one finite `direct-message` subscription for the peer.
+- Registration creates one seven-day reusable `direct-message` lease for the
+  peer; each message still has its own bounded attempt lifetime.
   Explicit subscriptions remain available for exact resources, deadlines, and
   async results. No registration, absent, unknown, or working means zero tmux
   input.
@@ -142,7 +143,8 @@ Never type peer messages into tmux. Without the recipient's active
 `direct-message` subscription, the message remains mailbox-only. Registration
 normally creates this subscription automatically; tmux receives only the short
 message id, abbreviated subject, safe one-line original body preview, and a
-final `C-m` submit key in one command.
+final `C-m` submit key in one tmux command queue. The queue uses bracketed paste
+before `C-m`; plain `send-keys <text> C-m` may leave Codex text unsubmitted.
 
 ## Explicit notifications
 
@@ -158,12 +160,14 @@ collab context
 collab inbox
 ```
 
-Subscriptions are owner-scoped, exact-event, bounded by TTL, and one-shot.
+Subscriptions are owner-scoped, exact-event, and bounded by TTL. The default
+`direct-message` lease accepts later peer messages until expiry; resource,
+deadline, and async-result subscriptions remain one-shot.
 tmux receives `COLLAB_NOTIFY <message-id> [<subject>] <original-body-preview>`
-and a final `C-m` in one command sequence. The Agent first weighs the id and
+through bracketed paste and a final `C-m` in one command queue. The Agent first weighs the id and
 subject against current work, then queries the durable body/result through
-CLI/MCP when it decides to act. Success consumes the subscription. Failure has
-a lifetime hard cap of three attempts. The daemon never creates periodic
+CLI/MCP when it decides to act. Direct-message delivery is serialized; each
+message has a lifetime hard cap of three attempts. The daemon never creates periodic
 `CONTINUE_TASK` messages.
 
 ## Existing-project migration

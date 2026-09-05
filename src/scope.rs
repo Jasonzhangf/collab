@@ -157,9 +157,10 @@ On a notification, use its id and abbreviated subject to weigh urgency against
 the current task. Query durable state before acting when the notice is relevant.
 `collab sendmessage` requires `--subject` and accepts only explicit coordination
 or asynchronous-result notices. Never type peer messages with tmux. After the
-receiving Agent registers a finite one-shot subscription, the daemon may send
-one id, abbreviated subject, safe one-line original body preview, and final
-submit key as a single tmux operation.
+receiving Agent registers a finite subscription, the daemon may send one id,
+abbreviated subject, safe one-line original body preview, and final submit key
+as one tmux command queue. The direct-message lease is reusable until expiry;
+resource, deadline, and async-result subscriptions remain one-shot.
 
 `collab inbox` and `collab msg <id>` query the durable local mailbox after a
 tmux pane disappears; mailbox state remains authoritative.
@@ -167,11 +168,12 @@ tmux pane disappears; mailbox state remains authoritative.
 ## Notifications and waits
 
 There is no periodic continuation. Agent-owned subscriptions are exact-event,
-exact-subject, finite, and one-shot. No registration, absent, unknown, working,
-expired, cancelled, consumed, or three-attempt-exhausted state produces tmux
-input. Every wait stores waiter, blocking task owner, reason, deadline, resume
-events, and P2P escalation. Timeout changes state without unsolicited messages;
-resource release notifies only an exact active subscriber.
+exact-subject, and finite. Direct-message delivery is serialized and reusable
+until expiry; other subscriptions are one-shot. No registration, absent,
+unknown, working, expired, cancelled, consumed, or exhausted message produces
+tmux input. Every wait stores waiter, blocking task owner, reason, deadline,
+resume events, and P2P escalation. Timeout changes state without unsolicited
+messages; resource release notifies only an exact active subscriber.
 "#;
 
 /// Scope guard used by every command except init.

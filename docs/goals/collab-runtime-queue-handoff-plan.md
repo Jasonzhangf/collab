@@ -78,7 +78,7 @@ remains frozen and requires explicit evidence; no owner is fabricated.
 - `src/server/mod.rs`: peer registration, self lifecycle, conflict/wait/release,
   context, migration, admission freeze, replay.
 - `src/server/timers.rs`: deadline and local continuation wake.
-- `src/server/knock.rs`: one tmux command with safe preview plus final `C-m`.
+- `src/server/knock.rs`: one tmux command queue with unique-buffer bracketed preview plus final `C-m`.
 - `src/identity.rs`: tmux-session identity; no outside-tmux declaration.
 - `src/proto.rs`, `src/main.rs`, `src/bin/collab-mcp.rs`: typed CLI/MCP surface
   and explicit deprecation errors.
