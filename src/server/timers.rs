@@ -1,4 +1,4 @@
-use crate::server::knock::pane_idle;
+use crate::server::knock::pane_accepts_notification;
 use crate::server::state::{now_ms, Event, Message, MAX_WAKE_ATTEMPTS};
 use crate::server::Server;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ const WAKE_ATTEMPT_LEASE_MS: i64 = 10_000;
 /// Server-side scheduler for finite subscriptions and bounded waits. It never
 /// creates task continuations or infers that ordinary work needs a wake.
 pub fn tick(server: &Arc<Server>) {
-    tick_with_idle(server, &pane_idle);
+    tick_with_idle(server, &pane_accepts_notification);
 }
 
 fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
@@ -125,7 +125,7 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
             &message_id,
             &subscription_id,
             is_idle,
-            &|pane, id| super::queue_system_knock(server, pane, id),
+            &|pane, text| super::knock_or_log(&server.log_path(), pane, text),
         );
     }
 }
@@ -211,7 +211,7 @@ mod tests {
                     subject: Some("released:held".into()),
                     body: "RESOURCE_RELEASED task=held".into(),
                     in_reply_to: None,
-                    created_ms: now_ms(),
+                    created_ms: now_ms() - 60_001,
                     state: "pending".into(),
                     wake_attempt_count: 0,
                     last_wake_attempt_ms: 0,
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_one_shot_notification_has_hard_three_attempt_lifetime_cap() {
+    fn failed_one_shot_notification_has_one_attempt_lifetime_cap() {
         let (server, root) = test_server();
         register(&server, "owner");
         let subscription_id = subscribe(&server, "owner", "resource-released", Some("held"), None);
@@ -305,7 +305,7 @@ mod tests {
         );
         assert_eq!(
             state.notification_subscriptions[&subscription_id].status,
-            "attempts-exhausted"
+            "armed"
         );
         drop(state);
         std::fs::remove_dir_all(root).ok();
@@ -468,6 +468,11 @@ mod tests {
             status: "armed".into(),
             updated_ms: now_ms() - super::super::DIRECT_MESSAGE_WAKE_COOLDOWN_MS - 1,
         }]);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.msgs.get_mut(&second_id).unwrap().created_ms = now_ms() - 60_001;
+            state.msgs.get_mut(&first_id).unwrap().last_wake_attempt_ms = now_ms() - 60_001;
+        }
         assert!(super::super::attempt_notification_with(
             &server,
             &second_id,
@@ -484,6 +489,98 @@ mod tests {
         );
         drop(state);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn batch_includes_newer_pending_messages_and_never_replays() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let subscription = subscribe(&server, "owner", "direct-message", None, None);
+        let first = bind_message(&server, "owner", &subscription);
+        let mut second = server.state.lock().unwrap().msgs[&first].clone();
+        second.id = "second".into();
+        second.subject = Some("new topic".into());
+        second.created_ms = now_ms();
+        server.commit(&[
+            Event::Sent { msg: second },
+            Event::WakeBound {
+                message_id: "second".into(),
+                subscription_id: subscription.clone(),
+            },
+        ]);
+        let calls = std::cell::RefCell::new(Vec::new());
+        assert!(super::super::attempt_notification_with(
+            &server,
+            &first,
+            &subscription,
+            &|_| true,
+            &|_, text| {
+                calls.borrow_mut().push(text.to_string());
+                true
+            }
+        ));
+        assert_eq!(calls.borrow().len(), 1);
+        assert!(calls.borrow()[0].contains(&first));
+        assert!(calls.borrow()[0].contains("second [new topic]"));
+        assert_eq!(
+            server.state.lock().unwrap().msgs["second"].state,
+            "delivered"
+        );
+        assert!(!super::super::attempt_notification_with(
+            &server,
+            &first,
+            &subscription,
+            &|_| true,
+            &|_, _| panic!("duplicate delivery")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_batch_waits_one_minute_and_absent_batch_is_not_replayed() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let sub = subscribe(&server, "owner", "direct-message", None, None);
+        let id = bind_message(&server, "owner", &sub);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .msgs
+            .get_mut(&id)
+            .unwrap()
+            .created_ms = now_ms();
+        assert!(!super::super::attempt_notification_with(
+            &server,
+            &id,
+            &sub,
+            &|_| true,
+            &|_, _| panic!("early delivery")
+        ));
+        server
+            .state
+            .lock()
+            .unwrap()
+            .msgs
+            .get_mut(&id)
+            .unwrap()
+            .created_ms -= 60_001;
+        assert!(!super::super::attempt_notification_with(
+            &server,
+            &id,
+            &sub,
+            &|_| false,
+            &|_, _| panic!("absent delivery")
+        ));
+        assert!(!super::super::attempt_notification_with(
+            &server,
+            &id,
+            &sub,
+            &|_| true,
+            &|_, _| panic!("late replay")
+        ));
+        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

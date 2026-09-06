@@ -22,7 +22,7 @@ is a bounded preview; the durable mailbox remains authoritative.
 - Registration creates one seven-day reusable `direct-message` lease for the
   peer; each message still has its own bounded attempt lifetime.
   Explicit subscriptions remain available for exact resources, deadlines, and
-  async results. No registration, absent, unknown, or working means zero tmux
+  async results. No registration, absent, or unknown means zero tmux
   input.
 - `/goal` delegation and interactive task recognition are deferred.
 
@@ -167,8 +167,13 @@ tmux receives `COLLAB_NOTIFY <message-id> [<subject>] <original-body-preview>`
 through bracketed paste and a final `C-m` in one command queue. The Agent first weighs the id and
 subject against current work. When it selects the notice, it runs
 `collab msg <message-id>`, reads durable detail, and executes actionable
-in-scope work; it must not stop at ACK or waiting. Direct-message delivery is serialized; each
-message has a lifetime hard cap of three attempts. The daemon never creates periodic
+in-scope work; it must not stop at ACK or waiting. The first pending notice opens
+a fixed 60-second window. At its end all eligible unsent notices for that peer
+are combined into one paste with one Enter, including notices arriving later
+in the window. Working Agents receive the batch without waiting for idle.
+Attempts are reserved durably before tmux; failure, unknown/absent Agent, and
+restart never replay an attempted batch. Details remain in the inbox.
+Each recipient has at most one batch attempt per minute. The daemon never creates periodic
 `CONTINUE_TASK` messages.
 
 ## Existing-project migration

@@ -62,6 +62,13 @@ pub fn pane_idle(pane: &str) -> bool {
     probe_agent_state(pane) == AgentState::Waiting
 }
 
+pub fn pane_accepts_notification(pane: &str) -> bool {
+    matches!(
+        probe_agent_state(pane),
+        AgentState::Working | AgentState::Waiting
+    )
+}
+
 fn agent_state_from(command: &str, title: &str) -> AgentState {
     if !matches!(command, "node" | "codex" | "claude" | "agy" | "dsh") {
         return AgentState::Absent;
@@ -107,8 +114,8 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if !pane_alive(pane) {
         anyhow::bail!("pane {} not alive", pane);
     }
-    if probe_agent_state(pane) != AgentState::Waiting {
-        anyhow::bail!("pane {} is not a waiting agent", pane);
+    if !pane_accepts_notification(pane) {
+        anyhow::bail!("pane {} has no known agent", pane);
     }
     let sequence = WAKE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let buffer = format!("collab-wake-{}-{sequence}", std::process::id());
@@ -124,6 +131,53 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{agent_state_from, wake_args, AgentState};
+
+    #[test]
+    #[ignore = "requires tmux and node; uses a disposable session"]
+    fn live_working_pane_receives_one_batch_with_enter() {
+        use std::process::Command;
+        let session = format!("collab-batch-test-{}", std::process::id());
+        let output = Command::new("tmux").args([
+            "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", &session,
+            "node -e 'process.stdin.setRawMode(true);process.stdin.resume();process.stdin.on(\"data\",b=>{process.stdout.write(\"RX:\"+b.toString(\"hex\")+\"\\n\")})'"
+        ]).output().unwrap();
+        assert!(output.status.success());
+        let pane = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", &self.0])
+                    .status();
+            }
+        }
+        let _cleanup = Cleanup(session);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(Command::new("tmux")
+            .args(["select-pane", "-t", &pane, "-T", "⠋ batch-test"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(super::probe_agent_state(&pane), AgentState::Working);
+        super::knock(
+            &pane,
+            "COLLAB_NOTIFY one [first] | COLLAB_NOTIFY two [second]",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let capture = Command::new("tmux")
+            .args(["capture-pane", "-p", "-J", "-t", &pane])
+            .output()
+            .unwrap();
+        let text = String::from_utf8(capture.stdout).unwrap();
+        let hex = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("RX:"))
+            .collect::<String>();
+        assert!(hex.contains("6f6e65205b66697273745d"));
+        assert!(hex.contains("74776f205b7365636f6e645d"));
+        assert_eq!(hex.matches("0d").count(), 1, "{text}");
+    }
 
     #[test]
     fn wake_is_one_tmux_command_queue_with_bracketed_paste_and_submit() {

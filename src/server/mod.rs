@@ -202,7 +202,7 @@ pub fn gen_msg_id() -> String {
 }
 
 const MAX_NOTIFICATION_SUBJECT_CHARS: usize = 48;
-const DIRECT_MESSAGE_WAKE_COOLDOWN_MS: i64 = 1_000;
+const DIRECT_MESSAGE_WAKE_COOLDOWN_MS: i64 = 60_000;
 
 fn abbreviated_subject(subject: &str) -> Option<String> {
     let normalized = subject.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -243,14 +243,6 @@ fn notification_text(message: &Message) -> Option<String> {
         visible_body(&message.body),
         message.id
     ))
-}
-
-pub(super) fn queue_system_knock(server: &Server, pane: &str, msg_id: &str) -> bool {
-    let text = {
-        let state = server.state.lock().unwrap();
-        state.msgs.get(msg_id).and_then(notification_text)
-    };
-    text.is_some_and(|text| knock_or_log(&server.log_path(), pane, &text))
 }
 
 fn iso(ms: i64) -> String {
@@ -352,80 +344,104 @@ fn attempt_notification_with(
     server: &Server,
     message_id: &str,
     subscription_id: &str,
-    is_waiting: &dyn Fn(&str) -> bool,
+    can_receive: &dyn Fn(&str) -> bool,
     deliver: &dyn Fn(&str, &str) -> bool,
 ) -> bool {
-    let attempt_ms = now_ms();
-    let (pane, exhausted, reusable, subscription_created_ms) = {
-        let state = server.state.lock().unwrap();
-        let Some(message) = state.msgs.get(message_id) else {
-            return false;
-        };
-        let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
-            return false;
-        };
-        let pane_matches = state
-            .workers
-            .get(&subscription.worker_id)
-            .and_then(|worker| worker.pane.as_deref())
-            == Some(subscription.pane.as_str());
-        let valid = message.to == subscription.worker_id
-            && message.state == "pending"
-            && message
-                .subject
-                .as_deref()
-                .is_some_and(|subject| !subject.trim().is_empty())
-            && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
-            && subscription.status == "armed"
-            && subscription.expires_ms > attempt_ms
-            && (subscription.event != "direct-message"
-                || subscription.updated_ms <= subscription.created_ms
-                || attempt_ms - subscription.updated_ms >= DIRECT_MESSAGE_WAKE_COOLDOWN_MS)
-            && pane_matches;
-        if !valid || !is_waiting(&subscription.pane) {
-            return false;
-        }
-        (
-            subscription.pane.clone(),
-            message.wake_attempt_count + 1 >= MAX_WAKE_ATTEMPTS,
-            subscription.event == "direct-message",
-            subscription.created_ms,
-        )
+    let now = now_ms();
+    let mut state = server.state.lock().unwrap();
+    let Some(seed) = state.msgs.get(message_id) else {
+        return false;
     };
-
-    server.commit(&[Event::WakeAttempted {
-        ids: vec![message_id.to_string()],
-        attempted_ms: attempt_ms,
-    }]);
-    if deliver(&pane, message_id) {
-        let mut events = vec![Event::Delivered {
-            ids: vec![message_id.to_string()],
-        }];
-        events.push(if reusable {
-            Event::NotificationStatus {
-                subscription_id: subscription_id.to_string(),
-                status: "armed".into(),
-                updated_ms: now_ms().max(subscription_created_ms.saturating_add(1)),
-            }
-        } else {
-            Event::NotificationConsumed {
-                subscription_id: subscription_id.to_string(),
-                message_id: message_id.to_string(),
-                consumed_ms: now_ms(),
-            }
-        });
-        server.commit(&events);
-        true
-    } else {
-        if exhausted && !reusable {
-            server.commit(&[Event::NotificationStatus {
-                subscription_id: subscription_id.to_string(),
-                status: "attempts-exhausted".into(),
-                updated_ms: now_ms(),
-            }]);
-        }
-        false
+    let recipient = seed.to.clone();
+    let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
+        return false;
+    };
+    let pane = subscription.pane.clone();
+    if subscription.worker_id != recipient {
+        return false;
     }
+    let mut batch = state
+        .msgs
+        .values()
+        .filter_map(|message| {
+            let binding = state.wake_bindings.get(&message.id)?;
+            let sub = state.notification_subscriptions.get(binding)?;
+            (message.to == recipient
+                && message.state == "pending"
+                && message.wake_attempt_count == 0
+                && sub.worker_id == recipient
+                && sub.pane == pane
+                && sub.status == "armed"
+                && sub.expires_ms > now
+                && state
+                    .workers
+                    .get(&recipient)
+                    .and_then(|w| w.pane.as_deref())
+                    == Some(pane.as_str()))
+            .then(|| {
+                notification_text(message).map(|text| {
+                    (
+                        message.created_ms,
+                        message.id.clone(),
+                        binding.clone(),
+                        sub.event.clone(),
+                        text,
+                    )
+                })
+            })
+            .flatten()
+        })
+        .collect::<Vec<_>>();
+    batch.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let Some(first) = batch.first() else {
+        return false;
+    };
+    let last_attempt = state
+        .msgs
+        .values()
+        .filter(|m| m.to == recipient)
+        .map(|m| m.last_wake_attempt_ms)
+        .max()
+        .unwrap_or(0);
+    if now - first.0 < DIRECT_MESSAGE_WAKE_COOLDOWN_MS
+        || now - last_attempt < DIRECT_MESSAGE_WAKE_COOLDOWN_MS
+    {
+        return false;
+    }
+    let ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
+    // Reserve the whole batch durably under the state lock before any external
+    // side effect. Failed/uncertain delivery and restart cannot replay it.
+    server.commit_locked(
+        &mut state,
+        &[Event::WakeAttempted {
+            ids: ids.clone(),
+            attempted_ms: now,
+        }],
+    );
+    drop(state);
+    if !can_receive(&pane) {
+        return false;
+    }
+    let text = batch
+        .iter()
+        .map(|m| m.4.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if !deliver(&pane, &text) {
+        return false;
+    }
+    let mut events = vec![Event::Delivered { ids }];
+    for (_, id, binding, event, _) in batch {
+        if event != "direct-message" {
+            events.push(Event::NotificationConsumed {
+                subscription_id: binding,
+                message_id: id,
+                consumed_ms: now,
+            });
+        }
+    }
+    server.commit(&events);
+    true
 }
 
 fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str) -> bool {
@@ -433,8 +449,8 @@ fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str
         server,
         message_id,
         subscription_id,
-        &pane_idle,
-        &|pane, id| queue_system_knock(server, pane, id),
+        &knock::pane_accepts_notification,
+        &|pane, text| knock_or_log(&server.log_path(), pane, text),
     )
 }
 

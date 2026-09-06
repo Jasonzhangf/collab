@@ -62,7 +62,7 @@ pub struct WorkerRec {
     pub registered_ms: i64,
 }
 
-pub const MAX_WAKE_ATTEMPTS: u32 = 3;
+pub const MAX_WAKE_ATTEMPTS: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationSubscription {
