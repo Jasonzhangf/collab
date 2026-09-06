@@ -186,6 +186,8 @@ fn launch_args(
         ];
         if let Some(model) = &profile.model {
             args.extend(["--model".into(), model.clone()]);
+        } else {
+            args.extend(["--model".into(), "auto".into()]);
         }
         args.push(prompt.into());
         if args.iter().any(|a| a == "--worktree" || a == "persist") {
@@ -196,10 +198,6 @@ fn launch_args(
     let mut args = vec![
         "--profile".into(),
         profile.codex_profile.clone(),
-        "--sandbox".into(),
-        "danger-full-access".into(),
-        "--ask-for-approval".into(),
-        "never".into(),
     ];
     if let Some(model) = &profile.model {
         args.extend(["--model".into(), model.clone()]);
@@ -971,8 +969,21 @@ mod tests {
             assert!(args.contains(&flag.to_string()), "{flag}");
         }
         assert!(args.windows(2).any(|w| w == ["--sandbox", "disabled"]));
+        assert!(args.windows(2).any(|w| w == ["--model", "test-model"]));
         assert!(!args.iter().any(|a| a == "--worktree" || a == "persist" || a == "-c"));
         assert_eq!(args.last().unwrap(), "hello");
+        let (_, default_args) = launch_args(
+            "cursor",
+            &config::Profile {
+                codex_profile: String::new(),
+                model: None,
+            },
+            std::path::Path::new("/tmp/project"),
+            "hello",
+            mcp,
+        )
+        .unwrap();
+        assert!(default_args.windows(2).any(|w| w == ["--model", "auto"]));
         let (exe, args) = launch_args(
             "codex",
             &config::Profile {
@@ -986,8 +997,7 @@ mod tests {
         .unwrap();
         assert_eq!(exe, "codex");
         assert_eq!(args[..2], ["--profile", "oauth"]);
-        assert!(args.windows(2).any(|w| w == ["--sandbox", "danger-full-access"]));
-        assert!(args.windows(2).any(|w| w == ["--ask-for-approval", "never"]));
+        assert!(!args.iter().any(|a| a == "danger-full-access" || a == "--ask-for-approval"));
         assert!(args.iter().any(|a| a.contains("mcp_servers.appsdk-subagent")));
         assert!(args.iter().any(|a| a.contains("collab_ack") && a.contains("approve")));
         assert!(args.last().unwrap().contains("collab CLI"));

@@ -156,14 +156,8 @@ fn ensure_codex_collab_permissions(root: &Path) -> std::io::Result<()> {
     } else {
         toml::Table::new()
     };
-    table.insert(
-        "sandbox_mode".into(),
-        toml::Value::String("danger-full-access".into()),
-    );
-    table.insert(
-        "approval_policy".into(),
-        toml::Value::String("never".into()),
-    );
+    table.remove("sandbox_mode");
+    table.remove("approval_policy");
     let servers = table
         .entry("mcp_servers")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -205,11 +199,8 @@ fn ensure_cursor_cli_permissions(root: &Path) -> std::io::Result<()> {
         serde_json::json!({})
     };
     if let Some(table) = root_value.as_object_mut() {
-        table
-            .entry("sandbox")
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .map(|sandbox| sandbox.insert("mode".into(), serde_json::json!("disabled")));
+        table.remove("sandbox");
+        table.remove("approvalMode");
         let permissions = table
             .entry("permissions")
             .or_insert_with(|| serde_json::json!({}));
@@ -223,6 +214,7 @@ fn ensure_cursor_cli_permissions(root: &Path) -> std::io::Result<()> {
                 "Mcp(collab,*)",
             ],
         );
+        merge_allow_patterns(permissions, "deny", &[]);
     }
     std::fs::write(
         path,
@@ -521,8 +513,8 @@ mod tests {
         let codex: toml::Value =
             toml::from_str(&std::fs::read_to_string(root.join(".codex/config.toml")).unwrap())
                 .unwrap();
-        assert_eq!(codex["sandbox_mode"].as_str(), Some("danger-full-access"));
-        assert_eq!(codex["approval_policy"].as_str(), Some("never"));
+        assert!(codex.get("sandbox_mode").is_none());
+        assert!(codex.get("approval_policy").is_none());
         assert!(codex["mcp_servers"]["collab"]["command"]
             .as_str()
             .unwrap()
@@ -530,7 +522,8 @@ mod tests {
         let cursor_cli: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(root.join(".cursor/cli.json")).unwrap())
                 .unwrap();
-        assert_eq!(cursor_cli["sandbox"]["mode"], "disabled");
+        assert!(cursor_cli.get("sandbox").is_none());
+        assert_eq!(cursor_cli["permissions"]["deny"], serde_json::json!([]));
         assert!(cursor_cli["permissions"]["allow"]
             .as_array()
             .unwrap()
@@ -541,15 +534,26 @@ mod tests {
             "model = \"keep-me\"\nsandbox_mode = \"workspace-write\"\n",
         )
         .unwrap();
+        std::fs::write(
+            root.join(".cursor/cli.json"),
+            r#"{"sandbox":{"mode":"disabled"},"permissions":{"allow":["Shell(other)"]}}"#,
+        )
+        .unwrap();
         init(&root).unwrap();
         let upgraded: toml::Value =
             toml::from_str(&std::fs::read_to_string(root.join(".codex/config.toml")).unwrap())
                 .unwrap();
         assert_eq!(upgraded["model"].as_str(), Some("keep-me"));
-        assert_eq!(
-            upgraded["sandbox_mode"].as_str(),
-            Some("danger-full-access")
-        );
+        assert!(upgraded.get("sandbox_mode").is_none());
+        let repaired: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(".cursor/cli.json")).unwrap())
+                .unwrap();
+        assert!(repaired.get("sandbox").is_none());
+        assert!(repaired["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("Shell(other)")));
         std::fs::remove_dir_all(root).ok();
     }
 }
