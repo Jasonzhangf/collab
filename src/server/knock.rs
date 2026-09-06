@@ -159,6 +159,11 @@ fn agent_state_from(command: &str, title: &str, screen: &str) -> AgentState {
     }
 }
 
+/// Cursor CLI (and some Ink TUIs) ignore Enter when it arrives in the same
+/// PTY read as the paste payload or bracketed-paste terminator. Keep one
+/// tmux client queue; the settle forces `C-m` onto a later write.
+const SUBMIT_SETTLE: &str = "sleep 0.05";
+
 fn wake_args<'a>(pane: &'a str, text: &'a str, buffer: &'a str) -> Vec<&'a str> {
     vec![
         "set-buffer",
@@ -173,6 +178,9 @@ fn wake_args<'a>(pane: &'a str, text: &'a str, buffer: &'a str) -> Vec<&'a str> 
         buffer,
         "-t",
         pane,
+        ";",
+        "run-shell",
+        SUBMIT_SETTLE,
         ";",
         "send-keys",
         "-t",
@@ -208,22 +216,48 @@ mod tests {
     fn live_working_pane_receives_one_batch_with_enter() {
         use std::process::Command;
         let session = format!("collab-batch-test-{}", std::process::id());
-        let output = Command::new("tmux").args([
-            "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", &session,
-            "node -e 'process.stdin.setRawMode(true);process.stdin.resume();process.stdin.on(\"data\",b=>{process.stdout.write(\"RX:\"+b.toString(\"hex\")+\"\\n\")})'"
-        ]).output().unwrap();
+        let directory = std::env::temp_dir().join(&session);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("rec.js"),
+            r#"process.stdout.write('\x1b[?2004h');
+process.stdin.setRawMode(true);
+process.stdin.resume();
+process.stdin.on('data', b => {
+  process.stdout.write('RX:' + b.toString('hex') + '\n');
+});
+setInterval(() => {}, 1 << 30);
+"#,
+        )
+        .unwrap();
+        let output = Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-s",
+                &session,
+                "-c",
+            ])
+            .arg(&directory)
+            .arg("node rec.js")
+            .output()
+            .unwrap();
         assert!(output.status.success());
         let pane = String::from_utf8(output.stdout).unwrap().trim().to_string();
-        struct Cleanup(String);
+        struct Cleanup(String, std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 let _ = Command::new("tmux")
                     .args(["kill-session", "-t", &self.0])
                     .status();
+                let _ = std::fs::remove_dir_all(&self.1);
             }
         }
-        let _cleanup = Cleanup(session);
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _cleanup = Cleanup(session, directory);
+        std::thread::sleep(std::time::Duration::from_millis(400));
         assert!(Command::new("tmux")
             .args(["select-pane", "-t", &pane, "-T", "⠋ batch-test"])
             .status()
@@ -241,13 +275,21 @@ mod tests {
             .output()
             .unwrap();
         let text = String::from_utf8(capture.stdout).unwrap();
-        let hex = text
-            .lines()
-            .filter_map(|l| l.strip_prefix("RX:"))
-            .collect::<String>();
-        assert!(hex.contains("6f6e65205b66697273745d"));
-        assert!(hex.contains("74776f205b7365636f6e645d"));
+        let chunks: Vec<_> = text.lines().filter_map(|l| l.strip_prefix("RX:")).collect();
+        let hex = chunks.join("");
+        assert!(hex.contains("6f6e65205b66697273745d"), "{text}");
+        assert!(hex.contains("74776f205b7365636f6e645d"), "{text}");
         assert_eq!(hex.matches("0d").count(), 1, "{text}");
+        assert!(
+            chunks.iter().any(|c| *c == "0d"),
+            "Enter must be its own PTY write: {text}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.contains("6f6e65205b66697273745d") && !c.contains("0d")),
+            "paste payload must not include Enter: {text}"
+        );
     }
 
     #[test]
@@ -267,6 +309,9 @@ mod tests {
                 "collab-wake-test",
                 "-t",
                 "%7",
+                ";",
+                "run-shell",
+                "sleep 0.05",
                 ";",
                 "send-keys",
                 "-t",
@@ -291,10 +336,7 @@ mod tests {
             agent_state_from("node", "⠋ routecodex", ""),
             AgentState::Working
         );
-        assert_eq!(
-            agent_state_from("codex", "collab", ""),
-            AgentState::Waiting
-        );
+        assert_eq!(agent_state_from("codex", "collab", ""), AgentState::Waiting);
         assert_eq!(
             agent_state_from("codex", "⠋ collab", ""),
             AgentState::Working
@@ -304,7 +346,11 @@ mod tests {
             AgentState::Unknown
         );
         assert_eq!(
-            agent_state_from("node", "Word Counter", "  Cursor Grok 4.6 High Fast · 54.5%\n"),
+            agent_state_from(
+                "node",
+                "Word Counter",
+                "  Cursor Grok 4.6 High Fast · 54.5%\n"
+            ),
             AgentState::Unknown
         );
         assert_eq!(
