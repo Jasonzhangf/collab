@@ -61,9 +61,14 @@ prompt. That same stdio MCP works for Cursor, Codex, Claude Code, and
 other agents. The `collab` CLI is a complete fallback when MCP tools are
 not listed.
 
-`collab role`, `collab master`, `collab transfer-master`, `collab task claim`,
+`collab role`, `collab transfer-master`, `collab task claim`,
 `collab task dispatch`, `collab remove-worker`, and `collab reset` are
-deprecated and fail explicitly.
+deprecated and fail explicitly. Collab master is not Codex/Cursor root.
+Protocol: `collab master status`, `collab master promote --approval` when no
+live master exists, and `collab master delegate` by the current live master.
+Init and register never create a master; a recorded identity without a live
+tmux pane is not a live master. Independent peers may decline a master
+collaboration invite; managed subagents must obey the master.
 
 ## Independent task lifecycle
 

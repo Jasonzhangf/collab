@@ -54,10 +54,17 @@ fn create_task(server: &Server, owner: &str, id: &str, feature: &str) -> Resp {
 #[test]
 fn failed_journal_cannot_apply_a_keepalive_reservation() {
     let (server, root) = test_server();
-    *server.journal.lock().unwrap() = std::fs::File::open(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    *server.journal.lock().unwrap() =
+        std::fs::File::open(root.join(".agent-collab/server/journal.jsonl")).unwrap();
     let mut state = State::default();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        server.commit_locked(&mut state, &[Event::KeepaliveUpdated {worker_id:"worker".into(),record:crate::server::keepalive::Record::default()}]);
+        server.commit_locked(
+            &mut state,
+            &[Event::KeepaliveUpdated {
+                worker_id: "worker".into(),
+                record: crate::server::keepalive::Record::default(),
+            }],
+        );
     }));
     assert!(result.is_err());
     assert!(state.keepalives.is_empty());
@@ -66,8 +73,15 @@ fn failed_journal_cannot_apply_a_keepalive_reservation() {
 
 #[test]
 fn activity_log_never_copies_launch_credentials() {
-    let request = Req::Subagent {worker_id:"parent".into(),token:"token".into(),command:crate::subagent::Action::Start {id:None, runtime:None},
-        launch_env:std::collections::BTreeMap::from([("SECRET".into(),"do-not-log".into())])};
+    let request = Req::Subagent {
+        worker_id: "parent".into(),
+        token: "token".into(),
+        command: crate::subagent::Action::Start {
+            id: None,
+            runtime: None,
+        },
+        launch_env: std::collections::BTreeMap::from([("SECRET".into(), "do-not-log".into())]),
+    };
     let log = request_activity(&request, &Resp::data(json!({})));
     assert!(log["request"].get("launch_env").is_none());
     assert!(!log.to_string().contains("do-not-log"));
@@ -80,38 +94,363 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
     register(&server, "parent", "%parent");
     register(&server, "child", "%child");
     register(&server, "other", "%other");
-    let record = Record { id: "managed".into(), parent: "parent".into(), peer: "child".into(), status: "starting".into(), session: None, pane: Some("%child".into()), profile: None, created_ms: now_ms(), ready_deadline_ms: now_ms()+90000, last_message: None, error: None, probe_failures: Vec::new(), runtime: None };
+    let record = Record {
+        id: "managed".into(),
+        parent: "parent".into(),
+        peer: "child".into(),
+        status: "starting".into(),
+        session: None,
+        pane: Some("%child".into()),
+        profile: None,
+        created_ms: now_ms(),
+        ready_deadline_ms: now_ms() + 90000,
+        last_message: None,
+        error: None,
+        probe_failures: Vec::new(),
+        runtime: None,
+    };
     let event = Event::SubagentUpdated { subagent: record };
     let encoded = serde_json::to_string(&event).unwrap();
     let mut replay = State::default();
     replay.apply(&serde_json::from_str(&encoded).unwrap());
     assert_eq!(replay.subagents["managed"].status, "starting");
     server.commit(&[event]);
-    assert!(!crate::subagent::handle(&server, "other", "token-other", Action::Close {id: "managed".into()}).ok);
+    let child_ctx = handle_context(&server, "child".into(), "token-child".into());
+    assert_eq!(child_ctx.data["authority"]["must_obey_master"], true);
+    assert_eq!(
+        child_ctx.data["authority"]["may_decline_master_invite"],
+        false
+    );
+    let parent_ctx = handle_context(&server, "parent".into(), "token-parent".into());
+    assert_eq!(
+        parent_ctx.data["authority"]["may_decline_master_invite"],
+        true
+    );
+    assert!(
+        !crate::subagent::handle(
+            &server,
+            "other",
+            "token-other",
+            Action::Close {
+                id: "managed".into()
+            }
+        )
+        .ok
+    );
     assert!(!crate::subagent::handle(&server, "parent", "wrong", Action::List).ok);
-    assert!(!crate::subagent::handle(&server, "parent", "token-parent", Action::Ready {id: "managed".into()}).ok);
-    assert!(crate::subagent::handle(&server, "child", "token-child", Action::Ready {id: "managed".into()}).ok);
+    assert!(
+        !crate::subagent::handle(
+            &server,
+            "parent",
+            "token-parent",
+            Action::Ready {
+                id: "managed".into()
+            }
+        )
+        .ok
+    );
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "child",
+            "token-child",
+            Action::Ready {
+                id: "managed".into()
+            }
+        )
+        .ok
+    );
     let count = server.state.lock().unwrap().msgs.len();
-    assert!(crate::subagent::handle(&server, "child", "token-child", Action::Ready {id: "managed".into()}).ok);
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "child",
+            "token-child",
+            Action::Ready {
+                id: "managed".into()
+            }
+        )
+        .ok
+    );
     assert_eq!(server.state.lock().unwrap().msgs.len(), count);
-    assert!(crate::subagent::handle(&server, "parent", "token-parent", Action::Send {id: "managed".into(), subject: "test".into(), body: "task".into()}).ok);
-    let message_id = server.state.lock().unwrap().subagents["managed"].last_message.clone().unwrap();
-    assert_eq!(server.state.lock().unwrap().tasks[&format!("task-{message_id}")].status, "assigned");
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "parent",
+            "token-parent",
+            Action::Send {
+                id: "managed".into(),
+                subject: "test".into(),
+                body: "task".into()
+            }
+        )
+        .ok
+    );
+    let message_id = server.state.lock().unwrap().subagents["managed"]
+        .last_message
+        .clone()
+        .unwrap();
+    assert_eq!(
+        server.state.lock().unwrap().tasks[&format!("task-{message_id}")].status,
+        "assigned"
+    );
     let server = Arc::new(server);
     let message = dispatch(&server, Req::MsgStatus { msg_id: message_id });
     assert_eq!(message.data["body"], "task");
-    assert!(!crate::subagent::handle(&server, "parent", "token-parent", Action::Send {id: "managed".into(), subject: "test".into(), body: "task".into()}).ok);
-    assert!(crate::subagent::handle(&server, "child", "token-child", Action::Working {id: "managed".into()}).ok);
-    assert_eq!(server.state.lock().unwrap().tasks.values().next().unwrap().status, "working");
-    let observed = dispatch(&server, Req::SubagentObserve {id:Some("managed".into()),snapshot_lines:None});
+    assert!(
+        !crate::subagent::handle(
+            &server,
+            "parent",
+            "token-parent",
+            Action::Send {
+                id: "managed".into(),
+                subject: "test".into(),
+                body: "task".into()
+            }
+        )
+        .ok
+    );
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "child",
+            "token-child",
+            Action::Working {
+                id: "managed".into()
+            }
+        )
+        .ok
+    );
+    assert_eq!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .tasks
+            .values()
+            .next()
+            .unwrap()
+            .status,
+        "working"
+    );
+    let observed = dispatch(
+        &server,
+        Req::SubagentObserve {
+            id: Some("managed".into()),
+            snapshot_lines: None,
+        },
+    );
     assert!(observed.ok);
     assert_eq!(observed.data["notification_channel"], "none");
     assert!(observed.data.get("screen_tail").is_none());
     assert!(observed.data["tasks"].as_array().unwrap().len() == 1);
-    assert!(crate::subagent::handle(&server, "child", "token-child", Action::Ready {id: "managed".into()}).ok);
-    assert_eq!(server.state.lock().unwrap().subagents["managed"].status, "idle");
-    assert!(crate::subagent::handle(&server, "parent", "token-parent", Action::Close {id: "managed".into()}).ok);
-    assert!(crate::subagent::handle(&server, "parent", "token-parent", Action::Close {id: "managed".into()}).ok);
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "child",
+            "token-child",
+            Action::Ready {
+                id: "managed".into()
+            }
+        )
+        .ok
+    );
+    assert_eq!(
+        server.state.lock().unwrap().subagents["managed"].status,
+        "idle"
+    );
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "parent",
+            "token-parent",
+            Action::Close {
+                id: "managed".into()
+            }
+        )
+        .ok
+    );
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "parent",
+            "token-parent",
+            Action::Close {
+                id: "managed".into()
+            }
+        )
+        .ok
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_promotion_requires_user_approval_and_existing_master_delegates() {
+    let (server, root) = test_server();
+    register(&server, "peer-a", "%a");
+    register(&server, "peer-b", "%b");
+
+    let missing =
+        super::handle_master_promote(&server, "peer-a".into(), "token-peer-a".into(), "".into());
+    assert!(!missing.ok);
+    assert!(missing.error.unwrap().contains("approval"));
+
+    let promoted = super::handle_master_promote(
+        &server,
+        "peer-a".into(),
+        "token-peer-a".into(),
+        "user approved peer-a as collab master".into(),
+    );
+    assert!(promoted.ok, "{}", promoted.error.unwrap_or_default());
+    assert_eq!(promoted.data["mode"], "user_approved_self_promotion");
+    let context = handle_context(&server, "peer-a".into(), "token-peer-a".into());
+    assert_eq!(context.data["master"]["worker_id"], "peer-a");
+    let status = super::handle_master_status(&server);
+    assert_eq!(status.data["master"]["worker_id"], "peer-a");
+    assert_eq!(
+        status.data["master"]["approval"],
+        "user approved peer-a as collab master"
+    );
+
+    let rejected = super::handle_master_promote(
+        &server,
+        "peer-b".into(),
+        "token-peer-b".into(),
+        "user approved peer-b as collab master".into(),
+    );
+    assert!(!rejected.ok);
+    assert!(rejected
+        .error
+        .unwrap()
+        .contains("only the registered master"));
+
+    let outsider = super::handle_master_delegate(
+        &server,
+        "peer-b".into(),
+        "token-peer-b".into(),
+        "peer-a".into(),
+    );
+    assert!(!outsider.ok);
+    assert!(outsider.error.unwrap().contains("master authority"));
+
+    let delegated = super::handle_master_delegate(
+        &server,
+        "peer-a".into(),
+        "token-peer-a".into(),
+        "peer-b".into(),
+    );
+    assert!(delegated.ok, "{}", delegated.error.unwrap_or_default());
+    assert_eq!(
+        server.state.lock().unwrap().master_worker_id.as_deref(),
+        Some("peer-b")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dead_master_pane_is_not_claimable_and_allows_approved_self_promote() {
+    fn only_b(pane: &str) -> bool {
+        pane == "%b"
+    }
+    let (mut server, root) = test_server();
+    register(&server, "peer-a", "%a");
+    register(&server, "peer-b", "%b");
+    assert!(
+        super::handle_master_promote(
+            &server,
+            "peer-a".into(),
+            "token-peer-a".into(),
+            "user approved peer-a as collab master".into(),
+        )
+        .ok
+    );
+    server.pane_alive_check = only_b;
+    let status = super::handle_master_status(&server);
+    assert!(status.data["master"].is_null(), "{status:?}");
+    assert_eq!(status.data["recorded_unusable"]["worker_id"], "peer-a");
+    let promoted = super::handle_master_promote(
+        &server,
+        "peer-b".into(),
+        "token-peer-b".into(),
+        "user approved peer-b after the previous master pane died".into(),
+    );
+    assert!(promoted.ok, "{}", promoted.error.unwrap_or_default());
+    assert_eq!(
+        server.state.lock().unwrap().master_worker_id.as_deref(),
+        Some("peer-b")
+    );
+    let live = super::handle_master_status(&server);
+    assert_eq!(live.data["master"]["worker_id"], "peer-b");
+    assert!(live.data["recorded_unusable"].is_null());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_promotion_requires_live_tmux_pane() {
+    fn none_alive(_: &str) -> bool {
+        false
+    }
+    let (mut server, root) = test_server();
+    register(&server, "peer-a", "%a");
+    server.pane_alive_check = none_alive;
+    let denied = super::handle_master_promote(
+        &server,
+        "peer-a".into(),
+        "token-peer-a".into(),
+        "user approved peer-a as collab master".into(),
+    );
+    assert!(!denied.ok);
+    assert!(denied.error.unwrap().contains("live tmux pane"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_assigned_replays_approval_and_live_identity() {
+    let event = Event::MasterAssigned {
+        worker_id: "peer-a".into(),
+        assigned_by: "peer-a".into(),
+        approval: Some("user approved peer-a as collab master".into()),
+        assigned_ms: 1,
+    };
+    let encoded = serde_json::to_string(&event).unwrap();
+    let mut replay = State::default();
+    replay.apply(&serde_json::from_str(&encoded).unwrap());
+    assert_eq!(replay.master_worker_id.as_deref(), Some("peer-a"));
+    assert_eq!(replay.master_assigned_by.as_deref(), Some("peer-a"));
+    assert_eq!(
+        replay.master_approval.as_deref(),
+        Some("user approved peer-a as collab master")
+    );
+    assert_eq!(replay.master_assigned_ms, Some(1));
+    let legacy = r#"{"ev":"RootAssigned","worker_id":"peer-b","assigned_by":"peer-a","approval":null,"assigned_ms":2}"#;
+    let mut legacy_replay = State::default();
+    legacy_replay.apply(&serde_json::from_str(legacy).unwrap());
+    assert_eq!(legacy_replay.master_worker_id.as_deref(), Some("peer-b"));
+}
+
+#[test]
+fn journal_root_assigned_rewrites_to_master_on_replay() {
+    let root = std::env::temp_dir().join(format!(
+        "collab-root-to-master-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let server_dir = root.join(".agent-collab/server");
+    std::fs::create_dir_all(&server_dir).unwrap();
+    let journal = server_dir.join("journal.jsonl");
+    std::fs::write(
+        &journal,
+        r#"{"ev":"RootAssigned","worker_id":"peer-a","assigned_by":"peer-a","approval":"user approved","assigned_ms":1}
+"#,
+    )
+    .unwrap();
+    let state = replay(&root).unwrap();
+    assert_eq!(state.master_worker_id.as_deref(), Some("peer-a"));
+    let rewritten = std::fs::read_to_string(&journal).unwrap();
+    assert!(rewritten.contains("MasterAssigned"), "{rewritten}");
+    assert!(!rewritten.contains("RootAssigned"), "{rewritten}");
+    let again = replay(&root).unwrap();
+    assert_eq!(again.master_worker_id.as_deref(), Some("peer-a"));
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -128,6 +467,7 @@ fn first_and_later_registration_are_equal_peers() {
     );
     let state = server.state.lock().unwrap();
     assert_eq!(state.workers.len(), 2);
+    assert!(state.master_worker_id.is_none());
     drop(state);
     std::fs::remove_dir_all(root).ok();
 }
@@ -189,7 +529,10 @@ fn registration_adds_default_lease_when_only_short_direct_message_lease_exists()
     for event in &events {
         state.apply(event);
     }
-    assert_eq!(state.notification_subscriptions["sub-short"].status, "rebound");
+    assert_eq!(
+        state.notification_subscriptions["sub-short"].status,
+        "rebound"
+    );
     assert!(default_direct_message_events(&state, "peer", "%peer", now + 1).is_empty());
 }
 
@@ -222,14 +565,29 @@ fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
     for event in default_direct_message_events(&state, "peer", "%one", 1000) {
         state.apply(&event);
     }
-    let mut old = state.notification_subscriptions.values().next().unwrap().clone();
+    let mut old = state
+        .notification_subscriptions
+        .values()
+        .next()
+        .unwrap()
+        .clone();
     old.id = "sub-legacy".into();
     state.apply(&Event::NotificationSubscribed { subscription: old });
     for event in default_direct_message_events(&state, "peer", "%one", 2000) {
         state.apply(&event);
     }
-    assert_eq!(state.notification_subscriptions.values().filter(|sub| sub.status == "armed").count(), 1);
-    assert_eq!(state.notification_subscriptions["sub-legacy"].status, "rebound");
+    assert_eq!(
+        state
+            .notification_subscriptions
+            .values()
+            .filter(|sub| sub.status == "armed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        state.notification_subscriptions["sub-legacy"].status,
+        "rebound"
+    );
     assert!(default_direct_message_events(&state, "peer", "%one", 2000).is_empty());
 }
 
@@ -239,7 +597,12 @@ fn default_subscription_renews_and_rebinds_without_new_ids() {
     for event in default_direct_message_events(&state, "peer", "%one", 1000) {
         state.apply(&event);
     }
-    let id = state.notification_subscriptions.keys().next().unwrap().clone();
+    let id = state
+        .notification_subscriptions
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
     let ttl = DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000;
     for (pane, time) in [("%one", ttl), ("%one", ttl * 3), ("%two", ttl * 4)] {
         for event in default_direct_message_events(&state, "peer", pane, time) {
@@ -1132,7 +1495,6 @@ fn removed_role_and_dispatch_commands_fail_fast() {
         Req::Role {
             worker_id: "peer".into(),
         },
-        Req::MasterId,
         Req::TransferMaster {
             worker_id: "peer".into(),
             token: "token-peer".into(),
@@ -1223,6 +1585,9 @@ fn context_is_read_only_and_does_not_consume_notifications() {
 
     let context = handle_context(&server, "peer".into(), "token-peer".into());
     assert!(context.ok);
+    assert!(context.data["master"].is_null());
+    assert_eq!(context.data["authority"]["must_obey_master"], false);
+    assert_eq!(context.data["authority"]["may_decline_master_invite"], true);
     assert_eq!(context.data["inbox"]["unread"], 1);
     let state = server.state.lock().unwrap();
     assert_eq!(state.msgs[&message_id].state, "pending");
@@ -1256,7 +1621,7 @@ fn architecture_source_has_no_live_declared_role_or_dispatch_owner() {
     assert!(!state_source.contains("pub last_nudge_ms:"));
     for removed_tool in [
         "\"collab_role\"",
-        "\"collab_master\"",
+        "\"collab_root\"",
         "\"collab_task_claim\"",
         "\"collab_task_dispatch\"",
         "\"project_root\"",
@@ -1502,7 +1867,14 @@ fn cursor_and_codex_subagents_exchange_messages() {
     assert_eq!(cursor_status.data["next_check"], "status");
     assert_eq!(cursor_status.data["progress"], "snapshot");
     assert_eq!(cursor_status.data["close_required"], false);
-    let msgs: Vec<_> = server.state.lock().unwrap().msgs.values().cloned().collect();
+    let msgs: Vec<_> = server
+        .state
+        .lock()
+        .unwrap()
+        .msgs
+        .values()
+        .cloned()
+        .collect();
     assert!(
         msgs.iter().any(|m| m.from == "cursor-peer"
             && m.to == "codex-peer"

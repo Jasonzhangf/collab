@@ -1,7 +1,7 @@
+pub(crate) mod keepalive;
 pub mod knock;
 pub mod state;
 pub mod timers;
-pub(crate) mod keepalive;
 
 use crate::proto::{Req, Resp, MSG_TYPES};
 use crate::scope::Scope;
@@ -169,7 +169,8 @@ impl Server {
             let line = serde_json::to_string(ev).expect("serialize event");
             writeln!(j, "{}", line).expect("journal append failed; refusing state mutation");
         }
-        j.sync_data().expect("journal sync failed; refusing state mutation");
+        j.sync_data()
+            .expect("journal sync failed; refusing state mutation");
         for ev in evs {
             st.apply(ev);
             if let Event::Sent { msg } = ev {
@@ -284,9 +285,7 @@ fn default_direct_message_events(
     let refresh_after_ms = DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000 / 2;
     let mut current_is_fresh = false;
     for subscription in state.notification_subscriptions.values().filter(|sub| {
-        sub.worker_id == worker_id
-            && sub.event == "direct-message"
-            && sub.status == "armed"
+        sub.worker_id == worker_id && sub.event == "direct-message" && sub.status == "armed"
     }) {
         if subscription.id == default_id
             && subscription.pane == pane
@@ -361,7 +360,9 @@ fn attempt_notification_with(
     deliver: &dyn Fn(&str, &str) -> bool,
 ) -> bool {
     let now = now_ms();
-    if !server.config.notifications.enabled { return false; }
+    if !server.config.notifications.enabled {
+        return false;
+    }
     let mut state = server.state.lock().unwrap();
     let Some(seed) = state.msgs.get(message_id) else {
         return false;
@@ -419,9 +420,7 @@ fn attempt_notification_with(
         .map(|m| m.last_wake_attempt_ms)
         .max()
         .unwrap_or(0);
-    if now - first.0 < delay
-        || now - last_attempt < delay
-    {
+    if now - first.0 < delay || now - last_attempt < delay {
         return false;
     }
     let ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
@@ -436,6 +435,10 @@ fn attempt_notification_with(
     );
     drop(state);
     if !can_receive(&pane) {
+        crate::server::knock::append_log(
+            &server.log_path(),
+            &format!("knock skipped pane={pane} no known agent"),
+        );
         return false;
     }
     let text = batch
@@ -1088,23 +1091,46 @@ pub(crate) fn handle_register(
     }))
 }
 
-fn verify_root_actor(state: &State, worker_id: &str, token: &str) -> Result<(), Resp> {
+fn live_master_id(server: &Server, state: &State) -> Option<String> {
+    let worker_id = state.master_worker_id.as_deref()?;
+    let worker = state.workers.get(worker_id)?;
+    let pane = worker.pane.as_deref()?;
+    (server.pane_alive_check)(pane).then(|| worker_id.to_string())
+}
+
+fn is_managed_subagent(state: &State, worker_id: &str) -> bool {
+    state
+        .subagents
+        .values()
+        .any(|record| record.peer == worker_id)
+}
+
+fn verify_master_actor(
+    server: &Server,
+    state: &State,
+    worker_id: &str,
+    token: &str,
+) -> Result<(), Resp> {
     let Some(worker) = state.workers.get(worker_id) else {
         return Err(Resp::err(format!("worker {} not registered", worker_id)));
     };
     if worker.token != token {
-        return Err(Resp::err("token mismatch: identity does not own this worker_id"));
+        return Err(Resp::err(
+            "token mismatch: identity does not own this worker_id",
+        ));
     }
-    if state.root_worker_id.as_deref() != Some(worker_id) {
-        return Err(Resp::err("root authority required; ask the registered root to delegate"));
+    match live_master_id(server, state) {
+        Some(master) if master == worker_id => Ok(()),
+        Some(_) => Err(Resp::err(
+            "master authority required; ask the registered master to delegate",
+        )),
+        None => Err(Resp::err(
+            "no live master; a peer may promote itself only with explicit user approval",
+        )),
     }
-    if worker.pane.as_deref().is_none_or(|pane| !pane_alive(pane)) {
-        return Err(Resp::err("root identity has no live tmux pane"));
-    }
-    Ok(())
 }
 
-fn handle_root_promote(
+fn handle_master_promote(
     server: &Server,
     worker_id: String,
     token: String,
@@ -1118,52 +1144,89 @@ fn handle_root_promote(
         return Resp::err("token mismatch: identity does not own this worker_id");
     }
     if approval.trim().is_empty() {
-        return Resp::err("root promotion requires explicit user approval");
+        return Resp::err("master promotion requires explicit user approval");
     }
-    if state.root_worker_id.is_some() {
-        return Resp::err("root already exists; only the registered root may delegate");
+    if live_master_id(server, &state).is_some() {
+        return Resp::err("master already exists; only the registered master may delegate");
     }
-    if worker.pane.as_deref().is_none_or(|pane| !pane_alive(pane)) {
-        return Resp::err("root promotion requires a live tmux pane");
+    if worker
+        .pane
+        .as_deref()
+        .is_none_or(|pane| !(server.pane_alive_check)(pane))
+    {
+        return Resp::err("master promotion requires a live tmux pane");
     }
     server.commit_locked(
         &mut state,
-        &[Event::RootAssigned {
+        &[Event::MasterAssigned {
             worker_id: worker_id.clone(),
             assigned_by: worker_id.clone(),
             approval: Some(approval),
             assigned_ms: now_ms(),
         }],
     );
-    Resp::data(json!({"root": worker_id, "mode": "user_approved_self_promotion"}))
+    Resp::data(json!({"master": worker_id, "mode": "user_approved_self_promotion"}))
 }
 
-fn handle_root_delegate(
+fn handle_master_delegate(
     server: &Server,
     worker_id: String,
     token: String,
     target_id: String,
 ) -> Resp {
     let mut state = server.state.lock().unwrap();
-    if let Err(error) = verify_root_actor(&state, &worker_id, &token) {
+    if let Err(error) = verify_master_actor(server, &state, &worker_id, &token) {
         return error;
     }
     let Some(target) = state.workers.get(&target_id) else {
         return Resp::err(format!("target worker {} not registered", target_id));
     };
-    if target.pane.as_deref().is_none_or(|pane| !pane_alive(pane)) {
-        return Resp::err("root delegation requires a live target tmux pane");
+    if target
+        .pane
+        .as_deref()
+        .is_none_or(|pane| !(server.pane_alive_check)(pane))
+    {
+        return Resp::err("master delegation requires a live target tmux pane");
     }
     server.commit_locked(
         &mut state,
-        &[Event::RootAssigned {
+        &[Event::MasterAssigned {
             worker_id: target_id.clone(),
             assigned_by: worker_id.clone(),
             approval: None,
             assigned_ms: now_ms(),
         }],
     );
-    Resp::data(json!({"root": target_id, "delegated_by": worker_id}))
+    Resp::data(json!({"master": target_id, "delegated_by": worker_id}))
+}
+
+fn master_assignment_view(state: &State, worker_id: &str, endpoint_live: bool) -> serde_json::Value {
+    let pane = state
+        .workers
+        .get(worker_id)
+        .and_then(|worker| worker.pane.clone());
+    json!({
+        "worker_id": worker_id,
+        "pane": pane,
+        "endpoint_live": endpoint_live,
+        "assigned_by": state.master_assigned_by,
+        "approval": state.master_approval,
+        "assigned_ms": state.master_assigned_ms,
+    })
+}
+
+fn handle_master_status(server: &Server) -> Resp {
+    let state = server.state.lock().unwrap();
+    let live = live_master_id(server, &state);
+    let master = live
+        .as_ref()
+        .map(|id| master_assignment_view(&state, id, true));
+    let recorded = state
+        .master_worker_id
+        .as_ref()
+        .filter(|id| live.as_deref() != Some(id.as_str()))
+        .map(|id| master_assignment_view(&state, id, false));
+    Resp::data(json!({"master": master, "recorded_unusable": recorded}))
 }
 
 pub(crate) fn handle_send(
@@ -1176,12 +1239,29 @@ pub(crate) fn handle_send(
     in_reply_to: Option<String>,
     delivery_mode: String,
 ) -> Resp {
-    handle_send_with_task(server, from, to, mtype, subject, body, in_reply_to, delivery_mode, false)
+    handle_send_with_task(
+        server,
+        from,
+        to,
+        mtype,
+        subject,
+        body,
+        in_reply_to,
+        delivery_mode,
+        false,
+    )
 }
 
 pub(crate) fn handle_send_with_task(
-    server: &Server, from: String, to: String, mtype: String, subject: Option<String>,
-    body: String, in_reply_to: Option<String>, delivery_mode: String, assign_task: bool,
+    server: &Server,
+    from: String,
+    to: String,
+    mtype: String,
+    subject: Option<String>,
+    body: String,
+    in_reply_to: Option<String>,
+    delivery_mode: String,
+    assign_task: bool,
 ) -> Resp {
     if mtype != "notify" {
         return Resp::err("peer messaging requires type notify");
@@ -1201,7 +1281,12 @@ pub(crate) fn handle_send_with_task(
         ));
     }
     let mut st = server.state.lock().unwrap();
-    if assign_task && !st.subagents.values().any(|s| s.parent == from && s.peer == to && s.status == "assigned") {
+    if assign_task
+        && !st
+            .subagents
+            .values()
+            .any(|s| s.parent == from && s.peer == to && s.status == "assigned")
+    {
         return Resp::err("managed task requires an authorized assigned subagent");
     }
     let Some(sender) = st.workers.get(&from) else {
@@ -1270,9 +1355,14 @@ pub(crate) fn handle_send_with_task(
             next_step:Some(format!("Read collab msg {mid}; accept via subagent working; bind a worktree with task relocate before code edits.")),
             wait:None,created_ms:now_ms(),updated_ms:now_ms(),
         }});
-        let mut child = st.subagents.values().find(|s| s.parent == from && s.peer == to && s.status == "assigned").unwrap().clone();
+        let mut child = st
+            .subagents
+            .values()
+            .find(|s| s.parent == from && s.peer == to && s.status == "assigned")
+            .unwrap()
+            .clone();
         child.last_message = Some(mid.clone());
-        events.push(Event::SubagentUpdated {subagent:child});
+        events.push(Event::SubagentUpdated { subagent: child });
     }
     events.push(Event::DeliveryMode {
         msg_id: mid.clone(),
@@ -1984,6 +2074,7 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
                 .map(str::to_owned)
         })
         .collect();
+    let managed = is_managed_subagent(&st, &worker_id);
     Resp::data(json!({
         "identity": {"worker_id": worker.id, "kind": "peer", "pane": worker.pane},
         "liveness": {
@@ -1993,6 +2084,12 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         "tasks": tasks,
         "inbox": {"unread": unread.len()},
         "next_actions": next_actions,
+        "master": live_master_id(server, &st).map(|id| json!({"worker_id": id})),
+        "authority": {
+            "managed_subagent": managed,
+            "must_obey_master": managed,
+            "may_decline_master_invite": !managed,
+        },
         "truth": "server journal and mailbox; tmux is wake-only",
     }))
 }
@@ -2122,7 +2219,10 @@ fn handle_task_wait(
 fn mutation_blocked_during_migration(req: &Req) -> bool {
     match req {
         Req::SubagentObserve { .. } => false,
-        Req::Subagent { command, .. } => !matches!(command, crate::subagent::Action::List | crate::subagent::Action::Status { .. }),
+        Req::Subagent { command, .. } => !matches!(
+            command,
+            crate::subagent::Action::List | crate::subagent::Action::Status { .. }
+        ),
         Req::Send { .. }
         | Req::NotificationSubscribe { .. }
         | Req::NotificationUnsubscribe { .. }
@@ -2138,8 +2238,8 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::TaskDispatch { .. }
         | Req::MigrationPlan { .. }
         | Req::MigrationApply { .. }
-        | Req::RootPromote { .. }
-        | Req::RootDelegate { .. }
+        | Req::MasterPromote { .. }
+        | Req::MasterDelegate { .. }
         | Req::TransferMaster { .. }
         | Req::RemoveWorker { .. }
         | Req::ResetBindings { .. } => true,
@@ -2153,7 +2253,7 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::TaskConflicts { .. }
         | Req::MigrationInspect { .. }
         | Req::MigrationVerify { .. }
-        | Req::RootStatus
+        | Req::MasterStatus
         | Req::Role { .. }
         | Req::Workers
         | Req::MasterId
@@ -2176,11 +2276,16 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                     value["notification_channel"] = json!("none");
                     value["next_action"] = json!("No push channel for a non-tmux agent. Check subagent status/mailbox yourself; request snapshot explicitly when useful.");
                     Resp::data(value)
-                },
+                }
                 Err(error) => Resp::err(error.to_string()),
             }
         }
-        Req::Subagent { worker_id, token, command, launch_env } => crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env),
+        Req::Subagent {
+            worker_id,
+            token,
+            command,
+            launch_env,
+        } => crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env),
         Req::Register {
             worker_id,
             token,
@@ -2401,23 +2506,17 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
         Req::MigrationVerify { worker_id, token } => {
             handle_migration_verify(server, worker_id, token)
         }
-        Req::RootPromote { worker_id, token, approval } => {
-            handle_root_promote(server, worker_id, token, approval)
-        }
-        Req::RootDelegate { worker_id, token, target_id } => {
-            handle_root_delegate(server, worker_id, token, target_id)
-        }
-        Req::RootStatus => {
-            let state = server.state.lock().unwrap();
-            let root = state.root_worker_id.as_ref().and_then(|id| {
-                state.workers.get(id).map(|worker| json!({
-                    "worker_id": id,
-                    "pane": worker.pane,
-                    "endpoint_live": worker.pane.as_deref().is_some_and(pane_alive),
-                }))
-            });
-            Resp::data(json!({"root": root}))
-        }
+        Req::MasterPromote {
+            worker_id,
+            token,
+            approval,
+        } => handle_master_promote(server, worker_id, token, approval),
+        Req::MasterDelegate {
+            worker_id,
+            token,
+            target_id,
+        } => handle_master_delegate(server, worker_id, token, target_id),
+        Req::MasterStatus => handle_master_status(server),
         Req::Role { worker_id: _ } => {
             Resp::err("declared roles are removed; use collab who/context for peer identity")
         }
@@ -2445,7 +2544,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 "count": workers.len()
             }))
         }
-        Req::MasterId => Resp::err("use collab root status; legacy master role is not supported"),
+        Req::MasterId => handle_master_status(server),
         Req::MasterRecover {
             worker_id: _,
             token: _,
@@ -2525,7 +2624,9 @@ fn replay(root: &Path) -> anyhow::Result<State> {
     if !journal.exists() {
         return Ok(st);
     }
-    let content = std::fs::read_to_string(journal)?;
+    let content = std::fs::read_to_string(&journal)?;
+    let mut events = Vec::new();
+    let mut convert_root = false;
     for (index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -2537,7 +2638,23 @@ fn replay(root: &Path) -> anyhow::Result<State> {
                 error
             )
         })?;
+        if matches!(event, Event::MasterAssigned { .. })
+            && (line.contains("\"ev\":\"RootAssigned\"") || line.contains("\"ev\": \"RootAssigned\""))
+        {
+            convert_root = true;
+        }
         st.apply(&event);
+        events.push(event);
+    }
+    if convert_root {
+        let mut body = String::new();
+        for event in events {
+            body.push_str(&serde_json::to_string(&event)?);
+            body.push('\n');
+        }
+        let tmp = journal.with_file_name("journal.jsonl.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &journal)?;
     }
     Ok(st)
 }
@@ -2554,12 +2671,12 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         std::fs::remove_file(&sock_path)?;
     }
 
+    let state = replay(&scope.root)?;
     let journal_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(server_dir.join("journal.jsonl"))?;
 
-    let state = replay(&scope.root)?;
     append_log(&server_dir.join("log.txt"), "server starting");
 
     let server = Arc::new(Server {
@@ -2586,7 +2703,8 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     // Background scheduler: bounded waits and explicitly registered notifications.
     let sched = server.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(sched.config.timers.tick_interval_ms));
+        let mut interval =
+            tokio::time::interval(Duration::from_millis(sched.config.timers.tick_interval_ms));
         loop {
             interval.tick().await;
             crate::server::timers::tick(&sched);

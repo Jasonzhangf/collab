@@ -84,9 +84,8 @@ pub fn init(root: &Path) -> std::io::Result<PathBuf> {
     ensure_codex_collab_permissions(root)?;
     ensure_cursor_cli_permissions(root)?;
     ensure_claude_collab_permissions(root)?;
-    crate::config::ensure_written().map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::Other, error)
-    })?;
+    crate::config::ensure_written()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
     Ok(base)
 }
 
@@ -167,14 +166,14 @@ fn ensure_codex_collab_permissions(root: &Path) -> std::io::Result<()> {
     if let Some(servers) = servers.as_table_mut() {
         if !servers.contains_key("collab") {
             let mut collab = toml::Table::new();
-            collab.insert(
-                "command".into(),
-                toml::Value::String(collab_mcp_command()),
-            );
+            collab.insert("command".into(), toml::Value::String(collab_mcp_command()));
             servers.insert("collab".into(), toml::Value::Table(collab));
         }
     }
-    std::fs::write(path, format!("{}\n", toml::to_string_pretty(&table).unwrap()))
+    std::fs::write(
+        path,
+        format!("{}\n", toml::to_string_pretty(&table).unwrap()),
+    )
 }
 
 fn merge_allow_patterns(value: &mut serde_json::Value, key: &str, patterns: &[&str]) {
@@ -279,7 +278,19 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
 
 ## Roles
 
-- Every registered identity is an equal `peer`; there is no permanent master.
+- Every registered identity is an equal `peer`; there is no inferred master
+  from first registration. Codex/Cursor root is not Collab master.
+- `collab init` and peer registration never create a master. A master exists
+  only when a registered peer has a live tmux pane and was assigned by
+  user-approved self-promotion or live-master delegation. A recorded identity
+  with a dead pane is not a live master.
+- If a live master exists, other peers cannot promote; only that master may
+  `collab master delegate <peer>`. If no live master exists, a peer may
+  `collab master promote --approval "<user text>"` itself after explicit user
+  approval. Master authority is arbitration only; it does not take another
+  peer's task. Independent peers may temporarily decline a master
+  collaboration invite to protect their own task; managed subagents must obey
+  the master.
 - Each peer self-registers one task and owns its full worktree, test,
   integration, main verification, push, cleanup, and resource lifecycle.
 - Task owner, resource holder, integration lease, and daemon operator are
@@ -313,6 +324,9 @@ collab notify methods             # discover opt-in notification methods
 collab notify subscribe --event direct-message --ttl-seconds 600
 collab notify status
 collab context                    # read-only authoritative state snapshot
+collab master status              # live master, or recorded-but-dead identity
+collab master promote --approval "<user text>"
+collab master delegate <peer>     # live master only
 collab task register <id> --feature <feature-id> --worktree <path> \
   --branch <branch> --base-commit <sha> --priority p2
 collab task wait <id> --for <blocking-task>
@@ -485,7 +499,9 @@ mod tests {
         let first = std::fs::read_to_string(&path).unwrap();
         assert!(first.contains("# collab workflow"));
         for mcp in [root.join(".cursor/mcp.json"), root.join(".mcp.json")] {
-            assert!(std::fs::read_to_string(&mcp).unwrap().contains("collab-mcp"));
+            assert!(std::fs::read_to_string(&mcp)
+                .unwrap()
+                .contains("collab-mcp"));
         }
 
         init(&root).unwrap();

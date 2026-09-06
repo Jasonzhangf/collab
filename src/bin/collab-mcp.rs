@@ -133,6 +133,12 @@ fn tools() -> Value {
             "Acknowledge owned mailbox messages.",
             json!({"ids":{"type":"array","items":{"type":"string"}}}),
             &["ids"]
+        ),
+        tool(
+            "collab_master",
+            "Inspect the live Collab master, self-promote after explicit user approval when no live master exists, or delegate as the current live master. Codex/Cursor root is unrelated. Init and register never create master. Independent peers may decline a master collaboration invite; managed subagents must obey the master.",
+            json!({"action":{"type":"string","enum":["status","promote","delegate"]},"approval":{"type":"string"},"target":{"type":"string"}}),
+            &["action"]
         )
     ])
 }
@@ -153,15 +159,30 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
         "collab_msg" => argv.extend(["msg".into(), required(args, "id")?]),
         "collab_subagent" => {
             let action = required(args, "action")?;
-            if !["start", "list", "status", "snapshot", "rearm", "send", "ready", "working", "close"].contains(&action.as_str()) { return Err("invalid subagent action".into()); }
+            if ![
+                "start", "list", "status", "snapshot", "rearm", "send", "ready", "working", "close",
+            ]
+            .contains(&action.as_str())
+            {
+                return Err("invalid subagent action".into());
+            }
             argv.extend(["subagent".into(), action.clone()]);
             if action == "start" {
                 optional_flag(&mut argv, args, "id", "--id")?;
                 optional_flag(&mut argv, args, "runtime", "--runtime")?;
+            } else if action != "list" {
+                argv.push(required(args, "id")?);
             }
-            else if action != "list" { argv.push(required(args, "id")?); }
-            if action == "send" { argv.extend(["--subject".into(), required(args, "subject")?, required(args, "body")?]); }
-            if action == "snapshot" { optional_integer_flag(&mut argv, args, "lines", "--lines")?; }
+            if action == "send" {
+                argv.extend([
+                    "--subject".into(),
+                    required(args, "subject")?,
+                    required(args, "body")?,
+                ]);
+            }
+            if action == "snapshot" {
+                optional_integer_flag(&mut argv, args, "lines", "--lines")?;
+            }
         }
         "collab_init" => argv.push("init".into()),
         "collab_whoami" => argv.push("whoami".into()),
@@ -248,6 +269,24 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
         "collab_task_close" => argv.extend(["task".into(), "close".into(), required(args, "id")?]),
         "collab_migrate" => {
             argv.extend(["migrate".into(), required(args, "action")?]);
+        }
+        "collab_master" => {
+            let action = required(args, "action")?;
+            match action.as_str() {
+                "status" => argv.extend(["master".into(), "status".into()]),
+                "promote" => argv.extend([
+                    "master".into(),
+                    "promote".into(),
+                    "--approval".into(),
+                    required(args, "approval")?,
+                ]),
+                "delegate" => argv.extend([
+                    "master".into(),
+                    "delegate".into(),
+                    required(args, "target")?,
+                ]),
+                _ => return Err("invalid master action".into()),
+            }
         }
         _ => return Err(format!("unknown tool {name}")),
     }
@@ -400,7 +439,9 @@ fn handle(req: &Value) -> Option<Value> {
                 ),
             }
         }
-        _ => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("method not found: {method}")}}),
+        _ => {
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("method not found: {method}")}})
+        }
     })
 }
 
@@ -425,12 +466,21 @@ mod tests {
         let framed = format!("Content-Length: {}\r\n\r\n{encoded}", encoded.len());
         let (frame, req) = read_message(&mut framed.as_bytes()).unwrap().unwrap();
         assert!(matches!(frame, Frame::ContentLength));
-        assert_eq!(handle(&req).unwrap()["result"]["protocolVersion"], "2025-03-26");
+        assert_eq!(
+            handle(&req).unwrap()["result"]["protocolVersion"],
+            "2025-03-26"
+        );
         let line = format!("{encoded}\n");
         let (frame, req) = read_message(&mut line.as_bytes()).unwrap().unwrap();
         assert!(matches!(frame, Frame::Line));
-        assert_eq!(handle(&req).unwrap()["result"]["serverInfo"]["name"], "collab");
-        assert_eq!(handle(&json!({"method":"resources/list","id":2})).unwrap()["result"]["resources"], json!([]));
+        assert_eq!(
+            handle(&req).unwrap()["result"]["serverInfo"]["name"],
+            "collab"
+        );
+        assert_eq!(
+            handle(&json!({"method":"resources/list","id":2})).unwrap()["result"]["resources"],
+            json!([])
+        );
     }
 
     #[test]
@@ -447,5 +497,21 @@ mod tests {
             json!(["to", "subject", "body"])
         );
         assert!(send["inputSchema"]["properties"]["subject"].is_object());
+    }
+
+    #[test]
+    fn master_tool_exposes_status_promote_and_delegate() {
+        let definitions = tools();
+        let master = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "collab_master")
+            .unwrap();
+        assert_eq!(master["inputSchema"]["required"], json!(["action"]));
+        assert_eq!(
+            master["inputSchema"]["properties"]["action"]["enum"],
+            json!(["status", "promote", "delegate"])
+        );
     }
 }

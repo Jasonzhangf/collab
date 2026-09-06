@@ -173,8 +173,13 @@ pub fn wait_cycle(tasks: &HashMap<String, TaskRec>, task_id: &str, waiting_for: 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ev")]
 pub enum Event {
-    KeepaliveUpdated { worker_id: String, record: super::keepalive::Record },
-    SubagentUpdated { subagent: crate::subagent::Record },
+    KeepaliveUpdated {
+        worker_id: String,
+        record: super::keepalive::Record,
+    },
+    SubagentUpdated {
+        subagent: crate::subagent::Record,
+    },
     Registered {
         worker: WorkerRec,
     },
@@ -241,7 +246,8 @@ pub enum Event {
     MigrationUpdated {
         migration: MigrationRecord,
     },
-    RootAssigned {
+    #[serde(alias = "RootAssigned")]
+    MasterAssigned {
         worker_id: String,
         assigned_by: String,
         approval: Option<String>,
@@ -261,14 +267,21 @@ pub struct State {
     pub notification_subscriptions: HashMap<String, NotificationSubscription>,
     pub wake_bindings: HashMap<String, String>,
     pub migration: Option<MigrationRecord>,
-    pub root_worker_id: Option<String>,
+    pub master_worker_id: Option<String>,
+    pub master_assigned_by: Option<String>,
+    pub master_approval: Option<String>,
+    pub master_assigned_ms: Option<i64>,
 }
 
 impl State {
     pub fn apply(&mut self, ev: &Event) {
         match ev {
-            Event::KeepaliveUpdated { worker_id, record } => { self.keepalives.insert(worker_id.clone(), record.clone()); }
-            Event::SubagentUpdated { subagent } => { self.subagents.insert(subagent.id.clone(), subagent.clone()); }
+            Event::KeepaliveUpdated { worker_id, record } => {
+                self.keepalives.insert(worker_id.clone(), record.clone());
+            }
+            Event::SubagentUpdated { subagent } => {
+                self.subagents.insert(subagent.id.clone(), subagent.clone());
+            }
             Event::Registered { worker } => {
                 self.workers.insert(worker.id.clone(), worker.clone());
             }
@@ -362,8 +375,16 @@ impl State {
             Event::MigrationUpdated { migration } => {
                 self.migration = Some(migration.clone());
             }
-            Event::RootAssigned { worker_id, .. } => {
-                self.root_worker_id = Some(worker_id.clone());
+            Event::MasterAssigned {
+                worker_id,
+                assigned_by,
+                approval,
+                assigned_ms,
+            } => {
+                self.master_worker_id = Some(worker_id.clone());
+                self.master_assigned_by = Some(assigned_by.clone());
+                self.master_approval = approval.clone();
+                self.master_assigned_ms = Some(*assigned_ms);
             }
         }
     }

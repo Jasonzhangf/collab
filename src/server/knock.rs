@@ -38,7 +38,7 @@ pub fn probe_agent_state(pane: &str) -> AgentState {
     let Some((command, title, screen)) = pane_view(pane) else {
         return AgentState::Absent;
     };
-    let first = agent_state_from(&command, &title, &screen);
+    let first = agent_state_from_with(&command, &title, &screen, official_status);
     if first != AgentState::Waiting {
         return first;
     }
@@ -46,7 +46,7 @@ pub fn probe_agent_state(pane: &str) -> AgentState {
     let Some((command2, title2, screen2)) = pane_view(pane) else {
         return AgentState::Absent;
     };
-    if agent_state_from(&command2, &title2, &screen2) == AgentState::Working
+    if agent_state_from_with(&command2, &title2, &screen2, official_status) == AgentState::Working
         || title2 != title
         || screen2 != screen
     {
@@ -102,54 +102,209 @@ fn has_spinner(text: &str) -> bool {
     })
 }
 
-fn cursor_model_line(screen: &str) -> bool {
-    screen.lines().any(|line| {
-        let Some(rest) = line.trim().strip_prefix("Cursor ") else {
-            return false;
-        };
-        let model = rest
-            .split('·')
-            .next()
-            .unwrap_or(rest)
-            .split_whitespace()
-            .next()
-            .unwrap_or("");
-        !model.is_empty() && model != "Agent"
-    })
-}
-
-fn cursor_workspace_line(screen: &str) -> bool {
+fn footer(screen: &str) -> String {
     screen
         .lines()
-        .any(|line| line.trim().starts_with('/') && line.contains(" · "))
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase()
 }
 
-fn cursor_tui_confidence(screen: &str) -> u8 {
-    let mut hits = 0u8;
-    if cursor_model_line(screen) {
-        hits += 1;
-    }
-    if screen.contains("Run Everything") {
-        hits += 1;
-    }
-    if cursor_workspace_line(screen) {
-        hits += 1;
-    }
-    hits.saturating_mul(33)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeKind {
+    Cursor,
+    Codex,
 }
 
 fn in_cursor_tui(screen: &str) -> bool {
-    cursor_tui_confidence(screen) > 50
+    screen.contains("Run Everything")
 }
 
-fn in_agent(command: &str, title: &str, screen: &str) -> bool {
-    matches!(command, "codex" | "claude" | "agy" | "dsh")
-        || ((matches!(command, "node" | "agent" | "cursor-agent"))
-            && (in_cursor_tui(screen) || has_spinner(title)))
+fn composer_ask_codex(screen: &str) -> bool {
+    screen.to_ascii_lowercase().contains("ask codex to do any")
 }
 
+fn tui_guess(screen: &str) -> Option<(RuntimeKind, u8)> {
+    if in_cursor_tui(screen) {
+        return Some((RuntimeKind::Cursor, 100));
+    }
+    if composer_ask_codex(screen) {
+        return Some((RuntimeKind::Codex, 100));
+    }
+    if footer(screen).contains("gpt-") {
+        return Some((RuntimeKind::Codex, 33));
+    }
+    None
+}
+
+fn in_codex_tui(screen: &str) -> bool {
+    matches!(tui_guess(screen), Some((RuntimeKind::Codex, confidence)) if confidence > 50)
+}
+
+fn bin_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(std::path::PathBuf::from(home).join(".local/bin"));
+    }
+    dirs.push("/opt/homebrew/bin".into());
+    dirs.push("/usr/local/bin".into());
+    dirs.into_iter().find_map(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn wait_child(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => return false,
+        }
+    }
+}
+
+fn cursor_status_ok() -> bool {
+    let Some(agent) = bin_on_path("agent") else {
+        return false;
+    };
+    let mut command = Command::new(agent);
+    command
+        .args(["status", "--format", "json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    if !wait_child(&mut child, std::time::Duration::from_secs(5)) {
+        return false;
+    }
+    let mut text = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return false;
+    };
+    value.get("loggedIn") == Some(&serde_json::json!(true))
+        || value.get("isAuthenticated") == Some(&serde_json::json!(true))
+        || value.get("status").and_then(|status| status.as_str()) == Some("authenticated")
+}
+
+fn codex_status_ok() -> bool {
+    let Some(codex) = bin_on_path("codex") else {
+        return false;
+    };
+    let mut command = Command::new(codex);
+    command
+        .args(["login", "status"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    if !wait_child(&mut child, std::time::Duration::from_secs(5)) {
+        return false;
+    }
+    let mut text = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+    }
+    text.to_ascii_lowercase().contains("logged in")
+}
+
+struct StatusCache {
+    cursor: Option<(std::time::Instant, bool)>,
+    codex: Option<(std::time::Instant, bool)>,
+}
+
+static STATUS_CACHE: std::sync::Mutex<StatusCache> = std::sync::Mutex::new(StatusCache {
+    cursor: None,
+    codex: None,
+});
+const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn official_status(kind: RuntimeKind) -> bool {
+    let now = std::time::Instant::now();
+    {
+        let cache = STATUS_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = match kind {
+            RuntimeKind::Cursor => cache.cursor,
+            RuntimeKind::Codex => cache.codex,
+        };
+        if let Some((at, ok)) = slot {
+            if now.saturating_duration_since(at) < STATUS_TTL {
+                return ok;
+            }
+        }
+    }
+    let ok = match kind {
+        RuntimeKind::Cursor => cursor_status_ok(),
+        RuntimeKind::Codex => codex_status_ok(),
+    };
+    let mut cache = STATUS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match kind {
+        RuntimeKind::Cursor => cache.cursor = Some((now, ok)),
+        RuntimeKind::Codex => cache.codex = Some((now, ok)),
+    }
+    ok
+}
+
+fn in_agent_with(
+    command: &str,
+    title: &str,
+    screen: &str,
+    confirm: impl Fn(RuntimeKind) -> bool,
+) -> bool {
+    if matches!(command, "codex" | "composer" | "claude" | "agy" | "dsh") {
+        return true;
+    }
+    if !matches!(command, "node" | "agent" | "cursor-agent") {
+        return false;
+    }
+    if in_cursor_tui(screen) || in_codex_tui(screen) || has_spinner(title) {
+        return true;
+    }
+    match tui_guess(screen) {
+        Some((kind, confidence)) if (1..=50).contains(&confidence) => confirm(kind),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
 fn agent_state_from(command: &str, title: &str, screen: &str) -> AgentState {
-    if !in_agent(command, title, screen) {
+    agent_state_from_with(command, title, screen, |_| false)
+}
+
+fn agent_state_from_with(
+    command: &str,
+    title: &str,
+    screen: &str,
+    confirm: impl Fn(RuntimeKind) -> bool,
+) -> AgentState {
+    if !in_agent_with(command, title, screen, confirm) {
         return AgentState::Unknown;
     }
     if has_spinner(title) || has_spinner(screen) {
@@ -231,7 +386,11 @@ fn knock_kind(pane: &str, text: &str, kind: SubmitKind) -> anyhow::Result<()> {
         SubmitKind::BracketedPaste => {
             let sequence = WAKE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let buffer = format!("collab-wake-{}-{sequence}", std::process::id());
-            tmux(&paste_submit_args(pane, text, &buffer), "paste-submit", pane)
+            tmux(
+                &paste_submit_args(pane, text, &buffer),
+                "paste-submit",
+                pane,
+            )
         }
     }
 }
@@ -252,8 +411,8 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_state_from, literal_args, paste_args, paste_submit_args, submit_kind,
-        AgentState, SubmitKind,
+        agent_state_from, agent_state_from_with, literal_args, paste_args, paste_submit_args,
+        submit_kind, AgentState, RuntimeKind, SubmitKind,
     };
 
     #[test]
@@ -376,11 +535,14 @@ setInterval(() => {}, 1 << 30);
             &literal_args("%7", "COLLAB_NOTIFY message")[..],
             &["send-keys", "-t", "%7", "-l", "--", "COLLAB_NOTIFY message"][..]
         );
-        let paste_submit =
-            paste_submit_args("%7", "COLLAB_NOTIFY message", "collab-wake-test");
-        assert!(paste_submit.windows(4).any(|w| w == ["paste-buffer", "-p", "-d", "-b"]));
+        let paste_submit = paste_submit_args("%7", "COLLAB_NOTIFY message", "collab-wake-test");
+        assert!(paste_submit
+            .windows(4)
+            .any(|w| w == ["paste-buffer", "-p", "-d", "-b"]));
         assert!(
-            paste_submit.windows(4).any(|w| w == ["send-keys", "-t", "%7", "C-m"]),
+            paste_submit
+                .windows(4)
+                .any(|w| w == ["send-keys", "-t", "%7", "C-m"]),
             "{paste_submit:?}"
         );
         assert!(
@@ -392,10 +554,25 @@ setInterval(() => {}, 1 << 30);
                 "node",
                 "  Cursor Grok 4.6 High Fast · 54.5%\n  /tmp/project · main\n"
             ),
-            SubmitKind::Literal
+            SubmitKind::BracketedPaste
         );
         assert_eq!(submit_kind("agent", ""), SubmitKind::Literal);
         assert_eq!(submit_kind("codex", ""), SubmitKind::BracketedPaste);
+        assert_eq!(
+            submit_kind("node", "  Auto · 10.3%                                                  Run Everything\n  /tmp/zterm ·\n  codex/branch\n"),
+            SubmitKind::Literal
+        );
+        assert_eq!(
+            submit_kind(
+                "node",
+                "› Ask Codex to do anything\n  gpt-5.6-luna high · /Volumes/extension/code/zterm\n"
+            ),
+            SubmitKind::BracketedPaste
+        );
+        assert_eq!(
+            submit_kind("node", "  gpt-5.6-luna high · /tmp/project\n"),
+            SubmitKind::BracketedPaste
+        );
     }
 
     #[test]
@@ -432,7 +609,7 @@ setInterval(() => {}, 1 << 30);
         );
         assert_eq!(
             agent_state_from("node", "Word Counter", "  Run Everything\n"),
-            AgentState::Unknown
+            AgentState::Waiting
         );
         assert_eq!(
             agent_state_from("node", "Word Counter", "  /tmp/cursor-cli-cap · main\n"),
@@ -444,7 +621,7 @@ setInterval(() => {}, 1 << 30);
                 "Word Counter",
                 "  Cursor Grok 4.6 High Fast · 54.5%\n  /tmp/cursor-cli-cap · main\n"
             ),
-            AgentState::Waiting
+            AgentState::Unknown
         );
         assert_eq!(
             agent_state_from(
@@ -459,6 +636,57 @@ setInterval(() => {}, 1 << 30);
                 "node",
                 "Word Counter",
                 "  → Add a follow-up\n  Cursor Grok 4.6 High Fast · 54.5% · 2 files edited          Run Everything\n"
+            ),
+            AgentState::Waiting
+        );
+        assert_eq!(
+            agent_state_from(
+                "node",
+                "AppSDK Subagent Ready",
+                "  → Add a follow-up\n  Auto · 10.3%                                                  Run Everything\n  /Volumes/extension/code/zterm ·\n"
+            ),
+            AgentState::Waiting
+        );
+        assert_eq!(
+            agent_state_from(
+                "node",
+                "zterm",
+                "› Ask Codex to do anything\n  gpt-5.6-luna high · /Volumes/extension/code/zterm      Goal paused (/goal resume)\n"
+            ),
+            AgentState::Waiting
+        );
+        assert_eq!(
+            agent_state_from("node", "zterm", "› Ask Codex to do anything\n"),
+            AgentState::Waiting
+        );
+        assert_eq!(
+            agent_state_from("node", "zterm", "  gpt-5.6-luna high · /tmp/zterm\n"),
+            AgentState::Unknown
+        );
+        assert_eq!(
+            agent_state_from_with(
+                "node",
+                "zterm",
+                "  gpt-5.6-luna high · /tmp/zterm\n",
+                |kind| kind == RuntimeKind::Codex
+            ),
+            AgentState::Waiting
+        );
+        assert_eq!(
+            agent_state_from_with(
+                "node",
+                "zterm",
+                "  gpt-5.6-luna high · /tmp/zterm\n",
+                |_| false
+            ),
+            AgentState::Unknown
+        );
+        assert_eq!(
+            agent_state_from_with(
+                "node",
+                "Word Counter",
+                "  Run Everything\n  gpt-5.6-luna high · /tmp/zterm\n",
+                |_| panic!("Run Everything is already Cursor")
             ),
             AgentState::Waiting
         );

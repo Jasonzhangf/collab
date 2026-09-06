@@ -261,7 +261,11 @@ mod tests {
 
     #[test]
     fn configured_immediate_and_disabled_delivery_are_respected() {
-        for (mode, enabled, expected) in [("immediate", true, true), ("batch", true, false), ("immediate", false, false)] {
+        for (mode, enabled, expected) in [
+            ("immediate", true, true),
+            ("batch", true, false),
+            ("immediate", false, false),
+        ] {
             let (mut server, root) = test_server();
             let config = &mut Arc::get_mut(&mut server).unwrap().config;
             config.notifications.mode = mode.into();
@@ -269,9 +273,24 @@ mod tests {
             register(&server, "owner");
             let sub = subscribe(&server, "owner", "direct-message", None, None);
             let id = bind_message(&server, "owner", &sub);
-            server.state.lock().unwrap().msgs.get_mut(&id).unwrap().created_ms = now_ms();
-            assert_eq!(super::super::attempt_notification_with(&server, &id, &sub, &|_| true, &|_, _| true), expected);
-            assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, if expected { 1 } else { 0 });
+            server
+                .state
+                .lock()
+                .unwrap()
+                .msgs
+                .get_mut(&id)
+                .unwrap()
+                .created_ms = now_ms();
+            assert_eq!(
+                super::super::attempt_notification_with(&server, &id, &sub, &|_| true, &|_, _| {
+                    true
+                }),
+                expected
+            );
+            assert_eq!(
+                server.state.lock().unwrap().msgs[&id].wake_attempt_count,
+                if expected { 1 } else { 0 }
+            );
             std::fs::remove_dir_all(root).unwrap();
         }
     }

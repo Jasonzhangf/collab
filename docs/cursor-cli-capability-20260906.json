@@ -41,7 +41,10 @@
     ],
     "tui_markers_observed": [
       "pane_current_command=node",
-      "three footer markers at 33% each; >50% (two or more) confirms Cursor TUI: Cursor <model>, Run Everything, path · branch",
+      "Run Everything anywhere is Cursor CLI and wins over Codex chrome",
+      "composer Ask Codex to do anything is a strong Codex signal",
+      "footer gpt- is 33% Codex confidence; official `codex login status` then confirms 100%",
+      "Cursor confirmation uses official `agent status --format json` (loggedIn or isAuthenticated)",
       "pane_title is chat name after first turn, not a status word"
     ],
     "spinner_location": "TUI status line braille cells, not pane_title",

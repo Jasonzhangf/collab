@@ -19,6 +19,7 @@
     {"id": "notification-subscription", "kind": "control", "owner": "NotificationSubscription"},
     {"id": "tmux-wake", "kind": "control", "owner": "queue_system_knock"},
     {"id": "agent-context", "kind": "projection", "owner": "handle_context"},
+    {"id": "project-master-authority", "kind": "truth", "owner": "Event::MasterAssigned"},
     {"id": "migration-transaction", "kind": "truth", "owner": "MigrationRecord"}
   ],
   "nodes": [
@@ -31,6 +32,7 @@
     {"id": "subscribed-resource-event", "owner_feature": "notification.subscription"},
     {"id": "tmux-wake-attempt", "owner_feature": "notification.tmux-wake"},
     {"id": "notification-query", "owner_feature": "notification.context"},
+    {"id": "master-authority", "owner_feature": "identity.master-authority"},
     {"id": "migration-freeze-verify", "owner_feature": "migration.peer-v1"}
   ],
   "verification_gates": [

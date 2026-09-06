@@ -2,7 +2,8 @@
 
 | resource_id | unique owner | truth store | allowed operations | forbidden relation |
 |---|---|---|---|---|
-| peer-identity | `identity::load_or_create` + Server registration | journaled `WorkerRec` | bind one tmux session identity to its current pane endpoint | role promotion, inferred master, copied token |
+| peer-identity | `identity::load_or_create` + Server registration | journaled `WorkerRec` | bind one tmux session identity to its current pane endpoint | inferred master from first register, copied token, claiming master from init/register |
+| project-master-authority | live registered master peer through Server | journaled `Event::MasterAssigned` plus live pane check | user-approved self-promote when no live master; live-master delegate to a live pane | implicit first-register promotion, promote while a live master exists, claim from a dead pane, treating Codex/Cursor root as Collab master |
 | task-lifecycle | task owner peer | journaled `TaskRec` | self-register, update, verify, integrate, close own task | central dispatch, another peer mutating lifecycle |
 | resource-claim | task owner peer through Server | active task feature/worktree claim | claim, hold, wait, release; conflict emits durable p2p notice | silent takeover, automatic release, global arbiter |
 | wait-edge | waiter peer + blocking resource owner | `TaskRec.wait` | bounded wait, synchronous conflict result, deadline transition, subscribed release event | cycle, missing responsible peer/deadline/resume path |

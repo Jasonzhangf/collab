@@ -129,7 +129,13 @@ fn pane_capture(pane: &str) -> String {
 
 fn pane_command(pane: &str) -> String {
     let output = Command::new("tmux")
-        .args(["display-message", "-p", "-t", pane, "#{pane_current_command}"])
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{pane_current_command}",
+        ])
         .output()
         .expect("pane command");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -159,7 +165,9 @@ fn set_title(pane: &str, title: &str) {
 }
 
 fn rx_chunks(text: &str) -> Vec<&str> {
-    text.lines().filter_map(|line| line.strip_prefix("RX:")).collect()
+    text.lines()
+        .filter_map(|line| line.strip_prefix("RX:"))
+        .collect()
 }
 
 fn wait_rx(pane: &str, needle_hex: &str) -> String {
@@ -296,7 +304,14 @@ exec node "{rec}"
     harness.sessions.push(cursor_peer.clone());
     wait_pane_command(&cursor_pane, "node");
     set_title(&cursor_pane, "⠋ cursor-rt");
-    let codex = harness.json(&["subagent", "start", "--id", "codex-rt", "--runtime", "codex"]);
+    let codex = harness.json(&[
+        "subagent",
+        "start",
+        "--id",
+        "codex-rt",
+        "--runtime",
+        "codex",
+    ]);
     assert_eq!(codex["subagent"]["runtime"], "codex", "{codex}");
     assert_eq!(codex["subagent"]["status"], "starting", "{codex}");
     let codex_peer = codex["subagent"]["peer"].as_str().unwrap().to_owned();
@@ -316,7 +331,9 @@ exec node "{rec}"
         "cursor probe must not use Codex-style --print\n{fixture_log}"
     );
     assert!(
-        fixture_log.lines().any(|line| line.starts_with("codex exec")),
+        fixture_log
+            .lines()
+            .any(|line| line.starts_with("codex exec")),
         "codex probe must use exec\n{fixture_log}"
     );
     let cursor_ready = harness.json_as(
@@ -357,11 +374,7 @@ exec node "{rec}"
         ],
     );
     assert_eq!(pong["notification"], "sent", "{pong}");
-    let cursor_inbox = harness.json_as(
-        Some(&cursor_pane),
-        Some(&cursor_peer),
-        &["inbox"],
-    );
+    let cursor_inbox = harness.json_as(Some(&cursor_pane), Some(&cursor_peer), &["inbox"]);
     let codex_inbox = harness.json_as(Some(&codex_pane), Some(&codex_peer), &["inbox"]);
     assert!(
         format!("{cursor_inbox}").contains("codex-to-cursor"),

@@ -3,6 +3,7 @@
 | feature_id | owner | entry symbols | required gate |
 |---|---|---|---|
 | identity.peer-register | `identity` + `server` | `load_or_create`, `provision`, `handle_register` | every registration is peer; no first-worker promotion; parent provisions a child pane identity before the agent starts |
+| identity.master-authority | `server` | `handle_master_promote`, `handle_master_delegate`, `handle_master_status`, `live_master_id`, `replay` | no live master: approved self-promote with a live pane; live master: only that master delegates to a live pane; init/register never assign master; dead recorded pane is not a live master; journal `RootAssigned` replays and rewrites as `MasterAssigned`; independent peers may decline a master invite; managed subagents must obey |
 | task.self-lifecycle | task owner peer | `handle_task_register`, `handle_task_update`, `handle_task_deliver`, `handle_task_close` | only owner mutates; full worktree→test→integrate→close lifecycle |
 | resource.p2p-conflict | `server` | `task_conflicts`, `handle_task_wait`, close release projection | task operations return synchronously; exact subscribed release exits waiting and clears edge |
 | wait.liveness | `server` | `handle_task_wait`, `wait_cycle`, `timers::tick` | bounded acyclic wait, responsible blocker owner, deadline state transition without unsolicited message |
@@ -13,6 +14,8 @@
 | migration.peer-v1 | `server` | migration inspect/plan/apply/verify handlers, `replay` | legacy role fields are discarded; snapshot/replay preserves lifecycle |
 | daemon.operator | CLI + `server::run` | `collab down`, `collab up`, `replay` | explicit operator path, one socket writer, no role-derived authority |
 
-Central dispatch, permanent master, transfer-master, master recovery, and
+Central dispatch, transfer-master, master recovery, and
 automatic idle-worker offers have no owner in the target architecture and must
-be physically removed after migration compatibility is covered.
+remain fail-closed. Explicit user-approved master promotion and live-master
+delegation are owned by `identity.master-authority`. Codex/Cursor root is not
+Collab master.

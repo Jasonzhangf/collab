@@ -2,7 +2,8 @@
 
 | feature_id | positive gate | negative gate |
 |---|---|---|
-| identity.peer-register | first and later tmux sessions register as equal peers | no `master` role, promotion, transfer, or inferred authority appears |
+| identity.peer-register | first and later tmux sessions register as equal peers | no inferred `master` from first register, implicit promotion, transfer, or Codex/Cursor root treated as Collab master |
+| identity.master-authority | approved self-promote when no live master exists; live master delegates to a live pane; status reports live master or `recorded_unusable`; journal `RootAssigned` becomes `MasterAssigned` on replay; context marks subagents `must_obey_master` and peers `may_decline_master_invite` | empty approval, dead pane, existing live-master promote, non-master delegate, and init/register-as-master fail closed |
 | task.self-lifecycle | one peer completes register→working→verifying→reviewed→delivered→merged→closed and cleanup | reviewed cannot bypass successful delivery; another peer cannot mutate/close; no central dispatch/offer |
 | task.worktree-cleanup | every worktree-bound task receives a durable cleanup receipt only after exact clean worktree/branch removal and absence verification | merged/closed/cancelled task with a bound worktree, missing receipt, mismatched receipt, existing path, dirty path, unmerged branch, or path escape fails closed |
 | resource.p2p-conflict | conflict returns holder synchronously; subscribed exact release changes waiter to blocked and clears wait | no automatic holder/waiter message; no wake without matching subscription |

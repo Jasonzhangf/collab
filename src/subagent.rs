@@ -180,7 +180,7 @@ fn is_cursor(runtime: &str) -> bool {
 
 fn child_prompt(record: &Record) -> String {
     format!(
-        "You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. Your Collab identity is already registered as this tmux session. Do not self-register, recover a worker, or ask the user to grant identity. First report ready {}. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request.\n\
+        "You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. Your Collab identity is already registered as this tmux session. Do not self-register, recover a worker, or ask the user to grant identity. First report ready {}. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request. Collab master is project arbitration, not Codex/Cursor root; you must follow master and parent direction and may not decline a master collaboration request.\n\
 collab-mcp is the shared Collab MCP for every agent. Use collab_* tools when this session lists them. The collab CLI in this cwd is also valid. If MCP is missing, unsupported, aborted, or unknown, use the CLI. Missing MCP is not a reason to skip ACK, ready, or send.\n\
 CLI: collab subagent ready {}; collab subagent working {}; collab ack <message-id>; collab msg <message-id>; collab inbox; collab sendmessage --to {} --subject <topic> \"<body>\"; collab task relocate <task-id> --worktree ./playground/<slug>.\n\
 Each dispatched message has a canonical task named task-<message-id>. working claims that task; do not register a duplicate. Bind a clean worktree before code edits. ready only means session idle. For a keepalive, ack once with its message ID, then resume work or record a real non-MCP blocker. Never ACK an ACK or request automatic rearm after exhaustion.",
@@ -224,10 +224,7 @@ fn launch_args(
         }
         return Ok(("agent".into(), args));
     }
-    let mut args = vec![
-        "--profile".into(),
-        profile.codex_profile.clone(),
-    ];
+    let mut args = vec!["--profile".into(), profile.codex_profile.clone()];
     if let Some(model) = &profile.model {
         args.extend(["--model".into(), model.clone()]);
     }
@@ -256,6 +253,7 @@ fn launch_args(
         "collab_task_block",
         "collab_task_deliver",
         "collab_task_close",
+        "collab_master",
     ] {
         args.extend([
             "-c".into(),
@@ -314,7 +312,10 @@ fn probe_cursor_status(
     }
     let value: serde_json::Value =
         serde_json::from_str(text.trim()).context("cursor status did not return JSON")?;
-    if value.get("loggedIn") != Some(&json!(true)) {
+    if value.get("loggedIn") != Some(&json!(true))
+        && value.get("isAuthenticated") != Some(&json!(true))
+        && value.get("status") != Some(&json!("authenticated"))
+    {
         bail!("cursor is not logged in");
     }
     Ok(())
@@ -491,13 +492,7 @@ fn launch(
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("collab-mcp")))
         .unwrap_or_else(|| std::path::PathBuf::from("collab-mcp"));
-    let (executable, args) = launch_args(
-        &settings.runtime,
-        profile,
-        &server.root,
-        &prompt,
-        &mcp,
-    )?;
+    let (executable, args) = launch_args(&settings.runtime, profile, &server.root, &prompt, &mcp)?;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let manifest = server
@@ -994,8 +989,10 @@ mod tests {
     }
     #[test]
     fn cursor_probe_uses_official_status_json() {
-        let directory =
-            std::env::temp_dir().join(format!("collab-cursor-probe-{:016x}", rand::random::<u64>()));
+        let directory = std::env::temp_dir().join(format!(
+            "collab-cursor-probe-{:016x}",
+            rand::random::<u64>()
+        ));
         std::fs::create_dir(&directory).unwrap();
         let executable = directory.join("agent-fixture");
         std::fs::write(
@@ -1020,11 +1017,7 @@ mod tests {
         )
         .is_ok());
         let logged_out = directory.join("agent-logged-out");
-        std::fs::write(
-            &logged_out,
-            "#!/bin/sh\nprintf '{\"loggedIn\":false}\\n'\n",
-        )
-        .unwrap();
+        std::fs::write(&logged_out, "#!/bin/sh\nprintf '{\"loggedIn\":false}\\n'\n").unwrap();
         std::fs::set_permissions(&logged_out, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(probe_with(
             &logged_out,
@@ -1046,7 +1039,7 @@ mod tests {
             "cursor",
             &config::Profile {
                 codex_profile: String::new(),
-                model: None
+                model: None,
             },
             &config::Health {
                 timeout_seconds: 1,
@@ -1071,13 +1064,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exe, "agent");
-        assert!(args.windows(2).any(|w| w == ["--workspace", "/tmp/project"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--workspace", "/tmp/project"]));
         for flag in ["--yolo", "--trust", "--approve-mcps"] {
             assert!(args.contains(&flag.to_string()), "{flag}");
         }
         assert!(args.windows(2).any(|w| w == ["--sandbox", "disabled"]));
         assert!(args.windows(2).any(|w| w == ["--model", "test-model"]));
-        assert!(!args.iter().any(|a| a == "--worktree" || a == "persist" || a == "-c"));
+        assert!(!args
+            .iter()
+            .any(|a| a == "--worktree" || a == "persist" || a == "-c"));
         assert_eq!(args.last().unwrap(), "hello");
         let (_, default_args) = launch_args(
             "cursor",
@@ -1104,9 +1101,15 @@ mod tests {
         .unwrap();
         assert_eq!(exe, "codex");
         assert_eq!(args[..2], ["--profile", "oauth"]);
-        assert!(!args.iter().any(|a| a == "danger-full-access" || a == "--ask-for-approval"));
-        assert!(args.iter().any(|a| a.contains("mcp_servers.appsdk-subagent")));
-        assert!(args.iter().any(|a| a.contains("collab_ack") && a.contains("approve")));
+        assert!(!args
+            .iter()
+            .any(|a| a == "danger-full-access" || a == "--ask-for-approval"));
+        assert!(args
+            .iter()
+            .any(|a| a.contains("mcp_servers.appsdk-subagent")));
+        assert!(args
+            .iter()
+            .any(|a| a.contains("collab_ack") && a.contains("approve")));
         assert!(args.last().unwrap().contains("collab CLI"));
         let prompt = child_prompt(&Record {
             id: "child-1".into(),

@@ -28,7 +28,10 @@ enum Cmd {
     #[command(hide = true)]
     SubagentExec { file: std::path::PathBuf },
     /// Managed persistent agent peers (current project only)
-    Subagent { #[command(subcommand)] command: subagent::Action },
+    Subagent {
+        #[command(subcommand)]
+        command: subagent::Action,
+    },
     /// Show the effective policy from ~/.appsdk/config.toml
     Config,
     /// Create .agent-collab skeleton in the current directory
@@ -46,12 +49,16 @@ enum Cmd {
     Role,
     /// List registered peers and their local activity projection
     Who,
-    /// Inspect or explicitly assign project root authority
-    Root { #[command(subcommand)] command: RootCmd },
-    /// Deprecated: permanent master role was removed
+    /// Inspect or explicitly assign collab master authority
     Master {
         #[command(subcommand)]
-        cmd: Option<MasterCmd>,
+        command: MasterCmd,
+    },
+    /// Hidden alias: previous collab root commands are collab master
+    #[command(hide = true)]
+    Root {
+        #[command(subcommand)]
+        command: MasterCmd,
     },
     /// Refresh this worker's tmux pane/session registration
     Worker {
@@ -234,18 +241,17 @@ enum TaskCmd {
 
 #[derive(Subcommand)]
 enum MasterCmd {
+    /// Promote this peer when no live master exists; requires the user's approval text
+    Promote {
+        #[arg(long)]
+        approval: String,
+    },
+    /// Delegate master authority to another registered peer (live master only)
+    Delegate { target: String },
+    /// Show the current live master, if any
+    Status,
     /// Deprecated: permanent master recovery was removed
     Recover,
-}
-
-#[derive(Subcommand)]
-enum RootCmd {
-    /// Promote this peer when no root exists; requires the user's approval text
-    Promote { #[arg(long)] approval: String },
-    /// Delegate root authority to another registered peer (root only)
-    Delegate { target: String },
-    /// Show the current root, if any
-    Status,
 }
 
 #[derive(Subcommand)]
@@ -303,7 +309,7 @@ fn main() {
 
 fn run(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
-        Cmd::SubagentExec {file} => subagent::exec_launch(&file),
+        Cmd::SubagentExec { file } => subagent::exec_launch(&file),
         Cmd::Config => {
             crate::config::ensure_written()?;
             out(&crate::config::load(&scope::project_root()?)?);
@@ -315,18 +321,35 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let query = match &command {
                     subagent::Action::List => Some((None, None)),
                     subagent::Action::Status { id } => Some((Some(id.clone()), None)),
-                    subagent::Action::Snapshot { id, lines } => Some((Some(id.clone()), Some(*lines))),
+                    subagent::Action::Snapshot { id, lines } => {
+                        Some((Some(id.clone()), Some(*lines)))
+                    }
                     _ => None,
                 };
                 if let Some((id, snapshot_lines)) = query {
-                    let value: serde_json::Value = client::call(&scope.sock_path(), &Req::SubagentObserve { id, snapshot_lines })?;
+                    let value: serde_json::Value = client::call(
+                        &scope.sock_path(),
+                        &Req::SubagentObserve { id, snapshot_lines },
+                    )?;
                     out(&value);
                     return Ok(());
                 }
             }
             let ident = me(&scope, None)?;
-            let launch_env = if matches!(command, subagent::Action::Start {..}) { std::env::vars().collect() } else { Default::default() };
-            let value: serde_json::Value = client::call(&scope.sock_path(), &Req::Subagent { worker_id: ident.worker_id, token: ident.token, command, launch_env })?;
+            let launch_env = if matches!(command, subagent::Action::Start { .. }) {
+                std::env::vars().collect()
+            } else {
+                Default::default()
+            };
+            let value: serde_json::Value = client::call(
+                &scope.sock_path(),
+                &Req::Subagent {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    command,
+                    launch_env,
+                },
+            )?;
             out(&value);
             Ok(())
         }
@@ -464,34 +487,35 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&v);
             Ok(())
         }
-        Cmd::Root { command } => {
+        Cmd::Root { command } | Cmd::Master { command } => {
             let scope = Scope::resolve()?;
             let req = match command {
-                RootCmd::Promote { approval } => {
+                MasterCmd::Recover => {
+                    anyhow::bail!(
+                        "collab master recover is deprecated; use collab master promote or delegate"
+                    )
+                }
+                MasterCmd::Promote { approval } => {
                     let ident = me(&scope, None)?;
-                    Req::RootPromote {
+                    Req::MasterPromote {
                         worker_id: ident.worker_id,
                         token: ident.token,
                         approval,
                     }
                 }
-                RootCmd::Delegate { target } => {
+                MasterCmd::Delegate { target } => {
                     let ident = me(&scope, None)?;
-                    Req::RootDelegate {
+                    Req::MasterDelegate {
                         worker_id: ident.worker_id,
                         token: ident.token,
                         target_id: target,
                     }
                 }
-                RootCmd::Status => Req::RootStatus,
+                MasterCmd::Status => Req::MasterStatus,
             };
             let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
             out(&v);
             Ok(())
-        }
-        Cmd::Master { cmd } => {
-            let _ = cmd;
-            anyhow::bail!("collab master is deprecated; all registered identities are peers")
         }
         Cmd::Worker {
             cmd: WorkerCmd::Recover,
@@ -510,7 +534,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::TransferMaster { target } => {
             let _ = target;
-            anyhow::bail!("collab transfer-master is deprecated; peer authority is task-scoped")
+            anyhow::bail!("collab transfer-master is deprecated; use collab master delegate")
         }
         Cmd::RemoveWorker { target, force } => {
             let _ = (target, force);
