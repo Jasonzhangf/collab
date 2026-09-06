@@ -160,7 +160,7 @@ pub struct Health {
 impl Default for Health {
     fn default() -> Self {
         Self {
-            timeout_seconds: 45,
+            timeout_seconds: 90,
             attempts_per_profile: 1,
             expected_response: "OK".into(),
         }
@@ -291,10 +291,10 @@ impl Config {
             bail!("subagents currently require persistent=true and close_on_task_complete=false");
         }
         if s.health.attempts_per_profile != 1
-            || !(1..=60).contains(&s.health.timeout_seconds)
+            || !(1..=180).contains(&s.health.timeout_seconds)
             || s.health.expected_response.trim().is_empty()
         {
-            bail!("health probe requires one attempt per profile and timeout 1..60s");
+            bail!("health probe requires one attempt per profile and timeout 1..180s");
         }
         if !(1..=600).contains(&s.startup.ready_timeout_seconds)
             || !s.tmux.name_template.contains("{short_id}")
@@ -367,6 +367,7 @@ mod tests {
     fn legacy_defaults_and_project_override() {
         let c = parse("", Path::new("/project")).unwrap();
         assert_eq!(c.subagent.runtime, "cursor");
+        assert_eq!(c.subagent.health.timeout_seconds, 90);
         assert_eq!(c.notifications.delay_ms("direct-message"), 60000);
         assert_eq!(c.notifications.delay_ms("deadline"), 0);
         let c = parse("[[projects]]\nroot='/project'\n[projects.notifications]\nmode='immediate'\n[projects.subagent]\nprofile_priority=['oauth']", Path::new("/project")).unwrap();

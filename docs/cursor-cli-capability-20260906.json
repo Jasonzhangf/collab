@@ -13,7 +13,7 @@
     "stdout": "OK",
     "exit": 0,
     "elapsed_s": 16.86,
-    "fits_current_timeout_s": 45
+    "fits_current_timeout_s": 90
   },
   "tmux_interactive": {
     "session_name": "cursor-cli-cap-20260906",
