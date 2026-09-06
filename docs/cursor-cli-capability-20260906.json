@@ -1,0 +1,77 @@
+{
+  "date": "2026-09-06",
+  "worktree": "/Volumes/extension/code/collab/playground/cursor-cli-subagent-20260906",
+  "base": "e07fa5a3f16ff878792cbf663f85b9cf3c5d8682",
+  "runtime": {
+    "executable": "/Users/fanzhang/.local/bin/agent",
+    "version": "2026.09.02-c22c1a3",
+    "interactive_argv": ["--yolo", "--trust", "--approve-mcps", "--workspace", "<cwd>"],
+    "probe_argv": ["--print", "--mode", "ask", "--trust", "--output-format", "text", "--workspace", "<probe-dir>"]
+  },
+  "health_probe": {
+    "prompt": "Connectivity probe only. Do not use tools or read files. Reply exactly: OK",
+    "stdout": "OK",
+    "exit": 0,
+    "elapsed_s": 16.86,
+    "fits_current_timeout_s": 45
+  },
+  "tmux_interactive": {
+    "session_name": "cursor-cli-cap-20260906",
+    "session_id": "$742",
+    "pane_id": "%749",
+    "pane_current_command": "node",
+    "title_idle_initial": "Cursor Agent",
+    "title_after_first_turn": "Word Counter",
+    "title_never_contains_status_words": true,
+    "snapshot": "tmux capture-pane works idle and busy; binding is session_id + session_name"
+  },
+  "status_line": {
+    "location": "screen, not pane_title",
+    "observed": ["Working", "Thinking  24 tokens", "Running  146 tokens"],
+    "user_reported": ["Thinking", "Running", "Working", "Updating"],
+    "note": "status words are labels only; they are not the idle/working signal"
+  },
+  "observation_rule": {
+    "owner": "knock agent-state, not task truth",
+    "applies_to": ["codex", "cursor", "other known agents"],
+    "steps": [
+      "pane gone: absent",
+      "gate: pane is inside a known agent TUI (codex process, cursor chrome, or other declared agents)",
+      "if not in an agent: unknown, never idle",
+      "if in agent and spinner present or successive frames change: working",
+      "if in agent and no change: idle"
+    ],
+    "tui_markers_observed": [
+      "pane_current_command=node",
+      "three footer markers at 33% each; >50% (two or more) confirms Cursor TUI: Cursor <model>, Run Everything, path · branch",
+      "pane_title is chat name after first turn, not a status word"
+    ],
+    "spinner_location": "TUI status line braille cells, not pane_title",
+    "idle_signal": "in TUI and successive captures do not change",
+    "rejected": "match Thinking|Running|Working|Updating anywhere on screen"
+  },
+  "permissions": {
+    "layers": [
+      "workspace trust: --trust (else prompt; store is ~/.cursor/projects/<slug>/.workspace-trusted)",
+      "MCP server load: --approve-mcps (else needs ~/.cursor/projects/<slug>/mcp-approvals.json)",
+      "tool execution: --yolo (else MCP tool call is denied even if server loaded)"
+    ],
+    "evidence": {
+      "yolo_trust_approve_mcps_fresh_dir": "MCP=ok, no prior enable",
+      "yolo_trust_without_approve_mcps": "MCP=missing, server not loaded",
+      "trust_approve_mcps_without_yolo": "MCP=denied, tool call rejected",
+      "mcp_enable_on_git_root": "worktree of same repo still needs approval",
+      "interactive_tui_with_three_flags": "collab_whoami executed; fail was missing .agent-collab, not permission"
+    },
+    "do_not_rely_on": [
+      "agent mcp enable (per workspace path, not inherited by playground worktrees)",
+      "rewriting ~/.cursor/mcp.json",
+      "launch-time MCP injection"
+    ],
+    "required_project_config": ".cursor/mcp.json mcpServers.collab -> collab-mcp"
+  },
+  "knock_gap": {
+    "current_rule": "known process + pane_title braille => working, else waiting",
+    "cursor_result": "title stays a chat name, so current rule would call a live TUI idle even while the spinner is moving"
+  }
+}

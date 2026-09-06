@@ -105,6 +105,7 @@ impl Default for Timers {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Subagent {
+    pub runtime: String,
     pub profile_priority: Vec<String>,
     pub persistent: bool,
     pub close_on_task_complete: bool,
@@ -116,6 +117,7 @@ pub struct Subagent {
 impl Default for Subagent {
     fn default() -> Self {
         Self {
+            runtime: "cursor".into(),
             profile_priority: vec!["gcm".into(), "oauth".into()],
             persistent: true,
             close_on_task_complete: false,
@@ -144,6 +146,7 @@ impl Default for Subagent {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    #[serde(default)]
     pub codex_profile: String,
     pub model: Option<String>,
 }
@@ -298,6 +301,9 @@ impl Config {
         {
             bail!("invalid startup timeout or tmux name template");
         }
+        if !matches!(s.runtime.as_str(), "cursor" | "codex") {
+            bail!("subagent.runtime must be cursor or codex");
+        }
         if s.profile_priority.is_empty() || s.profile_priority.len() > 4 {
             bail!("configure 1..4 profiles");
         }
@@ -307,9 +313,11 @@ impl Config {
                 .profiles
                 .get(name)
                 .context("profile_priority names an undefined profile")?;
-            if !seen.insert(name)
-                || p.codex_profile.trim().is_empty()
-                || p.codex_profile.starts_with('-')
+            if !seen.insert(name) {
+                bail!("invalid or duplicate profile");
+            }
+            if s.runtime == "codex"
+                && (p.codex_profile.trim().is_empty() || p.codex_profile.starts_with('-'))
             {
                 bail!("invalid or duplicate profile");
             }
@@ -358,6 +366,7 @@ mod tests {
     #[test]
     fn legacy_defaults_and_project_override() {
         let c = parse("", Path::new("/project")).unwrap();
+        assert_eq!(c.subagent.runtime, "cursor");
         assert_eq!(c.notifications.delay_ms("direct-message"), 60000);
         assert_eq!(c.notifications.delay_ms("deadline"), 0);
         let c = parse("[[projects]]\nroot='/project'\n[projects.notifications]\nmode='immediate'\n[projects.subagent]\nprofile_priority=['oauth']", Path::new("/project")).unwrap();
@@ -375,6 +384,7 @@ mod tests {
             "[subagent.health]\nattempts_per_profile=99",
             "[notifications]\nmode='typo'",
             "[timers]\ntick_interval_ms=0",
+            "[subagent]\nruntime='claude'",
         ] {
             assert!(parse(s, Path::new("/project")).is_err());
         }

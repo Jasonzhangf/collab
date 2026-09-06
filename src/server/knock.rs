@@ -35,27 +35,25 @@ pub fn probe_agent_state(pane: &str) -> AgentState {
     if !pane.starts_with('%') {
         return AgentState::Absent;
     }
-    Command::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            pane,
-            "#{pane_current_command}\t#{pane_title}",
-        ])
-        .output()
-        .ok()
-        .map(|o| {
-            if !o.status.success() {
-                return AgentState::Absent;
-            }
-            let output = String::from_utf8_lossy(&o.stdout);
-            let Some((command, title)) = output.trim().split_once('\t') else {
-                return AgentState::Unknown;
-            };
-            agent_state_from(command, title)
-        })
-        .unwrap_or(AgentState::Unknown)
+    let Some((command, title, screen)) = pane_view(pane) else {
+        return AgentState::Absent;
+    };
+    let first = agent_state_from(&command, &title, &screen);
+    if first != AgentState::Waiting {
+        return first;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let Some((command2, title2, screen2)) = pane_view(pane) else {
+        return AgentState::Absent;
+    };
+    if agent_state_from(&command2, &title2, &screen2) == AgentState::Working
+        || title2 != title
+        || screen2 != screen
+    {
+        AgentState::Working
+    } else {
+        AgentState::Waiting
+    }
 }
 
 pub fn pane_idle(pane: &str) -> bool {
@@ -69,19 +67,92 @@ pub fn pane_accepts_notification(pane: &str) -> bool {
     )
 }
 
-fn agent_state_from(command: &str, title: &str) -> AgentState {
-    if !matches!(command, "node" | "codex" | "claude" | "agy" | "dsh") {
-        return AgentState::Absent;
+fn pane_view(pane: &str) -> Option<(String, String, String)> {
+    let identity = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{pane_current_command}\t#{pane_title}",
+        ])
+        .output()
+        .ok()?;
+    if !identity.status.success() {
+        return None;
     }
-    let title = title.trim();
-    if title.is_empty() {
+    let output = String::from_utf8_lossy(&identity.stdout);
+    let (command, title) = output.trim().split_once('\t')?;
+    let screen = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", pane, "-S", "-40"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    Some((command.to_string(), title.to_string(), screen))
+}
+
+fn has_spinner(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim_start()
+            .chars()
+            .next()
+            .is_some_and(|first| ('\u{2800}'..='\u{28ff}').contains(&first))
+    })
+}
+
+fn cursor_model_line(screen: &str) -> bool {
+    screen.lines().any(|line| {
+        let Some(rest) = line.trim().strip_prefix("Cursor ") else {
+            return false;
+        };
+        let model = rest
+            .split('·')
+            .next()
+            .unwrap_or(rest)
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        !model.is_empty() && model != "Agent"
+    })
+}
+
+fn cursor_workspace_line(screen: &str) -> bool {
+    screen
+        .lines()
+        .any(|line| line.trim().starts_with('/') && line.contains(" · "))
+}
+
+fn cursor_tui_confidence(screen: &str) -> u8 {
+    let mut hits = 0u8;
+    if cursor_model_line(screen) {
+        hits += 1;
+    }
+    if screen.contains("Run Everything") {
+        hits += 1;
+    }
+    if cursor_workspace_line(screen) {
+        hits += 1;
+    }
+    hits.saturating_mul(33)
+}
+
+fn in_cursor_tui(screen: &str) -> bool {
+    cursor_tui_confidence(screen) > 50
+}
+
+fn in_agent(command: &str, title: &str, screen: &str) -> bool {
+    matches!(command, "codex" | "claude" | "agy" | "dsh")
+        || ((matches!(command, "node" | "agent" | "cursor-agent"))
+            && (in_cursor_tui(screen) || has_spinner(title)))
+}
+
+fn agent_state_from(command: &str, title: &str, screen: &str) -> AgentState {
+    if !in_agent(command, title, screen) {
         return AgentState::Unknown;
     }
-    if title
-        .chars()
-        .next()
-        .is_some_and(|first| ('\u{2800}'..='\u{28ff}').contains(&first))
-    {
+    if has_spinner(title) || has_spinner(screen) {
         AgentState::Working
     } else {
         AgentState::Waiting
@@ -206,17 +277,68 @@ mod tests {
     }
 
     #[test]
-    fn probe_distinguishes_absent_unknown_working_and_waiting() {
+    fn probe_requires_agent_tui_before_idle_or_working() {
         assert_eq!(
-            agent_state_from("zsh", "Macstudio.local"),
-            AgentState::Absent
+            agent_state_from("zsh", "Macstudio.local", ""),
+            AgentState::Unknown
         );
-        assert_eq!(agent_state_from("node", ""), AgentState::Unknown);
+        assert_eq!(agent_state_from("node", "", ""), AgentState::Unknown);
         assert_eq!(
-            agent_state_from("node", "⠋ routecodex"),
+            agent_state_from("node", "Word Counter", ""),
+            AgentState::Unknown
+        );
+        assert_eq!(
+            agent_state_from("node", "⠋ routecodex", ""),
             AgentState::Working
         );
-        assert_eq!(agent_state_from("codex", "collab"), AgentState::Waiting);
+        assert_eq!(
+            agent_state_from("codex", "collab", ""),
+            AgentState::Waiting
+        );
+        assert_eq!(
+            agent_state_from("codex", "⠋ collab", ""),
+            AgentState::Working
+        );
+        assert_eq!(
+            agent_state_from("node", "Cursor Agent", ""),
+            AgentState::Unknown
+        );
+        assert_eq!(
+            agent_state_from("node", "Word Counter", "  Cursor Grok 4.6 High Fast · 54.5%\n"),
+            AgentState::Unknown
+        );
+        assert_eq!(
+            agent_state_from("node", "Word Counter", "  Run Everything\n"),
+            AgentState::Unknown
+        );
+        assert_eq!(
+            agent_state_from("node", "Word Counter", "  /tmp/cursor-cli-cap · main\n"),
+            AgentState::Unknown
+        );
+        assert_eq!(
+            agent_state_from(
+                "node",
+                "Word Counter",
+                "  Cursor Grok 4.6 High Fast · 54.5%\n  /tmp/cursor-cli-cap · main\n"
+            ),
+            AgentState::Waiting
+        );
+        assert_eq!(
+            agent_state_from(
+                "node",
+                "Word Counter",
+                " ⠘⠆ Working\n  Cursor Grok 4.6 High Fast · 54.5% · 2 files edited          Run Everything\n"
+            ),
+            AgentState::Working
+        );
+        assert_eq!(
+            agent_state_from(
+                "node",
+                "Word Counter",
+                "  → Add a follow-up\n  Cursor Grok 4.6 High Fast · 54.5% · 2 files edited          Run Everything\n"
+            ),
+            AgentState::Waiting
+        );
     }
 }
 

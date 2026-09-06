@@ -27,7 +27,7 @@ struct Cli {
 enum Cmd {
     #[command(hide = true)]
     SubagentExec { file: std::path::PathBuf },
-    /// Managed persistent Codex peers (current project only)
+    /// Managed persistent agent peers (current project only)
     Subagent { #[command(subcommand)] command: subagent::Action },
     /// Show the effective policy from ~/.appsdk/config.toml
     Config,

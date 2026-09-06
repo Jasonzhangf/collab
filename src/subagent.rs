@@ -145,8 +145,48 @@ fn valid_id(id: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
+fn is_cursor(runtime: &str) -> bool {
+    runtime == "cursor"
+}
+
+fn child_prompt(record: &Record) -> String {
+    format!("You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. First initialize Collab in this inherited project cwd, then report ready {}. Do not claim ready until registration succeeds. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request.\nUse the preconfigured collab MCP if it is available; otherwise use the collab CLI. Do not expect a launch-injected appsdk-subagent MCP. First collab init, then collab subagent ready id={}. Accept a task using working. Read messages using collab msg or collab inbox. Each dispatched message has a canonical task named task-<message-id>. working claims that task; do not register a duplicate task. Before code edits bind its clean worktree with collab task relocate. Finish its real task lifecycle before claiming task completion; ready only means session idle and does not complete tasks. For a keepalive notice, ack once with its message ID, then resume actionable work or record the real blocker. Never ACK an ACK or request automatic rearm after exhaustion.", record.id, record.parent, record.id, record.id, record.parent, record.id, record.id)
+}
+
+fn launch_args(
+    runtime: &str,
+    profile: &config::Profile,
+    workspace: &std::path::Path,
+    prompt: &str,
+) -> Result<(String, Vec<String>)> {
+    if is_cursor(runtime) {
+        let mut args = vec![
+            "--yolo".into(),
+            "--trust".into(),
+            "--approve-mcps".into(),
+            "--workspace".into(),
+            workspace.to_string_lossy().into_owned(),
+        ];
+        if let Some(model) = &profile.model {
+            args.extend(["--model".into(), model.clone()]);
+        }
+        args.push(prompt.into());
+        if args.iter().any(|a| a == "--worktree" || a == "persist") {
+            bail!("cursor launch must not use persist or --worktree");
+        }
+        return Ok(("agent".into(), args));
+    }
+    let mut args = vec!["--profile".into(), profile.codex_profile.clone()];
+    if let Some(model) = &profile.model {
+        args.extend(["--model".into(), model.clone()]);
+    }
+    args.push(prompt.into());
+    Ok(("codex".into(), args))
+}
+
 fn probe_with(
     executable: &std::path::Path,
+    runtime: &str,
     profile: &config::Profile,
     settings: &config::Health,
     environment: &std::collections::BTreeMap<String, String>,
@@ -156,44 +196,71 @@ fn probe_with(
     std::fs::create_dir(&directory)?;
     let result = (|| {
         let output = directory.join("result.txt");
+        let prompt = format!(
+            "Connectivity probe only. Do not use tools or read files. Reply exactly: {}",
+            settings.expected_response
+        );
         let mut command = Command::new(executable);
         command.env_clear().envs(environment);
+        if is_cursor(runtime) {
+            command.args([
+                "--print",
+                "--mode",
+                "ask",
+                "--trust",
+                "--output-format",
+                "text",
+                "--workspace",
+            ]);
+            command.arg(&directory).arg(&prompt);
+            command.stdout(Stdio::piped());
+        } else {
+            command
+                .args([
+                    "exec",
+                    "--profile",
+                    &profile.codex_profile,
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    "--sandbox",
+                    "read-only",
+                    "--output-last-message",
+                ])
+                .arg(&output)
+                .arg(&prompt);
+            if let Some(model) = &profile.model {
+                command.args(["--model", model]);
+            }
+            command.stdout(Stdio::null());
+        }
         command
-            .args([
-                "exec",
-                "--profile",
-                &profile.codex_profile,
-                "--ephemeral",
-                "--skip-git-repo-check",
-                "--sandbox",
-                "read-only",
-                "--output-last-message",
-            ])
-            .arg(&output)
-            .arg(format!(
-                "Connectivity probe only. Do not use tools or read files. Reply exactly: {}",
-                settings.expected_response
-            ))
             .current_dir(&directory)
             .env_remove("TMUX_PANE")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(model) = &profile.model {
-            command.args(["--model", model]);
-        }
         use std::os::unix::process::CommandExt;
         command.process_group(0);
-        let mut child = command.spawn().context("cannot start codex health probe")?;
+        let mut child = command.spawn().context("cannot start health probe")?;
         let started = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
                 if !status.success() {
                     bail!("probe exited {status}");
                 }
-                let body = std::fs::read_to_string(output)?;
+                let body = if is_cursor(runtime) {
+                    let mut text = String::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        std::io::Read::read_to_string(&mut stdout, &mut text)?;
+                    }
+                    text
+                } else {
+                    std::fs::read_to_string(output)?
+                };
                 if body.trim() != settings.expected_response {
-                    bail!("probe response did not match expected response");
+                    bail!(
+                        "probe response did not match expected response: {:?}",
+                        body.trim()
+                    );
                 }
                 return Ok(());
             }
@@ -242,6 +309,7 @@ fn notify(
 }
 #[derive(Serialize, Deserialize)]
 struct LaunchSpec {
+    executable: String,
     args: Vec<String>,
     env: std::collections::BTreeMap<String, String>,
 }
@@ -254,7 +322,10 @@ pub fn exec_launch(file: &std::path::Path) -> Result<()> {
     }
     let spec: LaunchSpec = serde_json::from_slice(&std::fs::read(file)?)?;
     std::fs::remove_file(file)?;
-    let mut command = Command::new("codex");
+    if spec.executable.is_empty() || spec.executable.starts_with('-') {
+        bail!("unsafe launch executable");
+    }
+    let mut command = Command::new(&spec.executable);
     command.env_clear().envs(spec.env).args(spec.args);
     for key in [
         "TMUX",
@@ -278,10 +349,26 @@ fn launch(
     environment: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     let mut errors = Vec::new();
-    for name in &settings.profile_priority {
+    let executable = if is_cursor(&settings.runtime) {
+        std::path::Path::new("agent")
+    } else {
+        std::path::Path::new("codex")
+    };
+    let names: Vec<String> = if is_cursor(&settings.runtime) {
+        settings
+            .profile_priority
+            .first()
+            .cloned()
+            .into_iter()
+            .collect()
+    } else {
+        settings.profile_priority.clone()
+    };
+    for name in &names {
         let profile = &settings.profiles[name];
         match probe_with(
-            std::path::Path::new("codex"),
+            executable,
+            &settings.runtime,
             profile,
             &settings.health,
             &environment,
@@ -298,50 +385,8 @@ fn launch(
         .profile
         .as_ref()
         .context(format!("no healthy profile: {}", errors.join("; ")))?;
-    let prompt = format!("You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. First run collab init in this inherited project cwd, then collab subagent ready {}. Do not claim ready until registration succeeds. Wait quietly for Collab messages. When assigned a task, read it with collab msg, run collab subagent working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task run collab subagent ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request.", record.id, record.parent, record.id, record.id, record.parent, record.id);
-    let mut args = vec!["--profile".to_string(), profile.codex_profile.clone()];
-    if let Some(model) = &profile.model {
-        args.extend(["--model".into(), model.clone()]);
-    }
-    let mcp = std::env::current_exe()?.with_file_name("collab-mcp");
-    if !mcp.is_file() {
-        bail!("collab-mcp is missing beside the managed collab executable");
-    }
-    args.extend([
-        "-c".into(),
-        format!(
-            "mcp_servers.appsdk-subagent.command={}",
-            serde_json::to_string(&mcp.to_string_lossy())?
-        ),
-        "-c".into(),
-        "mcp_servers.appsdk-subagent.env_vars=[\"TMUX\",\"TMUX_PANE\",\"PATH\",\"HOME\"]".into(),
-    ]);
-    // This managed bridge may perform the explicitly authorized peer/task
-    // lifecycle without repeated prompts. Other MCP servers retain user policy.
-    for tool in [
-        "collab_init",
-        "collab_subagent",
-        "collab_msg",
-        "collab_inbox",
-        "collab_ack",
-        "collab_context",
-        "collab_sendmessage",
-        "collab_notify_status",
-        "collab_task_status",
-        "collab_task_register",
-        "collab_task_relocate",
-        "collab_task_update",
-        "collab_task_block",
-        "collab_task_deliver",
-        "collab_task_close",
-    ] {
-        args.extend([
-            "-c".into(),
-            format!("mcp_servers.appsdk-subagent.tools.{tool}.approval_mode=\"approve\""),
-        ]);
-    }
-    args.push(format!("{prompt}\nUse the appsdk-subagent MCP server for Collab operations, NOT sandboxed shell commands. First call collab_init, then collab_subagent with action=ready and id={}. Accept a task using action=working. Read messages using collab_msg or collab_inbox. These MCP operations inherit the live tmux environment and do not require shell access to its socket.", record.id));
-    args.last_mut().unwrap().push_str(" Each dispatched message has a canonical task named task-<message-id>. action=working claims that task; do not register a duplicate task. Before code edits bind its clean worktree with collab_task_relocate. Finish its real task lifecycle before claiming task completion; ready only means session idle and does not complete tasks. For a keepalive notice, call collab_ack once with its message ID, then resume actionable work or record the real blocker. Never ACK an ACK or request automatic rearm after exhaustion.");
+    let prompt = child_prompt(record);
+    let (executable, args) = launch_args(&settings.runtime, profile, &server.root, &prompt)?;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let manifest = server
@@ -357,6 +402,7 @@ fn launch(
     environment.remove("TMUX");
     environment.remove("TMUX_PANE");
     file.write_all(&serde_json::to_vec(&LaunchSpec {
+        executable,
         args,
         env: environment,
     })?)?;
@@ -775,6 +821,7 @@ mod tests {
             assert_eq!(
                 probe_with(
                     &executable,
+                    "codex",
                     &config::Profile {
                         codex_profile: name.into(),
                         model: None
@@ -787,6 +834,65 @@ mod tests {
             );
             assert!(start.elapsed() < Duration::from_secs(3));
         }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn cursor_probe_reads_stdout_and_launch_uses_session_flags() {
+        let directory =
+            std::env::temp_dir().join(format!("collab-cursor-probe-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("agent-fixture");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'OK\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let settings = config::Health {
+            timeout_seconds: 2,
+            ..Default::default()
+        };
+        assert!(probe_with(
+            &executable,
+            "cursor",
+            &config::Profile {
+                codex_profile: String::new(),
+                model: None
+            },
+            &settings,
+            &std::env::vars().collect()
+        )
+        .is_ok());
+        let (exe, args) = launch_args(
+            "cursor",
+            &config::Profile {
+                codex_profile: String::new(),
+                model: Some("test-model".into()),
+            },
+            std::path::Path::new("/tmp/project"),
+            "hello",
+        )
+        .unwrap();
+        assert_eq!(exe, "agent");
+        assert!(args.windows(2).any(|w| w == ["--workspace", "/tmp/project"]));
+        for flag in ["--yolo", "--trust", "--approve-mcps"] {
+            assert!(args.contains(&flag.to_string()), "{flag}");
+        }
+        assert!(!args.iter().any(|a| a == "--worktree" || a == "persist" || a == "-c"));
+        assert_eq!(args.last().unwrap(), "hello");
+        let (exe, args) = launch_args(
+            "codex",
+            &config::Profile {
+                codex_profile: "oauth".into(),
+                model: None,
+            },
+            std::path::Path::new("/tmp/project"),
+            "hello",
+        )
+        .unwrap();
+        assert_eq!(exe, "codex");
+        assert_eq!(args[..2], ["--profile", "oauth"]);
+        assert!(!args.iter().any(|a| a.contains("mcp_servers")));
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
