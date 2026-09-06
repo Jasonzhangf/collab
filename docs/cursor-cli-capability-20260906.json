@@ -68,7 +68,7 @@
       "rewriting ~/.cursor/mcp.json",
       "launch-time MCP injection"
     ],
-    "required_project_config": ".cursor/mcp.json mcpServers.collab -> collab-mcp"
+    "required_project_config": "project .cursor/mcp.json and .mcp.json mcpServers.collab -> absolute collab-mcp; collab-mcp speaks Content-Length and newline JSON-RPC"
   },
   "knock_gap": {
     "current_rule": "known process + pane_title braille => working, else waiting",

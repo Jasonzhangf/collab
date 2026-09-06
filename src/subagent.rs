@@ -150,7 +150,21 @@ fn is_cursor(runtime: &str) -> bool {
 }
 
 fn child_prompt(record: &Record) -> String {
-    format!("You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. First initialize Collab in this inherited project cwd, then report ready {}. Do not claim ready until registration succeeds. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request.\nUse the preconfigured collab MCP if it is available; otherwise use the collab CLI. Do not expect a launch-injected appsdk-subagent MCP. First collab init, then collab subagent ready id={}. Accept a task using working. Read messages using collab msg or collab inbox. Each dispatched message has a canonical task named task-<message-id>. working claims that task; do not register a duplicate task. Before code edits bind its clean worktree with collab task relocate. Finish its real task lifecycle before claiming task completion; ready only means session idle and does not complete tasks. For a keepalive notice, ack once with its message ID, then resume actionable work or record the real blocker. Never ACK an ACK or request automatic rearm after exhaustion.", record.id, record.parent, record.id, record.id, record.parent, record.id, record.id)
+    format!(
+        "You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. Your Collab identity is already registered as this tmux session. Do not self-register, recover a worker, or ask the user to grant identity. First report ready {}. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request.\n\
+collab-mcp is the shared Collab MCP for every agent. Use collab_* tools when this session lists them. The collab CLI in this cwd is also valid. If MCP is missing, unsupported, aborted, or unknown, use the CLI. Missing MCP is not a reason to skip ACK, ready, or send.\n\
+CLI: collab subagent ready {}; collab subagent working {}; collab ack <message-id>; collab msg <message-id>; collab inbox; collab sendmessage --to {} --subject <topic> \"<body>\"; collab task relocate <task-id> --worktree ./playground/<slug>.\n\
+Each dispatched message has a canonical task named task-<message-id>. working claims that task; do not register a duplicate. Bind a clean worktree before code edits. ready only means session idle. For a keepalive, ack once with its message ID, then resume work or record a real non-MCP blocker. Never ACK an ACK or request automatic rearm after exhaustion.",
+        record.id,
+        record.parent,
+        record.id,
+        record.id,
+        record.parent,
+        record.id,
+        record.id,
+        record.id,
+        record.parent
+    )
 }
 
 fn launch_args(
@@ -158,12 +172,15 @@ fn launch_args(
     profile: &config::Profile,
     workspace: &std::path::Path,
     prompt: &str,
+    mcp: &std::path::Path,
 ) -> Result<(String, Vec<String>)> {
     if is_cursor(runtime) {
         let mut args = vec![
             "--yolo".into(),
             "--trust".into(),
             "--approve-mcps".into(),
+            "--sandbox".into(),
+            "disabled".into(),
             "--workspace".into(),
             workspace.to_string_lossy().into_owned(),
         ];
@@ -176,11 +193,51 @@ fn launch_args(
         }
         return Ok(("agent".into(), args));
     }
-    let mut args = vec!["--profile".into(), profile.codex_profile.clone()];
+    let mut args = vec![
+        "--profile".into(),
+        profile.codex_profile.clone(),
+        "--sandbox".into(),
+        "danger-full-access".into(),
+        "--ask-for-approval".into(),
+        "never".into(),
+    ];
     if let Some(model) = &profile.model {
         args.extend(["--model".into(), model.clone()]);
     }
-    args.push(prompt.into());
+    args.extend([
+        "-c".into(),
+        format!(
+            "mcp_servers.appsdk-subagent.command={}",
+            serde_json::to_string(&mcp.to_string_lossy())?
+        ),
+        "-c".into(),
+        "mcp_servers.appsdk-subagent.env_vars=[\"TMUX\",\"TMUX_PANE\",\"PATH\",\"HOME\"]".into(),
+    ]);
+    for tool in [
+        "collab_init",
+        "collab_subagent",
+        "collab_msg",
+        "collab_inbox",
+        "collab_ack",
+        "collab_context",
+        "collab_sendmessage",
+        "collab_notify_status",
+        "collab_task_status",
+        "collab_task_register",
+        "collab_task_relocate",
+        "collab_task_update",
+        "collab_task_block",
+        "collab_task_deliver",
+        "collab_task_close",
+    ] {
+        args.extend([
+            "-c".into(),
+            format!("mcp_servers.appsdk-subagent.tools.{tool}.approval_mode=\"approve\""),
+        ]);
+    }
+    args.push(format!(
+        "{prompt}\nThis session may list the shared collab-mcp tools as appsdk-subagent. Use those tools when present. If collab_ack, collab_msg, or collab_init is missing, unsupported, or aborted, use the collab CLI in this cwd. That is protocol, not a bypass."
+    ));
     Ok(("codex".into(), args))
 }
 
@@ -348,6 +405,7 @@ fn launch(
     settings: &config::Subagent,
     environment: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
+    crate::scope::init(&server.root).context("cannot write project MCP and CLI permissions")?;
     let mut errors = Vec::new();
     let executable = if is_cursor(&settings.runtime) {
         std::path::Path::new("agent")
@@ -386,7 +444,17 @@ fn launch(
         .as_ref()
         .context(format!("no healthy profile: {}", errors.join("; ")))?;
     let prompt = child_prompt(record);
-    let (executable, args) = launch_args(&settings.runtime, profile, &server.root, &prompt)?;
+    let mcp = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("collab-mcp")))
+        .unwrap_or_else(|| std::path::PathBuf::from("collab-mcp"));
+    let (executable, args) = launch_args(
+        &settings.runtime,
+        profile,
+        &server.root,
+        &prompt,
+        &mcp,
+    )?;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let manifest = server
@@ -401,6 +469,7 @@ fn launch(
     let mut environment = environment;
     environment.remove("TMUX");
     environment.remove("TMUX_PANE");
+    environment.insert("COLLAB_WORKER".into(), record.peer.clone());
     file.write_all(&serde_json::to_vec(&LaunchSpec {
         executable,
         args,
@@ -441,6 +510,27 @@ fn launch(
     let mut parts = binding.split_whitespace();
     record.session = Some(parts.next().context("missing session ID")?.into());
     record.pane = Some(parts.next().context("missing pane ID")?.into());
+    let ident = crate::identity::provision(
+        &crate::scope::Scope {
+            root: server.root.clone(),
+        },
+        &record.peer,
+        record.pane.as_deref().context("missing pane")?,
+        &record.peer,
+    )?;
+    let registered = crate::server::handle_register(
+        server,
+        ident.worker_id,
+        ident.token,
+        ident.pane,
+        server.root.display().to_string(),
+    );
+    if !registered.ok {
+        bail!(
+            "cannot register child identity: {}",
+            registered.error.unwrap_or_default()
+        );
+    }
     record.status = "starting".into();
     record.ready_deadline_ms = now_ms() + settings.startup.ready_timeout_seconds as i64 * 1000;
     Ok(())
@@ -863,6 +953,7 @@ mod tests {
             &std::env::vars().collect()
         )
         .is_ok());
+        let mcp = std::path::Path::new("/tmp/collab-mcp");
         let (exe, args) = launch_args(
             "cursor",
             &config::Profile {
@@ -871,6 +962,7 @@ mod tests {
             },
             std::path::Path::new("/tmp/project"),
             "hello",
+            mcp,
         )
         .unwrap();
         assert_eq!(exe, "agent");
@@ -878,6 +970,7 @@ mod tests {
         for flag in ["--yolo", "--trust", "--approve-mcps"] {
             assert!(args.contains(&flag.to_string()), "{flag}");
         }
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "disabled"]));
         assert!(!args.iter().any(|a| a == "--worktree" || a == "persist" || a == "-c"));
         assert_eq!(args.last().unwrap(), "hello");
         let (exe, args) = launch_args(
@@ -888,11 +981,37 @@ mod tests {
             },
             std::path::Path::new("/tmp/project"),
             "hello",
+            mcp,
         )
         .unwrap();
         assert_eq!(exe, "codex");
         assert_eq!(args[..2], ["--profile", "oauth"]);
-        assert!(!args.iter().any(|a| a.contains("mcp_servers")));
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "danger-full-access"]));
+        assert!(args.windows(2).any(|w| w == ["--ask-for-approval", "never"]));
+        assert!(args.iter().any(|a| a.contains("mcp_servers.appsdk-subagent")));
+        assert!(args.iter().any(|a| a.contains("collab_ack") && a.contains("approve")));
+        assert!(args.last().unwrap().contains("collab CLI"));
+        let prompt = child_prompt(&Record {
+            id: "child-1".into(),
+            parent: "parent-1".into(),
+            peer: "peer-1".into(),
+            status: "starting".into(),
+            session: None,
+            pane: None,
+            profile: None,
+            created_ms: 0,
+            ready_deadline_ms: 0,
+            last_message: None,
+            error: None,
+            probe_failures: vec![],
+        });
+        assert!(prompt.contains("collab ack <message-id>"));
+        assert!(prompt.contains("already registered"));
+        assert!(!prompt.contains("collab init"));
+        assert!(!prompt.contains("worker recover"));
+        assert!(prompt.contains("shared Collab MCP"));
+        assert!(prompt.contains("collab CLI in this cwd is also valid"));
+        assert!(!prompt.contains("NOT sandboxed shell"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

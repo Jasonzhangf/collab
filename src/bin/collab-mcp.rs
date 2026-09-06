@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::process::Command;
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -306,54 +306,129 @@ fn response(id: &Value, result: Value) -> Value {
     json!({"jsonrpc":"2.0", "id":id, "result":result})
 }
 
-fn main() {
-    let stdin = io::stdin();
-    let mut out = io::stdout();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        let Ok(req) = serde_json::from_str::<Value>(&line) else {
-            continue;
+#[derive(Clone, Copy)]
+enum Frame {
+    Line,
+    ContentLength,
+}
+
+fn read_message(stdin: &mut impl BufRead) -> io::Result<Option<(Frame, Value)>> {
+    let mut first = String::new();
+    if stdin.read_line(&mut first)? == 0 {
+        return Ok(None);
+    }
+    let header = first.trim_end_matches(['\r', '\n']);
+    if header.is_empty() {
+        return read_message(stdin);
+    }
+    if header.to_ascii_lowercase().starts_with("content-length:") {
+        let Some(length) = header
+            .split_once(':')
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Content-Length",
+            ));
         };
-        let id = req.get("id").cloned().unwrap_or(Value::Null);
-        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
-            "initialize" => response(
+        loop {
+            let mut next = String::new();
+            if stdin.read_line(&mut next)? == 0 {
+                break;
+            }
+            if next == "\n" || next == "\r\n" {
+                break;
+            }
+        }
+        let mut body = vec![0; length];
+        Read::read_exact(stdin, &mut body)?;
+        let req = serde_json::from_slice(&body).map_err(io::Error::other)?;
+        return Ok(Some((Frame::ContentLength, req)));
+    }
+    let req = serde_json::from_str(header).map_err(io::Error::other)?;
+    Ok(Some((Frame::Line, req)))
+}
+
+fn write_message(out: &mut impl Write, frame: Frame, message: &Value) -> io::Result<()> {
+    let body = serde_json::to_string(message)?;
+    match frame {
+        Frame::Line => writeln!(out, "{body}")?,
+        Frame::ContentLength => write!(out, "Content-Length: {}\r\n\r\n{body}", body.len())?,
+    }
+    out.flush()
+}
+
+fn handle(req: &Value) -> Option<Value> {
+    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+    if method.starts_with("notifications/") {
+        return None;
+    }
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    Some(match method {
+        "initialize" => {
+            let version = req
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("2024-11-05");
+            response(
                 &id,
-                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"collab","version":env!("CARGO_PKG_VERSION")}}),
-            ),
-            "notifications/initialized" => continue,
-            "ping" => response(&id, json!({})),
-            "tools/list" => response(&id, json!({"tools":tools()})),
-            "tools/call" => {
-                let params = req.get("params").cloned().unwrap_or_default();
-                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                let args = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                match call(name, &args) {
-                    Ok(text) => response(
-                        &id,
-                        json!({"content":[{"type":"text","text":text}],"isError":false}),
-                    ),
-                    Err(error) => response(
-                        &id,
-                        json!({"content":[{"type":"text","text":error}],"isError":true}),
-                    ),
-                }
+                json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"collab","version":env!("CARGO_PKG_VERSION")}}),
+            )
+        }
+        "ping" => response(&id, json!({})),
+        "tools/list" => response(&id, json!({"tools":tools()})),
+        "resources/list" => response(&id, json!({"resources":[]})),
+        "prompts/list" => response(&id, json!({"prompts":[]})),
+        "tools/call" => {
+            let params = req.get("params").cloned().unwrap_or_default();
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match call(name, &args) {
+                Ok(text) => response(
+                    &id,
+                    json!({"content":[{"type":"text","text":text}],"isError":false}),
+                ),
+                Err(error) => response(
+                    &id,
+                    json!({"content":[{"type":"text","text":error}],"isError":true}),
+                ),
             }
-            _ => {
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("method not found: {method}")}})
-            }
-        };
-        let _ = writeln!(out, "{}", result);
-        let _ = out.flush();
+        }
+        _ => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("method not found: {method}")}}),
+    })
+}
+
+fn main() {
+    let mut stdin = io::stdin().lock();
+    let mut out = io::stdout();
+    while let Ok(Some((frame, req))) = read_message(&mut stdin) {
+        if let Some(reply) = handle(&req) {
+            let _ = write_message(&mut out, frame, &reply);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_length_and_newline_frames_round_trip() {
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}});
+        let encoded = serde_json::to_string(&body).unwrap();
+        let framed = format!("Content-Length: {}\r\n\r\n{encoded}", encoded.len());
+        let (frame, req) = read_message(&mut framed.as_bytes()).unwrap().unwrap();
+        assert!(matches!(frame, Frame::ContentLength));
+        assert_eq!(handle(&req).unwrap()["result"]["protocolVersion"], "2025-03-26");
+        let line = format!("{encoded}\n");
+        let (frame, req) = read_message(&mut line.as_bytes()).unwrap().unwrap();
+        assert!(matches!(frame, Frame::Line));
+        assert_eq!(handle(&req).unwrap()["result"]["serverInfo"]["name"], "collab");
+        assert_eq!(handle(&json!({"method":"resources/list","id":2})).unwrap()["result"]["resources"], json!([]));
+    }
 
     #[test]
     fn sendmessage_schema_requires_subject_and_body() {

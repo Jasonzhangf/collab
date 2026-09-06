@@ -968,7 +968,7 @@ fn handle_migration_verify(server: &Server, worker_id: String, token: String) ->
     }))
 }
 
-fn handle_register(
+pub(crate) fn handle_register(
     server: &Server,
     worker_id: String,
     token: String,

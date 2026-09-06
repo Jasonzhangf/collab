@@ -54,6 +54,13 @@ writing an identity declaration. A tmux session is the stable peer identity;
 its current pane is only the wake endpoint. Token proves access to that peer's
 mailbox and lifecycle.
 
+`collab init` also merges the shared `collab-mcp` server into project
+`.cursor/mcp.json` and `.mcp.json`, and writes the project CLI permissions
+those agents need so `collab` can reach the tmux socket without a sandbox
+prompt. That same stdio MCP works for Cursor, Codex, Claude Code, and
+other agents. The `collab` CLI is a complete fallback when MCP tools are
+not listed.
+
 `collab role`, `collab master`, `collab transfer-master`, `collab task claim`,
 `collab task dispatch`, `collab remove-worker`, and `collab reset` are
 deprecated and fail explicitly.

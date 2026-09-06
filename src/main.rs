@@ -275,6 +275,7 @@ fn register(scope: &Scope, ident: &Identity) -> anyhow::Result<()> {
 
 /// Identity bootstrap used by every command that acts as a worker.
 fn me(scope: &Scope, worker: Option<String>) -> anyhow::Result<Identity> {
+    let worker = worker.or_else(|| std::env::var("COLLAB_WORKER").ok());
     let ident = identity::load_or_create(scope, worker, None)?;
     register(scope, &ident)?;
     Ok(ident)

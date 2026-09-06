@@ -29,10 +29,18 @@ where
 /// The launching environment owns project scope. A tmux Agent is bound to the
 /// exact current directory of its pane; a non-tmux operator is bound to the
 /// exact process cwd. No caller may select a path and no ancestor is searched.
+fn inherited_cwd_if_initialized(cwd: PathBuf) -> anyhow::Result<PathBuf> {
+    if cwd.join(".agent-collab").is_dir() {
+        validate_project_root(cwd)
+    } else {
+        anyhow::bail!("no .agent-collab found in inherited cwd {}", cwd.display())
+    }
+}
+
 pub fn project_root() -> anyhow::Result<PathBuf> {
     let pane = std::env::var("TMUX_PANE").ok();
     let cwd = std::env::current_dir()?;
-    project_root_from(pane.as_deref(), cwd, |pane| {
+    match project_root_from(pane.as_deref(), cwd.clone(), |pane| {
         let output = Command::new("tmux")
             .args(["display-message", "-p", "-t", pane, "#{pane_current_path}"])
             .output()?;
@@ -45,7 +53,11 @@ pub fn project_root() -> anyhow::Result<PathBuf> {
             anyhow::bail!("tmux pane {pane} returned an empty project root");
         }
         Ok(PathBuf::from(path))
-    })
+    }) {
+        Ok(root) => Ok(root),
+        Err(_) if pane.is_some() => inherited_cwd_if_initialized(cwd),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn init(root: &Path) -> std::io::Result<PathBuf> {
@@ -68,7 +80,179 @@ pub fn init(root: &Path) -> std::io::Result<PathBuf> {
     if !collab_doc.exists() {
         std::fs::write(&collab_doc, COLLAB_DOC)?;
     }
+    ensure_project_collab_mcp(root)?;
+    ensure_codex_collab_permissions(root)?;
+    ensure_cursor_cli_permissions(root)?;
+    ensure_claude_collab_permissions(root)?;
     Ok(base)
+}
+
+fn collab_mcp_command() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("collab-mcp")))
+        .filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path).find_map(|dir| {
+                    let candidate = dir.join("collab-mcp");
+                    candidate
+                        .is_file()
+                        .then(|| candidate.to_string_lossy().into_owned())
+                })
+            })
+        })
+        .unwrap_or_else(|| "collab-mcp".into())
+}
+
+fn ensure_project_collab_mcp(root: &Path) -> std::io::Result<()> {
+    merge_collab_mcp(root.join(".cursor").join("mcp.json"))?;
+    merge_collab_mcp(root.join(".mcp.json"))
+}
+
+fn merge_collab_mcp(path: PathBuf) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut root_value = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&path)?)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    let servers = root_value
+        .as_object_mut()
+        .map(|table| {
+            table
+                .entry("mcpServers")
+                .or_insert_with(|| serde_json::json!({}))
+        })
+        .and_then(|value| value.as_object_mut());
+    let Some(servers) = servers else {
+        return Ok(());
+    };
+    if servers.contains_key("collab") {
+        return Ok(());
+    }
+    servers.insert(
+        "collab".into(),
+        serde_json::json!({"command": collab_mcp_command()}),
+    );
+    std::fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&root_value).unwrap()),
+    )
+}
+
+fn ensure_codex_collab_permissions(root: &Path) -> std::io::Result<()> {
+    let path = root.join(".codex").join("config.toml");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut table = if path.exists() {
+        toml::from_str::<toml::Value>(&std::fs::read_to_string(&path)?)
+            .ok()
+            .and_then(|value| value.as_table().cloned())
+            .unwrap_or_default()
+    } else {
+        toml::Table::new()
+    };
+    table.insert(
+        "sandbox_mode".into(),
+        toml::Value::String("danger-full-access".into()),
+    );
+    table.insert(
+        "approval_policy".into(),
+        toml::Value::String("never".into()),
+    );
+    let servers = table
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(servers) = servers.as_table_mut() {
+        if !servers.contains_key("collab") {
+            let mut collab = toml::Table::new();
+            collab.insert(
+                "command".into(),
+                toml::Value::String(collab_mcp_command()),
+            );
+            servers.insert("collab".into(), toml::Value::Table(collab));
+        }
+    }
+    std::fs::write(path, format!("{}\n", toml::to_string_pretty(&table).unwrap()))
+}
+
+fn merge_allow_patterns(value: &mut serde_json::Value, key: &str, patterns: &[&str]) {
+    let list = value
+        .as_object_mut()
+        .map(|table| table.entry(key).or_insert_with(|| serde_json::json!([])))
+        .and_then(|item| item.as_array_mut());
+    let Some(list) = list else {
+        return;
+    };
+    for pattern in patterns {
+        if !list.iter().any(|item| item.as_str() == Some(*pattern)) {
+            list.push(serde_json::json!(pattern));
+        }
+    }
+}
+
+fn ensure_cursor_cli_permissions(root: &Path) -> std::io::Result<()> {
+    let path = root.join(".cursor").join("cli.json");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut root_value = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&path)?)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(table) = root_value.as_object_mut() {
+        table
+            .entry("sandbox")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .map(|sandbox| sandbox.insert("mode".into(), serde_json::json!("disabled")));
+        let permissions = table
+            .entry("permissions")
+            .or_insert_with(|| serde_json::json!({}));
+        merge_allow_patterns(
+            permissions,
+            "allow",
+            &[
+                "Shell(collab)",
+                "Shell(collab *)",
+                "Shell(collab-mcp)",
+                "Mcp(collab,*)",
+            ],
+        );
+    }
+    std::fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&root_value).unwrap()),
+    )
+}
+
+fn ensure_claude_collab_permissions(root: &Path) -> std::io::Result<()> {
+    let path = root.join(".claude").join("settings.json");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut root_value = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&path)?)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(table) = root_value.as_object_mut() {
+        let permissions = table
+            .entry("permissions")
+            .or_insert_with(|| serde_json::json!({}));
+        merge_allow_patterns(
+            permissions,
+            "allow",
+            &["Bash(collab)", "Bash(collab *)", "Bash(collab-mcp)"],
+        );
+    }
+    std::fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&root_value).unwrap()),
+    )
 }
 
 pub const COLLAB_DOC: &str = r#"# collab workflow
@@ -283,6 +467,20 @@ mod tests {
     }
 
     #[test]
+    fn sandboxed_tmux_lookup_falls_back_to_initialized_cwd() {
+        let cwd = test_root("sandbox-cwd");
+        init(&cwd).unwrap();
+        let resolved = match project_root_from(Some("%743"), cwd.clone(), |_| {
+            anyhow::bail!("cannot resolve project root for tmux pane %743")
+        }) {
+            Ok(root) => root,
+            Err(_) => inherited_cwd_if_initialized(cwd.clone()).unwrap(),
+        };
+        assert_eq!(resolved, cwd);
+        std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[test]
     fn init_releases_collab_doc_only_once() {
         let root = test_root("init");
         init(&root).unwrap();
@@ -290,10 +488,68 @@ mod tests {
         assert!(path.exists());
         let first = std::fs::read_to_string(&path).unwrap();
         assert!(first.contains("# collab workflow"));
+        for mcp in [root.join(".cursor/mcp.json"), root.join(".mcp.json")] {
+            assert!(std::fs::read_to_string(&mcp).unwrap().contains("collab-mcp"));
+        }
 
         init(&root).unwrap();
         let second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(first, second);
+        let cursor_mcp = root.join(".cursor/mcp.json");
+        std::fs::write(&cursor_mcp, "{\"keep\":true}").unwrap();
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"keep-me"}}}"#,
+        )
+        .unwrap();
+        init(&root).unwrap();
+        let merged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cursor_mcp).unwrap()).unwrap();
+        assert_eq!(merged["keep"], true);
+        assert!(merged["mcpServers"]["collab"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("collab-mcp"));
+        let generic: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(generic["mcpServers"]["other"]["command"], "keep-me");
+        assert!(generic["mcpServers"]["collab"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("collab-mcp"));
+        let codex: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join(".codex/config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(codex["sandbox_mode"].as_str(), Some("danger-full-access"));
+        assert_eq!(codex["approval_policy"].as_str(), Some("never"));
+        assert!(codex["mcp_servers"]["collab"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("collab-mcp"));
+        let cursor_cli: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(".cursor/cli.json")).unwrap())
+                .unwrap();
+        assert_eq!(cursor_cli["sandbox"]["mode"], "disabled");
+        assert!(cursor_cli["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("Shell(collab *)")));
+        std::fs::write(
+            root.join(".codex/config.toml"),
+            "model = \"keep-me\"\nsandbox_mode = \"workspace-write\"\n",
+        )
+        .unwrap();
+        init(&root).unwrap();
+        let upgraded: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join(".codex/config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(upgraded["model"].as_str(), Some("keep-me"));
+        assert_eq!(
+            upgraded["sandbox_mode"].as_str(),
+            Some("danger-full-access")
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

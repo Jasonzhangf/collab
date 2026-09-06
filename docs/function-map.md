@@ -2,14 +2,14 @@
 
 | feature_id | owner | entry symbols | required gate |
 |---|---|---|---|
-| identity.peer-register | `identity` + `server` | `load_or_create`, `handle_register` | every registration is peer; no first-worker promotion |
+| identity.peer-register | `identity` + `server` | `load_or_create`, `provision`, `handle_register` | every registration is peer; no first-worker promotion; parent provisions a child pane identity before the agent starts |
 | task.self-lifecycle | task owner peer | `handle_task_register`, `handle_task_update`, `handle_task_deliver`, `handle_task_close` | only owner mutates; full worktree→test→integrate→close lifecycle |
 | resource.p2p-conflict | `server` | `task_conflicts`, `handle_task_wait`, close release projection | task operations return synchronously; exact subscribed release exits waiting and clears edge |
 | wait.liveness | `server` | `handle_task_wait`, `wait_cycle`, `timers::tick` | bounded acyclic wait, responsible blocker owner, deadline state transition without unsolicited message |
 | notification.subscription | `server::state` + `server` | `default_direct_message_events`, `registered_peer_default_events`, `restore_registered_peer_default_leases`, `handle_notification_subscribe`, `matching_subscription`, `handle_notification_unsubscribe` | peer registration owns one deterministic finite default direct-message lease; short explicit leases cannot suppress it; daemon replay restores it only for a matching registered tmux session; resource/deadline/async-result remain one-shot |
 | notification.tmux-wake | `server` + `timers` + `knock` | `abbreviated_subject`, `notification_text`, `attempt_notification_with`, `queue_system_knock`, `wake_args` | registered-only; required subject plus safe original-body preview and execute-not-ACK/wait action suffix; one tmux command queue performs unique-buffer bracketed paste, a short settle, then final C-m as a later PTY write; direct messages serialize through cooldown; absent/unknown/working reject; hard max three per message |
 | notification.context | `server` | `handle_context`, inbox/status handlers | authenticated read-only projection; durable body fetched through CLI/MCP |
-| daemon.project-scope | `scope` + CLI init | `project_root`, `init`, `Scope::resolve` | inherited `TMUX_PANE` resolves exact pane cwd; non-tmux operator uses exact process cwd; MCP cannot select either |
+| daemon.project-scope | `scope` + CLI init | `project_root`, `init`, `Scope::resolve`, `ensure_project_collab_mcp`, `ensure_codex_collab_permissions` | inherited `TMUX_PANE` resolves exact pane cwd; non-tmux operator uses exact process cwd; MCP cannot select either; init merges shared `collab-mcp` and grants project CLI/tmux permissions for Codex, Cursor, and Claude Code |
 | migration.peer-v1 | `server` | migration inspect/plan/apply/verify handlers, `replay` | legacy role fields are discarded; snapshot/replay preserves lifecycle |
 | daemon.operator | CLI + `server::run` | `collab down`, `collab up`, `replay` | explicit operator path, one socket writer, no role-derived authority |
 
