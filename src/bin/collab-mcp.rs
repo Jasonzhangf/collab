@@ -12,6 +12,8 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 
 fn tools() -> Value {
     json!([
+        tool("collab_msg", "Read a durable notification by ID.", json!({"id":{"type":"string"}}), &["id"]),
+        tool("collab_subagent", "Parent: start/list/status/send/close your children. Child: ready/working only; send results with collab_sendmessage to the parent peer, NOT this tool's send action. No automatic retries.", json!({"action":{"type":"string","enum":["start","list","status","send","ready","working","close"]},"id":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}}), &["action"]),
         tool(
             "collab_init",
             "Initialize/register this live project identity.",
@@ -148,6 +150,15 @@ fn collab_bin() -> std::path::PathBuf {
 fn call(name: &str, args: &Value) -> Result<String, String> {
     let mut argv = Vec::<String>::new();
     match name {
+        "collab_msg" => argv.extend(["msg".into(), required(args, "id")?]),
+        "collab_subagent" => {
+            let action = required(args, "action")?;
+            if !["start", "list", "status", "send", "ready", "working", "close"].contains(&action.as_str()) { return Err("invalid subagent action".into()); }
+            argv.extend(["subagent".into(), action.clone()]);
+            if action == "start" { optional_flag(&mut argv, args, "id", "--id")?; }
+            else if action != "list" { argv.push(required(args, "id")?); }
+            if action == "send" { argv.extend(["--subject".into(), required(args, "subject")?, required(args, "body")?]); }
+        }
         "collab_init" => argv.push("init".into()),
         "collab_whoami" => argv.push("whoami".into()),
         "collab_who" => argv.push("who".into()),

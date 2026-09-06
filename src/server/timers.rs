@@ -55,6 +55,7 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
         let state = server.state.lock().unwrap();
         for subscription in state.notification_subscriptions.values() {
             if subscription.status != "armed"
+                || !server.config.timers.enabled
                 || subscription.event != "deadline"
                 || subscription.trigger_ms.is_none_or(|trigger| trigger > now)
                 || state
@@ -152,6 +153,7 @@ mod tests {
             .unwrap();
         (
             Arc::new(Server {
+                config: crate::config::Config::default(),
                 root: root.clone(),
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
@@ -254,6 +256,23 @@ mod tests {
         tick_with_idle(&server, &|_| true);
         assert!(server.state.lock().unwrap().msgs.is_empty());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn configured_immediate_and_disabled_delivery_are_respected() {
+        for (mode, enabled, expected) in [("immediate", true, true), ("batch", true, false), ("immediate", false, false)] {
+            let (mut server, root) = test_server();
+            let config = &mut Arc::get_mut(&mut server).unwrap().config;
+            config.notifications.mode = mode.into();
+            config.notifications.enabled = enabled;
+            register(&server, "owner");
+            let sub = subscribe(&server, "owner", "direct-message", None, None);
+            let id = bind_message(&server, "owner", &sub);
+            server.state.lock().unwrap().msgs.get_mut(&id).unwrap().created_ms = now_ms();
+            assert_eq!(super::super::attempt_notification_with(&server, &id, &sub, &|_| true, &|_, _| true), expected);
+            assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, if expected { 1 } else { 0 });
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -362,6 +381,7 @@ mod tests {
             .open(root.join(".agent-collab/server/journal.jsonl"))
             .unwrap();
         let restarted = Server {
+            config: crate::config::Config::default(),
             root: root.clone(),
             state: Mutex::new(replayed),
             journal: Mutex::new(journal),

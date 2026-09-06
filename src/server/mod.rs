@@ -101,6 +101,7 @@ fn task_transition_allowed(current: &str, next: &str) -> bool {
 }
 
 pub struct Server {
+    pub config: crate::config::Config,
     pub root: PathBuf,
     pub state: Mutex<State>,
     pub journal: Mutex<std::fs::File>,
@@ -151,12 +152,12 @@ impl Server {
     }
 
     /// Apply events to memory and persist them atomically-ordered in the journal.
-    fn commit(&self, evs: &[Event]) {
+    pub(crate) fn commit(&self, evs: &[Event]) {
         let mut st = self.state.lock().unwrap();
         self.commit_locked(&mut st, evs);
     }
 
-    fn commit_locked(&self, st: &mut State, evs: &[Event]) {
+    pub(crate) fn commit_locked(&self, st: &mut State, evs: &[Event]) {
         let mut j = self.journal.lock().unwrap();
         use std::io::Write;
         for ev in evs {
@@ -202,6 +203,7 @@ pub fn gen_msg_id() -> String {
 }
 
 const MAX_NOTIFICATION_SUBJECT_CHARS: usize = 48;
+#[cfg(test)]
 const DIRECT_MESSAGE_WAKE_COOLDOWN_MS: i64 = 60_000;
 
 fn abbreviated_subject(subject: &str) -> Option<String> {
@@ -352,6 +354,7 @@ fn attempt_notification_with(
     deliver: &dyn Fn(&str, &str) -> bool,
 ) -> bool {
     let now = now_ms();
+    if !server.config.notifications.enabled { return false; }
     let mut state = server.state.lock().unwrap();
     let Some(seed) = state.msgs.get(message_id) else {
         return false;
@@ -361,6 +364,7 @@ fn attempt_notification_with(
         return false;
     };
     let pane = subscription.pane.clone();
+    let delay = server.config.notifications.delay_ms(&subscription.event);
     if subscription.worker_id != recipient {
         return false;
     }
@@ -371,6 +375,7 @@ fn attempt_notification_with(
             let binding = state.wake_bindings.get(&message.id)?;
             let sub = state.notification_subscriptions.get(binding)?;
             (message.to == recipient
+                && server.config.notifications.delay_ms(&sub.event) == delay
                 && message.state == "pending"
                 && message.wake_attempt_count == 0
                 && sub.worker_id == recipient
@@ -407,8 +412,8 @@ fn attempt_notification_with(
         .map(|m| m.last_wake_attempt_ms)
         .max()
         .unwrap_or(0);
-    if now - first.0 < DIRECT_MESSAGE_WAKE_COOLDOWN_MS
-        || now - last_attempt < DIRECT_MESSAGE_WAKE_COOLDOWN_MS
+    if now - first.0 < delay
+        || now - last_attempt < delay
     {
         return false;
     }
@@ -1076,7 +1081,7 @@ fn handle_register(
     }))
 }
 
-fn handle_send(
+pub(crate) fn handle_send(
     server: &Server,
     from: String,
     to: String,
@@ -2007,6 +2012,7 @@ fn handle_task_wait(
 
 fn mutation_blocked_during_migration(req: &Req) -> bool {
     match req {
+        Req::Subagent { command, .. } => !matches!(command, crate::subagent::Action::List | crate::subagent::Action::Status { .. }),
         Req::Send { .. }
         | Req::NotificationSubscribe { .. }
         | Req::NotificationUnsubscribe { .. }
@@ -2051,6 +2057,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
         );
     }
     match req {
+        Req::Subagent { worker_id, token, command, launch_env } => crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env),
         Req::Register {
             worker_id,
             token,
@@ -2163,7 +2170,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             match st.msgs.get(&msg_id) {
                 Some(m) => Resp::data(json!({
                     "id": m.id, "from": m.from, "to": m.to, "type": m.mtype,
-                    "subject": m.subject,
+                    "subject": m.subject, "body": m.body,
                     "state": m.state, "wake_attempts": m.wake_attempt_count,
                     "created_at": iso(m.created_ms), "answered": st.answered(&msg_id),
                 })),
@@ -2416,6 +2423,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     append_log(&server_dir.join("log.txt"), "server starting");
 
     let server = Arc::new(Server {
+        config: crate::config::load(&scope.root)?,
         root: scope.root.clone(),
         state: Mutex::new(state),
         journal: Mutex::new(journal_file),
@@ -2436,7 +2444,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     // Background scheduler: bounded waits and explicitly registered notifications.
     let sched = server.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_millis(sched.config.timers.tick_interval_ms));
         loop {
             interval.tick().await;
             crate::server::timers::tick(&sched);

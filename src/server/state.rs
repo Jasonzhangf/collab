@@ -173,6 +173,7 @@ pub fn wait_cycle(tasks: &HashMap<String, TaskRec>, task_id: &str, waiting_for: 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ev")]
 pub enum Event {
+    SubagentUpdated { subagent: crate::subagent::Record },
     Registered {
         worker: WorkerRec,
     },
@@ -243,6 +244,7 @@ pub enum Event {
 
 #[derive(Default)]
 pub struct State {
+    pub subagents: HashMap<String, crate::subagent::Record>,
     pub workers: HashMap<String, WorkerRec>,
     pub msgs: HashMap<String, Message>,
     pub tasks: HashMap<String, TaskRec>,
@@ -256,6 +258,7 @@ pub struct State {
 impl State {
     pub fn apply(&mut self, ev: &Event) {
         match ev {
+            Event::SubagentUpdated { subagent } => { self.subagents.insert(subagent.id.clone(), subagent.clone()); }
             Event::Registered { worker } => {
                 self.workers.insert(worker.id.clone(), worker.clone());
             }

@@ -16,6 +16,7 @@ fn test_server() -> (Server, PathBuf) {
         .unwrap();
     (
         Server {
+            config: crate::config::Config::default(),
             root: root.clone(),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
@@ -48,6 +49,41 @@ fn create_task(server: &Server, owner: &str, id: &str, feature: &str) -> Resp {
         None,
         default_priority(),
     )
+}
+
+#[test]
+fn managed_subagent_is_authenticated_persistent_and_replayable() {
+    use crate::subagent::{Action, Record};
+    let (server, root) = test_server();
+    register(&server, "parent", "%parent");
+    register(&server, "child", "%child");
+    register(&server, "other", "%other");
+    let record = Record { id: "managed".into(), parent: "parent".into(), peer: "child".into(), status: "starting".into(), session: None, pane: Some("%child".into()), profile: None, created_ms: now_ms(), ready_deadline_ms: now_ms()+90000, last_message: None, error: None, probe_failures: Vec::new() };
+    let event = Event::SubagentUpdated { subagent: record };
+    let encoded = serde_json::to_string(&event).unwrap();
+    let mut replay = State::default();
+    replay.apply(&serde_json::from_str(&encoded).unwrap());
+    assert_eq!(replay.subagents["managed"].status, "starting");
+    server.commit(&[event]);
+    assert!(!crate::subagent::handle(&server, "other", "token-other", Action::Close {id: "managed".into()}).ok);
+    assert!(!crate::subagent::handle(&server, "parent", "wrong", Action::List).ok);
+    assert!(!crate::subagent::handle(&server, "parent", "token-parent", Action::Ready {id: "managed".into()}).ok);
+    assert!(crate::subagent::handle(&server, "child", "token-child", Action::Ready {id: "managed".into()}).ok);
+    let count = server.state.lock().unwrap().msgs.len();
+    assert!(crate::subagent::handle(&server, "child", "token-child", Action::Ready {id: "managed".into()}).ok);
+    assert_eq!(server.state.lock().unwrap().msgs.len(), count);
+    assert!(crate::subagent::handle(&server, "parent", "token-parent", Action::Send {id: "managed".into(), subject: "test".into(), body: "task".into()}).ok);
+    let message_id = server.state.lock().unwrap().subagents["managed"].last_message.clone().unwrap();
+    let server = Arc::new(server);
+    let message = dispatch(&server, Req::MsgStatus { msg_id: message_id });
+    assert_eq!(message.data["body"], "task");
+    assert!(!crate::subagent::handle(&server, "parent", "token-parent", Action::Send {id: "managed".into(), subject: "test".into(), body: "task".into()}).ok);
+    assert!(crate::subagent::handle(&server, "child", "token-child", Action::Working {id: "managed".into()}).ok);
+    assert!(crate::subagent::handle(&server, "child", "token-child", Action::Ready {id: "managed".into()}).ok);
+    assert_eq!(server.state.lock().unwrap().subagents["managed"].status, "idle");
+    assert!(crate::subagent::handle(&server, "parent", "token-parent", Action::Close {id: "managed".into()}).ok);
+    assert!(crate::subagent::handle(&server, "parent", "token-parent", Action::Close {id: "managed".into()}).ok);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

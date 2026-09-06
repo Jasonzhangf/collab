@@ -1,8 +1,10 @@
 mod client;
+mod config;
 mod identity;
 mod proto;
 mod scope;
 mod server;
+mod subagent;
 
 use clap::{Parser, Subcommand};
 use identity::Identity;
@@ -23,6 +25,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    #[command(hide = true)]
+    SubagentExec { file: std::path::PathBuf },
+    /// Managed persistent Codex peers (current project only)
+    Subagent { #[command(subcommand)] command: subagent::Action },
+    /// Show the effective policy from ~/.appsdk/config.toml
+    Config,
     /// Create .agent-collab skeleton in the current directory
     Init,
     /// Hidden: daemon entrypoint (spawned by `up`)
@@ -282,6 +290,16 @@ fn main() {
 
 fn run(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
+        Cmd::SubagentExec {file} => subagent::exec_launch(&file),
+        Cmd::Config => { out(&crate::config::load(&scope::project_root()?)?); Ok(()) }
+        Cmd::Subagent { command } => {
+            let scope = Scope::resolve()?;
+            let ident = me(&scope, None)?;
+            let launch_env = if matches!(command, subagent::Action::Start {..}) { std::env::vars().collect() } else { Default::default() };
+            let value: serde_json::Value = client::call(&scope.sock_path(), &Req::Subagent { worker_id: ident.worker_id, token: ident.token, command, launch_env })?;
+            out(&value);
+            Ok(())
+        }
         Cmd::Init => {
             let project_root = scope::project_root()?;
             let in_tmux = std::env::var_os("TMUX_PANE").is_some();
