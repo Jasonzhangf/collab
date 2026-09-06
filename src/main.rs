@@ -294,6 +294,19 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Config => { out(&crate::config::load(&scope::project_root()?)?); Ok(()) }
         Cmd::Subagent { command } => {
             let scope = Scope::resolve()?;
+            if std::env::var_os("TMUX_PANE").is_none() {
+                let query = match &command {
+                    subagent::Action::List => Some((None, None)),
+                    subagent::Action::Status { id } => Some((Some(id.clone()), None)),
+                    subagent::Action::Snapshot { id, lines } => Some((Some(id.clone()), Some(*lines))),
+                    _ => None,
+                };
+                if let Some((id, snapshot_lines)) = query {
+                    let value: serde_json::Value = client::call(&scope.sock_path(), &Req::SubagentObserve { id, snapshot_lines })?;
+                    out(&value);
+                    return Ok(());
+                }
+            }
             let ident = me(&scope, None)?;
             let launch_env = if matches!(command, subagent::Action::Start {..}) { std::env::vars().collect() } else { Default::default() };
             let value: serde_json::Value = client::call(&scope.sock_path(), &Req::Subagent { worker_id: ident.worker_id, token: ident.token, command, launch_env })?;
@@ -305,7 +318,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let in_tmux = std::env::var_os("TMUX_PANE").is_some();
             if !in_tmux {
                 anyhow::bail!(
-                    "collab init requires a live tmux pane; tmux is the only wake channel"
+                    "NOTIFICATION_CHANNEL_NONE: collab init requires a live tmux pane for peer registration; no push notifications are available here. Independent work can continue. Check subagent status (includes parent mailbox) yourself; use subagent snapshot explicitly for screen diagnostics. No subscription was created."
                 );
             }
             if project_root.ancestors().skip(1).any(|ancestor| {

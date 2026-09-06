@@ -9,6 +9,7 @@ use std::{
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub keepalive: Keepalive,
     pub notifications: Notifications,
     pub timers: Timers,
     pub subagent: Subagent,
@@ -16,9 +17,26 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            keepalive: Keepalive::default(),
             notifications: Notifications::default(),
             timers: Timers::default(),
             subagent: Subagent::default(),
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Keepalive {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub max_unacked: u8,
+}
+impl Default for Keepalive {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 900,
+            max_unacked: 3,
         }
     }
 }
@@ -235,6 +253,11 @@ pub fn parse(text: &str, root: &Path) -> Result<Config> {
 }
 impl Config {
     fn validate(&self) -> Result<()> {
+        if !(900..=86400).contains(&self.keepalive.interval_seconds)
+            || !(1..=3).contains(&self.keepalive.max_unacked)
+        {
+            bail!("keepalive requires interval_seconds=900..86400 and max_unacked=1..3");
+        }
         let n = &self.notifications;
         if !matches!(n.mode.as_str(), "immediate" | "batch")
             || !(1..=3600).contains(&n.batch_window_seconds)

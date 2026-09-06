@@ -25,6 +25,14 @@ pub enum Action {
     Status {
         id: String,
     },
+    Snapshot {
+        id: String,
+        #[arg(long, default_value_t = 40)]
+        lines: usize,
+    },
+    Rearm {
+        id: String,
+    },
     Send {
         id: String,
         #[arg(long)]
@@ -57,6 +65,79 @@ pub struct Record {
     #[serde(default)]
     pub probe_failures: Vec<String>,
 }
+pub(crate) fn observe(
+    server: &Server,
+    id: Option<&str>,
+    lines: Option<usize>,
+) -> Result<serde_json::Value> {
+    let state = server.state.lock().unwrap();
+    let Some(id) = id else {
+        return Ok(json!({"subagents":state.subagents.values().collect::<Vec<_>>()}));
+    };
+    let record = state.subagents.get(id).context("unknown subagent")?;
+    if let Some(lines) = lines {
+        if !(1..=200).contains(&lines) {
+            bail!("snapshot lines must be 1..200");
+        }
+        let pane = record.pane.as_deref().context("subagent has no pane")?;
+        if !crate::server::knock::pane_alive(pane) {
+            bail!("subagent pane exited");
+        }
+        let binding = Command::new("tmux")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{session_id} #{session_name}",
+            ])
+            .output()?;
+        if !binding.status.success()
+            || String::from_utf8_lossy(&binding.stdout).trim()
+                != format!(
+                    "{} {}",
+                    record.session.as_deref().unwrap_or_default(),
+                    record.peer
+                )
+        {
+            bail!("subagent session identity changed");
+        }
+        let output = Command::new("tmux")
+            .args(["capture-pane", "-p", "-t", pane, "-S", &format!("-{lines}")])
+            .output()?;
+        if !output.status.success() {
+            bail!("tmux snapshot failed");
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let tail: Vec<_> = text.lines().rev().take(lines).collect();
+        return Ok(
+            json!({"subagent_id":record.id,"captured_ms":now_ms(),"pane":pane,
+            "screen_tail":tail.into_iter().rev().collect::<Vec<_>>().join("\n")}),
+        );
+    }
+    let observed = match record.pane.as_deref() {
+        None => "unknown",
+        Some(pane) if !crate::server::knock::pane_alive(pane) => "exited",
+        Some(pane) => match crate::server::knock::probe_agent_state(pane) {
+            crate::server::knock::AgentState::Absent => "agent_absent",
+            crate::server::knock::AgentState::Unknown => "unknown",
+            crate::server::knock::AgentState::Working => "working",
+            crate::server::knock::AgentState::Waiting => "idle",
+        },
+    };
+    let mut mailbox: Vec<_> = state
+        .msgs
+        .values()
+        .filter(|m| m.from == record.peer && m.to == record.parent)
+        .collect();
+    mailbox.sort_by_key(|m| m.created_ms);
+    Ok(
+        json!({"subagent":record,"observed_status":observed,"observed_ms":now_ms(),
+        "keepalive":crate::server::keepalive::view(&state,&record.peer),"mailbox":mailbox,
+        "tasks":state.tasks.values().filter(|t|t.owner==record.peer).collect::<Vec<_>>()}),
+    )
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 80
@@ -141,8 +222,9 @@ fn notify(
     to: &str,
     subject: &str,
     body: String,
+    assign_task: bool,
 ) -> Result<serde_json::Value> {
-    let response = crate::server::handle_send(
+    let response = crate::server::handle_send_with_task(
         server,
         from.into(),
         to.into(),
@@ -151,6 +233,7 @@ fn notify(
         body,
         None,
         "immediate".into(),
+        assign_task,
     );
     if !response.ok {
         bail!("{}", response.error.unwrap_or_default());
@@ -240,11 +323,13 @@ fn launch(
         "collab_subagent",
         "collab_msg",
         "collab_inbox",
+        "collab_ack",
         "collab_context",
         "collab_sendmessage",
         "collab_notify_status",
         "collab_task_status",
         "collab_task_register",
+        "collab_task_relocate",
         "collab_task_update",
         "collab_task_block",
         "collab_task_deliver",
@@ -256,6 +341,7 @@ fn launch(
         ]);
     }
     args.push(format!("{prompt}\nUse the appsdk-subagent MCP server for Collab operations, NOT sandboxed shell commands. First call collab_init, then collab_subagent with action=ready and id={}. Accept a task using action=working. Read messages using collab_msg or collab_inbox. These MCP operations inherit the live tmux environment and do not require shell access to its socket.", record.id));
+    args.last_mut().unwrap().push_str(" Each dispatched message has a canonical task named task-<message-id>. action=working claims that task; do not register a duplicate task. Before code edits bind its clean worktree with collab_task_relocate. Finish its real task lifecycle before claiming task completion; ready only means session idle and does not complete tasks. For a keepalive notice, call collab_ack once with its message ID, then resume actionable work or record the real blocker. Never ACK an ACK or request automatic rearm after exhaustion.");
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let manifest = server
@@ -419,6 +505,8 @@ fn run(
     }
     let id = match &action {
         Action::Status { id }
+        | Action::Snapshot { id, .. }
+        | Action::Rearm { id }
         | Action::Send { id, .. }
         | Action::Ready { id }
         | Action::Working { id }
@@ -436,28 +524,25 @@ fn run(
         bail!("only the creating parent may manage this subagent");
     }
     match action {
-        Action::Status { .. } => {
-            let observed = if let Some(pane) = &record.pane {
-                if crate::server::knock::pane_alive(pane) {
-                    let agent = crate::server::knock::probe_agent_state(pane);
-                    if agent == crate::server::knock::AgentState::Absent {
-                        "agent_absent"
-                    } else if agent == crate::server::knock::AgentState::Unknown {
-                        "unknown"
-                    } else if record.status == "starting" && now_ms() > record.ready_deadline_ms {
-                        "ready_timeout"
-                    } else {
-                        &record.status
-                    }
-                } else {
-                    "exited"
-                }
-            } else {
-                &record.status
-            };
-            return Ok(
-                json!({"subagent": record, "observed_status": observed, "tasks": state.tasks.values().filter(|t| t.owner == record.peer).collect::<Vec<_>>() }),
+        Action::Snapshot { lines, .. } => {
+            drop(state);
+            return observe(server, Some(&record.id), Some(lines));
+        }
+        Action::Rearm { .. } => {
+            server.commit_locked(
+                &mut state,
+                &[Event::KeepaliveUpdated {
+                    worker_id: record.peer.clone(),
+                    record: crate::server::keepalive::Record::default(),
+                }],
             );
+            return Ok(
+                json!({"subagent_id":record.id,"keepalive_rearmed":true,"notification":"none"}),
+            );
+        }
+        Action::Status { .. } => {
+            drop(state);
+            return observe(server, Some(&record.id), None);
         }
         Action::Ready { .. } | Action::Working { .. } => {
             let ready = matches!(action, Action::Ready { .. });
@@ -477,6 +562,20 @@ fn run(
                 bail!("accept the assigned task before reporting completion");
             }
             record.status = if ready { "idle" } else { "working" }.into();
+            if !ready {
+                if let Some(task_id) = record.last_message.as_ref().map(|id| format!("task-{id}")) {
+                    if let Some(mut task) = state.tasks.get(&task_id).cloned() {
+                        if task.owner != actor {
+                            bail!("task owner mismatch");
+                        }
+                        if task.status == "assigned" {
+                            task.status = "working".into();
+                            task.updated_ms = now_ms();
+                            server.commit_locked(&mut state, &[Event::TaskUpdated { task }]);
+                        }
+                    }
+                }
+            }
             server.commit_locked(
                 &mut state,
                 &[Event::SubagentUpdated {
@@ -491,6 +590,7 @@ fn run(
                     &record.parent,
                     "subagent-idle",
                     format!("subagent={} is idle and available", record.id),
+                    false,
                 )?;
             }
         }
@@ -509,7 +609,7 @@ fn run(
                 }],
             );
             drop(state);
-            let result = match notify(server, actor, &record.peer, &subject, body) {
+            let result = match notify(server, actor, &record.peer, &subject, body, true) {
                 Ok(value) => value,
                 Err(error) => {
                     let mut state = server.state.lock().unwrap();
@@ -598,6 +698,61 @@ fn run(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    #[ignore = "requires tmux and node; creates only a disposable session"]
+    fn snapshot_is_explicit_bounded_and_checks_session_binding() {
+        let (server, root) = crate::server::peer_tests::test_server();
+        let name = format!("collab-snapshot-test-{}", std::process::id());
+        let output = Command::new("tmux").args(["new-session","-d","-P","-F","#{session_id} #{pane_id}","-s",&name,
+            "node -e 'process.stdout.write(\"snapshot-marker\\n\".repeat(100));setInterval(()=>{},1000)'"
+        ]).output().unwrap();
+        assert!(output.status.success());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", &self.0])
+                    .status();
+            }
+        }
+        let _cleanup = Cleanup(name.clone());
+        let text = String::from_utf8(output.stdout).unwrap();
+        let binding: Vec<_> = text.split_whitespace().collect();
+        let mut record = Record {
+            id: "snapshot".into(),
+            parent: "parent".into(),
+            peer: name,
+            status: "idle".into(),
+            session: Some(binding[0].into()),
+            pane: Some(binding[1].into()),
+            profile: None,
+            created_ms: now_ms(),
+            ready_deadline_ms: 0,
+            last_message: None,
+            error: None,
+            probe_failures: vec![],
+        };
+        server.commit(&[Event::SubagentUpdated {
+            subagent: record.clone(),
+        }]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(observe(&server, Some("snapshot"), None)
+            .unwrap()
+            .get("screen_tail")
+            .is_none());
+        let snap = observe(&server, Some("snapshot"), Some(5)).unwrap();
+        assert!(snap["screen_tail"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot-marker"));
+        assert!(snap["screen_tail"].as_str().unwrap().lines().count() <= 5);
+        assert!(observe(&server, Some("snapshot"), Some(201)).is_err());
+        record.session = Some("$not-ours".into());
+        server.commit(&[Event::SubagentUpdated { subagent: record }]);
+        assert!(observe(&server, Some("snapshot"), Some(5)).is_err());
+        assert!(server.state.lock().unwrap().msgs.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn probes_are_bounded_and_require_exact_success() {
         let directory =

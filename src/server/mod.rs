@@ -1,6 +1,7 @@
 pub mod knock;
 pub mod state;
 pub mod timers;
+pub(crate) mod keepalive;
 
 use crate::proto::{Req, Resp, MSG_TYPES};
 use crate::scope::Scope;
@@ -19,7 +20,8 @@ use tokio::net::UnixListener;
 
 const MAX_POLL_MS: u64 = 3_600_000;
 const POLL_TICK_MS: u64 = 250;
-const TASK_STATUSES: [&str; 10] = [
+const TASK_STATUSES: [&str; 11] = [
+    "assigned",
     "working",
     "blocked",
     "waiting",
@@ -131,6 +133,7 @@ fn request_activity(req: &Req, resp: &Resp) -> serde_json::Value {
     let mut request = serde_json::to_value(req).unwrap_or_else(|_| json!({}));
     if let Some(obj) = request.as_object_mut() {
         obj.remove("token");
+        obj.remove("launch_env");
     }
     json!({
         "op": request.get("op").cloned().unwrap_or(json!("unknown")),
@@ -160,10 +163,15 @@ impl Server {
     pub(crate) fn commit_locked(&self, st: &mut State, evs: &[Event]) {
         let mut j = self.journal.lock().unwrap();
         use std::io::Write;
+        // Persist control truth before any state change or external notification.
+        // A failed journal poisons this owner instead of silently resetting budgets.
+        for ev in evs {
+            let line = serde_json::to_string(ev).expect("serialize event");
+            writeln!(j, "{}", line).expect("journal append failed; refusing state mutation");
+        }
+        j.sync_data().expect("journal sync failed; refusing state mutation");
         for ev in evs {
             st.apply(ev);
-            let line = serde_json::to_string(ev).expect("serialize event");
-            let _ = writeln!(j, "{}", line);
             if let Event::Sent { msg } = ev {
                 self.backup_message(msg);
             }
@@ -182,7 +190,6 @@ impl Server {
                 }
             }
         }
-        let _ = j.flush();
     }
 
     fn backup_message(&self, msg: &Message) {
@@ -1091,6 +1098,13 @@ pub(crate) fn handle_send(
     in_reply_to: Option<String>,
     delivery_mode: String,
 ) -> Resp {
+    handle_send_with_task(server, from, to, mtype, subject, body, in_reply_to, delivery_mode, false)
+}
+
+pub(crate) fn handle_send_with_task(
+    server: &Server, from: String, to: String, mtype: String, subject: Option<String>,
+    body: String, in_reply_to: Option<String>, delivery_mode: String, assign_task: bool,
+) -> Resp {
     if mtype != "notify" {
         return Resp::err("peer messaging requires type notify");
     }
@@ -1109,6 +1123,9 @@ pub(crate) fn handle_send(
         ));
     }
     let mut st = server.state.lock().unwrap();
+    if assign_task && !st.subagents.values().any(|s| s.parent == from && s.peer == to && s.status == "assigned") {
+        return Resp::err("managed task requires an authorized assigned subagent");
+    }
     let Some(sender) = st.workers.get(&from) else {
         return Resp::err(format!("sender {} not registered", from));
     };
@@ -1163,10 +1180,22 @@ pub(crate) fn handle_send(
         return Resp::data(json!({"msg_id": existing.id, "deduplicated": true}));
     }
     let mid = msg.id.clone();
+    let task_id = assign_task.then(|| format!("task-{mid}"));
     let subscription = st
         .matching_subscription(&to, "direct-message", None, now_ms())
         .cloned();
     let mut events = vec![Event::Sent { msg }];
+    if let Some(task_id) = &task_id {
+        events.push(Event::TaskCreated { task: TaskRec {
+            id:task_id.clone(),owner:to.clone(),created_by:from.clone(),feature_id:None,
+            worktree_path:None,branch:None,base_commit:None,priority:"p2".into(),status:"assigned".into(),
+            next_step:Some(format!("Read collab msg {mid}; accept via subagent working; bind a worktree with task relocate before code edits.")),
+            wait:None,created_ms:now_ms(),updated_ms:now_ms(),
+        }});
+        let mut child = st.subagents.values().find(|s| s.parent == from && s.peer == to && s.status == "assigned").unwrap().clone();
+        child.last_message = Some(mid.clone());
+        events.push(Event::SubagentUpdated {subagent:child});
+    }
     events.push(Event::DeliveryMode {
         msg_id: mid.clone(),
         mode: "explicit-notification".into(),
@@ -1189,6 +1218,7 @@ pub(crate) fn handle_send(
         .is_some_and(|subscription| attempt_notification(server, &mid, &subscription.id));
     Resp::data(json!({
         "msg_id": mid,
+        "task_id": task_id,
         "durable": true,
         "notification": if subscription.is_none() {
             "mailbox-only-no-subscription"
@@ -1849,6 +1879,7 @@ fn task_view(state: &State, task: &TaskRec) -> serde_json::Value {
             "receipt_id": cleanup_receipt.map(|receipt| receipt.id.clone()),
         },
         "updated_at": iso(task.updated_ms),
+        "keepalive": keepalive::view(state, &task.owner),
     })
 }
 
@@ -2012,6 +2043,7 @@ fn handle_task_wait(
 
 fn mutation_blocked_during_migration(req: &Req) -> bool {
     match req {
+        Req::SubagentObserve { .. } => false,
         Req::Subagent { command, .. } => !matches!(command, crate::subagent::Action::List | crate::subagent::Action::Status { .. }),
         Req::Send { .. }
         | Req::NotificationSubscribe { .. }
@@ -2057,6 +2089,16 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
         );
     }
     match req {
+        Req::SubagentObserve { id, snapshot_lines } => {
+            match crate::subagent::observe(server, id.as_deref(), snapshot_lines) {
+                Ok(mut value) => {
+                    value["notification_channel"] = json!("none");
+                    value["next_action"] = json!("No push channel for a non-tmux agent. Check subagent status/mailbox yourself; request snapshot explicitly when useful.");
+                    Resp::data(value)
+                },
+                Err(error) => Resp::err(error.to_string()),
+            }
+        }
         Req::Subagent { worker_id, token, command, launch_env } => crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env),
         Req::Register {
             worker_id,
@@ -2431,6 +2473,8 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     });
     restore_registered_peer_default_leases(&server);
     let listener = UnixListener::bind(&sock_path)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(
         server_dir.join("server.pid"),
         std::process::id().to_string(),
@@ -2463,4 +2507,4 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod peer_tests;
+pub(crate) mod peer_tests;

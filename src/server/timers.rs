@@ -8,6 +8,7 @@ const WAKE_ATTEMPT_LEASE_MS: i64 = 10_000;
 /// Server-side scheduler for finite subscriptions and bounded waits. It never
 /// creates task continuations or infers that ordinary work needs a wake.
 pub fn tick(server: &Arc<Server>) {
+    super::keepalive::tick(server);
     tick_with_idle(server, &pane_accepts_notification);
 }
 

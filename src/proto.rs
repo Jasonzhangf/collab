@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub enum Req {
+    SubagentObserve { id: Option<String>, snapshot_lines: Option<usize> },
     Subagent { worker_id: String, token: String, command: crate::subagent::Action, #[serde(default)] launch_env: std::collections::BTreeMap<String, String> },
     Register {
         worker_id: String,

@@ -3,7 +3,7 @@ use crate::server::state::default_priority;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-fn test_server() -> (Server, PathBuf) {
+pub(crate) fn test_server() -> (Server, PathBuf) {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!("collab-peer-{}-{n}", std::process::id()));
@@ -26,7 +26,7 @@ fn test_server() -> (Server, PathBuf) {
     )
 }
 
-fn register(server: &Server, id: &str, pane: &str) -> Resp {
+pub(super) fn register(server: &Server, id: &str, pane: &str) -> Resp {
     handle_register(
         server,
         id.into(),
@@ -52,6 +52,28 @@ fn create_task(server: &Server, owner: &str, id: &str, feature: &str) -> Resp {
 }
 
 #[test]
+fn failed_journal_cannot_apply_a_keepalive_reservation() {
+    let (server, root) = test_server();
+    *server.journal.lock().unwrap() = std::fs::File::open(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    let mut state = State::default();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        server.commit_locked(&mut state, &[Event::KeepaliveUpdated {worker_id:"worker".into(),record:crate::server::keepalive::Record::default()}]);
+    }));
+    assert!(result.is_err());
+    assert!(state.keepalives.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn activity_log_never_copies_launch_credentials() {
+    let request = Req::Subagent {worker_id:"parent".into(),token:"token".into(),command:crate::subagent::Action::Start {id:None},
+        launch_env:std::collections::BTreeMap::from([("SECRET".into(),"do-not-log".into())])};
+    let log = request_activity(&request, &Resp::data(json!({})));
+    assert!(log["request"].get("launch_env").is_none());
+    assert!(!log.to_string().contains("do-not-log"));
+}
+
+#[test]
 fn managed_subagent_is_authenticated_persistent_and_replayable() {
     use crate::subagent::{Action, Record};
     let (server, root) = test_server();
@@ -74,11 +96,18 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
     assert_eq!(server.state.lock().unwrap().msgs.len(), count);
     assert!(crate::subagent::handle(&server, "parent", "token-parent", Action::Send {id: "managed".into(), subject: "test".into(), body: "task".into()}).ok);
     let message_id = server.state.lock().unwrap().subagents["managed"].last_message.clone().unwrap();
+    assert_eq!(server.state.lock().unwrap().tasks[&format!("task-{message_id}")].status, "assigned");
     let server = Arc::new(server);
     let message = dispatch(&server, Req::MsgStatus { msg_id: message_id });
     assert_eq!(message.data["body"], "task");
     assert!(!crate::subagent::handle(&server, "parent", "token-parent", Action::Send {id: "managed".into(), subject: "test".into(), body: "task".into()}).ok);
     assert!(crate::subagent::handle(&server, "child", "token-child", Action::Working {id: "managed".into()}).ok);
+    assert_eq!(server.state.lock().unwrap().tasks.values().next().unwrap().status, "working");
+    let observed = dispatch(&server, Req::SubagentObserve {id:Some("managed".into()),snapshot_lines:None});
+    assert!(observed.ok);
+    assert_eq!(observed.data["notification_channel"], "none");
+    assert!(observed.data.get("screen_tail").is_none());
+    assert!(observed.data["tasks"].as_array().unwrap().len() == 1);
     assert!(crate::subagent::handle(&server, "child", "token-child", Action::Ready {id: "managed".into()}).ok);
     assert_eq!(server.state.lock().unwrap().subagents["managed"].status, "idle");
     assert!(crate::subagent::handle(&server, "parent", "token-parent", Action::Close {id: "managed".into()}).ok);
