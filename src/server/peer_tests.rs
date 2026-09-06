@@ -121,7 +121,10 @@ fn registration_adds_default_lease_when_only_short_direct_message_lease_exists()
         now + DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000
     );
 
-    state.apply(&events[0]);
+    for event in &events {
+        state.apply(event);
+    }
+    assert_eq!(state.notification_subscriptions["sub-short"].status, "rebound");
     assert!(default_direct_message_events(&state, "peer", "%peer", now + 1).is_empty());
 }
 
@@ -146,6 +149,43 @@ fn daemon_replay_restores_default_lease_for_registered_peer() {
         Event::NotificationSubscribed { subscription }
             if subscription.id == "sub-default-direct-message-peer"
     )));
+}
+
+#[test]
+fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
+    let mut state = State::default();
+    for event in default_direct_message_events(&state, "peer", "%one", 1000) {
+        state.apply(&event);
+    }
+    let mut old = state.notification_subscriptions.values().next().unwrap().clone();
+    old.id = "sub-legacy".into();
+    state.apply(&Event::NotificationSubscribed { subscription: old });
+    for event in default_direct_message_events(&state, "peer", "%one", 2000) {
+        state.apply(&event);
+    }
+    assert_eq!(state.notification_subscriptions.values().filter(|sub| sub.status == "armed").count(), 1);
+    assert_eq!(state.notification_subscriptions["sub-legacy"].status, "rebound");
+    assert!(default_direct_message_events(&state, "peer", "%one", 2000).is_empty());
+}
+
+#[test]
+fn default_subscription_renews_and_rebinds_without_new_ids() {
+    let mut state = State::default();
+    for event in default_direct_message_events(&state, "peer", "%one", 1000) {
+        state.apply(&event);
+    }
+    let id = state.notification_subscriptions.keys().next().unwrap().clone();
+    let ttl = DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000;
+    for (pane, time) in [("%one", ttl), ("%one", ttl * 3), ("%two", ttl * 4)] {
+        for event in default_direct_message_events(&state, "peer", pane, time) {
+            state.apply(&event);
+        }
+        assert_eq!(state.notification_subscriptions.len(), 1);
+        let sub = &state.notification_subscriptions[&id];
+        assert_eq!(sub.pane, pane);
+        assert_eq!(sub.status, "armed");
+        assert_eq!(sub.expires_ms, time + ttl);
+    }
 }
 
 #[test]

@@ -273,25 +273,29 @@ fn default_direct_message_events(
     let mut events = Vec::new();
     let default_id = default_direct_message_id(worker_id);
     let refresh_after_ms = DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000 / 2;
+    let mut current_is_fresh = false;
     for subscription in state.notification_subscriptions.values().filter(|sub| {
         sub.worker_id == worker_id
             && sub.event == "direct-message"
             && sub.status == "armed"
-            && sub.expires_ms > now
     }) {
         if subscription.id == default_id
             && subscription.pane == pane
             && subscription.expires_ms - now >= refresh_after_ms
         {
-            return events;
+            current_is_fresh = true;
+            continue;
         }
-        if subscription.id == default_id || subscription.pane != pane {
+        if subscription.id != default_id {
             events.push(Event::NotificationStatus {
                 subscription_id: subscription.id.clone(),
                 status: "rebound".into(),
                 updated_ms: now,
             });
         }
+    }
+    if current_is_fresh {
+        return events;
     }
     events.push(Event::NotificationSubscribed {
         subscription: NotificationSubscription {
