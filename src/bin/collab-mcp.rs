@@ -13,7 +13,7 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 fn tools() -> Value {
     json!([
         tool("collab_msg", "Read a durable notification by ID.", json!({"id":{"type":"string"}}), &["id"]),
-        tool("collab_subagent", "Parent manages children; child uses ready/working and sends results via collab_sendmessage. status includes mailbox, keepalive and notification history. snapshot is explicit screen-tail read only. Non-tmux observers get no push channel and must check status/mailbox themselves. rearm requires an explicit operator request after exhaustion.", json!({"action":{"type":"string","enum":["start","list","status","snapshot","rearm","send","ready","working","close"]},"id":{"type":"string"},"lines":{"type":"integer","minimum":1,"maximum":200},"subject":{"type":"string"},"body":{"type":"string"}}), &["action"]),
+        tool("collab_subagent", "Parent manages children; child uses ready/working and sends results via collab_sendmessage. status includes mailbox, keepalive and notification history. snapshot is explicit screen-tail read only, not a health probe. Cursor health is official `agent status --format json`. Non-tmux observers get no push channel and must check status/mailbox themselves. rearm requires an explicit operator request after exhaustion. start accepts optional runtime=cursor|codex to override ~/.appsdk/config.toml.", json!({"action":{"type":"string","enum":["start","list","status","snapshot","rearm","send","ready","working","close"]},"id":{"type":"string"},"runtime":{"type":"string","enum":["cursor","codex"]},"lines":{"type":"integer","minimum":1,"maximum":200},"subject":{"type":"string"},"body":{"type":"string"}}), &["action"]),
         tool(
             "collab_init",
             "Initialize/register this live project identity.",
@@ -155,7 +155,10 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
             let action = required(args, "action")?;
             if !["start", "list", "status", "snapshot", "rearm", "send", "ready", "working", "close"].contains(&action.as_str()) { return Err("invalid subagent action".into()); }
             argv.extend(["subagent".into(), action.clone()]);
-            if action == "start" { optional_flag(&mut argv, args, "id", "--id")?; }
+            if action == "start" {
+                optional_flag(&mut argv, args, "id", "--id")?;
+                optional_flag(&mut argv, args, "runtime", "--runtime")?;
+            }
             else if action != "list" { argv.push(required(args, "id")?); }
             if action == "send" { argv.extend(["--subject".into(), required(args, "subject")?, required(args, "body")?]); }
             if action == "snapshot" { optional_integer_flag(&mut argv, args, "lines", "--lines")?; }

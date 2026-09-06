@@ -143,6 +143,17 @@ pub enum Req {
         worker_id: String,
         token: String,
     },
+    RootPromote {
+        worker_id: String,
+        token: String,
+        approval: String,
+    },
+    RootDelegate {
+        worker_id: String,
+        token: String,
+        target_id: String,
+    },
+    RootStatus,
     Role {
         worker_id: String,
     },

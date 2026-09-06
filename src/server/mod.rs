@@ -1088,6 +1088,84 @@ pub(crate) fn handle_register(
     }))
 }
 
+fn verify_root_actor(state: &State, worker_id: &str, token: &str) -> Result<(), Resp> {
+    let Some(worker) = state.workers.get(worker_id) else {
+        return Err(Resp::err(format!("worker {} not registered", worker_id)));
+    };
+    if worker.token != token {
+        return Err(Resp::err("token mismatch: identity does not own this worker_id"));
+    }
+    if state.root_worker_id.as_deref() != Some(worker_id) {
+        return Err(Resp::err("root authority required; ask the registered root to delegate"));
+    }
+    if worker.pane.as_deref().is_none_or(|pane| !pane_alive(pane)) {
+        return Err(Resp::err("root identity has no live tmux pane"));
+    }
+    Ok(())
+}
+
+fn handle_root_promote(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    approval: String,
+) -> Resp {
+    let mut state = server.state.lock().unwrap();
+    let Some(worker) = state.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if worker.token != token {
+        return Resp::err("token mismatch: identity does not own this worker_id");
+    }
+    if approval.trim().is_empty() {
+        return Resp::err("root promotion requires explicit user approval");
+    }
+    if state.root_worker_id.is_some() {
+        return Resp::err("root already exists; only the registered root may delegate");
+    }
+    if worker.pane.as_deref().is_none_or(|pane| !pane_alive(pane)) {
+        return Resp::err("root promotion requires a live tmux pane");
+    }
+    server.commit_locked(
+        &mut state,
+        &[Event::RootAssigned {
+            worker_id: worker_id.clone(),
+            assigned_by: worker_id.clone(),
+            approval: Some(approval),
+            assigned_ms: now_ms(),
+        }],
+    );
+    Resp::data(json!({"root": worker_id, "mode": "user_approved_self_promotion"}))
+}
+
+fn handle_root_delegate(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    target_id: String,
+) -> Resp {
+    let mut state = server.state.lock().unwrap();
+    if let Err(error) = verify_root_actor(&state, &worker_id, &token) {
+        return error;
+    }
+    let Some(target) = state.workers.get(&target_id) else {
+        return Resp::err(format!("target worker {} not registered", target_id));
+    };
+    if target.pane.as_deref().is_none_or(|pane| !pane_alive(pane)) {
+        return Resp::err("root delegation requires a live target tmux pane");
+    }
+    server.commit_locked(
+        &mut state,
+        &[Event::RootAssigned {
+            worker_id: target_id.clone(),
+            assigned_by: worker_id.clone(),
+            approval: None,
+            assigned_ms: now_ms(),
+        }],
+    );
+    Resp::data(json!({"root": target_id, "delegated_by": worker_id}))
+}
+
 pub(crate) fn handle_send(
     server: &Server,
     from: String,
@@ -2060,6 +2138,8 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::TaskDispatch { .. }
         | Req::MigrationPlan { .. }
         | Req::MigrationApply { .. }
+        | Req::RootPromote { .. }
+        | Req::RootDelegate { .. }
         | Req::TransferMaster { .. }
         | Req::RemoveWorker { .. }
         | Req::ResetBindings { .. } => true,
@@ -2073,6 +2153,7 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::TaskConflicts { .. }
         | Req::MigrationInspect { .. }
         | Req::MigrationVerify { .. }
+        | Req::RootStatus
         | Req::Role { .. }
         | Req::Workers
         | Req::MasterId
@@ -2320,6 +2401,23 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
         Req::MigrationVerify { worker_id, token } => {
             handle_migration_verify(server, worker_id, token)
         }
+        Req::RootPromote { worker_id, token, approval } => {
+            handle_root_promote(server, worker_id, token, approval)
+        }
+        Req::RootDelegate { worker_id, token, target_id } => {
+            handle_root_delegate(server, worker_id, token, target_id)
+        }
+        Req::RootStatus => {
+            let state = server.state.lock().unwrap();
+            let root = state.root_worker_id.as_ref().and_then(|id| {
+                state.workers.get(id).map(|worker| json!({
+                    "worker_id": id,
+                    "pane": worker.pane,
+                    "endpoint_live": worker.pane.as_deref().is_some_and(pane_alive),
+                }))
+            });
+            Resp::data(json!({"root": root}))
+        }
         Req::Role { worker_id: _ } => {
             Resp::err("declared roles are removed; use collab who/context for peer identity")
         }
@@ -2347,7 +2445,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 "count": workers.len()
             }))
         }
-        Req::MasterId => Resp::err("permanent master role is deprecated; all identities are peers"),
+        Req::MasterId => Resp::err("use collab root status; legacy master role is not supported"),
         Req::MasterRecover {
             worker_id: _,
             token: _,

@@ -4,7 +4,7 @@ Approved scope: ~/.appsdk/config.toml is the only policy source; project
 overrides live there. Collab owns runtime state. AppSDK delegates commands.
 
 Default runtime is Cursor CLI. Codex remains an explicit `runtime = "codex"`
-opt-in. `collab-mcp` is the shared MCP for every agent. It speaks
+opt-in, or a per-start `--runtime cursor|codex` override. `collab-mcp` is the shared MCP for every agent. It speaks
 newline JSON-RPC (Codex) and Content-Length frames (Cursor and other
 stdio MCP clients). `collab init` merges `mcpServers.collab` into
 project `.cursor/mcp.json` and `.mcp.json` without overwriting other
@@ -25,5 +25,10 @@ depend on a prior `mcp enable` or directory login:
 
 `agent --yolo --trust --approve-mcps --sandbox disabled --model auto --workspace <project-cwd>`
 
-Do not pass `--worktree` or `persist`. Health probe is
-`agent --print --mode ask --trust` and never uses `--yolo`.
+Do not pass `--worktree` or `persist`. Cursor health probe is official
+`agent status --format json` (`loggedIn: true`), bounded by
+`[subagent.health] timeout_seconds = 90`. It is not Codex `exec` and not
+tmux snapshot. A probe timeout keeps the record; check `status` again
+without closing. Snapshot is only session-screen progress after a pane
+exists. Codex health remains `codex exec` with the configured expected
+response.

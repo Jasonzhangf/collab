@@ -6,14 +6,12 @@
     "executable": "/Users/fanzhang/.local/bin/agent",
     "version": "2026.09.02-c22c1a3",
     "interactive_argv": ["--yolo", "--trust", "--approve-mcps", "--workspace", "<cwd>"],
-    "probe_argv": ["--print", "--mode", "ask", "--trust", "--output-format", "text", "--workspace", "<probe-dir>"]
+    "probe_argv": ["status", "--format", "json"]
   },
   "health_probe": {
-    "prompt": "Connectivity probe only. Do not use tools or read files. Reply exactly: OK",
-    "stdout": "OK",
-    "exit": 0,
-    "elapsed_s": 16.86,
-    "fits_current_timeout_s": 90
+    "command": "agent status --format json",
+    "success": {"loggedIn": true},
+    "note": "Official Cursor CLI auth/status probe. Not Codex exec and not tmux snapshot."
   },
   "tmux_interactive": {
     "session_name": "cursor-cli-cap-20260906",

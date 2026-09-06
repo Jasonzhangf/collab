@@ -66,7 +66,7 @@ fn failed_journal_cannot_apply_a_keepalive_reservation() {
 
 #[test]
 fn activity_log_never_copies_launch_credentials() {
-    let request = Req::Subagent {worker_id:"parent".into(),token:"token".into(),command:crate::subagent::Action::Start {id:None},
+    let request = Req::Subagent {worker_id:"parent".into(),token:"token".into(),command:crate::subagent::Action::Start {id:None, runtime:None},
         launch_env:std::collections::BTreeMap::from([("SECRET".into(),"do-not-log".into())])};
     let log = request_activity(&request, &Resp::data(json!({})));
     assert!(log["request"].get("launch_env").is_none());
@@ -80,7 +80,7 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
     register(&server, "parent", "%parent");
     register(&server, "child", "%child");
     register(&server, "other", "%other");
-    let record = Record { id: "managed".into(), parent: "parent".into(), peer: "child".into(), status: "starting".into(), session: None, pane: Some("%child".into()), profile: None, created_ms: now_ms(), ready_deadline_ms: now_ms()+90000, last_message: None, error: None, probe_failures: Vec::new() };
+    let record = Record { id: "managed".into(), parent: "parent".into(), peer: "child".into(), status: "starting".into(), session: None, pane: Some("%child".into()), profile: None, created_ms: now_ms(), ready_deadline_ms: now_ms()+90000, last_message: None, error: None, probe_failures: Vec::new(), runtime: None };
     let event = Event::SubagentUpdated { subagent: record };
     let encoded = serde_json::to_string(&event).unwrap();
     let mut replay = State::default();
@@ -1346,4 +1346,180 @@ fn cleanup_rejects_unmerged_then_removes_only_merged_clean_worktree() {
     assert!(!playground.join("wt").exists());
     assert!(!git(&["rev-parse", "--verify", "feature"]).status.success());
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cursor_and_codex_subagents_exchange_messages() {
+    use crate::subagent::{Action, Record};
+    let (server, root) = test_server();
+    register(&server, "parent", "%parent");
+    register(&server, "cursor-peer", "%cursor");
+    register(&server, "codex-peer", "%codex");
+    let now = now_ms();
+    let cursor = Record {
+        id: "cursor-rt".into(),
+        parent: "parent".into(),
+        peer: "cursor-peer".into(),
+        status: "idle".into(),
+        session: Some("$cursor".into()),
+        pane: Some("%cursor".into()),
+        profile: None,
+        created_ms: now,
+        ready_deadline_ms: now + 90_000,
+        last_message: None,
+        error: None,
+        probe_failures: Vec::new(),
+        runtime: Some("cursor".into()),
+    };
+    let codex = Record {
+        id: "codex-rt".into(),
+        parent: "parent".into(),
+        peer: "codex-peer".into(),
+        status: "idle".into(),
+        session: Some("$codex".into()),
+        pane: Some("%codex".into()),
+        profile: None,
+        created_ms: now,
+        ready_deadline_ms: now + 90_000,
+        last_message: None,
+        error: None,
+        probe_failures: Vec::new(),
+        runtime: Some("codex".into()),
+    };
+    server.commit(&[
+        Event::SubagentUpdated {
+            subagent: cursor.clone(),
+        },
+        Event::SubagentUpdated {
+            subagent: codex.clone(),
+        },
+    ]);
+    let to_codex = handle_send(
+        &server,
+        "cursor-peer".into(),
+        "codex-peer".into(),
+        "notify".into(),
+        Some("cursor-to-codex".into()),
+        "ping from cursor runtime".into(),
+        None,
+        "immediate".into(),
+    );
+    assert!(to_codex.ok, "{}", to_codex.error.unwrap_or_default());
+    let to_cursor = handle_send(
+        &server,
+        "codex-peer".into(),
+        "cursor-peer".into(),
+        "notify".into(),
+        Some("codex-to-cursor".into()),
+        "pong from codex runtime".into(),
+        None,
+        "immediate".into(),
+    );
+    assert!(to_cursor.ok, "{}", to_cursor.error.unwrap_or_default());
+    let to_parent = handle_send(
+        &server,
+        "cursor-peer".into(),
+        "parent".into(),
+        "notify".into(),
+        Some("cursor-result".into()),
+        "cursor finished".into(),
+        None,
+        "immediate".into(),
+    );
+    assert!(to_parent.ok, "{}", to_parent.error.unwrap_or_default());
+    let from_parent_cursor = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Send {
+            id: "cursor-rt".into(),
+            subject: "assign-cursor".into(),
+            body: "task for cursor".into(),
+        },
+    );
+    assert!(
+        from_parent_cursor.ok,
+        "{}",
+        from_parent_cursor.error.unwrap_or_default()
+    );
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "cursor-peer",
+            "token-cursor-peer",
+            Action::Working {
+                id: "cursor-rt".into()
+            }
+        )
+        .ok
+    );
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "cursor-peer",
+            "token-cursor-peer",
+            Action::Ready {
+                id: "cursor-rt".into()
+            }
+        )
+        .ok
+    );
+    let from_parent_codex = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Send {
+            id: "codex-rt".into(),
+            subject: "assign-codex".into(),
+            body: "task for codex".into(),
+        },
+    );
+    assert!(
+        from_parent_codex.ok,
+        "{}",
+        from_parent_codex.error.unwrap_or_default()
+    );
+    let cursor_status = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Status {
+            id: "cursor-rt".into(),
+        },
+    );
+    let codex_status = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Status {
+            id: "codex-rt".into(),
+        },
+    );
+    assert!(cursor_status.ok);
+    assert!(codex_status.ok);
+    assert_eq!(cursor_status.data["subagent"]["runtime"], "cursor");
+    assert_eq!(codex_status.data["subagent"]["runtime"], "codex");
+    assert_eq!(cursor_status.data["next_check"], "status");
+    assert_eq!(cursor_status.data["progress"], "snapshot");
+    assert_eq!(cursor_status.data["close_required"], false);
+    let msgs: Vec<_> = server.state.lock().unwrap().msgs.values().cloned().collect();
+    assert!(
+        msgs.iter().any(|m| m.from == "cursor-peer"
+            && m.to == "codex-peer"
+            && m.subject.as_deref() == Some("cursor-to-codex")),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.from == "codex-peer"
+            && m.to == "cursor-peer"
+            && m.subject.as_deref() == Some("codex-to-cursor")),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.from == "cursor-peer"
+            && m.to == "parent"
+            && m.subject.as_deref() == Some("cursor-result")),
+        "{msgs:?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }

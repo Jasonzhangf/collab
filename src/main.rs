@@ -46,6 +46,8 @@ enum Cmd {
     Role,
     /// List registered peers and their local activity projection
     Who,
+    /// Inspect or explicitly assign project root authority
+    Root { #[command(subcommand)] command: RootCmd },
     /// Deprecated: permanent master role was removed
     Master {
         #[command(subcommand)]
@@ -237,6 +239,16 @@ enum MasterCmd {
 }
 
 #[derive(Subcommand)]
+enum RootCmd {
+    /// Promote this peer when no root exists; requires the user's approval text
+    Promote { #[arg(long)] approval: String },
+    /// Delegate root authority to another registered peer (root only)
+    Delegate { target: String },
+    /// Show the current root, if any
+    Status,
+}
+
+#[derive(Subcommand)]
 enum WorkerCmd {
     /// Re-register the current tmux pane without changing task ownership
     Recover,
@@ -292,7 +304,11 @@ fn main() {
 fn run(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::SubagentExec {file} => subagent::exec_launch(&file),
-        Cmd::Config => { out(&crate::config::load(&scope::project_root()?)?); Ok(()) }
+        Cmd::Config => {
+            crate::config::ensure_written()?;
+            out(&crate::config::load(&scope::project_root()?)?);
+            Ok(())
+        }
         Cmd::Subagent { command } => {
             let scope = Scope::resolve()?;
             if std::env::var_os("TMUX_PANE").is_none() {
@@ -445,6 +461,31 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Who => {
             let scope = Scope::resolve()?;
             let v: serde_json::Value = client::call(&scope.sock_path(), &Req::Workers)?;
+            out(&v);
+            Ok(())
+        }
+        Cmd::Root { command } => {
+            let scope = Scope::resolve()?;
+            let req = match command {
+                RootCmd::Promote { approval } => {
+                    let ident = me(&scope, None)?;
+                    Req::RootPromote {
+                        worker_id: ident.worker_id,
+                        token: ident.token,
+                        approval,
+                    }
+                }
+                RootCmd::Delegate { target } => {
+                    let ident = me(&scope, None)?;
+                    Req::RootDelegate {
+                        worker_id: ident.worker_id,
+                        token: ident.token,
+                        target_id: target,
+                    }
+                }
+                RootCmd::Status => Req::RootStatus,
+            };
+            let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
             out(&v);
             Ok(())
         }

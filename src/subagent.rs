@@ -20,6 +20,10 @@ pub enum Action {
     Start {
         #[arg(long)]
         id: Option<String>,
+        /// Override ~/.appsdk/config.toml [subagent].runtime for this child only
+        #[arg(long)]
+        #[serde(default)]
+        runtime: Option<String>,
     },
     List,
     Status {
@@ -64,6 +68,8 @@ pub struct Record {
     pub error: Option<String>,
     #[serde(default)]
     pub probe_failures: Vec<String>,
+    #[serde(default)]
+    pub runtime: Option<String>,
 }
 pub(crate) fn observe(
     server: &Server,
@@ -78,6 +84,16 @@ pub(crate) fn observe(
     if let Some(lines) = lines {
         if !(1..=200).contains(&lines) {
             bail!("snapshot lines must be 1..200");
+        }
+        if record.pane.is_none() {
+            let mut value = json!({
+                "subagent_id": record.id,
+                "captured_ms": now_ms(),
+                "pane": serde_json::Value::Null,
+                "screen_tail": ""
+            });
+            merge_follow_up(&mut value);
+            return Ok(value);
         }
         let pane = record.pane.as_deref().context("subagent has no pane")?;
         if !crate::server::knock::pane_alive(pane) {
@@ -110,10 +126,10 @@ pub(crate) fn observe(
         }
         let text = String::from_utf8_lossy(&output.stdout);
         let tail: Vec<_> = text.lines().rev().take(lines).collect();
-        return Ok(
-            json!({"subagent_id":record.id,"captured_ms":now_ms(),"pane":pane,
-            "screen_tail":tail.into_iter().rev().collect::<Vec<_>>().join("\n")}),
-        );
+        let mut value = json!({"subagent_id":record.id,"captured_ms":now_ms(),"pane":pane,
+            "screen_tail":tail.into_iter().rev().collect::<Vec<_>>().join("\n")});
+        merge_follow_up(&mut value);
+        return Ok(value);
     }
     let observed = match record.pane.as_deref() {
         None => "unknown",
@@ -131,11 +147,24 @@ pub(crate) fn observe(
         .filter(|m| m.from == record.peer && m.to == record.parent)
         .collect();
     mailbox.sort_by_key(|m| m.created_ms);
-    Ok(
-        json!({"subagent":record,"observed_status":observed,"observed_ms":now_ms(),
+    let mut value = json!({"subagent":record,"observed_status":observed,"observed_ms":now_ms(),
         "keepalive":crate::server::keepalive::view(&state,&record.peer),"mailbox":mailbox,
-        "tasks":state.tasks.values().filter(|t|t.owner==record.peer).collect::<Vec<_>>()}),
-    )
+        "tasks":state.tasks.values().filter(|t|t.owner==record.peer).collect::<Vec<_>>()});
+    merge_follow_up(&mut value);
+    Ok(value)
+}
+
+fn merge_follow_up(value: &mut serde_json::Value) {
+    value["retry_allowed"] = json!(true);
+    value["close_required"] = json!(false);
+    value["next_check"] = json!("status");
+    value["progress"] = json!("snapshot");
+}
+
+fn follow_up(record: &Record, reused: bool) -> serde_json::Value {
+    let mut value = json!({"subagent": record, "reused": reused});
+    merge_follow_up(&mut value);
+    value
 }
 
 fn valid_id(id: &str) -> bool {
@@ -239,6 +268,58 @@ fn launch_args(
     Ok(("codex".into(), args))
 }
 
+fn finish_probe(child: &mut std::process::Child, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                bail!("probe exited {status}");
+            }
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            // The probe owns this newly-created process group, including
+            // its MCP children. Never signal unrelated named processes.
+            let result = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            if result != 0 && child.try_wait()?.is_none() {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            child.wait()?;
+            bail!("probe timed out");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn probe_cursor_status(
+    executable: &std::path::Path,
+    settings: &config::Health,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let mut command = Command::new(executable);
+    command.env_clear().envs(environment);
+    command.args(["status", "--format", "json"]);
+    command
+        .env_remove("TMUX_PANE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    let mut child = command.spawn().context("cannot start health probe")?;
+    finish_probe(&mut child, Duration::from_secs(settings.timeout_seconds))?;
+    let mut text = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::io::Read::read_to_string(&mut stdout, &mut text)?;
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(text.trim()).context("cursor status did not return JSON")?;
+    if value.get("loggedIn") != Some(&json!(true)) {
+        bail!("cursor is not logged in");
+    }
+    Ok(())
+}
+
 fn probe_with(
     executable: &std::path::Path,
     runtime: &str,
@@ -246,6 +327,9 @@ fn probe_with(
     settings: &config::Health,
     environment: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
+    if is_cursor(runtime) {
+        return probe_cursor_status(executable, settings, environment);
+    }
     let directory =
         std::env::temp_dir().join(format!("appsdk-probe-{:016x}", rand::random::<u64>()));
     std::fs::create_dir(&directory)?;
@@ -257,80 +341,40 @@ fn probe_with(
         );
         let mut command = Command::new(executable);
         command.env_clear().envs(environment);
-        if is_cursor(runtime) {
-            command.args([
-                "--print",
-                "--mode",
-                "ask",
-                "--trust",
-                "--output-format",
-                "text",
-                "--workspace",
-            ]);
-            command.arg(&directory).arg(&prompt);
-            command.stdout(Stdio::piped());
-        } else {
-            command
-                .args([
-                    "exec",
-                    "--profile",
-                    &profile.codex_profile,
-                    "--ephemeral",
-                    "--skip-git-repo-check",
-                    "--sandbox",
-                    "read-only",
-                    "--output-last-message",
-                ])
-                .arg(&output)
-                .arg(&prompt);
-            if let Some(model) = &profile.model {
-                command.args(["--model", model]);
-            }
-            command.stdout(Stdio::null());
+        command
+            .args([
+                "exec",
+                "--profile",
+                &profile.codex_profile,
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "--output-last-message",
+            ])
+            .arg(&output)
+            .arg(&prompt);
+        if let Some(model) = &profile.model {
+            command.args(["--model", model]);
         }
         command
             .current_dir(&directory)
             .env_remove("TMUX_PANE")
             .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .stderr(Stdio::null());
         use std::os::unix::process::CommandExt;
         command.process_group(0);
         let mut child = command.spawn().context("cannot start health probe")?;
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    bail!("probe exited {status}");
-                }
-                let body = if is_cursor(runtime) {
-                    let mut text = String::new();
-                    if let Some(mut stdout) = child.stdout.take() {
-                        std::io::Read::read_to_string(&mut stdout, &mut text)?;
-                    }
-                    text
-                } else {
-                    std::fs::read_to_string(output)?
-                };
-                if body.trim() != settings.expected_response {
-                    bail!(
-                        "probe response did not match expected response: {:?}",
-                        body.trim()
-                    );
-                }
-                return Ok(());
-            }
-            if started.elapsed() >= Duration::from_secs(settings.timeout_seconds) {
-                // The probe owns this newly-created process group, including
-                // its MCP children. Never signal unrelated named processes.
-                let result = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-                if result != 0 && child.try_wait()?.is_none() {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                child.wait()?;
-                bail!("probe timed out");
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        finish_probe(&mut child, Duration::from_secs(settings.timeout_seconds))?;
+        let body = std::fs::read_to_string(output)?;
+        if body.trim() != settings.expected_response {
+            bail!(
+                "probe response did not match expected response: {:?}",
+                body.trim()
+            );
         }
+        Ok(())
     })();
     let cleanup = std::fs::remove_dir_all(&directory);
     result.and_then(|_| {
@@ -404,6 +448,7 @@ fn launch(
     environment: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     crate::scope::init(&server.root).context("cannot write project MCP and CLI permissions")?;
+    record.runtime = Some(settings.runtime.clone());
     let mut errors = Vec::new();
     let executable = if is_cursor(&settings.runtime) {
         std::path::Path::new("agent")
@@ -562,8 +607,15 @@ fn run(
             bail!("subagent authentication failed");
         }
     }
-    if let Action::Start { id } = action {
-        let config = config::load(&server.root)?;
+    if let Action::Start { id, runtime } = action {
+        config::ensure_written()?;
+        let mut config = config::load(&server.root)?;
+        if let Some(runtime) = runtime {
+            if !matches!(runtime.as_str(), "cursor" | "codex") {
+                bail!("subagent.runtime must be cursor or codex");
+            }
+            config.subagent.runtime = runtime;
+        }
         let id = id.unwrap_or_else(|| format!("sa-{:016x}", rand::random::<u64>()));
         if !valid_id(&id) {
             bail!("invalid subagent ID");
@@ -606,6 +658,7 @@ fn run(
             last_message: None,
             error: None,
             probe_failures: Vec::new(),
+            runtime: Some(config.subagent.runtime.clone()),
         };
         {
             let mut state = server.state.lock().unwrap();
@@ -613,23 +666,37 @@ fn run(
                 if existing.parent != actor {
                     bail!("subagent belongs to another parent");
                 }
-                return Ok(json!({"subagent": existing, "reused": true}));
+                if existing.pane.is_some() {
+                    let existing = existing.clone();
+                    return Ok(follow_up(&existing, true));
+                }
+                record = existing.clone();
+                record.runtime = Some(config.subagent.runtime.clone());
+            } else {
+                server.commit_locked(
+                    &mut state,
+                    &[Event::SubagentUpdated {
+                        subagent: record.clone(),
+                    }],
+                );
             }
-            server.commit_locked(
-                &mut state,
-                &[Event::SubagentUpdated {
-                    subagent: record.clone(),
-                }],
-            );
         }
         if let Err(e) = launch(server, &mut record, &config.subagent, environment) {
+            let msg = e.to_string();
+            record.error = Some(msg.clone());
+            if msg.contains("timed out") {
+                record.status = "probing".into();
+                server.commit(&[Event::SubagentUpdated {
+                    subagent: record.clone(),
+                }]);
+                return Ok(follow_up(&record, false));
+            }
             record.status = "failed".into();
-            record.error = Some(e.to_string());
         }
         server.commit(&[Event::SubagentUpdated {
             subagent: record.clone(),
         }]);
-        return Ok(json!({"subagent": record, "retry_allowed": false}));
+        return Ok(follow_up(&record, false));
     }
     if matches!(action, Action::List) {
         let state = server.state.lock().unwrap();
@@ -772,8 +839,8 @@ fn run(
             if record.status == "closed" {
                 return Ok(json!({"subagent": record, "reused": true}));
             }
-            if record.status == "probing" {
-                bail!("startup probe is in progress; close after its bounded completion");
+            if record.status == "probing" && record.error.is_none() {
+                bail!("startup probe is in progress; check status, or close after its bounded completion");
             }
             record.status = "closing".into();
             server.commit_locked(
@@ -865,6 +932,7 @@ mod tests {
             last_message: None,
             error: None,
             probe_failures: vec![],
+            runtime: None,
         };
         server.commit(&[Event::SubagentUpdated {
             subagent: record.clone(),
@@ -925,14 +993,14 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
-    fn cursor_probe_reads_stdout_and_launch_uses_session_flags() {
+    fn cursor_probe_uses_official_status_json() {
         let directory =
             std::env::temp_dir().join(format!("collab-cursor-probe-{:016x}", rand::random::<u64>()));
         std::fs::create_dir(&directory).unwrap();
         let executable = directory.join("agent-fixture");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nprintf 'OK\\n'\n",
+            "#!/bin/sh\ncase \"$1\" in\n status)\n  if [ \"$2\" = --format ] && [ \"$3\" = json ]; then\n    printf '{\"loggedIn\":true,\"authMethod\":\"test\"}\\n'\n    exit 0\n  fi\n  exit 2\n  ;;\n esac\n exit 1\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -951,6 +1019,45 @@ mod tests {
             &std::env::vars().collect()
         )
         .is_ok());
+        let logged_out = directory.join("agent-logged-out");
+        std::fs::write(
+            &logged_out,
+            "#!/bin/sh\nprintf '{\"loggedIn\":false}\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&logged_out, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(probe_with(
+            &logged_out,
+            "cursor",
+            &config::Profile {
+                codex_profile: String::new(),
+                model: None
+            },
+            &settings,
+            &std::env::vars().collect()
+        )
+        .is_err());
+        let slow = directory.join("agent-slow");
+        std::fs::write(&slow, "#!/bin/sh\nexec sleep 20\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let start = Instant::now();
+        let err = probe_with(
+            &slow,
+            "cursor",
+            &config::Profile {
+                codex_profile: String::new(),
+                model: None
+            },
+            &config::Health {
+                timeout_seconds: 1,
+                ..Default::default()
+            },
+            &std::env::vars().collect(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(3));
         let mcp = std::path::Path::new("/tmp/collab-mcp");
         let (exe, args) = launch_args(
             "cursor",
@@ -1014,6 +1121,7 @@ mod tests {
             last_message: None,
             error: None,
             probe_failures: vec![],
+            runtime: None,
         });
         assert!(prompt.contains("collab ack <message-id>"));
         assert!(prompt.contains("already registered"));

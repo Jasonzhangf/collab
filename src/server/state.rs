@@ -241,6 +241,12 @@ pub enum Event {
     MigrationUpdated {
         migration: MigrationRecord,
     },
+    RootAssigned {
+        worker_id: String,
+        assigned_by: String,
+        approval: Option<String>,
+        assigned_ms: i64,
+    },
 }
 
 #[derive(Default)]
@@ -255,6 +261,7 @@ pub struct State {
     pub notification_subscriptions: HashMap<String, NotificationSubscription>,
     pub wake_bindings: HashMap<String, String>,
     pub migration: Option<MigrationRecord>,
+    pub root_worker_id: Option<String>,
 }
 
 impl State {
@@ -354,6 +361,9 @@ impl State {
             }
             Event::MigrationUpdated { migration } => {
                 self.migration = Some(migration.clone());
+            }
+            Event::RootAssigned { worker_id, .. } => {
+                self.root_worker_id = Some(worker_id.clone());
             }
         }
     }

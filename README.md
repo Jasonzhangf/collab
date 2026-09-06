@@ -149,11 +149,12 @@ collab sendmessage --to <peer> --subject result-ready "The result is ready; quer
 Never type peer messages into tmux. Without the recipient's active
 `direct-message` subscription, the message remains mailbox-only. Registration
 normally creates this subscription automatically; tmux receives only the short
-message id, abbreviated subject, safe one-line original body preview, and a
-final `C-m` submit key in one tmux command queue. The queue uses bracketed paste,
-a short settle, then `C-m` so Enter is a later PTY write. Cursor CLI drops
-Enter when it arrives in the same PTY read as the paste. Plain
-`send-keys <text> C-m` may leave Codex text unsubmitted.
+message id, abbreviated subject, safe one-line original body preview, and one
+submit. Cursor CLI gets literal keys, then `C-m` from a second tmux process
+250ms later, so bracketed paste cannot swallow Enter on send or receive. Codex
+keeps `paste-buffer -p` and `C-m` in one tmux queue so the paste is submitted.
+Splitting Codex paste from Enter leaves the text unsubmitted; putting Cursor
+Enter in the same PTY chunk as paste swallows it.
 
 ## Explicit notifications
 
@@ -173,7 +174,8 @@ Subscriptions are owner-scoped, exact-event, and bounded by TTL. The default
 `direct-message` lease accepts later peer messages until expiry; resource,
 deadline, and async-result subscriptions remain one-shot.
 tmux receives `COLLAB_NOTIFY <message-id> [<subject>] <original-body-preview>`
-through bracketed paste, a short settle, and a final `C-m` in one command queue. The Agent first weighs the id and
+then one Enter: Cursor as delayed literal keys, Codex as paste-plus-`C-m` in
+one command queue. The Agent first weighs the id and
 subject against current work. When it selects the notice, it runs
 `collab msg <message-id>`, reads durable detail, and executes actionable
 in-scope work; it must not stop at ACK or waiting. The first pending notice opens

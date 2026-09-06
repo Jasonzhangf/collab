@@ -197,6 +197,60 @@ pub fn path() -> Result<PathBuf> {
             .join(".appsdk/config.toml"),
     )
 }
+
+pub fn ensure_written() -> Result<()> {
+    let path = path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&path, toml::to_string_pretty(&Config::default())?)?;
+            Ok(())
+        }
+        Ok(text) => {
+            if let Some(updated) = insert_subagent_runtime(&text) {
+                std::fs::write(&path, updated)?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn insert_subagent_runtime(text: &str) -> Option<String> {
+    let parsed: toml::Value = toml::from_str(text).ok()?;
+    if parsed
+        .get("subagent")
+        .and_then(|table| table.get("runtime"))
+        .is_some()
+    {
+        return None;
+    }
+    if let Some(idx) = text.match_indices("[subagent]").find_map(|(idx, _)| {
+        match text.as_bytes().get(idx + "[subagent]".len()) {
+            Some(b'.') => None,
+            _ => Some(idx),
+        }
+    }) {
+        let insert_at = idx + "[subagent]".len();
+        let (head, tail) = text.split_at(insert_at);
+        let mut out = String::from(head);
+        out.push('\n');
+        out.push_str("runtime = \"cursor\"");
+        if !tail.starts_with('\n') && !tail.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(tail);
+        return Some(out);
+    }
+    let mut out = text.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("\n[subagent]\nruntime = \"cursor\"\n");
+    Some(out)
+}
 fn merge(base: &mut toml::Value, overlay: toml::Value) {
     if let (Some(base), Some(overlay)) = (base.as_table_mut(), overlay.as_table()) {
         for (key, value) in overlay {
@@ -389,5 +443,11 @@ mod tests {
         ] {
             assert!(parse(s, Path::new("/project")).is_err());
         }
+    }
+    #[test]
+    fn writes_default_runtime_into_subagent_table() {
+        let added = insert_subagent_runtime("[subagent]\npersistent = true\n").unwrap();
+        assert!(added.contains("runtime = \"cursor\""));
+        assert!(insert_subagent_runtime("[subagent]\nruntime = \"codex\"\n").is_none());
     }
 }

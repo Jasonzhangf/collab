@@ -84,6 +84,9 @@ pub fn init(root: &Path) -> std::io::Result<PathBuf> {
     ensure_codex_collab_permissions(root)?;
     ensure_cursor_cli_permissions(root)?;
     ensure_claude_collab_permissions(root)?;
+    crate::config::ensure_written().map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::Other, error)
+    })?;
     Ok(base)
 }
 
@@ -338,7 +341,8 @@ the current task. Query durable state before acting when the notice is relevant.
 or asynchronous-result notices. Never type peer messages with tmux. After the
 receiving Agent registers a finite subscription, the daemon may send one id,
 abbreviated subject, safe one-line original body preview, and final submit key
-as one tmux command queue. The direct-message lease is reusable until expiry;
+as one submit. Cursor uses literal keys, then `C-m` after 250ms in a second
+tmux process; Codex uses `paste-buffer -p` plus `C-m` in one tmux queue. The direct-message lease is reusable until expiry;
 resource, deadline, and async-result subscriptions remain one-shot.
 
 `collab inbox` and `collab msg <id>` query the durable local mailbox after a

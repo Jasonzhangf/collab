@@ -159,12 +159,27 @@ fn agent_state_from(command: &str, title: &str, screen: &str) -> AgentState {
     }
 }
 
-/// Cursor CLI (and some Ink TUIs) ignore Enter when it arrives in the same
-/// PTY read as the paste payload or bracketed-paste terminator. Keep one
-/// tmux client queue; the settle forces `C-m` onto a later write.
-const SUBMIT_SETTLE: &str = "sleep 0.05";
+/// Cursor CLI swallows Enter that shares a PTY read with a bracketed-paste
+/// terminator. Codex needs the opposite: `paste-buffer -p` then `C-m` in the
+/// same tmux queue, or the paste lands without a submit.
+const SUBMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+static KNOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn wake_args<'a>(pane: &'a str, text: &'a str, buffer: &'a str) -> Vec<&'a str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitKind {
+    BracketedPaste,
+    Literal,
+}
+
+fn submit_kind(command: &str, screen: &str) -> SubmitKind {
+    if in_cursor_tui(screen) || matches!(command, "agent" | "cursor-agent") {
+        SubmitKind::Literal
+    } else {
+        SubmitKind::BracketedPaste
+    }
+}
+
+fn paste_args<'a>(pane: &'a str, text: &'a str, buffer: &'a str) -> Vec<&'a str> {
     vec![
         "set-buffer",
         "-b",
@@ -178,15 +193,47 @@ fn wake_args<'a>(pane: &'a str, text: &'a str, buffer: &'a str) -> Vec<&'a str> 
         buffer,
         "-t",
         pane,
-        ";",
-        "run-shell",
-        SUBMIT_SETTLE,
-        ";",
-        "send-keys",
-        "-t",
-        pane,
-        "C-m",
     ]
+}
+
+fn paste_submit_args<'a>(pane: &'a str, text: &'a str, buffer: &'a str) -> Vec<&'a str> {
+    let mut args = paste_args(pane, text, buffer);
+    args.extend([";", "send-keys", "-t", pane, "C-m"]);
+    args
+}
+
+fn literal_args<'a>(pane: &'a str, text: &'a str) -> Vec<&'a str> {
+    vec!["send-keys", "-t", pane, "-l", "--", text]
+}
+
+fn submit_args(pane: &str) -> [&str; 4] {
+    ["send-keys", "-t", pane, "C-m"]
+}
+
+fn tmux(args: &[&str], what: &str, pane: &str) -> anyhow::Result<()> {
+    let sent = Command::new("tmux").args(args).status()?;
+    if !sent.success() {
+        anyhow::bail!("tmux {what} delivery failed for pane {pane}");
+    }
+    Ok(())
+}
+
+fn knock_kind(pane: &str, text: &str, kind: SubmitKind) -> anyhow::Result<()> {
+    let _lock = KNOCK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match kind {
+        SubmitKind::Literal => {
+            tmux(&literal_args(pane, text), "literal", pane)?;
+            std::thread::sleep(SUBMIT_SETTLE);
+            tmux(&submit_args(pane), "submit", pane)
+        }
+        SubmitKind::BracketedPaste => {
+            let sequence = WAKE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let buffer = format!("collab-wake-{}-{sequence}", std::process::id());
+            tmux(&paste_submit_args(pane, text, &buffer), "paste-submit", pane)
+        }
+    }
 }
 
 pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
@@ -196,20 +243,18 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if !pane_accepts_notification(pane) {
         anyhow::bail!("pane {} has no known agent", pane);
     }
-    let sequence = WAKE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let buffer = format!("collab-wake-{}-{sequence}", std::process::id());
-    let sent = Command::new("tmux")
-        .args(wake_args(pane, text, &buffer))
-        .status()?;
-    if !sent.success() {
-        anyhow::bail!("tmux notification delivery failed for pane {}", pane);
-    }
-    Ok(())
+    let kind = pane_view(pane)
+        .map(|(command, _, screen)| submit_kind(&command, &screen))
+        .unwrap_or(SubmitKind::BracketedPaste);
+    knock_kind(pane, text, kind)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_state_from, wake_args, AgentState};
+    use super::{
+        agent_state_from, literal_args, paste_args, paste_submit_args, submit_kind,
+        AgentState, SubmitKind,
+    };
 
     #[test]
     #[ignore = "requires tmux and node; uses a disposable session"]
@@ -269,7 +314,7 @@ setInterval(() => {}, 1 << 30);
             "COLLAB_NOTIFY one [first] | COLLAB_NOTIFY two [second]",
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(400));
         let capture = Command::new("tmux")
             .args(["capture-pane", "-p", "-J", "-t", &pane])
             .output()
@@ -279,23 +324,39 @@ setInterval(() => {}, 1 << 30);
         let hex = chunks.join("");
         assert!(hex.contains("6f6e65205b66697273745d"), "{text}");
         assert!(hex.contains("74776f205b7365636f6e645d"), "{text}");
-        assert_eq!(hex.matches("0d").count(), 1, "{text}");
         assert!(
-            chunks.iter().any(|c| *c == "0d"),
-            "Enter must be its own PTY write: {text}"
+            hex.contains("0d"),
+            "Codex-style paste-submit must include Enter: {text}"
         );
+        super::knock_kind(
+            &pane,
+            "COLLAB_NOTIFY cursor [literal]",
+            super::SubmitKind::Literal,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let capture = Command::new("tmux")
+            .args(["capture-pane", "-p", "-J", "-t", &pane])
+            .output()
+            .unwrap();
+        let text = String::from_utf8(capture.stdout).unwrap();
+        let chunks: Vec<_> = text.lines().filter_map(|l| l.strip_prefix("RX:")).collect();
         assert!(
             chunks
                 .iter()
-                .any(|c| c.contains("6f6e65205b66697273745d") && !c.contains("0d")),
-            "paste payload must not include Enter: {text}"
+                .any(|c| c.contains("6c69746572616c") && !c.contains("0d")),
+            "cursor literal payload must not include Enter: {text}"
+        );
+        assert!(
+            chunks.iter().any(|c| *c == "0d"),
+            "cursor submit is a later Enter of its own: {text}"
         );
     }
 
     #[test]
-    fn wake_is_one_tmux_command_queue_with_bracketed_paste_and_submit() {
+    fn wake_splits_paste_or_literal_from_submit() {
         assert_eq!(
-            &wake_args("%7", "COLLAB_NOTIFY message", "collab-wake-test")[..],
+            &paste_args("%7", "COLLAB_NOTIFY message", "collab-wake-test")[..],
             &[
                 "set-buffer",
                 "-b",
@@ -308,17 +369,33 @@ setInterval(() => {}, 1 << 30);
                 "-b",
                 "collab-wake-test",
                 "-t",
-                "%7",
-                ";",
-                "run-shell",
-                "sleep 0.05",
-                ";",
-                "send-keys",
-                "-t",
-                "%7",
-                "C-m",
+                "%7"
             ][..]
         );
+        assert_eq!(
+            &literal_args("%7", "COLLAB_NOTIFY message")[..],
+            &["send-keys", "-t", "%7", "-l", "--", "COLLAB_NOTIFY message"][..]
+        );
+        let paste_submit =
+            paste_submit_args("%7", "COLLAB_NOTIFY message", "collab-wake-test");
+        assert!(paste_submit.windows(4).any(|w| w == ["paste-buffer", "-p", "-d", "-b"]));
+        assert!(
+            paste_submit.windows(4).any(|w| w == ["send-keys", "-t", "%7", "C-m"]),
+            "{paste_submit:?}"
+        );
+        assert!(
+            !paste_submit.iter().any(|a| a.contains("sleep")),
+            "Codex Enter must share the paste queue, not a delayed process: {paste_submit:?}"
+        );
+        assert_eq!(
+            submit_kind(
+                "node",
+                "  Cursor Grok 4.6 High Fast · 54.5%\n  /tmp/project · main\n"
+            ),
+            SubmitKind::Literal
+        );
+        assert_eq!(submit_kind("agent", ""), SubmitKind::Literal);
+        assert_eq!(submit_kind("codex", ""), SubmitKind::BracketedPaste);
     }
 
     #[test]
