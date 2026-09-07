@@ -365,6 +365,10 @@ fn submit_args(pane: &str) -> [&str; 4] {
     ["send-keys", "-t", pane, "C-m"]
 }
 
+fn steer_followup(kind: SubmitKind, working: bool) -> bool {
+    kind == SubmitKind::Literal && working
+}
+
 fn tmux(args: &[&str], what: &str, pane: &str) -> anyhow::Result<()> {
     let sent = Command::new("tmux").args(args).status()?;
     if !sent.success() {
@@ -373,7 +377,7 @@ fn tmux(args: &[&str], what: &str, pane: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn knock_kind(pane: &str, text: &str, kind: SubmitKind) -> anyhow::Result<()> {
+fn knock_kind(pane: &str, text: &str, kind: SubmitKind, working: bool) -> anyhow::Result<()> {
     let _lock = KNOCK_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -381,7 +385,14 @@ fn knock_kind(pane: &str, text: &str, kind: SubmitKind) -> anyhow::Result<()> {
         SubmitKind::Literal => {
             tmux(&literal_args(pane, text), "literal", pane)?;
             std::thread::sleep(SUBMIT_SETTLE);
-            tmux(&submit_args(pane), "submit", pane)
+            tmux(&submit_args(pane), "submit", pane)?;
+            if steer_followup(kind, working) {
+                // Cursor queues a busy follow-up on the first Enter. A later
+                // empty Enter injects it as steering instead of a next turn.
+                std::thread::sleep(SUBMIT_SETTLE);
+                tmux(&submit_args(pane), "steer", pane)?;
+            }
+            Ok(())
         }
         SubmitKind::BracketedPaste => {
             let sequence = WAKE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -399,20 +410,21 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if !pane_alive(pane) {
         anyhow::bail!("pane {} not alive", pane);
     }
-    if !pane_accepts_notification(pane) {
+    let state = probe_agent_state(pane);
+    if !matches!(state, AgentState::Working | AgentState::Waiting) {
         anyhow::bail!("pane {} has no known agent", pane);
     }
     let kind = pane_view(pane)
         .map(|(command, _, screen)| submit_kind(&command, &screen))
         .unwrap_or(SubmitKind::BracketedPaste);
-    knock_kind(pane, text, kind)
+    knock_kind(pane, text, kind, state == AgentState::Working)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         agent_state_from, agent_state_from_with, literal_args, paste_args, paste_submit_args,
-        submit_kind, AgentState, RuntimeKind, SubmitKind,
+        steer_followup, submit_kind, AgentState, RuntimeKind, SubmitKind,
     };
 
     #[test]
@@ -491,6 +503,7 @@ setInterval(() => {}, 1 << 30);
             &pane,
             "COLLAB_NOTIFY cursor [literal]",
             super::SubmitKind::Literal,
+            false,
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(400));
@@ -557,6 +570,9 @@ setInterval(() => {}, 1 << 30);
             SubmitKind::BracketedPaste
         );
         assert_eq!(submit_kind("agent", ""), SubmitKind::Literal);
+        assert!(steer_followup(SubmitKind::Literal, true));
+        assert!(!steer_followup(SubmitKind::Literal, false));
+        assert!(!steer_followup(SubmitKind::BracketedPaste, true));
         assert_eq!(submit_kind("codex", ""), SubmitKind::BracketedPaste);
         assert_eq!(
             submit_kind("node", "  Auto · 10.3%                                                  Run Everything\n  /tmp/zterm ·\n  codex/branch\n"),
