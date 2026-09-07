@@ -1507,6 +1507,25 @@ fn malformed_journal_replay_fails_fast() {
 }
 
 #[test]
+fn concatenated_journal_events_replay_and_self_heal() {
+    let (_server, root) = test_server();
+    let journal_path = root.join(".agent-collab/server/journal.jsonl");
+    let event1 = json!({"ev":"KeepaliveUpdated","worker_id":"w1","record":{"observed":"unknown","idle_since_ms":100,"activity_ms":50,"last_notice_ms":0,"last_notice_id":null,"unacked":0,"suspected_offline":false}}).to_string();
+    let event2 = json!({"ev":"KeepaliveUpdated","worker_id":"w2","record":{"observed":"unknown","idle_since_ms":200,"activity_ms":150,"last_notice_ms":0,"last_notice_id":null,"unacked":0,"suspected_offline":false}}).to_string();
+    std::fs::write(&journal_path, format!("{}{}\n", event1, event2)).unwrap();
+
+    let state = replay(&root).expect("concatenated journal events must self-heal and replay");
+    assert_eq!(state.keepalives.len(), 2);
+    assert_eq!(state.keepalives["w1"].idle_since_ms, 100);
+    assert_eq!(state.keepalives["w2"].idle_since_ms, 200);
+
+    let content = std::fs::read_to_string(&journal_path).unwrap();
+    let lines: Vec<_> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 2);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn worktree_path_budget_accepts_short_slug_and_rejects_escape() {
     let root = PathBuf::from("/tmp/project");
     assert!(validate_worktree_path(&root, "./playground/ar03-0828").is_ok());

@@ -167,10 +167,14 @@ impl Server {
         use std::io::Write;
         // Persist control truth before any state change or external notification.
         // A failed journal poisons this owner instead of silently resetting budgets.
+        let mut buf = Vec::new();
         for ev in evs {
             let line = serde_json::to_string(ev).expect("serialize event");
-            writeln!(j, "{}", line).expect("journal append failed; refusing state mutation");
+            buf.extend_from_slice(line.as_bytes());
+            buf.push(b'\n');
         }
+        j.write_all(&buf)
+            .expect("journal append failed; refusing state mutation");
         j.sync_data()
             .expect("journal sync failed; refusing state mutation");
         for ev in evs {
@@ -3082,24 +3086,51 @@ fn replay(root: &Path) -> anyhow::Result<State> {
     let mut events = Vec::new();
     let mut convert_root = false;
     for (index, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let event = serde_json::from_str::<Event>(line).map_err(|error| {
-            anyhow::anyhow!(
-                "journal replay failed at line {}: {}; manual journal edits are unsupported",
-                index + 1,
-                error
-            )
-        })?;
-        if matches!(event, Event::MasterAssigned { .. })
-            && (line.contains("\"ev\":\"RootAssigned\"")
-                || line.contains("\"ev\": \"RootAssigned\""))
-        {
+        let mut line_events = Vec::new();
+        let mut stream = serde_json::Deserializer::from_str(trimmed).into_iter::<Event>();
+        while let Some(item) = stream.next() {
+            let event = item.map_err(|error| {
+                anyhow::anyhow!(
+                    "journal replay failed at line {}: {}; manual journal edits are unsupported",
+                    index + 1,
+                    error
+                )
+            })?;
+            line_events.push(event);
+        }
+        let byte_offset = stream.byte_offset();
+        if byte_offset < trimmed.len() {
+            let remainder = &trimmed[byte_offset..];
+            if !remainder.trim().is_empty() {
+                anyhow::bail!(
+                    "journal replay failed at line {}: trailing characters; manual journal edits are unsupported",
+                    index + 1
+                );
+            }
+        }
+        if line_events.is_empty() {
+            anyhow::bail!(
+                "journal replay failed at line {}: empty event; manual journal edits are unsupported",
+                index + 1
+            );
+        }
+        if line_events.len() > 1 {
             convert_root = true;
         }
-        st.apply(&event);
-        events.push(event);
+        for event in line_events {
+            if matches!(event, Event::MasterAssigned { .. })
+                && (line.contains("\"ev\":\"RootAssigned\"")
+                    || line.contains("\"ev\": \"RootAssigned\""))
+            {
+                convert_root = true;
+            }
+            st.apply(&event);
+            events.push(event);
+        }
     }
     if convert_root {
         let mut body = String::new();
