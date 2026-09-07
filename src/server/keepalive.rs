@@ -207,12 +207,32 @@ pub(crate) fn tick_with(
     if !server.config.keepalive.enabled || !server.config.timers.enabled {
         return;
     }
-    let mut state = server.state.lock().unwrap();
-    if state.admission_frozen() {
-        return;
-    }
-    let workers: Vec<_> = state.workers.values().cloned().collect();
+    let workers: Vec<_> = {
+        let state = server.state.lock().unwrap();
+        if state.admission_frozen() {
+            return;
+        }
+        state.workers.values().cloned().collect()
+    };
     for worker in workers {
+        let Some(pane) = worker.pane.clone() else {
+            continue;
+        };
+        let is_alive = (server.pane_alive_check)(&pane);
+        let is_owned = is_alive && owns_pane(&worker.id, &pane);
+        let agent = if is_alive && is_owned {
+            probe(&pane)
+        } else {
+            AgentState::Absent
+        };
+
+        let mut state = server.state.lock().unwrap();
+        if state.admission_frozen() {
+            return;
+        }
+        if !state.workers.contains_key(&worker.id) {
+            continue;
+        }
         let mut tasks: Vec<_> = state
             .tasks
             .values()
@@ -220,11 +240,8 @@ pub(crate) fn tick_with(
             .map(|t| t.id.clone())
             .collect();
         tasks.sort();
-        let Some(pane) = worker.pane.as_deref() else {
-            continue;
-        };
-        let agent = probe(pane);
-        if !(server.pane_alive_check)(pane) || !owns_pane(&worker.id, pane) || agent == AgentState::Absent {
+
+        if !is_alive || !is_owned || agent == AgentState::Absent {
             let mut record = state
                 .keepalives
                 .get(&worker.id)
@@ -277,7 +294,6 @@ pub(crate) fn tick_with(
             if let Some((message_id, subscription_id)) = notification {
                 super::attempt_notification(server, &message_id, &subscription_id);
             }
-            state = server.state.lock().unwrap();
             continue;
         }
         let old = state
@@ -462,12 +478,11 @@ pub(crate) fn tick_with(
         );
         // No WakeBound: this reserved one-shot must never join a delayed/replayed queue.
         drop(state);
-        if probe(pane) == AgentState::Waiting
-            && wake(pane, &format!("COLLAB_NOTIFY {id} [{subject}] {body}"))
+        if probe(&pane) == AgentState::Waiting
+            && wake(&pane, &format!("COLLAB_NOTIFY {id} [{subject}] {body}"))
         {
             server.commit(&[Event::Delivered { ids: vec![id] }]);
         }
-        state = server.state.lock().unwrap();
     }
 }
 

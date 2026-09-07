@@ -17,6 +17,33 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
         return;
     }
     let now = now_ms();
+    let checks: Vec<(String, String, String, Option<String>)> = {
+        let state = server.state.lock().unwrap();
+        state
+            .notification_subscriptions
+            .values()
+            .filter(|s| s.status == "armed" && s.expires_ms > now)
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.worker_id.clone(),
+                    s.pane.clone(),
+                    state.workers.get(&s.worker_id).and_then(|w| w.pane.clone()),
+                )
+            })
+            .collect()
+    };
+    let mut lost_sub_ids = Vec::new();
+    for (id, worker_id, pane, current_worker_pane) in checks {
+        if current_worker_pane.as_deref() != Some(&pane)
+            || !(server.pane_alive_check)(&pane)
+            || !(server.pane_owner_check)(&worker_id, &pane)
+            || (server.pane_state_check)(&pane) == crate::server::knock::AgentState::Absent
+        {
+            lost_sub_ids.push(id);
+        }
+    }
+
     let mut lifecycle_events = Vec::new();
     {
         let state = server.state.lock().unwrap();
@@ -28,11 +55,7 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
                         status: "expired".into(),
                         updated_ms: now,
                     });
-                } else if !(server.pane_alive_check)(&subscription.pane)
-                    || !(server.pane_owner_check)(&subscription.worker_id, &subscription.pane)
-                    || state.workers.get(&subscription.worker_id).and_then(|w| w.pane.as_deref()) != Some(&subscription.pane)
-                    || (server.pane_state_check)(&subscription.pane) == crate::server::knock::AgentState::Absent
-                {
+                } else if lost_sub_ids.contains(&subscription.id) {
                     lifecycle_events.push(Event::NotificationStatus {
                         subscription_id: subscription.id.clone(),
                         status: "pane-lost".into(),

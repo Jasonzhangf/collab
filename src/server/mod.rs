@@ -375,26 +375,38 @@ fn attempt_notification_with(
     if !server.config.notifications.enabled {
         return false;
     }
+    let (recipient, pane, delay, worker_pane) = {
+        let state = server.state.lock().unwrap();
+        let Some(seed) = state.msgs.get(message_id) else {
+            return false;
+        };
+        let recipient = seed.to.clone();
+        let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
+            return false;
+        };
+        if subscription.worker_id != recipient {
+            return false;
+        }
+        let pane = subscription.pane.clone();
+        let delay = server.config.notifications.delay_ms(&subscription.event);
+        let worker_pane = state.workers.get(&recipient).and_then(|w| w.pane.clone());
+        (recipient, pane, delay, worker_pane)
+    };
+
+    let alive = (server.pane_alive_check)(&pane);
+    let owned = alive && owns_pane(&recipient, &pane);
+    let state_probe = if alive && owned {
+        (server.pane_state_check)(&pane)
+    } else {
+        crate::server::knock::AgentState::Absent
+    };
+
     let mut state = server.state.lock().unwrap();
-    let Some(seed) = state.msgs.get(message_id) else {
-        return false;
-    };
-    let recipient = seed.to.clone();
-    let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
-        return false;
-    };
-    let pane = subscription.pane.clone();
-    let delay = server.config.notifications.delay_ms(&subscription.event);
-    if subscription.worker_id != recipient {
-        return false;
-    }
-    let worker_opt = state.workers.get(&recipient);
-    let worker_pane_mismatch = worker_opt.and_then(|w| w.pane.as_deref()) != Some(&pane);
-    let state_probe = (server.pane_state_check)(&pane);
-    if worker_opt.is_none()
+    let worker_pane_mismatch = worker_pane.as_deref() != Some(&pane);
+    if worker_pane.is_none()
         || worker_pane_mismatch
-        || !(server.pane_alive_check)(&pane)
-        || !owns_pane(&recipient, &pane)
+        || !alive
+        || !owned
         || state_probe == crate::server::knock::AgentState::Absent
     {
         server.commit_locked(
@@ -2806,27 +2818,90 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             token,
             ids,
         } => {
-            let st = server.state.lock().unwrap();
+            let mut st = server.state.lock().unwrap();
             if let Err(e) = verify(&st, &worker_id, &token) {
                 return e;
             }
-            let owned: Vec<String> = if ids.is_empty() {
-                st.msgs
-                    .values()
-                    .filter(|m| m.to == worker_id && (m.state == "delivered" || m.state == "pending"))
-                    .map(|m| m.id.clone())
-                    .collect()
+            let mut acked = Vec::new();
+            let mut already_acked = Vec::new();
+            let mut not_found = Vec::new();
+            let mut restored_msgs = Vec::new();
+
+            if ids.is_empty() {
+                for m in st.msgs.values() {
+                    if m.to == worker_id {
+                        if m.state == "delivered" || m.state == "pending" {
+                            acked.push(m.id.clone());
+                        } else if m.state == "read" {
+                            already_acked.push(m.id.clone());
+                        }
+                    }
+                }
             } else {
-                ids.into_iter()
-                    .filter(|id| st.msgs.get(id).map(|m| m.to == worker_id).unwrap_or(false))
-                    .collect()
-            };
-            drop(st);
-            if owned.is_empty() {
-                return Resp::err("no ackable messages (must address your own inbox)");
+                for id in ids {
+                    let in_mem = st.msgs.get(&id).cloned();
+                    let msg = in_mem.or_else(|| {
+                        let path = server
+                            .root
+                            .join(".agent-collab")
+                            .join("mailbox")
+                            .join(format!("{}.json", id));
+                        std::fs::read_to_string(&path)
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<Message>(&s).ok())
+                    });
+                    match msg {
+                        Some(m) if m.to == worker_id => {
+                            if !st.msgs.contains_key(&id) {
+                                restored_msgs.push(m.clone());
+                            }
+                            if m.state == "delivered" || m.state == "pending" {
+                                acked.push(id);
+                            } else {
+                                already_acked.push(id);
+                            }
+                        }
+                        _ => {
+                            not_found.push(id);
+                        }
+                    }
+                }
             }
-            server.commit(&[Event::Acked { ids: owned.clone() }]);
-            Resp::data(json!({"acked": owned}))
+
+            let mut events = Vec::new();
+            for m in restored_msgs {
+                events.push(Event::Sent { msg: m });
+            }
+            if !acked.is_empty() {
+                events.push(Event::Acked { ids: acked.clone() });
+            }
+
+            // An explicit or bulk ACK from an authenticated worker proves
+            // the worker is responsive and active. Clear keepalive unacked counter.
+            if let Some(record) = st.keepalives.get(&worker_id).cloned() {
+                if record.unacked > 0 || record.last_notice_id.is_some() || record.suspected_offline {
+                    let mut updated = record;
+                    let now = crate::server::state::now_ms();
+                    updated.unacked = 0;
+                    updated.last_notice_id = None;
+                    updated.suspected_offline = false;
+                    updated.activity_ms = now;
+                    events.push(Event::KeepaliveUpdated {
+                        worker_id: worker_id.clone(),
+                        record: updated,
+                    });
+                }
+            }
+
+            if !events.is_empty() {
+                server.commit_locked(&mut st, &events);
+            }
+            drop(st);
+            Resp::data(json!({
+                "acked": acked,
+                "already_acked": already_acked,
+                "not_found": not_found,
+            }))
         }
         Req::Inbox { worker_id, token } => {
             let st = server.state.lock().unwrap();
@@ -2850,12 +2925,25 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
         Req::Context { worker_id, token } => handle_context(server, worker_id, token),
         Req::MsgStatus { msg_id } => {
             let st = server.state.lock().unwrap();
-            match st.msgs.get(&msg_id) {
+            let in_mem = st.msgs.get(&msg_id).cloned();
+            let msg = in_mem.or_else(|| {
+                let path = server
+                    .root
+                    .join(".agent-collab")
+                    .join("mailbox")
+                    .join(format!("{}.json", msg_id));
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Message>(&s).ok())
+            });
+            let answered = st.answered(&msg_id);
+            drop(st);
+            match msg {
                 Some(m) => Resp::data(json!({
                     "id": m.id, "from": m.from, "to": m.to, "type": m.mtype,
                     "subject": m.subject, "body": m.body,
                     "state": m.state, "wake_attempts": m.wake_attempt_count,
-                    "created_at": iso(m.created_ms), "answered": st.answered(&msg_id),
+                    "created_at": iso(m.created_ms), "answered": answered,
                 })),
                 None => Resp::err(format!("message {} not found", msg_id)),
             }
