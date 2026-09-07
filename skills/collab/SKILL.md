@@ -1,12 +1,96 @@
 ---
 name: collab
-description: Coordinate independent peers with reusable finite direct-message leases, one-shot event subscriptions, task/worktree ownership, resource waits, controlled daemon maintenance, and explicit user-approved master promotion when no live master exists. Ordinary peer notices use one direct command with no discovery or retry step. Codex/Cursor root is not Collab master.
+description: >
+  Coordinate independent peers with reusable finite direct-message leases,
+  one-shot event subscriptions, task/worktree ownership, resource waits,
+  controlled daemon maintenance, and explicit user-approved master promotion
+  when no live master exists. Guidance: (1) recovery: inspect durable status,
+  verify the real live tmux identity, re-register/rebind only the named peer,
+  then send one recovery report request; (2) failure: preserve the exact error,
+  keep journal/mailbox truth, do not retry or claim delivery, and escalate with
+  root cause and evidence; (3) reset: never delete journal/mailbox, copy tokens,
+  reset bindings, or start a second daemon; use explicit down/up or migration
+  only; (4) regression recognition: distinguish durable send, tmux delivery,
+  agent response, ACK/consume, task close, and cleanup evidence. Ordinary peer
+  notices use one direct command with no discovery or retry step. Codex/Cursor
+  root is not Collab master.
 ---
 
 # Collab
 
 Durable truth lives in the project server. tmux carries only a bounded wake
 preview. Production projects use the globally installed Collab v1.
+
+## Recovery, Failure, Reset, Regression
+
+### 1. Recovery
+
+Use recovery only after a daemon restart, pane replacement, identity mismatch,
+or an explicitly reported delivery failure:
+
+```sh
+collab status --all
+collab worker status <peer>
+collab context
+```
+
+Verify the recorded pane is live and owned by the same real tmux identity.
+If the pane is stale, use the explicit pane-scoped re-registration/rebind
+path for that peer, then send one registration/report request. Do not inject
+`collab init` into a foreign pane, guess among multiple panes, or replay an
+old message batch. A recovery request is a maintenance action, not a normal
+keepalive.
+
+### 2. Failure
+
+Treat each claim separately:
+
+```text
+durable=true -> mailbox journal accepted
+notification=sent -> tmux command path accepted
+pane evidence -> TUI received/submitted the preview
+recv response -> peer consumed the message
+task close receipt -> lifecycle ended
+```
+
+An error, timeout, `subscribed-not-sent`, `pane-lost`, `identity-mismatch`,
+`unknown`, or absent Agent is not success. Preserve the exact error and
+durable IDs; do not retry automatically, ACK for another identity, or mark a
+task delivered/closed without its required evidence. A worker reports the
+root cause and proposed fix to the live master. The master takes ownership by
+fixing, re-dispatching, or force-closing with an auditable reason.
+
+### 3. Reset
+
+There is no routine destructive reset:
+
+```text
+collab down/up -> controlled daemon restart; journal/mailbox survive
+collab migrate -> authenticated migration and identity rebind
+```
+
+Never remove `.agent-collab/server/journal.jsonl`, mailbox files, identity
+tokens, task records, or bindings to make status look clean. Never start a
+second daemon or use broad process kills. `collab ack` remains a compatibility
+operation; it is not a substitute for task close or identity recovery.
+
+### 4. Regression recognition
+
+After a fix, verify the same user path again and classify the first divergence:
+
+- `send` durable but no tmux preview: inspect subscription, pane liveness,
+  ownership, Agent state, and daemon log.
+- tmux preview appears but no worker result: inspect the pane snapshot and
+  worker state; do not call that a reply.
+- `recv` returns messages: the read is consumed atomically; no follow-up ACK is
+  required. `msg`, `inbox`, and `context` remain read-only.
+- task remains open: inspect owner identity, master responsibility, cleanup
+  receipt, and keepalive supersession.
+
+Record the tested source commit, binary digest, daemon PID/socket, exact
+commands, and live replay result in the bug system. A test pass without
+latest-main merge, installed-binary verification, or applicable live replay
+does not close the bug.
 
 ## Automatic multi-worker collaboration
 
@@ -51,9 +135,9 @@ overflow retained in the inbox). Cursor gets literal keys, a 250ms settle, then
 `C-m` in a second tmux process. Codex keeps `paste-buffer -p` and `C-m` in the
 same tmux queue. Delivery requires the agent to be in safe waiting/idle state;
 actively working panes defer delivery without burning attempts so in-flight tasks
-are not polluted. If unacknowledged notifications reach the throttle threshold
-(default 3), further push knocks pause until `collab ack <id>` or `collab ack --all`
-is run, preventing terminal pollution and storms. Each batch has one attempt;
+are not polluted. If delivered-but-unconsumed notifications reach the throttle
+threshold (default 3), further push knocks pause until `collab recv` consumes
+them, preventing terminal pollution and storms. Each batch has one attempt;
 the default window is one minute. Policy changes require controlled daemon restart,
 not task reset.
 
@@ -71,24 +155,27 @@ Cursor health is `agent status --format json`, not snapshot. Then `status`,
 tools when this session lists them. The `collab` CLI is also valid.
 If MCP is missing, unsupported, aborted, or unknown, run the same
 actions with the CLI in the inherited project cwd:
-`collab init`, `collab ack <id>` / `collab ack --all`, `collab msg <id>`,
+`collab init`, `collab recv`, `collab ack <id>` / `collab ack --all`,
+`collab msg <id>`,
 `collab inbox`, `collab worker status [id]`, `collab subagent ready|working <id>`,
 `collab sendmessage --to <parent> --subject <topic> "<body>"`.
 The CLI is a complete protocol path. Missing MCP is not a blocker and
-does not justify skipping ACK or waiting. Do not repeat `collab init`
+does not justify skipping receive or waiting. Do not repeat `collab init`
 after it already succeeded. Child results go to the parent with
 `collab sendmessage`, not the parent-only `subagent send` action.
 No ACK loops, automatic respawn or redispatch.
 
-Acknowledge notifications promptly with `collab ack <id>` or `collab ack --all`.
-After 3 unacknowledged notifications, push knocks pause automatically to prevent
-notification storms and prompt pollution; workers must ack or read inbox (`collab inbox`)
-to resume. Inspect peer/worker health, identity validity, and throttle status at any
-time with `collab worker status [id]` or `collab who`.
+Consume notifications promptly with `collab recv`. A successful receive delivers
+and acknowledges the batch atomically. After 3 delivered-but-unconsumed
+notifications, push knocks pause automatically to prevent notification storms
+and prompt pollution; `collab inbox` is read-only and does not resume delivery.
+Use explicit `collab ack` only for legacy clients or recovery of an already
+delivered message. Inspect peer/worker health, identity validity, and throttle
+status at any time with `collab worker status [id]` or `collab who`.
 
 Task keepalive: only unfinished actionable tasks plus explicit idle qualify;
-one activation per 15 minutes, grouped per worker. ACK a keepalive once with
-`collab ack <id>`, then work or record a blocker. Sending a message or positive
+one activation per 15 minutes, grouped per worker. Consume a keepalive with
+`collab recv`, then work or record a blocker. Sending a message or positive
 working observation also counts as activity. Three unconfirmed attempts stop;
 never automatically `subagent rearm` to bypass exhaustion. Unknown stays unknown.
 
@@ -282,9 +369,10 @@ reach this observer. Screen text is diagnostic, never task/control truth.
 | Intent | Command |
 |---|---|
 | Notify a peer now | `collab sendmessage --to <peer> --subject <short-topic> "<original message>"` |
-| Read one notification | `collab msg <notification-id>` |
+| Receive and consume notifications | `collab recv` |
+| Read one notification without consuming | `collab msg <notification-id>` |
 | List unread messages | `collab inbox` |
-| Acknowledge one or all notifications | `collab ack <id>` or `collab ack --all` |
+| Recover an already-delivered notification | `collab ack <id>` or `collab ack --all` |
 | Inspect worker health and notification status | `collab worker status [id]` |
 | Read own authoritative context | `collab context` |
 | List peers | `collab who` |

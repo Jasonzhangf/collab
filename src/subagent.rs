@@ -182,9 +182,9 @@ fn child_prompt(record: &Record) -> String {
     format!(
         "You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. Your Collab identity is already registered as this tmux session. Do not self-register, recover a worker, or ask the user to grant identity. First report ready {}. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request. Collab master is project arbitration, not Codex/Cursor root; you must follow master and parent direction and may not decline a master collaboration request.\n\
 Collab master owns the final outcome for every dispatched task in this project. If master is unreachable within one escalation cycle, the master -- not you -- has the authority and the obligation to force-close with collab task close <task-id> --force --reason \"<text>\". You do not get to block, idle, or keep the task actionable. When you report a blocker, also report the concrete fix or the conditions the master must satisfy. Sending \"I'm blocked\" without a proposed solution is a master failure, not yours to ignore; do not let the master defer it back to you.\n\
-collab-mcp is the shared Collab MCP for every agent. Use collab_* tools when this session lists them. The collab CLI in this cwd is also valid. If MCP is missing, unsupported, aborted, or unknown, use the CLI. Missing MCP is not a reason to skip ACK, ready, or send.\n\
-CLI: collab subagent ready {}; collab subagent working {}; collab ack <message-id>; collab msg <message-id>; collab inbox; collab sendmessage --to {} --subject <topic> \"<body>\"; collab task relocate <task-id> --worktree ./playground/<slug>.\n\
-Each dispatched message has a canonical task named task-<message-id>. working claims that task; do not register a duplicate. Bind a clean worktree before code edits. ready only means session idle. For a keepalive, ack once with its message ID, then resume work or record a real non-MCP blocker. Never ACK an ACK or request automatic rearm after exhaustion.",
+ collab-mcp is the shared Collab MCP for every agent. Use collab_* tools when this session lists them. The collab CLI in this cwd is also valid. If MCP is missing, unsupported, aborted, or unknown, use the CLI. Missing MCP is not a reason to skip receive, ready, or send.\n\
+CLI: collab subagent ready {}; collab subagent working {}; collab recv; collab ack <message-id>; collab msg <message-id>; collab inbox; collab sendmessage --to {} --subject <topic> \"<body>\"; collab task relocate <task-id> --worktree ./playground/<slug>.\n\
+Each dispatched message has a canonical task named task-<message-id>. working claims that task; do not register a duplicate. Bind a clean worktree before code edits. ready only means session idle. Use collab recv to read and consume a notification; use explicit ack only for legacy or already-delivered recovery. Never ACK an ACK or request automatic rearm after exhaustion.",
         record.id,
         record.parent,
         record.id,
@@ -717,7 +717,9 @@ fn run(
         if record.peer != actor || state.workers[actor].pane != record.pane {
             bail!("only the bound subagent may report readiness or work");
         }
-    } else if record.parent != actor && crate::server::live_master_id(server, &state).as_deref() != Some(actor) {
+    } else if record.parent != actor
+        && crate::server::live_master_id(server, &state).as_deref() != Some(actor)
+    {
         bail!("only the creating parent or live master may manage this subagent");
     }
     match action {

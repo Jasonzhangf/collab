@@ -398,11 +398,9 @@ fn registered_peer_rebind_events(
 fn restore_registered_peer_default_leases(server: &Server) {
     let rebind_events = {
         let state = server.state.lock().unwrap();
-        registered_peer_rebind_events(
-            &state,
-            &tmux_pane_for_session,
-            &|worker_id, pane| tmux_session_for_pane(pane).as_deref() == Some(worker_id),
-        )
+        registered_peer_rebind_events(&state, &tmux_pane_for_session, &|worker_id, pane| {
+            tmux_session_for_pane(pane).as_deref() == Some(worker_id)
+        })
     };
     if !rebind_events.is_empty() {
         server.commit(&rebind_events);
@@ -562,12 +560,12 @@ fn attempt_notification_with(
         }],
     );
     drop(state);
-    let mut text_parts = batch
-        .iter()
-        .map(|m| m.4.clone())
-        .collect::<Vec<_>>();
+    let mut text_parts = batch.iter().map(|m| m.4.clone()).collect::<Vec<_>>();
     if remaining > 0 {
-        text_parts.push(format!("[+{} older messages remain in inbox; run collab inbox]", remaining));
+        text_parts.push(format!(
+            "[+{} older messages remain in inbox; run collab inbox]",
+            remaining
+        ));
     }
     let text = truncate_notification(text_parts.join(" | "));
     if !deliver(&pane, &text) {
@@ -650,8 +648,17 @@ fn handle_notification_subscribe(
             "direct-message subscription must not specify a subject"
         });
     }
-    if event != "deadline" && (trigger_ms.is_some() || !trigger_times_ms.is_empty() || interval_ms.is_some() || repeat_count != 1) { return Resp::err("schedule options are valid only for deadline subscriptions"); }
-    if event == "deadline" && trigger_ms.is_some() && !trigger_times_ms.is_empty() { return Resp::err("use at-ms or trigger-ms, not both"); }
+    if event != "deadline"
+        && (trigger_ms.is_some()
+            || !trigger_times_ms.is_empty()
+            || interval_ms.is_some()
+            || repeat_count != 1)
+    {
+        return Resp::err("schedule options are valid only for deadline subscriptions");
+    }
+    if event == "deadline" && trigger_ms.is_some() && !trigger_times_ms.is_empty() {
+        return Resp::err("use at-ms or trigger-ms, not both");
+    }
     let now = now_ms();
     let expires_ms = now.saturating_add((ttl_seconds as i64).saturating_mul(1000));
     let mut state = server.state.lock().unwrap();
@@ -664,19 +671,54 @@ fn handle_notification_subscribe(
     if runtime_for_pane(Some(&pane)).is_none() {
         return Resp::err("notification subscription method tmux is unavailable for this pane");
     }
-    let active = state.notification_subscriptions.values().filter(|s| s.worker_id == worker_id && s.status == "armed").count();
-    if active >= MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER { return Resp::err("maximum 3 active subscriptions per agent"); }
+    let active = state
+        .notification_subscriptions
+        .values()
+        .filter(|s| s.worker_id == worker_id && s.status == "armed")
+        .count();
+    if active >= MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER {
+        return Resp::err("maximum 3 active subscriptions per agent");
+    }
     if event == "deadline" {
-        if interval_ms.is_some() && (!trigger_times_ms.is_empty() || trigger_ms.is_some()) { return Resp::err("periodic schedule cannot include an absolute time list"); }
-        if interval_ms.is_none() && trigger_times_ms.is_empty() && trigger_ms.is_none() { return Resp::err("deadline requires at-ms or every-ms"); }
-        if repeat_count == 0 || repeat_count > crate::server::state::MAX_NOTIFICATION_REPEATS { return Resp::err("repeat_count must be between 1 and 100"); }
-        if interval_ms.is_some_and(|ms| ms <= 0) { return Resp::err("every-ms must be positive"); }
-        if interval_ms.is_some() && trigger_times_ms.is_empty() && trigger_ms.is_none() && repeat_count == 1 { }
-        if !trigger_times_ms.is_empty() && (interval_ms.is_some() || repeat_count != 1) { return Resp::err("absolute schedule uses at-ms values and repeat_count is their length"); }
-        let times = if trigger_times_ms.is_empty() { trigger_ms.into_iter().collect() } else { trigger_times_ms.clone() };
-        if times.len() > crate::server::state::MAX_NOTIFICATION_REPEATS as usize { return Resp::err("absolute schedule supports at most 100 times"); }
-        if times.iter().any(|trigger| *trigger <= now || *trigger >= expires_ms) { return Resp::err("absolute trigger times must be in the future and before expiry"); }
-        if interval_ms.is_some_and(|ms| now.saturating_add(ms) >= expires_ms) { return Resp::err("every-ms must fire before subscription expiry"); }
+        if interval_ms.is_some() && (!trigger_times_ms.is_empty() || trigger_ms.is_some()) {
+            return Resp::err("periodic schedule cannot include an absolute time list");
+        }
+        if interval_ms.is_none() && trigger_times_ms.is_empty() && trigger_ms.is_none() {
+            return Resp::err("deadline requires at-ms or every-ms");
+        }
+        if repeat_count == 0 || repeat_count > crate::server::state::MAX_NOTIFICATION_REPEATS {
+            return Resp::err("repeat_count must be between 1 and 100");
+        }
+        if interval_ms.is_some_and(|ms| ms <= 0) {
+            return Resp::err("every-ms must be positive");
+        }
+        if interval_ms.is_some()
+            && trigger_times_ms.is_empty()
+            && trigger_ms.is_none()
+            && repeat_count == 1
+        {}
+        if !trigger_times_ms.is_empty() && (interval_ms.is_some() || repeat_count != 1) {
+            return Resp::err(
+                "absolute schedule uses at-ms values and repeat_count is their length",
+            );
+        }
+        let times = if trigger_times_ms.is_empty() {
+            trigger_ms.into_iter().collect()
+        } else {
+            trigger_times_ms.clone()
+        };
+        if times.len() > crate::server::state::MAX_NOTIFICATION_REPEATS as usize {
+            return Resp::err("absolute schedule supports at most 100 times");
+        }
+        if times
+            .iter()
+            .any(|trigger| *trigger <= now || *trigger >= expires_ms)
+        {
+            return Resp::err("absolute trigger times must be in the future and before expiry");
+        }
+        if interval_ms.is_some_and(|ms| now.saturating_add(ms) >= expires_ms) {
+            return Resp::err("every-ms must fire before subscription expiry");
+        }
     }
     let id = format!("sub-{}", gen_msg_id());
     let subscription = NotificationSubscription {
@@ -702,7 +744,9 @@ fn handle_notification_subscribe(
             subscription: subscription.clone(),
         }],
     );
-    Resp::data(json!({"subscription": subscription, "one_shot": false, "max_repeat_count": crate::server::state::MAX_NOTIFICATION_REPEATS}))
+    Resp::data(
+        json!({"subscription": subscription, "one_shot": false, "max_repeat_count": crate::server::state::MAX_NOTIFICATION_REPEATS}),
+    )
 }
 
 fn handle_notification_status(server: &Server, worker_id: String, token: String) -> Resp {
@@ -1582,15 +1626,21 @@ fn handle_cross_project_send(
     in_reply_to: Option<String>,
 ) -> Resp {
     if from_project.trim().is_empty() || source_master_assigned_by.trim().is_empty() {
-        return Resp::err("cross-project send requires source project and master assignment evidence");
+        return Resp::err(
+            "cross-project send requires source project and master assignment evidence",
+        );
     }
     if source_master_assigned_ms <= 0 {
         return Resp::err("cross-project send requires source master assignment timestamp");
     }
-    if source_master_approval.as_deref().is_none_or(|v| v.trim().is_empty())
+    if source_master_approval
+        .as_deref()
+        .is_none_or(|v| v.trim().is_empty())
         && source_master_assigned_by == from
     {
-        return Resp::err("cross-project send requires user approval evidence for self-promoted source master");
+        return Resp::err(
+            "cross-project send requires user approval evidence for self-promoted source master",
+        );
     }
     let mut st = server.state.lock().unwrap();
     if live_master_id(server, &st).as_deref() != Some(to.as_str()) {
@@ -1983,12 +2033,10 @@ fn tmux_pane_for_session(session: &str) -> Option<String> {
         return None;
     }
     let output = String::from_utf8_lossy(&output.stdout);
-    let mut panes = output
-        .lines()
-        .filter_map(|line| {
-            let (name, pane) = line.split_once('\t')?;
-            (name == session && pane.starts_with('%')).then(|| pane.to_owned())
-        });
+    let mut panes = output.lines().filter_map(|line| {
+        let (name, pane) = line.split_once('\t')?;
+        (name == session && pane.starts_with('%')).then(|| pane.to_owned())
+    });
     let pane = panes.next()?;
     panes.next().is_none().then_some(pane)
 }
@@ -2200,8 +2248,7 @@ fn handle_task_close(
                 (server.pane_alive_check)(pane) && (server.pane_owner_check)(&task.owner, pane)
             });
         let authorized = live_master.as_deref() == Some(worker_id.as_str())
-            || (live_master.is_none()
-                && (task.owner == worker_id || !owner_identity_live));
+            || (live_master.is_none() && (task.owner == worker_id || !owner_identity_live));
         if !authorized {
             return Resp::err_data(
                 "manual force close is not authorized for this caller",
@@ -2230,7 +2277,11 @@ fn handle_task_close(
         let superseded: Vec<String> = st
             .msgs
             .values()
-            .filter(|m| m.to == closed.owner && m.mtype == "keepalive" && matches!(m.state.as_str(), "pending" | "delivered"))
+            .filter(|m| {
+                m.to == closed.owner
+                    && m.mtype == "keepalive"
+                    && matches!(m.state.as_str(), "pending" | "delivered")
+            })
             .map(|m| m.id.clone())
             .collect();
         let mut events: Vec<Event> = vec![
@@ -2322,7 +2373,11 @@ fn handle_task_close(
     let superseded: Vec<String> = st
         .msgs
         .values()
-        .filter(|m| m.to == closed.owner && m.mtype == "keepalive" && matches!(m.state.as_str(), "pending" | "delivered"))
+        .filter(|m| {
+            m.to == closed.owner
+                && m.mtype == "keepalive"
+                && matches!(m.state.as_str(), "pending" | "delivered")
+        })
         .map(|m| m.id.clone())
         .collect();
     let mut close_events: Vec<Event> = vec![
@@ -2334,9 +2389,7 @@ fn handle_task_close(
         },
     ];
     if !superseded.is_empty() {
-        close_events.push(Event::Superseded {
-            ids: superseded,
-        });
+        close_events.push(Event::Superseded { ids: superseded });
     }
     let other_actionable = st.tasks.values().any(|t| {
         t.id != closed.id
@@ -2514,16 +2567,30 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
 fn poll_messages(server: &Server, worker_id: &str) -> Option<Resp> {
     let ids: Vec<String>;
     let msgs: Vec<Message>;
-    {
-        let st = server.state.lock().unwrap();
-        let unread = st.inbox_of(worker_id);
-        if unread.is_empty() {
-            return None;
-        }
-        ids = unread.iter().map(|m| m.id.clone()).collect();
-        msgs = unread.into_iter().cloned().collect();
+    let mut st = server.state.lock().unwrap();
+    let unread = st.inbox_of(worker_id);
+    if unread.is_empty() {
+        return None;
     }
-    server.commit(&[Event::Delivered { ids }]);
+    ids = unread.iter().map(|m| m.id.clone()).collect();
+    msgs = unread.into_iter().cloned().collect();
+    // recv is an explicit read operation: deliver and consume the same batch
+    // atomically so a successful read cannot leave a new ACK obligation.
+    let mut events = vec![Event::Delivered { ids: ids.clone() }, Event::Acked { ids }];
+    if let Some(record) = st.keepalives.get(worker_id).cloned() {
+        if record.unacked > 0 || record.last_notice_id.is_some() || record.suspected_offline {
+            let mut updated = record;
+            updated.unacked = 0;
+            updated.last_notice_id = None;
+            updated.suspected_offline = false;
+            updated.activity_ms = now_ms();
+            events.push(Event::KeepaliveUpdated {
+                worker_id: worker_id.to_owned(),
+                record: updated,
+            });
+        }
+    }
+    server.commit_locked(&mut st, &events);
     Some(Resp::data(json!({
         "messages": msgs,
         "count": msgs.len(),
@@ -2654,10 +2721,9 @@ fn worker_status_summary_with_maps(
     keepalives: &std::collections::HashMap<String, crate::server::keepalive::Record>,
     w: &WorkerRec,
 ) -> serde_json::Value {
-    let active = tasks.values().find(|task| {
-        task.owner == w.id
-            && !matches!(task.status.as_str(), "closed" | "cancelled")
-    });
+    let active = tasks
+        .values()
+        .find(|task| task.owner == w.id && !matches!(task.status.as_str(), "closed" | "cancelled"));
     let pane = w.pane.as_deref();
     let endpoint_live = pane.is_some_and(server.pane_alive_check);
     let identity_valid = endpoint_live && pane.is_some_and(|p| (server.pane_owner_check)(&w.id, p));
@@ -2881,9 +2947,9 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             token,
             subscription_id,
         } => handle_notification_unsubscribe(server, worker_id, token, subscription_id),
-        Req::Poll { .. } => Resp::err(
-            "Poll is only handled by the async daemon connection path; use collab recv",
-        ),
+        Req::Poll { .. } => {
+            Resp::err("Poll is only handled by the async daemon connection path; use collab recv")
+        }
         Req::Ack {
             worker_id,
             token,
@@ -2950,7 +3016,8 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             // An explicit or bulk ACK from an authenticated worker proves
             // the worker is responsive and active. Clear keepalive unacked counter.
             if let Some(record) = st.keepalives.get(&worker_id).cloned() {
-                if record.unacked > 0 || record.last_notice_id.is_some() || record.suspected_offline {
+                if record.unacked > 0 || record.last_notice_id.is_some() || record.suspected_offline
+                {
                     let mut updated = record;
                     let now = crate::server::state::now_ms();
                     updated.unacked = 0;
@@ -3148,7 +3215,15 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             };
             let mut workers: Vec<serde_json::Value> = workers_rec
                 .iter()
-                .map(|w| worker_status_summary_with_maps(server, &tasks_map, &msgs_map, &keepalives_map, w))
+                .map(|w| {
+                    worker_status_summary_with_maps(
+                        server,
+                        &tasks_map,
+                        &msgs_map,
+                        &keepalives_map,
+                        w,
+                    )
+                })
                 .collect();
             workers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
             Resp::data(json!({
@@ -3169,7 +3244,15 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             let mut workers: Vec<serde_json::Value> = workers_rec
                 .iter()
                 .filter(|w| worker_id.as_ref().is_none_or(|id| id == &w.id))
-                .map(|w| worker_status_summary_with_maps(server, &tasks_map, &msgs_map, &keepalives_map, w))
+                .map(|w| {
+                    worker_status_summary_with_maps(
+                        server,
+                        &tasks_map,
+                        &msgs_map,
+                        &keepalives_map,
+                        w,
+                    )
+                })
                 .collect();
             workers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
             Resp::data(json!({
@@ -3215,17 +3298,11 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             let (workers_rec, tasks, subagents, msgs_len, tasks_map, msgs_map, keepalives_map, now) = {
                 let st = server.state.lock().unwrap();
                 let workers_rec: Vec<WorkerRec> = st.workers.values().cloned().collect();
-                let mut tasks: Vec<serde_json::Value> = st
-                    .tasks
-                    .values()
-                    .map(|task| task_view(&st, task))
-                    .collect();
+                let mut tasks: Vec<serde_json::Value> =
+                    st.tasks.values().map(|task| task_view(&st, task)).collect();
                 tasks.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-                let mut subagents: Vec<crate::subagent::Record> = st
-                    .subagents
-                    .values()
-                    .cloned()
-                    .collect();
+                let mut subagents: Vec<crate::subagent::Record> =
+                    st.subagents.values().cloned().collect();
                 subagents.sort_by(|a, b| a.id.cmp(&b.id));
                 let msgs_len = st.msgs.len();
                 let now = now_ms();
@@ -3242,7 +3319,15 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             };
             let mut workers: Vec<serde_json::Value> = workers_rec
                 .iter()
-                .map(|w| worker_status_summary_with_maps(server, &tasks_map, &msgs_map, &keepalives_map, w))
+                .map(|w| {
+                    worker_status_summary_with_maps(
+                        server,
+                        &tasks_map,
+                        &msgs_map,
+                        &keepalives_map,
+                        w,
+                    )
+                })
                 .collect();
             workers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
 
@@ -3493,7 +3578,9 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         loop {
             interval.tick().await;
             let s = sched.clone();
-            tokio::task::spawn_blocking(move || crate::server::timers::tick(&s)).await.ok();
+            tokio::task::spawn_blocking(move || crate::server::timers::tick(&s))
+                .await
+                .ok();
         }
     });
 

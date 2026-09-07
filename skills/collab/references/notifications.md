@@ -83,6 +83,11 @@ collab who
 
 - `collab ack <id>` acknowledges a single notification.
 - `collab ack --all` acknowledges all unread or pending delivered notifications in one step.
+- `collab recv` reads and consumes the returned message batch atomically; a
+  successful receive writes `Delivered` and `Acked` together, so a follow-up
+  ACK is not required. `collab msg`, `collab inbox`, and `collab context` are
+  read-only and do not consume messages. Keep `ack` for legacy clients or
+  explicit recovery of already-delivered messages.
 - `collab worker status [worker-id]` inspects real-time worker health, including
   `endpoint_live`, `identity_valid`, `agent_state`, `unacked_notifications`,
   `notifications_paused`, `suspected_offline`, and `active_task`.

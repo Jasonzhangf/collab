@@ -414,7 +414,10 @@ fn cross_project_send_requires_master_endpoints_on_both_sides() {
         None,
     );
     assert!(!denied_peer.ok);
-    assert!(denied_peer.error.unwrap().contains("target to be a live master"));
+    assert!(denied_peer
+        .error
+        .unwrap()
+        .contains("target to be a live master"));
 
     let delivered = super::handle_cross_project_send(
         &server,
@@ -678,12 +681,10 @@ fn daemon_restart_does_not_guess_between_multiple_or_unowned_panes() {
     });
 
     assert!(registered_peer_rebind_events(&state, &|_| None, &|_, _| true).is_empty());
-    assert!(registered_peer_rebind_events(
-        &state,
-        &|_| Some("%foreign".into()),
-        &|_, _| false,
-    )
-    .is_empty());
+    assert!(
+        registered_peer_rebind_events(&state, &|_| Some("%foreign".into()), &|_, _| false,)
+            .is_empty()
+    );
     assert_eq!(state.workers["peer"].pane.as_deref(), Some("%stale"));
 }
 
@@ -1667,6 +1668,40 @@ async fn poll_wakes_when_a_message_is_committed() {
     assert!(response.ok);
     assert_eq!(response.data["count"], 1);
     assert_eq!(response.data["messages"][0]["id"], "wake-message");
+    assert_eq!(
+        server.state.lock().unwrap().msgs["wake-message"].state,
+        "read"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn recv_consumes_messages_without_a_follow_up_ack() {
+    let (server, root) = test_server();
+    register(&server, "peer", "%peer");
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "recv-message".into(),
+            from: "sender".into(),
+            to: "peer".into(),
+            mtype: "notify".into(),
+            subject: Some("recv".into()),
+            body: "message".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    let server = Arc::new(server);
+    let response = handle_poll_async(server.clone(), "peer".into(), 100).await;
+    assert!(response.ok);
+    assert_eq!(response.data["count"], 1);
+    assert_eq!(
+        server.state.lock().unwrap().msgs["recv-message"].state,
+        "read"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -2438,7 +2473,10 @@ fn worker_freed_transitions_notify_live_master() {
         .msgs
         .values()
         .find(|m| m.to == "master-worker" && m.subject == Some("worker-idle: task-worker".into()));
-    assert!(idle_alert.is_some(), "expected worker-idle alert sent to master");
+    assert!(
+        idle_alert.is_some(),
+        "expected worker-idle alert sent to master"
+    );
     let alert = idle_alert.unwrap();
     assert!(alert.body.contains("now idle with no active task"));
     drop(state);
@@ -2470,13 +2508,17 @@ fn worker_unresponsive_notifies_live_master_with_snapshot_advice() {
     );
 
     let state = server_arc.state.lock().unwrap();
-    let alert = state
-        .msgs
-        .values()
-        .find(|m| m.to == "master-worker" && m.subject == Some("worker-unresponsive: stuck-worker".into()));
-    assert!(alert.is_some(), "expected worker-unresponsive alert sent to master");
+    let alert = state.msgs.values().find(|m| {
+        m.to == "master-worker" && m.subject == Some("worker-unresponsive: stuck-worker".into())
+    });
+    assert!(
+        alert.is_some(),
+        "expected worker-unresponsive alert sent to master"
+    );
     let alert = alert.unwrap();
-    assert!(alert.body.contains("subagent snapshot stuck-worker --lines 40"));
+    assert!(alert
+        .body
+        .contains("subagent snapshot stuck-worker --lines 40"));
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -2701,4 +2743,40 @@ fn mailbox_read_all_chronological_sort_asc_and_desc() {
     assert_eq!(worker_resp.data["messages"][0]["id"], "m-3");
 
     std::fs::remove_dir_all(root).unwrap();
+}
+#[tokio::test]
+async fn recv_clears_keepalive_unacked_counter() {
+    let (server, root) = test_server();
+    register(&server, "peer", "%peer");
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "wake-message".into(),
+            from: "sender".into(),
+            to: "peer".into(),
+            mtype: "notify".into(),
+            subject: Some("wake".into()),
+            body: "message".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    let mut keepalive = crate::server::keepalive::Record::default();
+    keepalive.unacked = 3;
+    keepalive.last_notice_id = Some("stale-notice".into());
+    keepalive.suspected_offline = true;
+    server.commit(&[Event::KeepaliveUpdated {
+        worker_id: "peer".into(),
+        record: keepalive,
+    }]);
+    let server = Arc::new(server);
+    let response = handle_poll_async(server.clone(), "peer".into(), 100).await;
+    assert!(response.ok);
+    let record = server.state.lock().unwrap().keepalives["peer"].clone();
+    assert_eq!(record.unacked, 0);
+    assert_eq!(record.last_notice_id, None);
+    assert!(!record.suspected_offline);
+    std::fs::remove_dir_all(root).ok();
 }
