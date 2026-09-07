@@ -2111,3 +2111,110 @@ fn bulk_ack_with_empty_ids_acknowledges_all_inbox_messages() {
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn external_or_operator_sender_can_send_without_registration_or_pane() {
+    let (server, root) = test_server();
+    register(&server, "recipient-worker", "%recipient");
+    let resp = handle_send(
+        &server,
+        "external-operator".into(),
+        "recipient-worker".into(),
+        "notify".into(),
+        Some("test-topic".into()),
+        "hello from outside tmux".into(),
+        None,
+        "immediate".into(),
+    );
+    assert!(resp.ok);
+    assert_eq!(resp.data["durable"].as_bool(), Some(true));
+    let msg_id = resp.data["msg_id"].as_str().unwrap();
+
+    let state = server.state.lock().unwrap();
+    let msg = state.msgs.get(msg_id).unwrap();
+    assert_eq!(msg.from, "external-operator");
+    assert_eq!(msg.to, "recipient-worker");
+    assert_eq!(msg.body, "hello from outside tmux");
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_freed_transitions_notify_live_master() {
+    let (server, root) = test_server();
+    register(&server, "master-worker", "%master");
+    register(&server, "task-worker", "%worker");
+    let server_arc = std::sync::Arc::new(server);
+    let promote_resp = dispatch(
+        &server_arc,
+        Req::MasterPromote {
+            worker_id: "master-worker".into(),
+            token: "token-master-worker".into(),
+            approval: "approved".into(),
+        },
+    );
+    assert!(promote_resp.ok);
+
+    let mut initial_rec = crate::server::keepalive::Record::default();
+    initial_rec.observed = "working".into();
+    initial_rec.idle_since_ms = 1000;
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "task-worker".into(),
+        record: initial_rec,
+    }]);
+
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        2000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+
+    let state = server_arc.state.lock().unwrap();
+    let idle_alert = state
+        .msgs
+        .values()
+        .find(|m| m.to == "master-worker" && m.subject == Some("worker-idle: task-worker".into()));
+    assert!(idle_alert.is_some(), "expected worker-idle alert sent to master");
+    let alert = idle_alert.unwrap();
+    assert!(alert.body.contains("now idle with no active task"));
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_unresponsive_notifies_live_master_with_snapshot_advice() {
+    let (server, root) = test_server();
+    register(&server, "master-worker", "%master");
+    register(&server, "stuck-worker", "%stuck");
+    let server_arc = std::sync::Arc::new(server);
+    let promote_resp = dispatch(
+        &server_arc,
+        Req::MasterPromote {
+            worker_id: "master-worker".into(),
+            token: "token-master-worker".into(),
+            approval: "approved".into(),
+        },
+    );
+    assert!(promote_resp.ok);
+
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        2000,
+        &|_pane| crate::server::knock::AgentState::Absent,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+
+    let state = server_arc.state.lock().unwrap();
+    let alert = state
+        .msgs
+        .values()
+        .find(|m| m.to == "master-worker" && m.subject == Some("worker-unresponsive: stuck-worker".into()));
+    assert!(alert.is_some(), "expected worker-unresponsive alert sent to master");
+    let alert = alert.unwrap();
+    assert!(alert.body.contains("subagent snapshot stuck-worker --lines 40"));
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}

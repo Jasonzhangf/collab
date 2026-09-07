@@ -90,7 +90,7 @@ pub fn tick(server: &Server) {
     );
 }
 
-fn tick_with(
+pub(crate) fn tick_with(
     server: &Server,
     now: i64,
     probe: &dyn Fn(&str) -> AgentState,
@@ -113,9 +113,6 @@ fn tick_with(
             .map(|t| t.id.clone())
             .collect();
         tasks.sort();
-        if tasks.is_empty() {
-            continue;
-        }
         let Some(pane) = worker.pane.as_deref() else {
             continue;
         };
@@ -129,13 +126,40 @@ fn tick_with(
             if !record.suspected_offline {
                 record.suspected_offline = true;
                 record.observed = "absent".into();
-                server.commit_locked(
-                    &mut state,
-                    &[Event::KeepaliveUpdated {
-                        worker_id: worker.id.clone(),
-                        record,
-                    }],
-                );
+                let mut events = vec![Event::KeepaliveUpdated {
+                    worker_id: worker.id.clone(),
+                    record,
+                }];
+                if let Some(master_id) = super::live_master_id(server, &state) {
+                    if master_id != worker.id {
+                        let alert_id = super::gen_msg_id();
+                        events.push(Event::Sent {
+                            msg: Message {
+                                id: alert_id.clone(),
+                                from: "collab-server".into(),
+                                to: master_id.clone(),
+                                mtype: "notify".into(),
+                                subject: Some(format!("worker-unresponsive: {}", worker.id)),
+                                body: format!(
+                                    "Worker {} pane is absent, unowned or dead. Diagnostic closure required: run collab subagent snapshot {} --lines 40 to inspect ground truth.",
+                                    worker.id, worker.id
+                                ),
+                                in_reply_to: None,
+                                created_ms: now,
+                                state: "pending".into(),
+                                wake_attempt_count: 0,
+                                last_wake_attempt_ms: 0,
+                            },
+                        });
+                        if let Some(sub) = state.matching_subscription(&master_id, "direct-message", None, now) {
+                            events.push(Event::WakeBound {
+                                message_id: alert_id,
+                                subscription_id: sub.id.clone(),
+                            });
+                        }
+                    }
+                }
+                server.commit_locked(&mut state, &events);
             }
             continue;
         }
@@ -145,6 +169,63 @@ fn tick_with(
             .cloned()
             .unwrap_or_default();
         let mut record = old.clone();
+
+        if tasks.is_empty() {
+            let was_working = old.observed == "working";
+            let is_idle = agent == AgentState::Waiting;
+            let observed_str = match agent {
+                AgentState::Waiting => "idle",
+                AgentState::Working => "working",
+                AgentState::Unknown => "unknown",
+                AgentState::Absent => "absent",
+            };
+            if record.observed != observed_str {
+                record.observed = observed_str.into();
+                record.idle_since_ms = now;
+            }
+            let mut events = Vec::new();
+            if was_working && is_idle {
+                if let Some(master_id) = super::live_master_id(server, &state) {
+                    if master_id != worker.id {
+                        let alert_id = super::gen_msg_id();
+                        events.push(Event::Sent {
+                            msg: Message {
+                                id: alert_id.clone(),
+                                from: "collab-server".into(),
+                                to: master_id.clone(),
+                                mtype: "notify".into(),
+                                subject: Some(format!("worker-idle: {}", worker.id)),
+                                body: format!(
+                                    "Worker {} is now idle with no active task. Action required: check task graph for unblocked downstream tasks, or pull from appsdk bug list --status open (P0/P1). If all work is complete, propose next steps to user and pause.",
+                                    worker.id
+                                ),
+                                in_reply_to: None,
+                                created_ms: now,
+                                state: "pending".into(),
+                                wake_attempt_count: 0,
+                                last_wake_attempt_ms: 0,
+                            },
+                        });
+                        if let Some(sub) = state.matching_subscription(&master_id, "direct-message", None, now) {
+                            events.push(Event::WakeBound {
+                                message_id: alert_id,
+                                subscription_id: sub.id.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            if record != old {
+                events.insert(0, Event::KeepaliveUpdated {
+                    worker_id: worker.id.clone(),
+                    record,
+                });
+            }
+            if !events.is_empty() {
+                server.commit_locked(&mut state, &events);
+            }
+            continue;
+        }
         let activity = state
             .msgs
             .values()
@@ -176,6 +257,38 @@ fn tick_with(
             server.config.keepalive.interval_seconds as i64 * 1000,
             server.config.keepalive.max_unacked,
         );
+        if !old.suspected_offline && record.suspected_offline {
+            if let Some(master_id) = super::live_master_id(server, &state) {
+                if master_id != worker.id {
+                    let alert_id = super::gen_msg_id();
+                    let mut alert_events = vec![Event::Sent {
+                        msg: Message {
+                            id: alert_id.clone(),
+                            from: "collab-server".into(),
+                            to: master_id.clone(),
+                            mtype: "notify".into(),
+                            subject: Some(format!("worker-unresponsive: {}", worker.id)),
+                            body: format!(
+                                "Worker {} is unresponsive ({} unacked keepalives). Diagnostic closure required: run collab subagent snapshot {} --lines 40 to inspect ground truth and determine recovery action.",
+                                worker.id, server.config.keepalive.max_unacked, worker.id
+                            ),
+                            in_reply_to: None,
+                            created_ms: now,
+                            state: "pending".into(),
+                            wake_attempt_count: 0,
+                            last_wake_attempt_ms: 0,
+                        },
+                    }];
+                    if let Some(sub) = state.matching_subscription(&master_id, "direct-message", None, now) {
+                        alert_events.push(Event::WakeBound {
+                            message_id: alert_id,
+                            subscription_id: sub.id.clone(),
+                        });
+                    }
+                    server.commit_locked(&mut state, &alert_events);
+                }
+            }
+        }
         // Missing subscription/disabled notifications never consumes a send or queues one.
         if due && (subscription.is_none() || !server.config.notifications.enabled) {
             record.unacked = old.unacked;
