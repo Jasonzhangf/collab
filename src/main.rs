@@ -338,6 +338,17 @@ enum WorkerCmd {
         /// Optional worker ID to inspect (defaults to all registered workers)
         id: Option<String>,
     },
+    /// Live master retires a worker registration; optionally kills its tmux session
+    Close {
+        /// Worker ID to close
+        id: String,
+        /// Why this worker is being closed; recorded for audit
+        #[arg(long)]
+        reason: String,
+        /// Also kill the worker's tmux session
+        #[arg(long)]
+        kill_session: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -688,6 +699,25 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let v: serde_json::Value = client::call(
                         &scope.sock_path(),
                         &Req::WorkerStatus { worker_id: id },
+                    )?;
+                    out(&v);
+                    Ok(())
+                }
+                WorkerCmd::Close {
+                    id,
+                    reason,
+                    kill_session,
+                } => {
+                    let ident = me(&scope, None)?;
+                    let v: serde_json::Value = client::call(
+                        &scope.sock_path(),
+                        &Req::WorkerClose {
+                            worker_id: ident.worker_id,
+                            token: ident.token,
+                            target_id: id,
+                            reason,
+                            kill_session,
+                        },
                     )?;
                     out(&v);
                     Ok(())

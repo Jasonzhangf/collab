@@ -288,6 +288,125 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
 }
 
 #[test]
+#[test]
+fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
+    let (server, root) = test_server();
+    register(&server, "peer-a", "%a");
+    register(&server, "peer-b", "%b");
+    assert!(
+        super::handle_master_promote(
+            &server,
+            "peer-a".into(),
+            "token-peer-a".into(),
+            "user approved peer-a as collab master".into(),
+        )
+        .ok
+    );
+
+    // A non-master peer cannot retire another peer.
+    let outsider = super::handle_worker_close(
+        &server,
+        "peer-b".into(),
+        "token-peer-b".into(),
+        "peer-a".into(),
+        "trying to close the master".into(),
+        false,
+    );
+    assert!(!outsider.ok);
+
+    // The audit reason is mandatory.
+    let no_reason = super::handle_worker_close(
+        &server,
+        "peer-a".into(),
+        "token-peer-a".into(),
+        "peer-b".into(),
+        "   ".into(),
+        false,
+    );
+    assert!(!no_reason.ok);
+    assert!(no_reason.error.unwrap().contains("--reason"));
+
+    // Master may not close itself into a headless project.
+    let self_close = super::handle_worker_close(
+        &server,
+        "peer-a".into(),
+        "token-peer-a".into(),
+        "peer-a".into(),
+        "self".into(),
+        false,
+    );
+    assert!(!self_close.ok);
+    assert!(self_close.error.unwrap().contains("cannot close itself"));
+
+    // A worker holding live work keeps its registration; the task lifecycle
+    // has to be resolved first or the worktree is stranded.
+    server.commit(&[Event::TaskCreated {
+        task: crate::server::state::TaskRec {
+            id: "task-b".into(),
+            owner: "peer-b".into(),
+            created_by: "peer-a".into(),
+            feature_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            priority: "p2".into(),
+            status: "working".into(),
+            next_step: None,
+            wait: None,
+            created_ms: now_ms(),
+            updated_ms: now_ms(),
+        },
+    }]);
+    let owns_work = super::handle_worker_close(
+        &server,
+        "peer-a".into(),
+        "token-peer-a".into(),
+        "peer-b".into(),
+        "pane looks dead".into(),
+        false,
+    );
+    assert!(!owns_work.ok);
+    assert!(owns_work.error.unwrap().contains("task-b"));
+
+    server.commit(&[Event::TaskUpdated {
+        task: crate::server::state::TaskRec {
+            id: "task-b".into(),
+            owner: "peer-b".into(),
+            created_by: "peer-a".into(),
+            feature_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            priority: "p2".into(),
+            status: "closed".into(),
+            next_step: None,
+            wait: None,
+            created_ms: now_ms(),
+            updated_ms: now_ms(),
+        },
+    }]);
+    let closed = super::handle_worker_close(
+        &server,
+        "peer-a".into(),
+        "token-peer-a".into(),
+        "peer-b".into(),
+        "pane dead after snapshot".into(),
+        false,
+    );
+    assert!(closed.ok, "{}", closed.error.clone().unwrap_or_default());
+    assert_eq!(closed.data["closed"], "peer-b");
+    assert_eq!(closed.data["reason"], "pane dead after snapshot");
+    assert_eq!(closed.data["killed_session"], false);
+
+    let state = server.state.lock().unwrap();
+    assert!(!state.workers.contains_key("peer-b"));
+    assert!(!state.keepalives.contains_key("peer-b"));
+    drop(state);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn master_promotion_requires_user_approval_and_existing_master_delegates() {
     let (server, root) = test_server();
     register(&server, "peer-a", "%a");

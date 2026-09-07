@@ -192,6 +192,14 @@ pub enum Req {
     WorkerStatus {
         worker_id: Option<String>,
     },
+    /// Live master retires a worker registration, optionally killing its tmux session.
+    WorkerClose {
+        worker_id: String,
+        token: String,
+        target_id: String,
+        reason: String,
+        kill_session: bool,
+    },
     MasterId,
     MasterRecover {
         worker_id: String,

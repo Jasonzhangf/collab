@@ -200,6 +200,15 @@ pub enum Event {
     LegacyWorkerRemoved {
         worker_id: String,
     },
+    /// Master-authorized retirement of a worker registration. Unlike the legacy
+    /// remove-worker path this records who closed it and why.
+    WorkerClosed {
+        worker_id: String,
+        closed_by: String,
+        reason: String,
+        killed_session: bool,
+        at_ms: i64,
+    },
     #[serde(rename = "MasterTransferred")]
     LegacyMasterTransferred {
         from: String,
@@ -300,6 +309,10 @@ impl State {
             }
             Event::LegacyWorkerRemoved { worker_id } => {
                 self.workers.remove(worker_id);
+            }
+            Event::WorkerClosed { worker_id, .. } => {
+                self.workers.remove(worker_id);
+                self.keepalives.remove(worker_id);
             }
             Event::LegacyMasterTransferred { .. } => {}
             Event::Sent { msg } => {

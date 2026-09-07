@@ -14,7 +14,19 @@ pub struct Record {
     pub last_notice_id: Option<String>,
     pub unacked: u8,
     pub suspected_offline: bool,
+    /// Last state actually reported to the master. Durable state advances every
+    /// tick; the master is told only when a state settles into something new.
+    #[serde(default)]
+    pub notified_state: String,
+    /// When the current not-yet-reported observation first appeared.
+    #[serde(default)]
+    pub pending_since_ms: i64,
 }
+
+/// A starting agent legitimately flaps between idle and working while it boots
+/// and renders. Reporting each flap floods the master, so a state must hold
+/// before it is worth one scheduling notification.
+const SUBAGENT_STATE_SETTLE_MS: i64 = 60_000;
 
 pub(crate) fn actionable(status: &str) -> bool {
     matches!(
@@ -69,9 +81,27 @@ fn handle_managed_subagent(
         record.unacked = 0;
         record.last_notice_id = None;
     }
+
+    // Durable state follows every observation; the master hears only settled,
+    // genuinely new states. A flap that returns to what the master already
+    // knows produces no message at all.
+    let notify_due = if observed == record.notified_state {
+        record.pending_since_ms = 0;
+        false
+    } else {
+        if record.pending_since_ms == 0 || changed {
+            record.pending_since_ms = now;
+        }
+        now - record.pending_since_ms >= SUBAGENT_STATE_SETTLE_MS
+    };
+    if notify_due {
+        record.notified_state = observed.into();
+        record.pending_since_ms = 0;
+    }
+
     let mut current = subagent.clone();
     current.status = observed.into();
-    let target = changed
+    let target = notify_due
         .then(|| managed_subagent_target(state, server))
         .flatten();
     let subscription = target.as_ref().and_then(|target| {
@@ -85,6 +115,8 @@ fn handle_managed_subagent(
     }];
     if changed {
         events.push(Event::SubagentUpdated { subagent: current });
+    }
+    if notify_due {
         if let Some(target) = &target {
             let id = super::gen_msg_id();
             let body = format!("subagent={} state={} tasks={}", subagent.id, observed, tasks.join(","));
@@ -114,7 +146,7 @@ fn handle_managed_subagent(
                 });
             }
         }
-    } else {
+    } else if !changed {
         return (true, None);
     }
     server.commit_locked(state, &events);
@@ -702,6 +734,21 @@ mod tests {
         assert_eq!(wakes.get(), 0);
         assert_eq!(state.subagents["managed"].status, "idle");
         assert_eq!(state.msgs.values().filter(|m| m.to == "child").count(), 0);
+        // Durable state is current immediately, but the master is not told
+        // until the state has settled.
+        assert_eq!(
+            state
+                .msgs
+                .values()
+                .filter(|m| m.mtype == "subagent-status")
+                .count(),
+            0
+        );
+        drop(state);
+
+        tick_with(&server, now + 1_800_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        let state = server.state.lock().unwrap();
+        assert_eq!(wakes.get(), 0);
         let status_messages: Vec<_> = state
             .msgs
             .values()
@@ -710,11 +757,88 @@ mod tests {
         assert_eq!(status_messages.len(), 1);
         assert!(status_messages[0].body.contains("state=idle"));
         drop(state);
-        tick_with(&server, now + 1_800_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+
+        // A settled state is reported once, not on every later tick.
+        tick_with(&server, now + 2_700_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
         let state = server.state.lock().unwrap();
         assert_eq!(wakes.get(), 0);
         assert_eq!(state.msgs.values().filter(|m| m.mtype == "subagent-status").count(), 1);
         drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flapping_managed_subagent_does_not_flood_master() {
+        use super::super::peer_tests::{register, test_server};
+        use crate::subagent::Record as SubagentRecord;
+        use std::cell::Cell;
+
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "child", "%child");
+        assert!(super::super::handle_master_promote(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "user approved master".into(),
+        )
+        .ok);
+        let now = super::super::state::now_ms();
+        server.commit(&[Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                id: "managed".into(),
+                parent: "master".into(),
+                peer: "child".into(),
+                status: "working".into(),
+                session: Some("session".into()),
+                pane: Some("%child".into()),
+                profile: None,
+                created_ms: now,
+                ready_deadline_ms: now + 90_000,
+                last_message: None,
+                error: None,
+                probe_failures: Vec::new(),
+                runtime: Some("cursor".into()),
+            },
+        }]);
+
+        let wakes = Cell::new(0);
+        let wake = |_: &str, _: &str| {
+            wakes.set(wakes.get() + 1);
+            true
+        };
+        let status_count = |server: &Server| {
+            server
+                .state
+                .lock()
+                .unwrap()
+                .msgs
+                .values()
+                .filter(|m| m.mtype == "subagent-status")
+                .count()
+        };
+
+        // A booting pane flaps faster than the settle window. None of these
+        // transitions is worth a master notification.
+        let flaps = [
+            AgentState::Waiting,
+            AgentState::Working,
+            AgentState::Waiting,
+            AgentState::Working,
+            AgentState::Waiting,
+        ];
+        for (i, agent) in flaps.iter().enumerate() {
+            let at = now + 1_000 + (i as i64 * 5_000);
+            tick_with(&server, at, &|_| *agent, &wake, &|_, _| true);
+        }
+        assert_eq!(status_count(&server), 0, "flaps must not notify");
+
+        // Once a state holds past the settle window it is reported exactly once.
+        tick_with(&server, now + 200_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        assert_eq!(status_count(&server), 1);
+        tick_with(&server, now + 400_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        assert_eq!(status_count(&server), 1, "settled state reports once");
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1532,6 +1532,92 @@ fn handle_master_delegate(
     Resp::data(json!({"master": target_id, "delegated_by": worker_id}))
 }
 
+fn handle_worker_close(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    target_id: String,
+    reason: String,
+    kill_session: bool,
+) -> Resp {
+    let mut state = server.state.lock().unwrap();
+    if let Err(error) = verify_master_actor(server, &state, &worker_id, &token) {
+        return error;
+    }
+    if reason.trim().is_empty() {
+        return Resp::err("worker close requires a non-empty --reason");
+    }
+    if target_id == worker_id {
+        return Resp::err("master cannot close itself; delegate first");
+    }
+    let Some(target) = state.workers.get(&target_id).cloned() else {
+        return Resp::err(format!("target worker {} not registered", target_id));
+    };
+
+    // Closing a worker that still owns live work would strand the task and its
+    // worktree. The task lifecycle must be resolved first.
+    let owned: Vec<String> = state
+        .tasks
+        .values()
+        .filter(|task| task.owner == target_id && keepalive::actionable(&task.status))
+        .map(|task| task.id.clone())
+        .collect();
+    if !owned.is_empty() {
+        return Resp::err(format!(
+            "worker {} still owns {}; close or force-close the task first",
+            target_id,
+            owned.join(", ")
+        ));
+    }
+
+    let mut killed_session = false;
+    if kill_session {
+        if let Some(pane) = target.pane.as_deref() {
+            if (server.pane_alive_check)(pane) {
+                let output = std::process::Command::new("tmux")
+                    .args(["display-message", "-p", "-t", pane, "#{session_id}"])
+                    .output();
+                match output {
+                    Ok(output) if output.status.success() => {
+                        let session = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if session.is_empty() {
+                            return Resp::err("could not resolve the target tmux session");
+                        }
+                        // Kill only the resolved session, never a name guess.
+                        match std::process::Command::new("tmux")
+                            .args(["kill-session", "-t", &session])
+                            .status()
+                        {
+                            Ok(status) if status.success() => killed_session = true,
+                            _ => return Resp::err(format!("tmux kill-session {} failed", session)),
+                        }
+                    }
+                    _ => return Resp::err("could not resolve the target tmux session"),
+                }
+            }
+        }
+    }
+
+    let now = now_ms();
+    server.commit_locked(
+        &mut state,
+        &[Event::WorkerClosed {
+            worker_id: target_id.clone(),
+            closed_by: worker_id.clone(),
+            reason: reason.clone(),
+            killed_session,
+            at_ms: now,
+        }],
+    );
+    Resp::data(json!({
+        "closed": target_id,
+        "closed_by": worker_id,
+        "reason": reason,
+        "killed_session": killed_session,
+        "pane": target.pane,
+    }))
+}
+
 fn master_assignment_view(
     state: &State,
     worker_id: &str,
@@ -2933,6 +3019,7 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::MasterDelegate { .. }
         | Req::TransferMaster { .. }
         | Req::RemoveWorker { .. }
+        | Req::WorkerClose { .. }
         | Req::ResetBindings { .. } => true,
         Req::Register { .. }
         | Req::NotificationMethods
@@ -3349,6 +3436,13 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 "count": workers.len()
             }))
         }
+        Req::WorkerClose {
+            worker_id,
+            token,
+            target_id,
+            reason,
+            kill_session,
+        } => handle_worker_close(server, worker_id, token, target_id, reason, kill_session),
         Req::WorkerStatus { worker_id } => {
             let (workers_rec, tasks_map, msgs_map, keepalives_map) = {
                 let st = server.state.lock().unwrap();
