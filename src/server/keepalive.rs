@@ -114,6 +114,8 @@ fn handle_managed_subagent(
                 });
             }
         }
+    } else {
+        return (true, None);
     }
     server.commit_locked(state, &events);
     let notification = if let (Some(target), Some(subscription)) = (target, subscription) {
