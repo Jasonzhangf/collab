@@ -2675,7 +2675,9 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::MasterId
         | Req::MasterRecover { .. }
         | Req::Shutdown { .. }
-        | Req::Ping => false,
+        | Req::Ping
+        | Req::StatusAll
+        | Req::MailboxRead { .. } => false,
     }
 }
 
@@ -3034,6 +3036,72 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 "messages": st.msgs.len(),
                 "tasks": st.tasks.len(),
                 "now": iso(now_ms()),
+            }))
+        }
+        Req::StatusAll => {
+            let st = server.state.lock().unwrap();
+            let mut workers: Vec<serde_json::Value> = st
+                .workers
+                .values()
+                .map(|w| worker_status_summary(server, &st, w))
+                .collect();
+            workers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+            let mut tasks: Vec<serde_json::Value> = st
+                .tasks
+                .values()
+                .map(|task| task_view(&st, task))
+                .collect();
+            tasks.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+            let mut subagents: Vec<crate::subagent::Record> = st
+                .subagents
+                .values()
+                .cloned()
+                .collect();
+            subagents.sort_by(|a, b| a.id.cmp(&b.id));
+
+            Resp::data(json!({
+                "summary": {
+                    "workers": workers.len(),
+                    "messages": st.msgs.len(),
+                    "tasks": tasks.len(),
+                    "subagents": subagents.len(),
+                    "now": iso(now_ms()),
+                },
+                "workers": workers,
+                "tasks": tasks,
+                "subagents": subagents,
+            }))
+        }
+        Req::MailboxRead {
+            all,
+            sort,
+            worker_id,
+        } => {
+            let st = server.state.lock().unwrap();
+            let mut msgs: Vec<&Message> = st
+                .msgs
+                .values()
+                .filter(|m| {
+                    if all {
+                        true
+                    } else if let Some(wid) = &worker_id {
+                        &m.to == wid || &m.from == wid
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            let sort_order = sort.as_deref().unwrap_or("time-asc");
+            if sort_order == "time-desc" {
+                msgs.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+            } else {
+                msgs.sort_by(|a, b| a.created_ms.cmp(&b.created_ms));
+            }
+            let count = msgs.len();
+            Resp::data(json!({
+                "count": count,
+                "sort": sort_order,
+                "messages": msgs,
             }))
         }
     }

@@ -2375,3 +2375,152 @@ fn closed_and_delivered_tasks_do_not_trigger_keepalives() {
     assert_eq!(sends.get(), 0, "closed task must not trigger keepalive");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn status_all_aggregates_workers_tasks_subagents_and_summary() {
+    let (server, root) = test_server();
+    let server_arc = Arc::new(server);
+
+    // Register a worker
+    server_arc.commit(&[Event::Registered {
+        worker: WorkerRec {
+            id: "worker-1".into(),
+            token: "tok-1".into(),
+            pane: Some("%1".into()),
+            cwd: root.display().to_string(),
+            registered_ms: 1000,
+        },
+    }]);
+
+    // Create a task
+    server_arc.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "task-1".into(),
+            owner: "worker-1".into(),
+            created_by: "master".into(),
+            feature_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            priority: "normal".into(),
+            status: "working".into(),
+            next_step: Some("implementing".into()),
+            wait: None,
+            created_ms: 1000,
+            updated_ms: 1000,
+        },
+    }]);
+
+    let resp = dispatch(&server_arc, Req::StatusAll);
+    assert!(resp.ok);
+    assert_eq!(resp.data["summary"]["workers"], 1);
+    assert_eq!(resp.data["summary"]["tasks"], 1);
+    assert_eq!(resp.data["workers"].as_array().unwrap().len(), 1);
+    assert_eq!(resp.data["workers"][0]["id"], "worker-1");
+    assert_eq!(resp.data["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(resp.data["tasks"][0]["id"], "task-1");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mailbox_read_all_chronological_sort_asc_and_desc() {
+    let (server, root) = test_server();
+    let server_arc = Arc::new(server);
+
+    // Send messages with different timestamps
+    server_arc.commit(&[
+        Event::Sent {
+            msg: Message {
+                id: "m-1".into(),
+                from: "alice".into(),
+                to: "bob".into(),
+                mtype: "notify".into(),
+                subject: Some("first".into()),
+                body: "first body".into(),
+                in_reply_to: None,
+                created_ms: 1000,
+                state: "delivered".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        },
+        Event::Sent {
+            msg: Message {
+                id: "m-2".into(),
+                from: "bob".into(),
+                to: "alice".into(),
+                mtype: "notify".into(),
+                subject: Some("second".into()),
+                body: "second body".into(),
+                in_reply_to: None,
+                created_ms: 2000,
+                state: "pending".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        },
+        Event::Sent {
+            msg: Message {
+                id: "m-3".into(),
+                from: "charlie".into(),
+                to: "bob".into(),
+                mtype: "notify".into(),
+                subject: Some("third".into()),
+                body: "third body".into(),
+                in_reply_to: None,
+                created_ms: 3000,
+                state: "pending".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        },
+    ]);
+
+    // Test time-asc (default)
+    let asc_resp = dispatch(
+        &server_arc,
+        Req::MailboxRead {
+            all: true,
+            sort: Some("time-asc".into()),
+            worker_id: None,
+        },
+    );
+    assert!(asc_resp.ok);
+    assert_eq!(asc_resp.data["count"], 3);
+    let asc_msgs = asc_resp.data["messages"].as_array().unwrap();
+    assert_eq!(asc_msgs[0]["id"], "m-1");
+    assert_eq!(asc_msgs[1]["id"], "m-2");
+    assert_eq!(asc_msgs[2]["id"], "m-3");
+
+    // Test time-desc
+    let desc_resp = dispatch(
+        &server_arc,
+        Req::MailboxRead {
+            all: true,
+            sort: Some("time-desc".into()),
+            worker_id: None,
+        },
+    );
+    assert!(desc_resp.ok);
+    let desc_msgs = desc_resp.data["messages"].as_array().unwrap();
+    assert_eq!(desc_msgs[0]["id"], "m-3");
+    assert_eq!(desc_msgs[1]["id"], "m-2");
+    assert_eq!(desc_msgs[2]["id"], "m-1");
+
+    // Test worker filter
+    let worker_resp = dispatch(
+        &server_arc,
+        Req::MailboxRead {
+            all: false,
+            sort: Some("time-asc".into()),
+            worker_id: Some("charlie".into()),
+        },
+    );
+    assert!(worker_resp.ok);
+    assert_eq!(worker_resp.data["count"], 1);
+    assert_eq!(worker_resp.data["messages"][0]["id"], "m-3");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+

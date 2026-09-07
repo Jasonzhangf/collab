@@ -44,8 +44,16 @@ enum Cmd {
     Up,
     /// Explicitly stop the daemon and disable automatic restart
     Down,
-    /// Show server summary
-    Status,
+    /// Show server summary (pass --all to aggregate all workers, tasks, subagents)
+    Status {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Inspect or read messages from durable mailbox
+    Mailbox {
+        #[command(subcommand)]
+        cmd: MailboxCmd,
+    },
     /// Deprecated: declared roles were removed
     Role,
     /// List registered peers and their local activity projection
@@ -276,6 +284,22 @@ enum TaskCmd {
     Dispatch,
     /// Show task registry
     Status { id: Option<String> },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum MailboxCmd {
+    /// Read messages in chronological order
+    Read {
+        /// Include all messages across the project mailbox
+        #[arg(long)]
+        all: bool,
+        /// Sorting order: time-asc (default) or time-desc
+        #[arg(long, default_value = "time-asc")]
+        sort: String,
+        /// Filter messages by specific worker ID
+        #[arg(long)]
+        worker: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -527,11 +551,35 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&json!({"ok": true, "down": true, "server": scope.sock_path()}));
             Ok(())
         }
-        Cmd::Status => {
+        Cmd::Status { all } => {
             let scope = Scope::resolve()?;
-            let v: serde_json::Value = client::call(&scope.sock_path(), &Req::Ping)?;
+            let req = if all { Req::StatusAll } else { Req::Ping };
+            let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
             out(&v);
             Ok(())
+        }
+        Cmd::Mailbox { cmd } => {
+            let scope = Scope::resolve()?;
+            match cmd {
+                MailboxCmd::Read { all, sort, worker } => {
+                    let ident = if !all && worker.is_none() {
+                        me(&scope, None).ok()
+                    } else {
+                        None
+                    };
+                    let worker_id = worker.or_else(|| ident.map(|i| i.worker_id));
+                    let v: serde_json::Value = client::call(
+                        &scope.sock_path(),
+                        &Req::MailboxRead {
+                            all,
+                            sort: Some(sort),
+                            worker_id,
+                        },
+                    )?;
+                    out(&v);
+                    Ok(())
+                }
+            }
         }
         Cmd::Role => {
             anyhow::bail!("collab role is deprecated; declared roles were removed")

@@ -217,6 +217,15 @@ pub enum Req {
         operator: bool,
     },
     Ping,
+    StatusAll,
+    MailboxRead {
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        sort: Option<String>,
+        #[serde(default)]
+        worker_id: Option<String>,
+    },
 }
 
 fn default_delivery_mode() -> String {
