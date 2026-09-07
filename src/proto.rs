@@ -32,6 +32,17 @@ pub enum Req {
         #[serde(default = "default_delivery_mode")]
         delivery: String,
     },
+    CrossProjectSend {
+        from: String,
+        from_project: String,
+        source_master_assigned_by: String,
+        source_master_approval: Option<String>,
+        source_master_assigned_ms: i64,
+        to: String,
+        subject: String,
+        body: String,
+        in_reply_to: Option<String>,
+    },
     NotificationMethods,
     NotificationSubscribe {
         worker_id: String,

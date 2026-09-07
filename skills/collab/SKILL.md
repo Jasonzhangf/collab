@@ -91,6 +91,13 @@ one activation per 15 minutes, grouped per worker. ACK a keepalive once with
 `collab ack <id>`, then work or record a blocker. Sending a message or positive
 working observation also counts as activity. Three unconfirmed attempts stop;
 never automatically `subagent rearm` to bypass exhaustion. Unknown stays unknown.
+
+Managed subagents do not get child-targeted keepalive ACK loops. When the
+daemon probes a managed subagent and finds it `idle` or `working`, it persists
+that state on the subagent and sends one durable `subagent-status` message to
+the live master. The master, not the child, owns the outcome and decides
+whether to re-dispatch, force-close, or leave the child idle. A subagent with
+an unfinished task is not repeatedly woken just because its task is not closed.
 `subagent status` includes tasks, parent mailbox, counters and notification/ACK
 history. `subagent snapshot <id> --lines 40` reads the screen only on request.
 

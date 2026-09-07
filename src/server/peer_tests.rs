@@ -388,6 +388,70 @@ fn dead_master_pane_is_not_claimable_and_allows_approved_self_promote() {
 }
 
 #[test]
+fn cross_project_send_requires_master_endpoints_on_both_sides() {
+    let (server, root) = test_server();
+    register(&server, "target-master", "%target-master");
+    register(&server, "target-peer", "%target-peer");
+    let promoted = super::handle_master_promote(
+        &server,
+        "target-master".into(),
+        "token-target-master".into(),
+        "user approved target-master as collab master".into(),
+    );
+    assert!(promoted.ok, "{}", promoted.error.unwrap_or_default());
+
+    let denied_peer = super::handle_cross_project_send(
+        &server,
+        "appsdk-master".into(),
+        "/tmp/appsdk".into(),
+        "appsdk-operator".into(),
+        None,
+        1,
+        "target-peer".into(),
+        "feature".into(),
+        "must reject non-master target".into(),
+        None,
+    );
+    assert!(!denied_peer.ok);
+    assert!(denied_peer.error.unwrap().contains("target to be a live master"));
+
+    let delivered = super::handle_cross_project_send(
+        &server,
+        "appsdk-master".into(),
+        "/tmp/appsdk".into(),
+        "appsdk-operator".into(),
+        None,
+        1,
+        "target-master".into(),
+        "feature".into(),
+        "master-to-master message".into(),
+        None,
+    );
+    assert!(delivered.ok, "{}", delivered.error.unwrap_or_default());
+    let msg_id = delivered.data["msg_id"].as_str().unwrap();
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.msgs[msg_id].to, "target-master");
+    assert_eq!(state.msgs[msg_id].from, "appsdk-master@/tmp/appsdk");
+    drop(state);
+
+    let missing_approval = super::handle_cross_project_send(
+        &server,
+        "self-promoted".into(),
+        "/tmp/appsdk".into(),
+        "self-promoted".into(),
+        None,
+        1,
+        "target-master".into(),
+        "feature".into(),
+        "must reject missing approval".into(),
+        None,
+    );
+    assert!(!missing_approval.ok);
+    assert!(missing_approval.error.unwrap().contains("user approval"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn master_promotion_requires_live_tmux_pane() {
     fn none_alive(_: &str) -> bool {
         false

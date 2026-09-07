@@ -284,6 +284,17 @@ enum MasterCmd {
     },
     /// Delegate master authority to another registered peer (live master only)
     Delegate { target: String },
+    /// Send a durable message to the master of another explicit project
+    Send {
+        #[arg(long)]
+        project: std::path::PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(trailing_var_arg = true)]
+        body: Vec<String>,
+    },
     /// Show the current live master, if any
     Status,
     /// Deprecated: permanent master recovery was removed
@@ -551,6 +562,54 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         token: ident.token,
                         target_id: target,
                     }
+                }
+                MasterCmd::Send { project, to, subject, body } => {
+                    let ident = me(&scope, None)?;
+                    let local: serde_json::Value =
+                        client::call(&scope.sock_path(), &Req::MasterStatus)?;
+                    let Some(master) = local.get("master") else {
+                        anyhow::bail!("cross-project send requires this peer to be a live master")
+                    };
+                    if master.get("worker_id").and_then(|v| v.as_str())
+                        != Some(ident.worker_id.as_str())
+                        || master.get("endpoint_live").and_then(|v| v.as_bool()) != Some(true)
+                    {
+                        anyhow::bail!("cross-project send requires this peer to be the live master")
+                    }
+                    let target = project.canonicalize()?;
+                    if target == scope.root.canonicalize()? {
+                        anyhow::bail!("cross-project send requires a different project")
+                    }
+                    if !target.join(".agent-collab").is_dir() {
+                        anyhow::bail!("target project has no .agent-collab: {}", target.display())
+                    }
+                    let target_scope = Scope { root: target };
+                    let value: serde_json::Value = client::call(
+                        &target_scope.sock_path(),
+                        &Req::CrossProjectSend {
+                            from: ident.worker_id,
+                            from_project: scope.root.display().to_string(),
+                            source_master_assigned_by: master
+                                .get("assigned_by")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            source_master_approval: master
+                                .get("approval")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
+                            source_master_assigned_ms: master
+                                .get("assigned_ms")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or_default(),
+                            to,
+                            subject,
+                            body: body.join(" "),
+                            in_reply_to: None,
+                        },
+                    )?;
+                    out(&value);
+                    return Ok(());
                 }
                 MasterCmd::Status => Req::MasterStatus,
             };

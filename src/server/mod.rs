@@ -1525,6 +1525,89 @@ pub(crate) fn handle_send_with_task(
     }))
 }
 
+fn handle_cross_project_send(
+    server: &Server,
+    from: String,
+    from_project: String,
+    source_master_assigned_by: String,
+    source_master_approval: Option<String>,
+    source_master_assigned_ms: i64,
+    to: String,
+    subject: String,
+    body: String,
+    in_reply_to: Option<String>,
+) -> Resp {
+    if from_project.trim().is_empty() || source_master_assigned_by.trim().is_empty() {
+        return Resp::err("cross-project send requires source project and master assignment evidence");
+    }
+    if source_master_assigned_ms <= 0 {
+        return Resp::err("cross-project send requires source master assignment timestamp");
+    }
+    if source_master_approval.as_deref().is_none_or(|v| v.trim().is_empty())
+        && source_master_assigned_by == from
+    {
+        return Resp::err("cross-project send requires user approval evidence for self-promoted source master");
+    }
+    let mut st = server.state.lock().unwrap();
+    if live_master_id(server, &st).as_deref() != Some(to.as_str()) {
+        return Resp::err("cross-project communication requires the target to be a live master");
+    }
+    let Some(recipient) = st.workers.get(&to) else {
+        return Resp::err(format!("recipient {} not registered", to));
+    };
+    if recipient.pane.as_deref().is_none_or(|pane| {
+        !(server.pane_alive_check)(pane) || !(server.pane_owner_check)(&to, pane)
+    }) {
+        return Resp::err("cross-project communication requires a live target tmux identity");
+    }
+    if subject.trim().is_empty() {
+        return Resp::err("MESSAGE_SUBJECT_REQUIRED: cross-project send requires --subject");
+    }
+    let msg = Message {
+        id: gen_msg_id(),
+        from: format!("{}@{}", from, from_project),
+        to: to.clone(),
+        mtype: "notify".into(),
+        subject: Some(subject),
+        body,
+        in_reply_to,
+        created_ms: now_ms(),
+        state: "pending".into(),
+        wake_attempt_count: 0,
+        last_wake_attempt_ms: 0,
+    };
+    let mid = msg.id.clone();
+    let subscription = st
+        .matching_subscription(&to, "direct-message", None, now_ms())
+        .cloned();
+    let mut events = vec![
+        Event::Sent { msg },
+        Event::DeliveryMode {
+            msg_id: mid.clone(),
+            mode: "explicit-notification".into(),
+        },
+    ];
+    if let Some(subscription) = &subscription {
+        events.push(Event::WakeBound {
+            message_id: mid.clone(),
+            subscription_id: subscription.id.clone(),
+        });
+    }
+    server.commit_locked(&mut st, &events);
+    drop(st);
+    let notified = subscription
+        .as_ref()
+        .is_some_and(|sub| attempt_notification(server, &mid, &sub.id));
+    Resp::data(json!({
+        "msg_id": mid,
+        "durable": true,
+        "cross_project": true,
+        "source_master": from,
+        "target_master": to,
+        "notification": if notified { "sent" } else { "mailbox-only-no-subscription" }
+    }))
+}
+
 #[cfg(test)]
 fn handle_task_register(
     server: &Server,
@@ -2499,6 +2582,7 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
             crate::subagent::Action::List | crate::subagent::Action::Status { .. }
         ),
         Req::Send { .. }
+        | Req::CrossProjectSend { .. }
         | Req::NotificationSubscribe { .. }
         | Req::NotificationUnsubscribe { .. }
         | Req::Poll { .. }
@@ -2585,6 +2669,28 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             body,
             in_reply_to,
             delivery,
+        ),
+        Req::CrossProjectSend {
+            from,
+            from_project,
+            source_master_assigned_by,
+            source_master_approval,
+            source_master_assigned_ms,
+            to,
+            subject,
+            body,
+            in_reply_to,
+        } => handle_cross_project_send(
+            server,
+            from,
+            from_project,
+            source_master_assigned_by,
+            source_master_approval,
+            source_master_assigned_ms,
+            to,
+            subject,
+            body,
+            in_reply_to,
         ),
         Req::NotificationMethods => Resp::data(json!({
             "methods": ["tmux"],

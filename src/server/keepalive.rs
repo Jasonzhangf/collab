@@ -1,6 +1,6 @@
 use super::{
     knock::AgentState,
-    state::{Event, Message, State},
+    state::{Event, Message, State, WorkerRec},
     Server,
 };
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,111 @@ fn actionable(status: &str) -> bool {
         status,
         "assigned" | "working" | "verifying" | "reviewed" | "rework" | "delivered" | "merged"
     )
+}
+
+fn observed_label(agent: AgentState) -> &'static str {
+    match agent {
+        AgentState::Waiting => "idle",
+        AgentState::Working => "working",
+        AgentState::Unknown => "unknown",
+        AgentState::Absent => "absent",
+    }
+}
+
+fn managed_subagent_target(state: &State, server: &Server) -> Option<String> {
+    let target = super::live_master_id(server, state)?;
+    let worker = state.workers.get(&target)?;
+    let pane = worker.pane.as_deref()?;
+    ((server.pane_alive_check)(pane) && (server.pane_owner_check)(&target, pane)).then_some(target)
+}
+
+fn handle_managed_subagent(
+    server: &Server,
+    state: &mut State,
+    worker: &WorkerRec,
+    tasks: &[String],
+    agent: AgentState,
+    now: i64,
+) -> (bool, Option<(String, String)>) {
+    let Some(subagent) = state
+        .subagents
+        .values()
+        .find(|subagent| subagent.peer == worker.id)
+        .cloned()
+    else {
+        return (false, None);
+    };
+    if !matches!(agent, AgentState::Waiting | AgentState::Working) {
+        return (false, None);
+    }
+    let observed = observed_label(agent);
+    let old = state.keepalives.get(&worker.id).cloned().unwrap_or_default();
+    let changed = old.observed != observed || subagent.status != observed;
+    let mut record = old;
+    record.observed = observed.into();
+    if changed {
+        record.idle_since_ms = now;
+        record.activity_ms = now;
+        record.unacked = 0;
+        record.last_notice_id = None;
+    }
+    let mut current = subagent.clone();
+    current.status = observed.into();
+    let target = changed
+        .then(|| managed_subagent_target(state, server))
+        .flatten();
+    let subscription = target.as_ref().and_then(|target| {
+        state
+            .matching_subscription(target, "direct-message", None, now)
+            .cloned()
+    });
+    let mut events = vec![Event::KeepaliveUpdated {
+        worker_id: worker.id.clone(),
+        record,
+    }];
+    if changed {
+        events.push(Event::SubagentUpdated { subagent: current });
+        if let Some(target) = &target {
+            let id = super::gen_msg_id();
+            let body = format!("subagent={} state={} tasks={}", subagent.id, observed, tasks.join(","));
+            events.push(Event::Sent {
+                msg: Message {
+                    id: id.clone(),
+                    from: "collab-server".into(),
+                    to: target.clone(),
+                    mtype: "subagent-status".into(),
+                    subject: Some("subagent-status".into()),
+                    body,
+                    in_reply_to: None,
+                    created_ms: now,
+                    state: "pending".into(),
+                    wake_attempt_count: 0,
+                    last_wake_attempt_ms: 0,
+                },
+            });
+            events.push(Event::DeliveryMode {
+                msg_id: id.clone(),
+                mode: "explicit-notification".into(),
+            });
+            if let Some(subscription) = &subscription {
+                events.push(Event::WakeBound {
+                    message_id: id,
+                    subscription_id: subscription.id.clone(),
+                });
+            }
+        }
+    }
+    server.commit_locked(state, &events);
+    let notification = if let (Some(target), Some(subscription)) = (target, subscription) {
+        let message_id = events.iter().find_map(|event| match event {
+            Event::Sent { msg } if msg.to == target => Some(msg.id.clone()),
+            _ => None,
+        });
+        message_id.map(|message_id| (message_id, subscription.id))
+    } else {
+        None
+    };
+    (true, notification)
 }
 
 fn advance(
@@ -113,9 +218,6 @@ fn tick_with(
             .map(|t| t.id.clone())
             .collect();
         tasks.sort();
-        if tasks.is_empty() {
-            continue;
-        }
         let Some(pane) = worker.pane.as_deref() else {
             continue;
         };
@@ -137,6 +239,19 @@ fn tick_with(
                     }],
                 );
             }
+            continue;
+        }
+        let (managed, notification) =
+            handle_managed_subagent(server, &mut state, &worker, &tasks, agent, now);
+        if managed {
+            drop(state);
+            if let Some((message_id, subscription_id)) = notification {
+                super::attempt_notification(server, &message_id, &subscription_id);
+            }
+            state = server.state.lock().unwrap();
+            continue;
+        }
+        if tasks.is_empty() {
             continue;
         }
         let old = state
@@ -391,5 +506,83 @@ mod tests {
             }
             assert_eq!(r.unacked, 0);
         }
+    }
+
+    #[test]
+    fn idle_managed_subagent_reports_to_master_without_child_wake_loop() {
+        use super::super::peer_tests::{register, test_server};
+        use crate::subagent::Record as SubagentRecord;
+        use std::cell::Cell;
+
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "child", "%child");
+        assert!(super::super::handle_master_promote(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "user approved master".into(),
+        ).ok);
+        let now = super::super::state::now_ms();
+        server.commit(&[
+            Event::SubagentUpdated {
+                subagent: SubagentRecord {
+                    id: "managed".into(),
+                    parent: "master".into(),
+                    peer: "child".into(),
+                    status: "working".into(),
+                    session: Some("session".into()),
+                    pane: Some("%child".into()),
+                    profile: None,
+                    created_ms: now,
+                    ready_deadline_ms: now + 90_000,
+                    last_message: None,
+                    error: None,
+                    probe_failures: Vec::new(),
+                    runtime: Some("cursor".into()),
+                },
+            },
+            Event::TaskCreated {
+                task: crate::server::state::TaskRec {
+                    id: "task-child".into(),
+                    owner: "child".into(),
+                    created_by: "master".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p2".into(),
+                    status: "working".into(),
+                    next_step: Some("work".into()),
+                    wait: None,
+                    created_ms: now,
+                    updated_ms: now,
+                },
+            },
+        ]);
+        let wakes = Cell::new(0);
+        let wake = |_: &str, _: &str| {
+            wakes.set(wakes.get() + 1);
+            true
+        };
+        tick_with(&server, now + 900_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        let state = server.state.lock().unwrap();
+        assert_eq!(wakes.get(), 0);
+        assert_eq!(state.subagents["managed"].status, "idle");
+        assert_eq!(state.msgs.values().filter(|m| m.to == "child").count(), 0);
+        let status_messages: Vec<_> = state
+            .msgs
+            .values()
+            .filter(|m| m.to == "master" && m.mtype == "subagent-status")
+            .collect();
+        assert_eq!(status_messages.len(), 1);
+        assert!(status_messages[0].body.contains("state=idle"));
+        drop(state);
+        tick_with(&server, now + 1_800_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        let state = server.state.lock().unwrap();
+        assert_eq!(wakes.get(), 0);
+        assert_eq!(state.msgs.values().filter(|m| m.mtype == "subagent-status").count(), 1);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
