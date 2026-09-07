@@ -205,6 +205,7 @@ mod tests {
                 pane_alive_check: |_| true,
                 pane_owner_check: |_, _| true,
                 pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+                mailbox_notify: tokio::sync::Notify::new(),
             }),
             root,
         )
@@ -470,6 +471,7 @@ mod tests {
             pane_alive_check: |_| true,
             pane_owner_check: |_, _| true,
             pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            mailbox_notify: tokio::sync::Notify::new(),
         };
         let sent = std::sync::atomic::AtomicBool::new(false);
         assert!(!super::super::attempt_notification_with_default(
@@ -980,4 +982,3 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 }
-

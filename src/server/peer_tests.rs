@@ -23,6 +23,7 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
             pane_alive_check: |_| true,
             pane_owner_check: |_, _| true,
             pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            mailbox_notify: tokio::sync::Notify::new(),
         },
         root,
     )
@@ -1515,6 +1516,100 @@ async fn duplicate_daemon_rejection_preserves_authoritative_pid() {
 
     first.abort();
     let _ = first.await;
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn long_polls_do_not_starve_ping_on_the_blocking_pool() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixStream;
+        use tokio::time::{timeout, Duration};
+
+        let (server, root) = test_server();
+        register(&server, "peer", "%peer");
+        let server = Arc::new(server);
+        let mut poll_clients = Vec::new();
+        let mut poll_tasks = Vec::new();
+
+        for _ in 0..8 {
+            let (mut client, server_stream) = UnixStream::pair().unwrap();
+            poll_tasks.push(tokio::spawn(conn_task(server.clone(), server_stream)));
+            let request = serde_json::to_string(&Req::Poll {
+                worker_id: "peer".into(),
+                token: "token-peer".into(),
+                timeout_ms: 10_000,
+            })
+            .unwrap();
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.write_all(b"\n").await.unwrap();
+            poll_clients.push(client);
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (mut ping_client, server_stream) = UnixStream::pair().unwrap();
+        let ping_task = tokio::spawn(conn_task(server.clone(), server_stream));
+        let request = serde_json::to_string(&Req::Ping).unwrap();
+        ping_client.write_all(request.as_bytes()).await.unwrap();
+        ping_client.write_all(b"\n").await.unwrap();
+        let mut response = String::new();
+        timeout(
+            Duration::from_secs(1),
+            BufReader::new(&mut ping_client).read_line(&mut response),
+        )
+        .await
+        .expect("Ping must not wait behind long Poll requests")
+        .unwrap();
+        let response: Resp = serde_json::from_str(response.trim()).unwrap();
+        assert!(response.ok);
+
+        ping_task.abort();
+        for task in poll_tasks {
+            task.abort();
+        }
+        drop(poll_clients);
+        std::fs::remove_dir_all(root).ok();
+    });
+}
+
+#[tokio::test]
+async fn poll_wakes_when_a_message_is_committed() {
+    let (server, root) = test_server();
+    register(&server, "peer", "%peer");
+    let server = Arc::new(server);
+    let poll = tokio::spawn(handle_poll_async(server.clone(), "peer".into(), 5_000));
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "wake-message".into(),
+            from: "sender".into(),
+            to: "peer".into(),
+            mtype: "notify".into(),
+            subject: Some("wake".into()),
+            body: "message".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+
+    let response = tokio::time::timeout(Duration::from_secs(1), poll)
+        .await
+        .expect("Poll must wake after a durable message commit")
+        .unwrap();
+    assert!(response.ok);
+    assert_eq!(response.data["count"], 1);
+    assert_eq!(response.data["messages"][0]["id"], "wake-message");
     std::fs::remove_dir_all(root).ok();
 }
 

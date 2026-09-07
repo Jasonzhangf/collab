@@ -15,11 +15,11 @@ use state::{
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UnixListener;
+use tokio::sync::Notify;
 
 const MAX_POLL_MS: u64 = 3_600_000;
-const POLL_TICK_MS: u64 = 250;
 const TASK_STATUSES: [&str; 11] = [
     "assigned",
     "working",
@@ -110,6 +110,7 @@ pub struct Server {
     pub pane_alive_check: fn(&str) -> bool,
     pub pane_owner_check: fn(&str, &str) -> bool,
     pub pane_state_check: fn(&str) -> crate::server::knock::AgentState,
+    pub mailbox_notify: Notify,
 }
 
 fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) {
@@ -196,6 +197,9 @@ impl Server {
                     }
                 }
             }
+        }
+        if evs.iter().any(|event| matches!(event, Event::Sent { .. })) {
+            self.mailbox_notify.notify_waiters();
         }
     }
 
@@ -2461,35 +2465,51 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
     }))
 }
 
-fn handle_poll(server: &Server, worker_id: String, timeout_ms: u64) -> Resp {
+fn poll_messages(server: &Server, worker_id: &str) -> Option<Resp> {
+    let ids: Vec<String>;
+    let msgs: Vec<Message>;
+    {
+        let st = server.state.lock().unwrap();
+        let unread = st.inbox_of(worker_id);
+        if unread.is_empty() {
+            return None;
+        }
+        ids = unread.iter().map(|m| m.id.clone()).collect();
+        msgs = unread.into_iter().cloned().collect();
+    }
+    server.commit(&[Event::Delivered { ids }]);
+    Some(Resp::data(json!({
+        "messages": msgs,
+        "count": msgs.len(),
+        "fetched_at": iso(now_ms()),
+    })))
+}
+
+async fn poll_messages_async(server: Arc<Server>, worker_id: &str) -> Option<Resp> {
+    let worker_id = worker_id.to_owned();
+    tokio::task::spawn_blocking(move || poll_messages(&server, &worker_id))
+        .await
+        .unwrap_or_else(|error| Some(Resp::err(format!("poll handler join error: {}", error))))
+}
+
+async fn handle_poll_async(server: Arc<Server>, worker_id: String, timeout_ms: u64) -> Resp {
     let timeout_ms = timeout_ms.min(MAX_POLL_MS);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut notified = Box::pin(server.mailbox_notify.notified());
+    let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
+    tokio::pin!(timeout);
     loop {
-        let ids: Vec<String>;
-        let msgs: Vec<Message>;
-        {
-            let st = server.state.lock().unwrap();
-            let unread = st.inbox_of(&worker_id);
-            if unread.is_empty() {
-                ids = Vec::new();
-                msgs = Vec::new();
-            } else {
-                ids = unread.iter().map(|m| m.id.clone()).collect();
-                msgs = unread.into_iter().cloned().collect();
+        notified.as_mut().enable();
+        if let Some(response) = poll_messages_async(server.clone(), &worker_id).await {
+            return response;
+        }
+        tokio::select! {
+            _ = notified.as_mut() => {
+                notified.set(server.mailbox_notify.notified());
+            }
+            _ = &mut timeout => {
+                return Resp::data(json!({"messages": [], "count": 0, "timeout": true}));
             }
         }
-        if !ids.is_empty() {
-            server.commit(&[Event::Delivered { ids }]);
-            return Resp::data(json!({
-                "messages": msgs,
-                "count": msgs.len(),
-                "fetched_at": iso(now_ms()),
-            }));
-        }
-        if Instant::now() >= deadline {
-            return Resp::data(json!({"messages": [], "count": 0, "timeout": true}));
-        }
-        std::thread::sleep(Duration::from_millis(POLL_TICK_MS));
     }
 }
 
@@ -2817,18 +2837,9 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             token,
             subscription_id,
         } => handle_notification_unsubscribe(server, worker_id, token, subscription_id),
-        Req::Poll {
-            worker_id,
-            token,
-            timeout_ms,
-        } => {
-            let check = server.state.lock().unwrap();
-            if let Err(e) = verify(&check, &worker_id, &token) {
-                return e;
-            }
-            drop(check);
-            handle_poll(server, worker_id, timeout_ms)
-        }
+        Req::Poll { .. } => Resp::err(
+            "Poll is only handled by the async daemon connection path; use collab recv",
+        ),
         Req::Ack {
             worker_id,
             token,
@@ -3250,11 +3261,34 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
         let resp = match serde_json::from_str::<Req>(&line) {
             Ok(req) => {
                 let activity_req = req.clone();
-                // blocking handlers (poll/wait) run off the async reactor thread pool
-                let srv = server.clone();
-                let resp = tokio::task::spawn_blocking(move || dispatch(&srv, req))
-                    .await
-                    .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e)));
+                let resp = match req {
+                    Req::Poll {
+                        worker_id,
+                        token,
+                        timeout_ms,
+                    } => {
+                        let admission = {
+                            let check = server.state.lock().unwrap();
+                            if let Err(error) = verify(&check, &worker_id, &token) {
+                                Some(error)
+                            } else if check.admission_frozen() {
+                                Some(Resp::err("MIGRATION_ADMISSION_FROZEN: only identity rebind, read queries, daemon restart, and migration verify are allowed"))
+                            } else {
+                                None
+                            }
+                        };
+                        match admission {
+                            Some(response) => response,
+                            None => handle_poll_async(server.clone(), worker_id, timeout_ms).await,
+                        }
+                    }
+                    req => {
+                        let srv = server.clone();
+                        tokio::task::spawn_blocking(move || dispatch(&srv, req))
+                            .await
+                            .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e)))
+                    }
+                };
                 record_activity(
                     &server.root,
                     "request",
@@ -3391,6 +3425,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         pane_alive_check: pane_alive,
         pane_owner_check: pane_owner_authoritative,
         pane_state_check: knock::probe_agent_state,
+        mailbox_notify: Notify::new(),
     });
     restore_registered_peer_default_leases(&server);
     let listener = UnixListener::bind(&sock_path)?;
