@@ -101,6 +101,22 @@ an unfinished task is not repeatedly woken just because its task is not closed.
 `subagent status` includes tasks, parent mailbox, counters and notification/ACK
 history. `subagent snapshot <id> --lines 40` reads the screen only on request.
 
+## Cross-project master communication
+
+Collab communication across projects is master-only and explicit. Only a live
+master may send to the live master of another initialized project; non-master
+peers and managed subagents are rejected before any message is persisted:
+
+```sh
+collab master send --project /abs/path/to/target --to <target-master> \
+  --subject <short-topic> "<original message>"
+```
+
+`--project` must be the exact target project root with `.agent-collab`, and
+`--to` must be that project's live master. The target daemon also verifies the
+sender-side `assigned_by` / `approval` / `assigned_ms` from the local master
+status before accepting the message.
+
 Task liveness is an obligation, not an ACK ceremony. Every assigned task that
 has not reached verified cleanup/close is checked at least once per 15 minutes.
 When the check arrives, continue the task immediately if actionable; if it is
