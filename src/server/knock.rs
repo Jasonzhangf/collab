@@ -12,23 +12,50 @@ pub enum AgentState {
     Waiting,
 }
 
+struct PaneAliveCache {
+    at: Option<std::time::Instant>,
+    panes: Option<std::collections::HashSet<String>>,
+}
+static PANE_ALIVE_CACHE: std::sync::Mutex<PaneAliveCache> = std::sync::Mutex::new(PaneAliveCache {
+    at: None,
+    panes: None,
+});
+const PANE_ALIVE_TTL: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub fn pane_alive(pane: &str) -> bool {
     if !pane.starts_with('%') {
         return false;
     }
+    let now = std::time::Instant::now();
+    {
+        let cache = PANE_ALIVE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(at), Some(panes)) = (cache.at, cache.panes.as_ref()) {
+            if now.saturating_duration_since(at) < PANE_ALIVE_TTL {
+                return panes.contains(pane);
+            }
+        }
+    }
     // `tmux display-message -t <pane>` exits 0 even when the pane does not
     // exist, so enumerate all panes and compare pane ids exactly.
-    Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["list-panes", "-a", "-F", "#{pane_id}"])
-        .output()
-        .ok()
-        .map(|o| {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .any(|id| id.trim() == pane)
-        })
-        .unwrap_or(false)
+        .output();
+    let mut set = std::collections::HashSet::new();
+    if let Ok(o) = output {
+        if o.status.success() {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let id = line.trim();
+                if !id.is_empty() {
+                    set.insert(id.to_string());
+                }
+            }
+        }
+    }
+    let alive = set.contains(pane);
+    let mut cache = PANE_ALIVE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    cache.at = Some(now);
+    cache.panes = Some(set);
+    alive
 }
 
 pub fn probe_agent_state(pane: &str) -> AgentState {

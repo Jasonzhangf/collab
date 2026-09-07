@@ -2581,34 +2581,41 @@ fn handle_task_wait(
     }))
 }
 
-fn worker_status_summary(server: &Server, st: &State, w: &WorkerRec) -> serde_json::Value {
-    let active = st.tasks.values().find(|task| {
+fn worker_status_summary_with_maps(
+    server: &Server,
+    tasks: &std::collections::HashMap<String, TaskRec>,
+    msgs: &std::collections::HashMap<String, Message>,
+    keepalives: &std::collections::HashMap<String, crate::server::keepalive::Record>,
+    w: &WorkerRec,
+) -> serde_json::Value {
+    let active = tasks.values().find(|task| {
         task.owner == w.id
             && !matches!(task.status.as_str(), "closed" | "cancelled")
     });
     let pane = w.pane.as_deref();
     let endpoint_live = pane.is_some_and(server.pane_alive_check);
-    let identity_valid = pane.is_some_and(|p| (server.pane_owner_check)(&w.id, p));
-    let agent_state = pane
-        .map(|p| match (server.pane_state_check)(p) {
+    let identity_valid = endpoint_live && pane.is_some_and(|p| (server.pane_owner_check)(&w.id, p));
+    let agent_state = if endpoint_live && identity_valid {
+        pane.map(|p| match (server.pane_state_check)(p) {
             crate::server::knock::AgentState::Waiting => "waiting",
             crate::server::knock::AgentState::Working => "working",
             crate::server::knock::AgentState::Absent => "absent",
             crate::server::knock::AgentState::Unknown => "unknown",
         })
-        .unwrap_or("absent");
-    let unacked_notifications = st
-        .msgs
+        .unwrap_or("absent")
+    } else {
+        "absent"
+    };
+    let unacked_notifications = msgs
         .values()
         .filter(|m| m.to == w.id && m.state == "delivered")
         .count();
-    let pending_notifications = st
-        .msgs
+    let pending_notifications = msgs
         .values()
         .filter(|m| m.to == w.id && m.state == "pending")
         .count();
     let notifications_paused = (unacked_notifications as u32) >= server.config.notifications.max_unacked;
-    let keepalive = st.keepalives.get(&w.id);
+    let keepalive = keepalives.get(&w.id);
     let suspected_offline = keepalive.map(|k| k.suspected_offline).unwrap_or(false);
     let unacked_keepalives = keepalive.map(|k| k.unacked).unwrap_or(0);
     let status = if !endpoint_live {
@@ -3075,11 +3082,18 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             Resp::err("declared roles are removed; use collab who/context for peer identity")
         }
         Req::Workers => {
-            let st = server.state.lock().unwrap();
-            let mut workers: Vec<serde_json::Value> = st
-                .workers
-                .values()
-                .map(|w| worker_status_summary(server, &st, w))
+            let (workers_rec, tasks_map, msgs_map, keepalives_map) = {
+                let st = server.state.lock().unwrap();
+                (
+                    st.workers.values().cloned().collect::<Vec<_>>(),
+                    st.tasks.clone(),
+                    st.msgs.clone(),
+                    st.keepalives.clone(),
+                )
+            };
+            let mut workers: Vec<serde_json::Value> = workers_rec
+                .iter()
+                .map(|w| worker_status_summary_with_maps(server, &tasks_map, &msgs_map, &keepalives_map, w))
                 .collect();
             workers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
             Resp::data(json!({
@@ -3088,12 +3102,19 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             }))
         }
         Req::WorkerStatus { worker_id } => {
-            let st = server.state.lock().unwrap();
-            let mut workers: Vec<serde_json::Value> = st
-                .workers
-                .values()
+            let (workers_rec, tasks_map, msgs_map, keepalives_map) = {
+                let st = server.state.lock().unwrap();
+                (
+                    st.workers.values().cloned().collect::<Vec<_>>(),
+                    st.tasks.clone(),
+                    st.msgs.clone(),
+                    st.keepalives.clone(),
+                )
+            };
+            let mut workers: Vec<serde_json::Value> = workers_rec
+                .iter()
                 .filter(|w| worker_id.as_ref().is_none_or(|id| id == &w.id))
-                .map(|w| worker_status_summary(server, &st, w))
+                .map(|w| worker_status_summary_with_maps(server, &tasks_map, &msgs_map, &keepalives_map, w))
                 .collect();
             workers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
             Resp::data(json!({
@@ -3136,33 +3157,47 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             }))
         }
         Req::StatusAll => {
-            let st = server.state.lock().unwrap();
-            let mut workers: Vec<serde_json::Value> = st
-                .workers
-                .values()
-                .map(|w| worker_status_summary(server, &st, w))
+            let (workers_rec, tasks, subagents, msgs_len, tasks_map, msgs_map, keepalives_map, now) = {
+                let st = server.state.lock().unwrap();
+                let workers_rec: Vec<WorkerRec> = st.workers.values().cloned().collect();
+                let mut tasks: Vec<serde_json::Value> = st
+                    .tasks
+                    .values()
+                    .map(|task| task_view(&st, task))
+                    .collect();
+                tasks.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+                let mut subagents: Vec<crate::subagent::Record> = st
+                    .subagents
+                    .values()
+                    .cloned()
+                    .collect();
+                subagents.sort_by(|a, b| a.id.cmp(&b.id));
+                let msgs_len = st.msgs.len();
+                let now = now_ms();
+                (
+                    workers_rec,
+                    tasks,
+                    subagents,
+                    msgs_len,
+                    st.tasks.clone(),
+                    st.msgs.clone(),
+                    st.keepalives.clone(),
+                    now,
+                )
+            };
+            let mut workers: Vec<serde_json::Value> = workers_rec
+                .iter()
+                .map(|w| worker_status_summary_with_maps(server, &tasks_map, &msgs_map, &keepalives_map, w))
                 .collect();
             workers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-            let mut tasks: Vec<serde_json::Value> = st
-                .tasks
-                .values()
-                .map(|task| task_view(&st, task))
-                .collect();
-            tasks.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-            let mut subagents: Vec<crate::subagent::Record> = st
-                .subagents
-                .values()
-                .cloned()
-                .collect();
-            subagents.sort_by(|a, b| a.id.cmp(&b.id));
 
             Resp::data(json!({
                 "summary": {
                     "workers": workers.len(),
-                    "messages": st.msgs.len(),
+                    "messages": msgs_len,
                     "tasks": tasks.len(),
                     "subagents": subagents.len(),
-                    "now": iso(now_ms()),
+                    "now": iso(now),
                 },
                 "workers": workers,
                 "tasks": tasks,
@@ -3378,7 +3413,8 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
             tokio::time::interval(Duration::from_millis(sched.config.timers.tick_interval_ms));
         loop {
             interval.tick().await;
-            crate::server::timers::tick(&sched);
+            let s = sched.clone();
+            tokio::task::spawn_blocking(move || crate::server::timers::tick(&s)).await.ok();
         }
     });
 
