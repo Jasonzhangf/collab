@@ -156,7 +156,9 @@ Never type peer messages into tmux. Without the recipient's active
 normally creates this subscription automatically; tmux receives only the short
 message id, abbreviated subject, safe one-line original body preview, and one
 submit. Cursor CLI gets literal keys, then `C-m` from a second tmux process
-250ms later, so bracketed paste cannot swallow Enter on send or receive. Codex
+250ms later, so bracketed paste cannot swallow Enter on send or receive. A
+working Cursor pane then gets one empty `C-m` so the follow-up steers the
+active run instead of waiting in the queue. Codex
 keeps `paste-buffer -p` and `C-m` in one tmux queue so the paste is submitted.
 Splitting Codex paste from Enter leaves the text unsubmitted; putting Cursor
 Enter in the same PTY chunk as paste swallows it.
@@ -185,7 +187,8 @@ explicitly subscribe again; no automatic rearm exists. The default
 `direct-message` lease accepts later peer messages until expiry; resource,
 deadline, and async-result event matching remains owner-scoped and finite.
 tmux receives `COLLAB_NOTIFY <message-id> [<subject>] <original-body-preview>`
-then one Enter: Cursor as delayed literal keys, Codex as paste-plus-`C-m` in
+then one Enter: Cursor as delayed literal keys, plus one empty Enter when that
+pane is working so the follow-up steers; Codex as paste-plus-`C-m` in
 one command queue. The Agent first weighs the id and
 subject against current work. When it selects the notice, it runs
 `collab msg <message-id>`, reads durable detail, and executes actionable
