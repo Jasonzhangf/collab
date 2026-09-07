@@ -108,6 +108,7 @@ pub struct Server {
     pub state: Mutex<State>,
     pub journal: Mutex<std::fs::File>,
     pub pane_alive_check: fn(&str) -> bool,
+    pub pane_owner_check: fn(&str, &str) -> bool,
 }
 
 fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) {
@@ -363,6 +364,7 @@ fn attempt_notification_with(
     subscription_id: &str,
     can_receive: &dyn Fn(&str) -> bool,
     deliver: &dyn Fn(&str, &str) -> bool,
+    owns_pane: &dyn Fn(&str, &str) -> bool,
 ) -> bool {
     let now = now_ms();
     if !server.config.notifications.enabled {
@@ -379,6 +381,9 @@ fn attempt_notification_with(
     let pane = subscription.pane.clone();
     let delay = server.config.notifications.delay_ms(&subscription.event);
     if subscription.worker_id != recipient {
+        return false;
+    }
+    if !owns_pane(&recipient, &pane) {
         return false;
     }
     let mut batch = state
@@ -475,6 +480,27 @@ fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str
         subscription_id,
         &knock::pane_accepts_notification,
         &|pane, text| knock_or_log(&server.log_path(), pane, text),
+        &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
+    )
+}
+
+/// Test and migration helper: assume every pane is authoritative so
+/// legacy fixtures keep working without threading the owner check through.
+#[cfg(test)]
+pub(crate) fn attempt_notification_with_default(
+    server: &Server,
+    message_id: &str,
+    subscription_id: &str,
+    can_receive: &dyn Fn(&str) -> bool,
+    deliver: &dyn Fn(&str, &str) -> bool,
+) -> bool {
+    attempt_notification_with(
+        server,
+        message_id,
+        subscription_id,
+        can_receive,
+        deliver,
+        &|_, _| true,
     )
 }
 
@@ -1001,6 +1027,16 @@ pub(crate) fn handle_register(
     let Some(runtime) = runtime_for_pane(pane.as_deref()) else {
         return Resp::err("collab registration requires a live tmux pane");
     };
+    if let Some(pane) = pane.as_deref() {
+        if let Some(session) = tmux_session_for_pane(pane) {
+            if session != worker_id {
+                return Resp::err(format!(
+                    "pane {} belongs to tmux session {}; worker {} cannot bind it",
+                    pane, session, worker_id
+                ));
+            }
+        }
+    }
     if st.admission_frozen() && !st.workers.contains_key(&worker_id) {
         return Resp::err("MIGRATION_ADMISSION_FROZEN: only an existing tmux identity may rebind");
     }
@@ -1114,7 +1150,8 @@ fn live_master_id(server: &Server, state: &State) -> Option<String> {
     let worker_id = state.master_worker_id.as_deref()?;
     let worker = state.workers.get(worker_id)?;
     let pane = worker.pane.as_deref()?;
-    (server.pane_alive_check)(pane).then(|| worker_id.to_string())
+    ((server.pane_alive_check)(pane) && (server.pane_owner_check)(worker_id, pane))
+        .then(|| worker_id.to_string())
 }
 
 fn is_managed_subagent(state: &State, worker_id: &str) -> bool {
@@ -1219,7 +1256,11 @@ fn handle_master_delegate(
     Resp::data(json!({"master": target_id, "delegated_by": worker_id}))
 }
 
-fn master_assignment_view(state: &State, worker_id: &str, endpoint_live: bool) -> serde_json::Value {
+fn master_assignment_view(
+    state: &State,
+    worker_id: &str,
+    endpoint_live: bool,
+) -> serde_json::Value {
     let pane = state
         .workers
         .get(worker_id)
@@ -1739,6 +1780,18 @@ fn tmux_session_for_pane(pane: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// A peer owns its tmux pane only when the live session name matches the
+/// worker id. Non-tmux operators always pass. Stale or split bindings wake
+/// the wrong agent, so keepalive and notification paths consult this guard
+/// before touching a pane.
+pub(crate) fn pane_owner_authoritative(worker_id: &str, pane: &str) -> bool {
+    if pane.starts_with('%') {
+        tmux_session_for_pane(pane).as_deref() == Some(worker_id)
+    } else {
+        true
+    }
+}
+
 fn close_task_resources(
     root: &Path,
     worktree_path: Option<&str>,
@@ -1898,7 +1951,14 @@ fn handle_task_deliver(
     }))
 }
 
-fn handle_task_close(server: &Server, worker_id: String, token: String, task_id: String) -> Resp {
+fn handle_task_close(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    task_id: String,
+    force: bool,
+    reason: Option<String>,
+) -> Resp {
     let mut st = server.state.lock().unwrap();
     let Some(worker) = st.workers.get(&worker_id).cloned() else {
         return Resp::err(format!("worker {} not registered", worker_id));
@@ -1909,6 +1969,76 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
     let Some(task) = st.tasks.get(&task_id).cloned() else {
         return Resp::err(format!("task {} not found", task_id));
     };
+    if force {
+        let reason = reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let Some(reason) = reason else {
+            return Resp::err("force close requires a non-empty --reason");
+        };
+        let live_master = live_master_id(server, &st);
+        let authorized = live_master.as_deref() == Some(worker_id.as_str())
+            || (live_master.is_none() && task.owner == worker_id);
+        if !authorized {
+            return Resp::err_data(
+                "manual force close is not authorized for this caller",
+                json!({
+                    "live_master": live_master,
+                    "task_owner": task.owner,
+                    "requester": worker_id,
+                    "rule": "live master may close any task; the owner may close its own task when no live master exists",
+                }),
+            );
+        }
+        let mut closed = task;
+        closed.status = "closed".into();
+        closed.wait = None;
+        closed.next_step = Some(format!("manual close: {reason}"));
+        closed.updated_ms = now_ms();
+        let receipt = CleanupReceipt {
+            id: format!("cleanup-manual-{}-{}", closed.id, closed.updated_ms),
+            task_id: closed.id.clone(),
+            worktree_path: closed.worktree_path.clone(),
+            branch: closed.branch.clone(),
+            verified_ms: closed.updated_ms,
+            manual_reason: Some(reason.clone()),
+        };
+        let superseded: Vec<String> = st
+            .msgs
+            .values()
+            .filter(|m| m.to == closed.owner && m.state == "pending" && m.mtype == "keepalive")
+            .map(|m| m.id.clone())
+            .collect();
+        let mut events: Vec<Event> = vec![
+            Event::CleanupVerified {
+                receipt: receipt.clone(),
+            },
+            Event::TaskUpdated {
+                task: closed.clone(),
+            },
+        ];
+        if !superseded.is_empty() {
+            events.push(Event::Superseded {
+                ids: superseded.clone(),
+            });
+        }
+        server.commit_locked(&mut st, &events);
+        let stale_workers = stale_worker_views(&st, &server.pane_alive_check);
+        drop(st);
+        return Resp::data(json!({
+            "task": closed.id,
+            "status": closed.status,
+            "owner": closed.owner,
+            "manual": true,
+            "reason": reason,
+            "receipt_id": receipt.id,
+            "superseded_pending_keepalives": superseded,
+            "stale_workers": stale_workers,
+            "next_action": "lifecycle complete; keepalives for this task owner stopped",
+        }));
+    }
     if task.owner != worker_id {
         return Resp::err("only the task owner may close its lifecycle");
     }
@@ -1947,6 +2077,7 @@ fn handle_task_close(server: &Server, worker_id: String, token: String, task_id:
         worktree_path: closed.worktree_path.clone(),
         branch: closed.branch.clone(),
         verified_ms: closed.updated_ms,
+        manual_reason: None,
     };
     server.commit_locked(
         &mut st,
@@ -2503,7 +2634,9 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             worker_id,
             token,
             task_id,
-        } => handle_task_close(server, worker_id, token, task_id),
+            force,
+            reason,
+        } => handle_task_close(server, worker_id, token, task_id, force, reason),
         Req::TaskDispatch { worker_id, token } => handle_task_dispatch(server, worker_id, token),
         Req::TaskStatus { task_id } => {
             let st = server.state.lock().unwrap();
@@ -2666,7 +2799,8 @@ fn replay(root: &Path) -> anyhow::Result<State> {
             )
         })?;
         if matches!(event, Event::MasterAssigned { .. })
-            && (line.contains("\"ev\":\"RootAssigned\"") || line.contains("\"ev\": \"RootAssigned\""))
+            && (line.contains("\"ev\":\"RootAssigned\"")
+                || line.contains("\"ev\": \"RootAssigned\""))
         {
             convert_root = true;
         }
@@ -2712,6 +2846,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         state: Mutex::new(state),
         journal: Mutex::new(journal_file),
         pane_alive_check: pane_alive,
+        pane_owner_check: pane_owner_authoritative,
     });
     restore_registered_peer_default_leases(&server);
     let listener = UnixListener::bind(&sock_path)?;

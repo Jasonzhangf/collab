@@ -240,8 +240,18 @@ enum TaskCmd {
         #[arg(long)]
         next: Option<String>,
     },
-    /// Close a merged task and clean up its declared worktree/branch
-    Close { id: String },
+    /// Close a merged task and clean up its declared worktree/branch.
+    /// With --force the live master may close any task, or the owner may
+    /// close its own task when no live master exists. Force close stops
+    /// keepalives without deleting the worktree or branch and requires
+    /// a non-empty --reason.
+    Close {
+        id: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "reason")]
+        reason: Option<String>,
+    },
     /// Deprecated: peers self-register tasks; no central dispatch
     Dispatch,
     /// Show task registry
@@ -779,10 +789,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     status: Some("blocked".into()),
                     next_step: next,
                 },
-                TaskCmd::Close { id } => Req::TaskClose {
+                TaskCmd::Close { id, force, reason } => Req::TaskClose {
                     worker_id: ident.worker_id,
                     token: ident.token,
                     task_id: id,
+                    force,
+                    reason,
                 },
                 TaskCmd::Dispatch => Req::TaskDispatch {
                     worker_id: ident.worker_id,

@@ -155,6 +155,8 @@ pub struct CleanupReceipt {
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
     pub verified_ms: i64,
+    #[serde(default)]
+    pub manual_reason: Option<String>,
 }
 
 pub fn task_resource_active(status: &str) -> bool {

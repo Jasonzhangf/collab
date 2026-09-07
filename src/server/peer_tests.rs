@@ -21,6 +21,7 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
             pane_alive_check: |_| true,
+            pane_owner_check: |_, _| true,
         },
         root,
     )
@@ -657,6 +658,8 @@ fn only_owner_mutates_and_closes_task() {
         "peer-b".into(),
         "token-peer-b".into(),
         "task-a".into(),
+        false,
+        None,
     );
     assert!(!close.ok);
     assert_eq!(
@@ -705,7 +708,14 @@ fn owner_completes_local_lifecycle_without_peer_reports() {
         )
         .ok
     );
-    let closed = handle_task_close(&server, "peer".into(), "token-peer".into(), "task".into());
+    let closed = handle_task_close(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "task".into(),
+        false,
+        None,
+    );
     assert!(closed.ok);
     let state = server.state.lock().unwrap();
     assert_eq!(state.tasks["task"].status, "closed");
@@ -714,6 +724,129 @@ fn owner_completes_local_lifecycle_without_peer_reports() {
         state.msgs.is_empty(),
         "normal lifecycle must not report to peers"
     );
+    drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn master_force_close_skips_owner_and_cleanup_requirements() {
+    let (server, root) = test_server();
+    register(&server, "owner", "%owner");
+    register(&server, "master", "%master");
+    server.commit(&[Event::MasterAssigned {
+        worker_id: "master".into(),
+        assigned_by: "master".into(),
+        approval: Some("user approved force-close test".into()),
+        assigned_ms: now_ms(),
+    }]);
+    let now = now_ms();
+    server.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "stuck".into(),
+            owner: "owner".into(),
+            created_by: "owner".into(),
+            feature_id: None,
+            worktree_path: Some("playground/stuck".into()),
+            branch: Some("codex/stuck".into()),
+            base_commit: Some("base".into()),
+            priority: default_priority(),
+            status: "blocked".into(),
+            next_step: None,
+            wait: None,
+            created_ms: now,
+            updated_ms: now,
+        },
+    }]);
+    let resp = handle_task_close(
+        &server,
+        "master".into(),
+        "token-master".into(),
+        "stuck".into(),
+        true,
+        Some("worktree dirty and merge blocked; force closing per master".into()),
+    );
+    assert!(resp.ok, "{}", resp.error.unwrap_or_default());
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.tasks["stuck"].status, "closed");
+    assert_eq!(
+        state.cleanup_receipts["stuck"].manual_reason.as_deref(),
+        Some("worktree dirty and merge blocked; force closing per master"),
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn non_master_force_close_is_rejected() {
+    let (server, root) = test_server();
+    register(&server, "owner", "%owner");
+    register(&server, "peer", "%peer");
+    let now = now_ms();
+    server.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "stuck".into(),
+            owner: "owner".into(),
+            created_by: "owner".into(),
+            feature_id: None,
+            worktree_path: Some("playground/stuck".into()),
+            branch: Some("codex/stuck".into()),
+            base_commit: Some("base".into()),
+            priority: default_priority(),
+            status: "working".into(),
+            next_step: None,
+            wait: None,
+            created_ms: now,
+            updated_ms: now,
+        },
+    }]);
+    let resp = handle_task_close(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "stuck".into(),
+        true,
+        Some("not authorized".into()),
+    );
+    assert!(!resp.ok);
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.tasks["stuck"].status, "working");
+    drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn owner_force_close_when_no_live_master_is_allowed() {
+    let (server, root) = test_server();
+    register(&server, "owner", "%owner");
+    let now = now_ms();
+    server.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "orphan".into(),
+            owner: "owner".into(),
+            created_by: "owner".into(),
+            feature_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            priority: default_priority(),
+            status: "blocked".into(),
+            next_step: None,
+            wait: None,
+            created_ms: now,
+            updated_ms: now,
+        },
+    }]);
+    let resp = handle_task_close(
+        &server,
+        "owner".into(),
+        "token-owner".into(),
+        "orphan".into(),
+        true,
+        Some("master unreachable; owner closes".into()),
+    );
+    assert!(resp.ok, "{}", resp.error.unwrap_or_default());
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.tasks["orphan"].status, "closed");
     drop(state);
     std::fs::remove_dir_all(root).ok();
 }
@@ -894,6 +1027,8 @@ fn holder_close_persists_release_only_for_waiter() {
             "holder".into(),
             "token-holder".into(),
             "held".into(),
+            false,
+            None,
         )
         .ok
     );

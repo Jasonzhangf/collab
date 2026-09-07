@@ -86,6 +86,7 @@ pub fn tick(server: &Server) {
         super::state::now_ms(),
         &super::knock::probe_agent_state,
         &|pane, text| super::knock_or_log(&server.log_path(), pane, text),
+        &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
     );
 }
 
@@ -94,6 +95,7 @@ fn tick_with(
     now: i64,
     probe: &dyn Fn(&str) -> AgentState,
     wake: &dyn Fn(&str, &str) -> bool,
+    owns_pane: &dyn Fn(&str, &str) -> bool,
 ) {
     if !server.config.keepalive.enabled || !server.config.timers.enabled {
         return;
@@ -117,6 +119,24 @@ fn tick_with(
         let Some(pane) = worker.pane.as_deref() else {
             continue;
         };
+        if !owns_pane(&worker.id, pane) {
+            let mut record = state
+                .keepalives
+                .get(&worker.id)
+                .cloned()
+                .unwrap_or_default();
+            if !record.suspected_offline {
+                record.suspected_offline = true;
+                server.commit_locked(
+                    &mut state,
+                    &[Event::KeepaliveUpdated {
+                        worker_id: worker.id.clone(),
+                        record,
+                    }],
+                );
+            }
+            continue;
+        }
         let old = state
             .keepalives
             .get(&worker.id)
@@ -255,10 +275,22 @@ mod tests {
             sends.set(sends.get() + 1);
             false
         };
-        tick_with(&server, base, &|_| AgentState::Waiting, &send);
+        tick_with(&server, base, &|_| AgentState::Waiting, &send, &|_, _| true);
         for n in 1..=3 {
-            tick_with(&server, base + n * 900_000, &|_| AgentState::Waiting, &send);
-            tick_with(&server, base + n * 900_000, &|_| AgentState::Waiting, &send);
+            tick_with(
+                &server,
+                base + n * 900_000,
+                &|_| AgentState::Waiting,
+                &send,
+                &|_, _| true,
+            );
+            tick_with(
+                &server,
+                base + n * 900_000,
+                &|_| AgentState::Waiting,
+                &send,
+                &|_, _| true,
+            );
         }
         assert_eq!(sends.get(), 3);
         let mut replay = State::default();
@@ -269,8 +301,20 @@ mod tests {
             replay.apply(&serde_json::from_str::<Event>(line).unwrap());
         }
         *server.state.lock().unwrap() = replay;
-        tick_with(&server, base + 3_600_000, &|_| AgentState::Waiting, &send);
-        tick_with(&server, base + 9_000_000, &|_| AgentState::Waiting, &send);
+        tick_with(
+            &server,
+            base + 3_600_000,
+            &|_| AgentState::Waiting,
+            &send,
+            &|_, _| true,
+        );
+        tick_with(
+            &server,
+            base + 9_000_000,
+            &|_| AgentState::Waiting,
+            &send,
+            &|_, _| true,
+        );
         let state = server.state.lock().unwrap();
         assert!(state.keepalives["worker"].suspected_offline);
         assert_eq!(state.msgs.len(), 3);
