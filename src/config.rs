@@ -48,6 +48,7 @@ pub struct Notifications {
     pub batch_window_seconds: u64,
     pub transport: String,
     pub submit_enter: bool,
+    pub max_unacked: u32,
     pub events: BTreeMap<String, EventPolicy>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -63,6 +64,7 @@ impl Default for Notifications {
             batch_window_seconds: 60,
             transport: "tmux".into(),
             submit_enter: true,
+            max_unacked: 3,
             events: BTreeMap::from([(
                 "deadline".into(),
                 EventPolicy {
@@ -318,6 +320,7 @@ impl Config {
         let n = &self.notifications;
         if !matches!(n.mode.as_str(), "immediate" | "batch")
             || !(1..=3600).contains(&n.batch_window_seconds)
+            || !(1..=5).contains(&n.max_unacked)
         {
             bail!("invalid notification mode/window");
         }

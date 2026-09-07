@@ -214,7 +214,7 @@ fn cursor_and_codex_subagents_launch_and_message_each_other() {
 if (process.env.COLLAB_FAKE_TUI === 'cursor') {
   process.stdout.write('  Cursor Grok 4.6 High Fast · 54.5%\n  /tmp/project · main\n  Run Everything\n');
 } else {
-  process.stdout.write('CODEX-TUI\n');
+  process.stdout.write('› Ask Codex to do anything\n  gpt-5.6-luna high · /tmp/project\n');
 }
 process.stdin.setRawMode(true);
 process.stdin.resume();
@@ -342,12 +342,14 @@ exec node "{rec}"
         &["subagent", "ready", "cursor-rt"],
     );
     assert!(cursor_ready.get("subagent").is_some(), "{cursor_ready}");
+    set_title(&cursor_pane, "cursor-rt");
     let codex_ready = harness.json_as(
         Some(&codex_pane),
         Some(&codex_peer),
         &["subagent", "ready", "codex-rt"],
     );
     assert!(codex_ready.get("subagent").is_some(), "{codex_ready}");
+    set_title(&codex_pane, "codex-rt");
     let ping = harness.json_as(
         Some(&cursor_pane),
         Some(&cursor_peer),

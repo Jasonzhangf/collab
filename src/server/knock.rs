@@ -60,12 +60,6 @@ pub fn pane_idle(pane: &str) -> bool {
     probe_agent_state(pane) == AgentState::Waiting
 }
 
-pub fn pane_accepts_notification(pane: &str) -> bool {
-    matches!(
-        probe_agent_state(pane),
-        AgentState::Working | AgentState::Waiting
-    )
-}
 
 fn pane_view(pane: &str) -> Option<(String, String, String)> {
     let identity = Command::new("tmux")
@@ -411,13 +405,13 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
         anyhow::bail!("pane {} not alive", pane);
     }
     let state = probe_agent_state(pane);
-    if !matches!(state, AgentState::Working | AgentState::Waiting) {
-        anyhow::bail!("pane {} has no known agent", pane);
+    if state != AgentState::Waiting {
+        anyhow::bail!("pane {} is not a waiting agent (state: {:?})", pane, state);
     }
     let kind = pane_view(pane)
         .map(|(command, _, screen)| submit_kind(&command, &screen))
         .unwrap_or(SubmitKind::BracketedPaste);
-    knock_kind(pane, text, kind, state == AgentState::Working)
+    knock_kind(pane, text, kind, false)
 }
 
 #[cfg(test)]

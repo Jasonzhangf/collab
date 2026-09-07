@@ -119,7 +119,8 @@ fn tick_with(
         let Some(pane) = worker.pane.as_deref() else {
             continue;
         };
-        if !owns_pane(&worker.id, pane) {
+        let agent = probe(pane);
+        if !(server.pane_alive_check)(pane) || !owns_pane(&worker.id, pane) || agent == AgentState::Absent {
             let mut record = state
                 .keepalives
                 .get(&worker.id)
@@ -127,6 +128,7 @@ fn tick_with(
                 .unwrap_or_default();
             if !record.suspected_offline {
                 record.suspected_offline = true;
+                record.observed = "absent".into();
                 server.commit_locked(
                     &mut state,
                     &[Event::KeepaliveUpdated {
@@ -165,7 +167,6 @@ fn tick_with(
         let subscription = state
             .matching_subscription(&worker.id, "direct-message", None, now)
             .cloned();
-        let agent = probe(pane);
         let due = advance(
             &mut record,
             now,

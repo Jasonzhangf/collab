@@ -131,6 +131,9 @@ enum Cmd {
         ids: Vec<String>,
         #[arg(long)]
         worker: Option<String>,
+        /// Acknowledge all pending and delivered messages in inbox
+        #[arg(long)]
+        all: bool,
     },
     /// Query message status (wake attempts, answered)
     Msg { msg_id: String },
@@ -291,6 +294,11 @@ enum MasterCmd {
 enum WorkerCmd {
     /// Re-register the current tmux pane without changing task ownership
     Recover,
+    /// Inspect worker status (liveness, identity, agent state, unacked notifications)
+    Status {
+        /// Optional worker ID to inspect (defaults to all registered workers)
+        id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -550,20 +558,30 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&v);
             Ok(())
         }
-        Cmd::Worker {
-            cmd: WorkerCmd::Recover,
-        } => {
+        Cmd::Worker { cmd } => {
             let scope = Scope::resolve()?;
-            let ident = me(&scope, None)?;
-            out(&json!({
-                "recovered": true,
-                "worker_id": ident.worker_id,
-                "pane": ident.pane,
-                "session": ident.session,
-                "identity_kind": "peer",
-                "next": "run collab who and collab task status; task ownership is unchanged"
-            }));
-            Ok(())
+            match cmd {
+                WorkerCmd::Recover => {
+                    let ident = me(&scope, None)?;
+                    out(&json!({
+                        "recovered": true,
+                        "worker_id": ident.worker_id,
+                        "pane": ident.pane,
+                        "session": ident.session,
+                        "identity_kind": "peer",
+                        "next": "run collab who and collab task status; task ownership is unchanged"
+                    }));
+                    Ok(())
+                }
+                WorkerCmd::Status { id } => {
+                    let v: serde_json::Value = client::call(
+                        &scope.sock_path(),
+                        &Req::WorkerStatus { worker_id: id },
+                    )?;
+                    out(&v);
+                    Ok(())
+                }
+            }
         }
         Cmd::TransferMaster { target } => {
             let _ = target;
@@ -703,9 +721,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&v);
             Ok(())
         }
-        Cmd::Ack { ids, worker } => {
-            if ids.is_empty() {
-                anyhow::bail!("usage: collab ack <msg_id>... [--worker <id>]");
+        Cmd::Ack { ids, worker, all } => {
+            if ids.is_empty() && !all {
+                anyhow::bail!("usage: collab ack <msg_id>... [--all] [--worker <id>]");
             }
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;

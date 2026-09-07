@@ -178,6 +178,9 @@ pub enum Req {
         worker_id: String,
     },
     Workers,
+    WorkerStatus {
+        worker_id: Option<String>,
+    },
     MasterId,
     MasterRecover {
         worker_id: String,

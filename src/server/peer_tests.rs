@@ -22,6 +22,7 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
             journal: Mutex::new(journal),
             pane_alive_check: |_| true,
             pane_owner_check: |_, _| true,
+            pane_state_check: |_| crate::server::knock::AgentState::Waiting,
         },
         root,
     )
@@ -2035,5 +2036,78 @@ fn cursor_and_codex_subagents_exchange_messages() {
             && m.subject.as_deref() == Some("cursor-result")),
         "{msgs:?}"
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_status_query_exposes_liveness_identity_and_notification_pressure() {
+    let (server, root) = test_server();
+    register(&server, "status-worker", "%test-status-worker");
+    let resp = dispatch(&Arc::new(server), Req::WorkerStatus { worker_id: None });
+    assert!(resp.ok);
+    let workers = resp.data["workers"].as_array().unwrap();
+    assert_eq!(workers.len(), 1);
+    let w = &workers[0];
+    assert_eq!(w["id"], "status-worker");
+    assert_eq!(w["pane"], "%test-status-worker");
+    assert_eq!(w["endpoint_live"], true);
+    assert_eq!(w["identity_valid"], true);
+    assert_eq!(w["agent_state"], "waiting");
+    assert_eq!(w["status"], "waiting");
+    assert_eq!(w["unacked_notifications"], 0);
+    assert_eq!(w["notifications_paused"], false);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn bulk_ack_with_empty_ids_acknowledges_all_inbox_messages() {
+    let (server, root) = test_server();
+    register(&server, "sender-worker", "%test-sender-worker");
+    register(&server, "bulk-worker", "%test-bulk-worker");
+    let server_arc = Arc::new(server);
+
+    // Send 2 messages to bulk-worker
+    for i in 1..=2 {
+        dispatch(
+            &server_arc,
+            Req::Send {
+                from: "sender-worker".into(),
+                to: "bulk-worker".into(),
+                mtype: "notify".into(),
+                subject: Some(format!("test-{i}")),
+                body: format!("body {i}"),
+                in_reply_to: None,
+                delivery: "immediate".into(),
+            },
+        );
+    }
+
+    // Deliver them
+    let ids: Vec<String> = server_arc
+        .state
+        .lock()
+        .unwrap()
+        .msgs
+        .values()
+        .map(|m| m.id.clone())
+        .collect();
+    server_arc.commit(&[Event::Delivered { ids: ids.clone() }]);
+
+    // Bulk ack with empty ids
+    let resp = dispatch(
+        &server_arc,
+        Req::Ack {
+            worker_id: "bulk-worker".into(),
+            token: "token-bulk-worker".into(),
+            ids: vec![],
+        },
+    );
+    assert!(resp.ok);
+    assert_eq!(resp.data["acked"].as_array().unwrap().len(), 2);
+
+    // Verify all messages are read
+    let state = server_arc.state.lock().unwrap();
+    assert!(state.msgs.values().all(|m| m.state == "read"));
+    drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

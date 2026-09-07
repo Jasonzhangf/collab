@@ -109,6 +109,7 @@ pub struct Server {
     pub journal: Mutex<std::fs::File>,
     pub pane_alive_check: fn(&str) -> bool,
     pub pane_owner_check: fn(&str, &str) -> bool,
+    pub pane_state_check: fn(&str) -> crate::server::knock::AgentState,
 }
 
 fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) {
@@ -383,7 +384,42 @@ fn attempt_notification_with(
     if subscription.worker_id != recipient {
         return false;
     }
-    if !owns_pane(&recipient, &pane) {
+    let worker_opt = state.workers.get(&recipient);
+    let worker_pane_mismatch = worker_opt.and_then(|w| w.pane.as_deref()) != Some(&pane);
+    let state_probe = (server.pane_state_check)(&pane);
+    if worker_opt.is_none()
+        || worker_pane_mismatch
+        || !(server.pane_alive_check)(&pane)
+        || !owns_pane(&recipient, &pane)
+        || state_probe == crate::server::knock::AgentState::Absent
+    {
+        server.commit_locked(
+            &mut state,
+            &[Event::NotificationStatus {
+                subscription_id: subscription_id.to_string(),
+                status: "pane-lost".into(),
+                updated_ms: now,
+            }],
+        );
+        crate::server::knock::append_log(
+            &server.log_path(),
+            &format!("notification cancelled pane={pane} recipient={recipient} worker lost, identity mismatch or agent absent"),
+        );
+        return false;
+    }
+    let unacked_count = state
+        .msgs
+        .values()
+        .filter(|m| m.to == recipient && m.state == "delivered")
+        .count() as u32;
+    if unacked_count >= server.config.notifications.max_unacked {
+        crate::server::knock::append_log(
+            &server.log_path(),
+            &format!(
+                "knock paused pane={pane} recipient={recipient} unacked={unacked_count}>={} awaiting ack",
+                server.config.notifications.max_unacked
+            ),
+        );
         return false;
     }
     let mut batch = state
@@ -433,9 +469,38 @@ fn attempt_notification_with(
     if now - first.0 < delay || now - last_attempt < delay {
         return false;
     }
+    if state_probe == crate::server::knock::AgentState::Working {
+        crate::server::knock::append_log(
+            &server.log_path(),
+            &format!("knock deferred pane={pane} recipient={recipient} agent is working"),
+        );
+        return false;
+    }
+    const MAX_BATCH_DELIVERY: usize = 3;
+    let total_pending = batch.len();
+    let remaining = if total_pending > MAX_BATCH_DELIVERY {
+        total_pending - MAX_BATCH_DELIVERY
+    } else {
+        0
+    };
+    if total_pending > MAX_BATCH_DELIVERY {
+        batch.truncate(MAX_BATCH_DELIVERY);
+    }
     let ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
-    // Reserve the whole batch durably under the state lock before any external
-    // side effect. Failed/uncertain delivery and restart cannot replay it.
+    if !can_receive(&pane) {
+        server.commit_locked(
+            &mut state,
+            &[Event::WakeAttempted {
+                ids: ids.clone(),
+                attempted_ms: now,
+            }],
+        );
+        crate::server::knock::append_log(
+            &server.log_path(),
+            &format!("knock skipped pane={pane} state={state_probe:?}"),
+        );
+        return false;
+    }
     server.commit_locked(
         &mut state,
         &[Event::WakeAttempted {
@@ -444,18 +509,20 @@ fn attempt_notification_with(
         }],
     );
     drop(state);
-    if !can_receive(&pane) {
-        crate::server::knock::append_log(
-            &server.log_path(),
-            &format!("knock skipped pane={pane} no known agent"),
-        );
-        return false;
-    }
-    let text = batch
+    let mut text_parts = batch
         .iter()
-        .map(|m| m.4.as_str())
-        .collect::<Vec<_>>()
-        .join(" | ");
+        .map(|m| m.4.clone())
+        .collect::<Vec<_>>();
+    if remaining > 0 {
+        text_parts.push(format!("[+{} more pending in inbox; run collab ack / collab inbox]", remaining));
+    }
+    if unacked_count + (batch.len() as u32) >= server.config.notifications.max_unacked {
+        text_parts.push(format!(
+            "[ACK REQUIRED: {} unacked; run collab ack <id> to keep push notifications active]",
+            unacked_count + (batch.len() as u32)
+        ));
+    }
+    let text = text_parts.join(" | ");
     if !deliver(&pane, &text) {
         return false;
     }
@@ -478,7 +545,7 @@ fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str
         server,
         message_id,
         subscription_id,
-        &knock::pane_accepts_notification,
+        &knock::pane_idle,
         &|pane, text| knock_or_log(&server.log_path(), pane, text),
         &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
     )
@@ -2364,6 +2431,64 @@ fn handle_task_wait(
     }))
 }
 
+fn worker_status_summary(server: &Server, st: &State, w: &WorkerRec) -> serde_json::Value {
+    let active = st.tasks.values().find(|task| {
+        task.owner == w.id
+            && !matches!(task.status.as_str(), "closed" | "cancelled")
+    });
+    let pane = w.pane.as_deref();
+    let endpoint_live = pane.is_some_and(server.pane_alive_check);
+    let identity_valid = pane.is_some_and(|p| (server.pane_owner_check)(&w.id, p));
+    let agent_state = pane
+        .map(|p| match (server.pane_state_check)(p) {
+            crate::server::knock::AgentState::Waiting => "waiting",
+            crate::server::knock::AgentState::Working => "working",
+            crate::server::knock::AgentState::Absent => "absent",
+            crate::server::knock::AgentState::Unknown => "unknown",
+        })
+        .unwrap_or("absent");
+    let unacked_notifications = st
+        .msgs
+        .values()
+        .filter(|m| m.to == w.id && m.state == "delivered")
+        .count();
+    let pending_notifications = st
+        .msgs
+        .values()
+        .filter(|m| m.to == w.id && m.state == "pending")
+        .count();
+    let notifications_paused = (unacked_notifications as u32) >= server.config.notifications.max_unacked;
+    let keepalive = st.keepalives.get(&w.id);
+    let suspected_offline = keepalive.map(|k| k.suspected_offline).unwrap_or(false);
+    let unacked_keepalives = keepalive.map(|k| k.unacked).unwrap_or(0);
+    let status = if !endpoint_live {
+        "lost"
+    } else if !identity_valid {
+        "identity-mismatch"
+    } else if suspected_offline {
+        "offline"
+    } else if notifications_paused {
+        "ack-required"
+    } else {
+        agent_state
+    };
+    json!({
+        "id": w.id,
+        "pane": w.pane,
+        "status": status,
+        "endpoint_live": endpoint_live,
+        "identity_valid": identity_valid,
+        "agent_state": agent_state,
+        "unacked_notifications": unacked_notifications,
+        "pending_notifications": pending_notifications,
+        "notifications_paused": notifications_paused,
+        "unacked_keepalives": unacked_keepalives,
+        "suspected_offline": suspected_offline,
+        "active_task": active.map(|task| task.id.as_str()),
+        "active_status": active.map(|task| task.status.as_str()),
+    })
+}
+
 // ---------- dispatch ----------
 
 fn mutation_blocked_during_migration(req: &Req) -> bool {
@@ -2406,6 +2531,7 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::MasterStatus
         | Req::Role { .. }
         | Req::Workers
+        | Req::WorkerStatus { .. }
         | Req::MasterId
         | Req::MasterRecover { .. }
         | Req::Shutdown { .. }
@@ -2520,10 +2646,17 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             if let Err(e) = verify(&st, &worker_id, &token) {
                 return e;
             }
-            let owned: Vec<String> = ids
-                .into_iter()
-                .filter(|id| st.msgs.get(id).map(|m| m.to == worker_id).unwrap_or(false))
-                .collect();
+            let owned: Vec<String> = if ids.is_empty() {
+                st.msgs
+                    .values()
+                    .filter(|m| m.to == worker_id && (m.state == "delivered" || m.state == "pending"))
+                    .map(|m| m.id.clone())
+                    .collect()
+            } else {
+                ids.into_iter()
+                    .filter(|id| st.msgs.get(id).map(|m| m.to == worker_id).unwrap_or(false))
+                    .collect()
+            };
             drop(st);
             if owned.is_empty() {
                 return Resp::err("no ackable messages (must address your own inbox)");
@@ -2682,23 +2815,26 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
         }
         Req::Workers => {
             let st = server.state.lock().unwrap();
-            let workers: Vec<serde_json::Value> = st
+            let mut workers: Vec<serde_json::Value> = st
                 .workers
                 .values()
-                .map(|w| {
-                    let active = st.tasks.values().find(|task| {
-                        task.owner == w.id
-                            && !matches!(task.status.as_str(), "closed" | "cancelled")
-                    });
-                    json!({
-                        "id": w.id,
-                        "pane": w.pane,
-                        "endpoint_live": w.pane.as_deref().is_some_and(pane_alive),
-                        "active_task": active.map(|task| task.id.as_str()),
-                        "active_status": active.map(|task| task.status.as_str()),
-                    })
-                })
+                .map(|w| worker_status_summary(server, &st, w))
                 .collect();
+            workers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+            Resp::data(json!({
+                "workers": workers,
+                "count": workers.len()
+            }))
+        }
+        Req::WorkerStatus { worker_id } => {
+            let st = server.state.lock().unwrap();
+            let mut workers: Vec<serde_json::Value> = st
+                .workers
+                .values()
+                .filter(|w| worker_id.as_ref().is_none_or(|id| id == &w.id))
+                .map(|w| worker_status_summary(server, &st, w))
+                .collect();
+            workers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
             Resp::data(json!({
                 "workers": workers,
                 "count": workers.len()
@@ -2847,6 +2983,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         journal: Mutex::new(journal_file),
         pane_alive_check: pane_alive,
         pane_owner_check: pane_owner_authoritative,
+        pane_state_check: knock::probe_agent_state,
     });
     restore_registered_peer_default_leases(&server);
     let listener = UnixListener::bind(&sock_path)?;

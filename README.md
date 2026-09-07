@@ -156,12 +156,19 @@ Never type peer messages into tmux. Without the recipient's active
 normally creates this subscription automatically; tmux receives only the short
 message id, abbreviated subject, safe one-line original body preview, and one
 submit. Cursor CLI gets literal keys, then `C-m` from a second tmux process
-250ms later, so bracketed paste cannot swallow Enter on send or receive. A
-working Cursor pane then gets one empty `C-m` so the follow-up steers the
-active run instead of waiting in the queue. Codex
+250ms later, so bracketed paste cannot swallow Enter on send or receive. Codex
 keeps `paste-buffer -p` and `C-m` in one tmux queue so the paste is submitted.
 Splitting Codex paste from Enter leaves the text unsubmitted; putting Cursor
-Enter in the same PTY chunk as paste swallows it.
+Enter in the same PTY chunk as paste swallows it. Notifications deliver only
+when an agent is idle (waiting); if the agent is working, delivery defers
+without burning wake attempts until working->idle transition occurs. When a pane
+is dead, unowned, or agent process absent, the subscription cancels to pane-lost
+immediately without storm. If unacknowledged delivered notifications reach the limit
+(default 3, configurable 1..=5), push knocks pause awaiting `collab ack <id>` or
+`collab ack --all` to prevent backlog flooding and terminal pollution. When delivery
+occurs with a larger backlog, batches are capped at 3 with inbox reminders. Worker
+status, identity validity, and notification pressure can be inspected via
+`collab worker status [id]` and `collab who`.
 
 ## Explicit notifications
 
