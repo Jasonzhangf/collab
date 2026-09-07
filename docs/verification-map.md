@@ -4,7 +4,7 @@
 |---|---|---|
 | identity.peer-register | first and later tmux sessions register as equal peers | no inferred `master` from first register, implicit promotion, transfer, or Codex/Cursor root treated as Collab master |
 | identity.master-authority | approved self-promote when no live master exists; live master delegates to a live pane; status reports live master or `recorded_unusable`; journal `RootAssigned` becomes `MasterAssigned` on replay; context marks subagents `must_obey_master` and peers `may_decline_master_invite` | empty approval, dead pane, existing live-master promote, non-master delegate, and init/register-as-master fail closed |
-| task.self-lifecycle | one peer completes register→working→verifying→reviewed→delivered→merged→closed and cleanup | reviewed cannot bypass successful delivery; another peer cannot mutate/close; no central dispatch/offer |
+| task.self-lifecycle | one peer completes register→working→verifying→reviewed→delivered→merged→closed and cleanup; closed/delivered/merged tasks excluded from keepalives; task close supersedes all keepalives | reviewed cannot bypass successful delivery; another peer cannot mutate/close; no central dispatch/offer |
 | task.worktree-cleanup | every worktree-bound task receives a durable cleanup receipt only after exact clean worktree/branch removal and absence verification | merged/closed/cancelled task with a bound worktree, missing receipt, mismatched receipt, existing path, dirty path, unmerged branch, or path escape fails closed |
 | resource.p2p-conflict | conflict returns holder synchronously; subscribed exact release changes waiter to blocked and clears wait | no automatic holder/waiter message; no wake without matching subscription |
 | wait.liveness | wait records waiter, blocker owner, deadline, resume, escalation and release | direct/two-peer/three-peer cycle, missing owner/deadline, terminal wait rejected; timeout creates no unsolicited message |
@@ -13,7 +13,7 @@
 | notification.context | inbox/context/status return durable body and control projection | context does not consume or ACK notification; no unrelated peer supervision |
 | daemon.project-scope | inherited `TMUX_PANE` exact pane cwd resolves one local daemon; non-tmux operator uses exact process cwd; `collab init` merges `mcpServers.collab` and writes schema-valid Cursor/Claude permission files | MCP/Agent path override absent; invalid pane/path, ancestor capture, and sibling sharing fail closed; existing non-collab MCP servers and unrelated project settings are preserved; project `.cursor/cli.json` cannot contain `sandbox` |
 | migration.peer-v1 | inspect→plan→apply→restart/rebind→verify preserves task/mailbox/journal and removes legacy declared roles | malformed/manual journal, second writer, changed snapshot, missing/inactive/unrelated wait holder fail closed |
-| daemon.operator | controlled down→up uses installed binary and journal replay | mailbox text or peer role cannot authorize maintenance; duplicate daemon rejected |
+| daemon.operator | controlled down→up uses installed binary and journal replay; exclusive `daemon.lock` flock prevents duplicate daemons and socket overwrite | mailbox text or peer role cannot authorize maintenance; duplicate daemon rejected |
 
 Required integration gate: real isolated tmux peers complete independent
 worktrees and explicit sendmessage/subscription/restart notification without `/goal`.

@@ -16,10 +16,10 @@ pub struct Record {
     pub suspected_offline: bool,
 }
 
-fn actionable(status: &str) -> bool {
+pub(crate) fn actionable(status: &str) -> bool {
     matches!(
         status,
-        "assigned" | "working" | "verifying" | "reviewed" | "rework" | "delivered" | "merged"
+        "assigned" | "working" | "verifying" | "reviewed" | "rework"
     )
 }
 
@@ -300,6 +300,8 @@ pub(crate) fn tick_with(
                 record.observed = observed_str.into();
                 record.idle_since_ms = now;
             }
+            record.unacked = 0;
+            record.last_notice_id = None;
             let mut events = Vec::new();
             if was_working && is_idle {
                 if let Some(master_id) = super::live_master_id(server, &state) {

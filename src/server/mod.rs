@@ -2155,7 +2155,7 @@ fn handle_task_close(
         let superseded: Vec<String> = st
             .msgs
             .values()
-            .filter(|m| m.to == closed.owner && m.state == "pending" && m.mtype == "keepalive")
+            .filter(|m| m.to == closed.owner && m.mtype == "keepalive" && matches!(m.state.as_str(), "pending" | "delivered"))
             .map(|m| m.id.clone())
             .collect();
         let mut events: Vec<Event> = vec![
@@ -2170,6 +2170,24 @@ fn handle_task_close(
             events.push(Event::Superseded {
                 ids: superseded.clone(),
             });
+        }
+        let other_actionable = st.tasks.values().any(|t| {
+            t.id != closed.id
+                && t.owner == closed.owner
+                && crate::server::keepalive::actionable(&t.status)
+        });
+        if !other_actionable {
+            if let Some(record) = st.keepalives.get(&closed.owner).cloned() {
+                if record.unacked > 0 || record.last_notice_id.is_some() {
+                    let mut updated = record;
+                    updated.unacked = 0;
+                    updated.last_notice_id = None;
+                    events.push(Event::KeepaliveUpdated {
+                        worker_id: closed.owner.clone(),
+                        record: updated,
+                    });
+                }
+            }
         }
         server.commit_locked(&mut st, &events);
         let stale_workers = stale_worker_views(&st, &server.pane_alive_check);
@@ -2226,17 +2244,44 @@ fn handle_task_close(
         verified_ms: closed.updated_ms,
         manual_reason: None,
     };
-    server.commit_locked(
-        &mut st,
-        &[
-            Event::CleanupVerified {
-                receipt: receipt.clone(),
-            },
-            Event::TaskUpdated {
-                task: closed.clone(),
-            },
-        ],
-    );
+    let superseded: Vec<String> = st
+        .msgs
+        .values()
+        .filter(|m| m.to == closed.owner && m.mtype == "keepalive" && matches!(m.state.as_str(), "pending" | "delivered"))
+        .map(|m| m.id.clone())
+        .collect();
+    let mut close_events: Vec<Event> = vec![
+        Event::CleanupVerified {
+            receipt: receipt.clone(),
+        },
+        Event::TaskUpdated {
+            task: closed.clone(),
+        },
+    ];
+    if !superseded.is_empty() {
+        close_events.push(Event::Superseded {
+            ids: superseded,
+        });
+    }
+    let other_actionable = st.tasks.values().any(|t| {
+        t.id != closed.id
+            && t.owner == closed.owner
+            && crate::server::keepalive::actionable(&t.status)
+    });
+    if !other_actionable {
+        if let Some(record) = st.keepalives.get(&closed.owner).cloned() {
+            if record.unacked > 0 || record.last_notice_id.is_some() {
+                let mut updated = record;
+                updated.unacked = 0;
+                updated.last_notice_id = None;
+                close_events.push(Event::KeepaliveUpdated {
+                    worker_id: closed.owner.clone(),
+                    record: updated,
+                });
+            }
+        }
+    }
+    server.commit_locked(&mut st, &close_events);
 
     let waiting: Vec<TaskRec> = st
         .tasks
@@ -3073,6 +3118,24 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     let sock_path = scope.sock_path();
     let server_dir = scope.server_dir();
     std::fs::create_dir_all(&server_dir)?;
+
+    let lock_path = server_dir.join("daemon.lock");
+    let _lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)?;
+    use std::os::unix::io::AsRawFd;
+    let fd = _lock_file.as_raw_fd();
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let pid_str = std::fs::read_to_string(server_dir.join("server.pid")).unwrap_or_default();
+        anyhow::bail!(
+            "server already running at {} (pid {})",
+            sock_path.display(),
+            pid_str.trim()
+        );
+    }
 
     if sock_path.exists() {
         if crate::client::alive(&sock_path) {
