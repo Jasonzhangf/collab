@@ -46,8 +46,8 @@ fn tools() -> Value {
         ),
         tool(
             "collab_notify_subscribe",
-            "Register one finite notification subscription owned by the calling Agent; direct-message is reusable until expiry and other event subscriptions are one-shot.",
-            json!({"event":{"type":"string","enum":["direct-message","resource-released","deadline","async-result"]},"subject":{"type":"string"},"trigger_ms":{"type":"integer"},"ttl_seconds":{"type":"integer","minimum":1}}),
+            "Register one owner-scoped finite subscription; deadline uses either absolute at_ms values or a periodic interval, with at most three active subscriptions per Agent.",
+            json!({"event":{"type":"string","enum":["direct-message","resource-released","deadline","async-result"]},"subject":{"type":"string"},"at_ms":{"type":"array","items":{"type":"integer"}},"every_ms":{"type":"integer","minimum":1},"repeat_count":{"type":"integer","minimum":1,"maximum":100},"ttl_seconds":{"type":"integer","minimum":1}}),
             &["event", "ttl_seconds"]
         ),
         tool(
@@ -206,6 +206,9 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
                 required(args, "event")?,
             ]);
             optional_flag(&mut argv, args, "subject", "--subject")?;
+            if let Some(values) = args.get("at_ms").and_then(Value::as_array) { for value in values { argv.extend(["--at-ms".into(), value.as_i64().ok_or("at_ms must contain integers")?.to_string()]); } }
+            optional_integer_flag(&mut argv, args, "every_ms", "--every-ms")?;
+            optional_integer_flag(&mut argv, args, "repeat_count", "--repeat-count")?;
             optional_integer_flag(&mut argv, args, "trigger_ms", "--trigger-ms")?;
             optional_integer_flag(&mut argv, args, "ttl_seconds", "--ttl-seconds")?;
         }

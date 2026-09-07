@@ -55,10 +55,15 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
     {
         let state = server.state.lock().unwrap();
         for subscription in state.notification_subscriptions.values() {
+            let next_trigger = subscription
+                .interval_ms
+                .map(|interval| subscription.trigger_ms.unwrap_or(subscription.created_ms.saturating_add(interval)).saturating_add(interval.saturating_mul(subscription.fired_count as i64)))
+                .or_else(|| subscription.trigger_times_ms.get(subscription.fired_count as usize).copied())
+                .or(subscription.trigger_ms);
             if subscription.status != "armed"
                 || !server.config.timers.enabled
                 || subscription.event != "deadline"
-                || subscription.trigger_ms.is_none_or(|trigger| trigger > now)
+                || next_trigger.is_none_or(|trigger| trigger > now)
                 || state
                     .wake_bindings
                     .values()
@@ -78,10 +83,7 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
                             .subject
                             .as_ref()
                             .map(|subject| format!("deadline:{subject}")),
-                        body: format!(
-                            "DEADLINE_REACHED subject={}",
-                            subscription.subject.as_deref().unwrap_or_default()
-                        ),
+                        body: format!("DEADLINE_REACHED subject={}{}", subscription.subject.as_deref().unwrap_or_default(), if subscription.fired_count + 1 >= if subscription.interval_ms.is_some() { subscription.repeat_count } else { subscription.trigger_times_ms.len().max(1) as u32 } { "; LAST_REMINDER=true; renew explicitly: collab notify subscribe --event deadline --subject <subject> --at-ms <future-epoch-ms> --ttl-seconds <bounded>" } else { "" }),
                         in_reply_to: None,
                         created_ms: now,
                         state: "pending".into(),
@@ -193,6 +195,10 @@ mod tests {
                 pane: format!("%test-{worker_id}"),
                 method: "tmux".into(),
                 trigger_ms,
+                trigger_times_ms: Vec::new(),
+                interval_ms: None,
+                repeat_count: 1,
+                fired_count: 0,
                 expires_ms: now_ms() + 60_000,
                 status: "armed".into(),
                 created_ms: now_ms(),

@@ -63,6 +63,7 @@ pub struct WorkerRec {
 }
 
 pub const MAX_WAKE_ATTEMPTS: u32 = 1;
+pub const MAX_NOTIFICATION_REPEATS: u32 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationSubscription {
@@ -73,11 +74,21 @@ pub struct NotificationSubscription {
     pub pane: String,
     pub method: String,
     pub trigger_ms: Option<i64>,
+    #[serde(default)]
+    pub trigger_times_ms: Vec<i64>,
+    #[serde(default)]
+    pub interval_ms: Option<i64>,
+    #[serde(default = "default_repeat_count")]
+    pub repeat_count: u32,
+    #[serde(default)]
+    pub fired_count: u32,
     pub expires_ms: i64,
     pub status: String,
     pub created_ms: i64,
     pub updated_ms: i64,
 }
+
+pub fn default_repeat_count() -> u32 { 1 }
 
 impl NotificationSubscription {
     pub fn matches(&self, worker_id: &str, event: &str, subject: Option<&str>, now: i64) -> bool {
@@ -325,7 +336,16 @@ impl State {
             } => {
                 if let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id)
                 {
-                    subscription.status = "consumed".into();
+                    subscription.fired_count = subscription.fired_count.saturating_add(1);
+                    let total = if subscription.interval_ms.is_some() { subscription.repeat_count } else { subscription.trigger_times_ms.len().max(1) as u32 };
+                    if subscription.fired_count >= total {
+                        subscription.status = "consumed".into();
+                    } else if let Some(interval) = subscription.interval_ms {
+                        subscription.trigger_ms = subscription.trigger_ms.map(|start| start.saturating_add(interval.saturating_mul(subscription.fired_count as i64)));
+                        subscription.status = "armed".into();
+                    } else {
+                        subscription.status = "armed".into();
+                    }
                     subscription.updated_ms = *consumed_ms;
                 }
             }
@@ -660,6 +680,10 @@ mod tests {
                 pane: "%7".into(),
                 method: "tmux".into(),
                 trigger_ms: None,
+                trigger_times_ms: Vec::new(),
+                interval_ms: None,
+                repeat_count: 1,
+                fired_count: 0,
                 expires_ms: 10_000,
                 status: "armed".into(),
                 created_ms: 1,
@@ -703,5 +727,25 @@ mod tests {
             .unwrap()
             .get("subscription_id")
             .is_none());
+    }
+
+    #[test]
+    fn periodic_subscription_consumes_exactly_its_repeat_count() {
+        let mut state = State::default();
+        state.apply(&Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: "sub-periodic".into(), worker_id: "waiter".into(), event: "deadline".into(),
+                subject: Some("timer".into()), pane: "%7".into(), method: "tmux".into(),
+                trigger_ms: None, trigger_times_ms: Vec::new(), interval_ms: Some(1_000),
+                repeat_count: 3, fired_count: 0, expires_ms: 10_000,
+                status: "armed".into(), created_ms: 1, updated_ms: 1,
+            },
+        });
+        for count in 1..=3 {
+            state.apply(&Event::NotificationConsumed { subscription_id: "sub-periodic".into(), message_id: format!("m{count}"), consumed_ms: count * 1_000 });
+            if count < 3 { assert_eq!(state.notification_subscriptions["sub-periodic"].status, "armed"); }
+        }
+        assert_eq!(state.notification_subscriptions["sub-periodic"].status, "consumed");
+        assert_eq!(state.notification_subscriptions["sub-periodic"].fired_count, 3);
     }
 }

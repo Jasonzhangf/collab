@@ -39,6 +39,12 @@ pub enum Req {
         event: String,
         subject: Option<String>,
         trigger_ms: Option<i64>,
+        #[serde(default)]
+        trigger_times_ms: Vec<i64>,
+        #[serde(default)]
+        interval_ms: Option<i64>,
+        #[serde(default = "crate::server::state::default_repeat_count")]
+        repeat_count: u32,
         ttl_seconds: u64,
     },
     NotificationStatus {

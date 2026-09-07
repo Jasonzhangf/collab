@@ -167,7 +167,8 @@ Enter in the same PTY chunk as paste swallows it.
 collab notify methods
 collab notify subscribe --event direct-message --ttl-seconds 600
 collab notify subscribe --event resource-released --subject <task-id> --ttl-seconds 3600
-collab notify subscribe --event deadline --subject <timer-id> --trigger-ms <epoch-ms> --ttl-seconds 3600
+collab notify subscribe --event deadline --subject <timer-id> --at-ms <epoch-ms> --ttl-seconds 3600
+collab notify subscribe --event deadline --subject <timer-id> --every-ms 900000 --repeat-count 3 --ttl-seconds 3600
 collab notify subscribe --event async-result --subject <operation-id> --ttl-seconds 3600
 collab notify status
 collab notify unsubscribe <subscription-id>
@@ -175,9 +176,14 @@ collab context
 collab inbox
 ```
 
-Subscriptions are owner-scoped, exact-event, and bounded by TTL. The default
+Subscriptions are owner-scoped, exact-event, and bounded by TTL. Each Agent
+may hold at most three active subscriptions. A deadline uses either one or
+more absolute `--at-ms` values, or a periodic `--every-ms` schedule with a
+finite `--repeat-count` from 1 through 100. These modes are mutually exclusive.
+The final delivery says it is the last reminder and instructs the Agent to
+explicitly subscribe again; no automatic rearm exists. The default
 `direct-message` lease accepts later peer messages until expiry; resource,
-deadline, and async-result subscriptions remain one-shot.
+deadline, and async-result event matching remains owner-scoped and finite.
 tmux receives `COLLAB_NOTIFY <message-id> [<subject>] <original-body-preview>`
 then one Enter: Cursor as delayed literal keys, Codex as paste-plus-`C-m` in
 one command queue. The Agent first weighs the id and

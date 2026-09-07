@@ -505,6 +505,10 @@ fn registration_adds_default_lease_when_only_short_direct_message_lease_exists()
             pane: "%peer".into(),
             method: "tmux".into(),
             trigger_ms: None,
+            trigger_times_ms: Vec::new(),
+            interval_ms: None,
+            repeat_count: 1,
+            fired_count: 0,
             expires_ms: now + 600_000,
             status: "armed".into(),
             created_ms: now,
@@ -842,6 +846,9 @@ fn holder_close_persists_release_only_for_waiter() {
             "resource-released".into(),
             Some("held".into()),
             None,
+            Vec::new(),
+            None,
+            1,
             60,
         )
         .ok

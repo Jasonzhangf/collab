@@ -155,6 +155,15 @@ enum NotifyCmd {
         event: String,
         #[arg(long)]
         subject: Option<String>,
+        /// Absolute UTC epoch milliseconds; repeat to define multiple fire times
+        #[arg(long = "at-ms")]
+        at_ms: Vec<i64>,
+        /// Period in milliseconds; mutually exclusive with --at-ms
+        #[arg(long = "every-ms")]
+        every_ms: Option<i64>,
+        /// Total number of notifications for a periodic subscription (1..=100)
+        #[arg(long, default_value_t = 1)]
+        repeat_count: u32,
         #[arg(long)]
         trigger_ms: Option<i64>,
         #[arg(long)]
@@ -591,6 +600,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 NotifyCmd::Subscribe {
                     event,
                     subject,
+                    at_ms,
+                    every_ms,
+                    repeat_count,
                     trigger_ms,
                     ttl_seconds,
                 } => {
@@ -601,6 +613,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         event,
                         subject,
                         trigger_ms,
+                        trigger_times_ms: at_ms,
+                        interval_ms: every_ms,
+                        repeat_count,
                         ttl_seconds,
                     }
                 }

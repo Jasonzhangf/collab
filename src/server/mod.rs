@@ -262,6 +262,7 @@ fn iso(ms: i64) -> String {
 }
 
 const MAX_NOTIFICATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+const MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER: usize = 3;
 const NOTIFICATION_EVENTS: [&str; 4] = [
     "direct-message",
     "resource-released",
@@ -314,6 +315,10 @@ fn default_direct_message_events(
             pane: pane.into(),
             method: "tmux".into(),
             trigger_ms: None,
+            trigger_times_ms: Vec::new(),
+            interval_ms: None,
+            repeat_count: 1,
+            fired_count: 0,
             expires_ms: now.saturating_add(DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000),
             status: "armed".into(),
             created_ms: now,
@@ -480,6 +485,9 @@ fn handle_notification_subscribe(
     event: String,
     subject: Option<String>,
     trigger_ms: Option<i64>,
+    trigger_times_ms: Vec<i64>,
+    interval_ms: Option<i64>,
+    repeat_count: u32,
     ttl_seconds: u64,
 ) -> Resp {
     if !NOTIFICATION_EVENTS.contains(&event.as_str()) {
@@ -502,17 +510,10 @@ fn handle_notification_subscribe(
             "direct-message subscription must not specify a subject"
         });
     }
-    if event == "deadline" && trigger_ms.is_none() {
-        return Resp::err("deadline subscription requires trigger_ms");
-    }
-    if event != "deadline" && trigger_ms.is_some() {
-        return Resp::err("trigger_ms is valid only for deadline subscriptions");
-    }
+    if event != "deadline" && (trigger_ms.is_some() || !trigger_times_ms.is_empty() || interval_ms.is_some() || repeat_count != 1) { return Resp::err("schedule options are valid only for deadline subscriptions"); }
+    if event == "deadline" && trigger_ms.is_some() && !trigger_times_ms.is_empty() { return Resp::err("use at-ms or trigger-ms, not both"); }
     let now = now_ms();
     let expires_ms = now.saturating_add((ttl_seconds as i64).saturating_mul(1000));
-    if trigger_ms.is_some_and(|trigger| trigger <= now || trigger >= expires_ms) {
-        return Resp::err("deadline trigger_ms must be in the future and before expiry");
-    }
     let mut state = server.state.lock().unwrap();
     if let Err(error) = verify(&state, &worker_id, &token) {
         return error;
@@ -523,6 +524,20 @@ fn handle_notification_subscribe(
     if runtime_for_pane(Some(&pane)).is_none() {
         return Resp::err("notification subscription method tmux is unavailable for this pane");
     }
+    let active = state.notification_subscriptions.values().filter(|s| s.worker_id == worker_id && s.status == "armed").count();
+    if active >= MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER { return Resp::err("maximum 3 active subscriptions per agent"); }
+    if event == "deadline" {
+        if interval_ms.is_some() && (!trigger_times_ms.is_empty() || trigger_ms.is_some()) { return Resp::err("periodic schedule cannot include an absolute time list"); }
+        if interval_ms.is_none() && trigger_times_ms.is_empty() && trigger_ms.is_none() { return Resp::err("deadline requires at-ms or every-ms"); }
+        if repeat_count == 0 || repeat_count > crate::server::state::MAX_NOTIFICATION_REPEATS { return Resp::err("repeat_count must be between 1 and 100"); }
+        if interval_ms.is_some_and(|ms| ms <= 0) { return Resp::err("every-ms must be positive"); }
+        if interval_ms.is_some() && trigger_times_ms.is_empty() && trigger_ms.is_none() && repeat_count == 1 { }
+        if !trigger_times_ms.is_empty() && (interval_ms.is_some() || repeat_count != 1) { return Resp::err("absolute schedule uses at-ms values and repeat_count is their length"); }
+        let times = if trigger_times_ms.is_empty() { trigger_ms.into_iter().collect() } else { trigger_times_ms.clone() };
+        if times.len() > crate::server::state::MAX_NOTIFICATION_REPEATS as usize { return Resp::err("absolute schedule supports at most 100 times"); }
+        if times.iter().any(|trigger| *trigger <= now || *trigger >= expires_ms) { return Resp::err("absolute trigger times must be in the future and before expiry"); }
+        if interval_ms.is_some_and(|ms| now.saturating_add(ms) >= expires_ms) { return Resp::err("every-ms must fire before subscription expiry"); }
+    }
     let id = format!("sub-{}", gen_msg_id());
     let subscription = NotificationSubscription {
         id: id.clone(),
@@ -532,6 +547,10 @@ fn handle_notification_subscribe(
         pane,
         method: "tmux".into(),
         trigger_ms,
+        trigger_times_ms,
+        interval_ms,
+        repeat_count,
+        fired_count: 0,
         expires_ms,
         status: "armed".into(),
         created_ms: now,
@@ -543,7 +562,7 @@ fn handle_notification_subscribe(
             subscription: subscription.clone(),
         }],
     );
-    Resp::data(json!({"subscription": subscription, "one_shot": true}))
+    Resp::data(json!({"subscription": subscription, "one_shot": false, "max_repeat_count": crate::server::state::MAX_NOTIFICATION_REPEATS}))
 }
 
 fn handle_notification_status(server: &Server, worker_id: String, token: String) -> Resp {
@@ -2313,8 +2332,10 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
         Req::NotificationMethods => Resp::data(json!({
             "methods": ["tmux"],
             "events": NOTIFICATION_EVENTS,
-            "one_shot": true,
+            "one_shot": false,
             "max_lifetime_attempts": MAX_WAKE_ATTEMPTS,
+            "max_repeat_count": crate::server::state::MAX_NOTIFICATION_REPEATS,
+            "max_active_subscriptions_per_agent": MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER,
             "max_ttl_seconds": MAX_NOTIFICATION_TTL_SECONDS,
         })),
         Req::NotificationSubscribe {
@@ -2323,6 +2344,9 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             event,
             subject,
             trigger_ms,
+            trigger_times_ms,
+            interval_ms,
+            repeat_count,
             ttl_seconds,
         } => handle_notification_subscribe(
             server,
@@ -2331,6 +2355,9 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             event,
             subject,
             trigger_ms,
+            trigger_times_ms,
+            interval_ms,
+            repeat_count,
             ttl_seconds,
         ),
         Req::NotificationStatus { worker_id, token } => {
