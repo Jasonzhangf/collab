@@ -211,6 +211,61 @@ impl Server {
             let _ = std::fs::write(&path, data);
         }
     }
+
+    fn rewrite_journal_locked(&self, st: &State) {
+        let path = self.root.join(".agent-collab/server/journal.jsonl");
+        let tmp = path.with_file_name("journal.jsonl.tmp");
+        let mut body = String::new();
+        for event in st.snapshot_events() {
+            body.push_str(&serde_json::to_string(&event).expect("serialize compact event"));
+            body.push('\n');
+        }
+        std::fs::write(&tmp, body).expect("journal compact write failed");
+        std::fs::rename(&tmp, &path).expect("journal compact rename failed");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("journal compact reopen failed");
+        *self.journal.lock().unwrap() = file;
+    }
+}
+
+pub(crate) fn purge_expired_storage(server: &Server, now: i64) -> usize {
+    if server.state.lock().unwrap().admission_frozen() {
+        return 0;
+    }
+    let cutoff = server.config.retention.cutoff_ms(now);
+    let mailbox = server.root.join(".agent-collab").join("mailbox");
+    let mut st = server.state.lock().unwrap();
+    let expired: Vec<String> = st
+        .msgs
+        .values()
+        .filter(|message| message.created_ms <= cutoff)
+        .map(|message| message.id.clone())
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(&mailbox) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if expired.iter().any(|expired_id| expired_id == id) || !st.msgs.contains_key(id) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    if expired.is_empty() {
+        return 0;
+    }
+    for id in &expired {
+        st.drop_message(id);
+    }
+    server.rewrite_journal_locked(&st);
+    expired.len()
 }
 
 pub fn gen_msg_id() -> String {
@@ -3557,6 +3612,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         mailbox_notify: Notify::new(),
     });
     restore_registered_peer_default_leases(&server);
+    purge_expired_storage(&server, now_ms());
     let listener = UnixListener::bind(&sock_path)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;

@@ -411,6 +411,81 @@ impl State {
         }
     }
 
+    pub fn drop_message(&mut self, id: &str) {
+        self.msgs.remove(id);
+        self.delivery_modes.remove(id);
+        self.wake_bindings.remove(id);
+    }
+
+    pub fn snapshot_events(&self) -> Vec<Event> {
+        let mut events = Vec::new();
+        let mut workers: Vec<_> = self.workers.values().cloned().collect();
+        workers.sort_by(|a, b| a.id.cmp(&b.id));
+        events.extend(workers.into_iter().map(|worker| Event::Registered { worker }));
+        let mut keepalives: Vec<_> = self.keepalives.iter().collect();
+        keepalives.sort_by(|a, b| a.0.cmp(b.0));
+        events.extend(keepalives.into_iter().map(|(worker_id, record)| {
+            Event::KeepaliveUpdated {
+                worker_id: worker_id.clone(),
+                record: record.clone(),
+            }
+        }));
+        let mut subagents: Vec<_> = self.subagents.values().cloned().collect();
+        subagents.sort_by(|a, b| a.id.cmp(&b.id));
+        events.extend(
+            subagents
+                .into_iter()
+                .map(|subagent| Event::SubagentUpdated { subagent }),
+        );
+        let mut tasks: Vec<_> = self.tasks.values().cloned().collect();
+        tasks.sort_by(|a, b| a.id.cmp(&b.id));
+        events.extend(tasks.into_iter().map(|task| Event::TaskCreated { task }));
+        let mut receipts: Vec<_> = self.cleanup_receipts.values().cloned().collect();
+        receipts.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        events.extend(
+            receipts
+                .into_iter()
+                .map(|receipt| Event::CleanupVerified { receipt }),
+        );
+        let mut subscriptions: Vec<_> = self.notification_subscriptions.values().cloned().collect();
+        subscriptions.sort_by(|a, b| a.id.cmp(&b.id));
+        events.extend(
+            subscriptions
+                .into_iter()
+                .map(|subscription| Event::NotificationSubscribed { subscription }),
+        );
+        let mut messages: Vec<_> = self.msgs.values().cloned().collect();
+        messages.sort_by(|a, b| (a.created_ms, a.id.clone()).cmp(&(b.created_ms, b.id.clone())));
+        for msg in messages {
+            let id = msg.id.clone();
+            events.push(Event::Sent { msg });
+            if let Some(mode) = self.delivery_modes.get(&id) {
+                events.push(Event::DeliveryMode {
+                    msg_id: id.clone(),
+                    mode: mode.clone(),
+                });
+            }
+            if let Some(subscription_id) = self.wake_bindings.get(&id) {
+                events.push(Event::WakeBound {
+                    message_id: id,
+                    subscription_id: subscription_id.clone(),
+                });
+            }
+        }
+        if let Some(migration) = self.migration.clone() {
+            events.push(Event::MigrationUpdated { migration });
+        }
+        if let Some(worker_id) = self.master_worker_id.clone() {
+            events.push(Event::MasterAssigned {
+                worker_id,
+                assigned_by: self.master_assigned_by.clone().unwrap_or_default(),
+                approval: self.master_approval.clone(),
+                assigned_ms: self.master_assigned_ms.unwrap_or(0),
+            });
+        }
+        events
+    }
+
     pub fn admission_frozen(&self) -> bool {
         self.migration
             .as_ref()

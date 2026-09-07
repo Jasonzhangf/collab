@@ -13,6 +13,7 @@ pub struct Config {
     pub notifications: Notifications,
     pub timers: Timers,
     pub subagent: Subagent,
+    pub retention: Retention,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -21,6 +22,7 @@ impl Default for Config {
             notifications: Notifications::default(),
             timers: Timers::default(),
             subagent: Subagent::default(),
+            retention: Retention::default(),
         }
     }
 }
@@ -102,6 +104,21 @@ impl Default for Timers {
             enabled: true,
             tick_interval_ms: 1000,
         }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Retention {
+    pub ttl_days: u64,
+}
+impl Default for Retention {
+    fn default() -> Self {
+        Self { ttl_days: 7 }
+    }
+}
+impl Retention {
+    pub fn cutoff_ms(&self, now_ms: i64) -> i64 {
+        now_ms.saturating_sub((self.ttl_days as i64).saturating_mul(86_400_000))
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -343,6 +360,9 @@ impl Config {
         if !(100..=60000).contains(&self.timers.tick_interval_ms) {
             bail!("timer tick must be 100..60000ms");
         }
+        if !(1..=365).contains(&self.retention.ttl_days) {
+            bail!("retention ttl_days must be 1..365");
+        }
         let s = &self.subagent;
         if !s.persistent || s.close_on_task_complete {
             bail!("subagents currently require persistent=true and close_on_task_complete=false");
@@ -423,6 +443,7 @@ mod tests {
     #[test]
     fn legacy_defaults_and_project_override() {
         let c = parse("", Path::new("/project")).unwrap();
+        assert_eq!(c.retention.ttl_days, 7);
         assert_eq!(c.subagent.runtime, "cursor");
         assert_eq!(c.subagent.health.timeout_seconds, 90);
         assert_eq!(c.notifications.delay_ms("direct-message"), 60000);
@@ -443,6 +464,7 @@ mod tests {
             "[notifications]\nmode='typo'",
             "[timers]\ntick_interval_ms=0",
             "[subagent]\nruntime='claude'",
+            "[retention]\nttl_days=0",
         ] {
             assert!(parse(s, Path::new("/project")).is_err());
         }

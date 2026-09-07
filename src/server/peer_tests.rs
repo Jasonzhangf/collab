@@ -689,6 +689,138 @@ fn daemon_restart_does_not_guess_between_multiple_or_unowned_panes() {
 }
 
 #[test]
+fn expired_mailbox_and_journal_are_removed_and_do_not_replay() {
+    let (server, root) = test_server();
+    assert!(register(&server, "peer", "%peer").ok);
+    let now = now_ms();
+    let old_id = "m-old".to_string();
+    let fresh_id = "m-fresh".to_string();
+    server.commit(&[
+        Event::Sent {
+            msg: Message {
+                id: old_id.clone(),
+                from: "peer".into(),
+                to: "peer".into(),
+                mtype: "notify".into(),
+                subject: Some("old".into()),
+                body: "expired body".into(),
+                in_reply_to: None,
+                created_ms: now - 8 * 86_400_000,
+                state: "read".into(),
+                wake_attempt_count: 1,
+                last_wake_attempt_ms: now - 8 * 86_400_000,
+            },
+        },
+        Event::Sent {
+            msg: Message {
+                id: fresh_id.clone(),
+                from: "peer".into(),
+                to: "peer".into(),
+                mtype: "notify".into(),
+                subject: Some("new".into()),
+                body: "fresh body".into(),
+                in_reply_to: None,
+                created_ms: now,
+                state: "pending".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        },
+    ]);
+    let mailbox = root.join(".agent-collab/mailbox");
+    assert!(mailbox.join("m-old.json").exists());
+    assert!(mailbox.join("m-fresh.json").exists());
+    let journal_before = std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+        .unwrap()
+        .lines()
+        .count();
+
+    assert_eq!(purge_expired_storage(&server, now), 1);
+    let state = server.state.lock().unwrap();
+    assert!(!state.msgs.contains_key(&old_id));
+    assert!(state.msgs.contains_key(&fresh_id));
+    assert!(state.workers.contains_key("peer"));
+    drop(state);
+    assert!(!mailbox.join("m-old.json").exists());
+    assert!(mailbox.join("m-fresh.json").exists());
+    let journal = std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    assert!(!journal.contains("m-old"));
+    assert!(journal.contains("m-fresh"));
+    assert!(journal.lines().count() < journal_before);
+
+    let replayed = replay(&root).unwrap();
+    assert!(!replayed.msgs.contains_key(&old_id));
+    assert_eq!(replayed.msgs[&fresh_id].body, "fresh body");
+    assert_eq!(replayed.workers["peer"].pane.as_deref(), Some("%peer"));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn retention_skips_fresh_messages_and_frozen_admission() {
+    let (server, root) = test_server();
+    assert!(register(&server, "peer", "%peer").ok);
+    let now = now_ms();
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "m-keep".into(),
+            from: "peer".into(),
+            to: "peer".into(),
+            mtype: "notify".into(),
+            subject: Some("keep".into()),
+            body: "keep".into(),
+            in_reply_to: None,
+            created_ms: now - 86_400_000,
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    assert_eq!(purge_expired_storage(&server, now), 0);
+    assert!(server.state.lock().unwrap().msgs.contains_key("m-keep"));
+
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "m-old-frozen".into(),
+            from: "peer".into(),
+            to: "peer".into(),
+            mtype: "notify".into(),
+            subject: Some("old".into()),
+            body: "old".into(),
+            in_reply_to: None,
+            created_ms: now - 8 * 86_400_000,
+            state: "read".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    server.commit(&[Event::MigrationUpdated {
+        migration: MigrationRecord {
+            id: "migration".into(),
+            from_version: "v1".into(),
+            to_version: "v1".into(),
+            phase: "applied".into(),
+            admission_frozen: true,
+            snapshot_hash: None,
+            worker_count: 1,
+            task_count: 0,
+            message_count: 2,
+            operator: "peer".into(),
+            issues: Vec::new(),
+            created_ms: now,
+            updated_ms: now,
+        },
+    }]);
+    assert_eq!(purge_expired_storage(&server, now), 0);
+    assert!(server
+        .state
+        .lock()
+        .unwrap()
+        .msgs
+        .contains_key("m-old-frozen"));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
     let mut state = State::default();
     for event in default_direct_message_events(&state, "peer", "%one", 1000) {
