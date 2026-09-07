@@ -917,6 +917,33 @@ fn owner_force_close_when_no_live_master_is_allowed() {
 }
 
 #[test]
+fn registered_peer_force_closes_orphaned_owner_with_no_live_master() {
+    let (server, root) = test_server();
+    register(&server, "owner", "%owner");
+    register(&server, "peer", "%peer");
+    assert!(create_task(&server, "owner", "orphan", "feature").ok);
+    let mut server = server;
+    server.pane_alive_check = |pane| pane != "%owner";
+    let resp = handle_task_close(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "orphan".into(),
+        true,
+        Some("owner pane lost; no live master; peer closes orphan".into()),
+    );
+    assert!(resp.ok, "{}", resp.error.unwrap_or_default());
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.tasks["orphan"].status, "closed");
+    assert_eq!(
+        state.cleanup_receipts["orphan"].manual_reason.as_deref(),
+        Some("owner pane lost; no live master; peer closes orphan"),
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn worktree_claim_requires_cleanup_and_cannot_cancel() {
     let (server, root) = test_server();
     register(&server, "peer", "%peer");
@@ -2523,4 +2550,3 @@ fn mailbox_read_all_chronological_sort_asc_and_desc() {
 
     std::fs::remove_dir_all(root).unwrap();
 }
-

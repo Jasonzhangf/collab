@@ -177,9 +177,11 @@ worker's blocker. Concretely:
   clean.
 - An ordinary peer that cannot reach a live master within one escalation
   cycle may self-close its own task with `collab task close <id> --force
-  --reason "<text>"`. This is the only allowed fallback; the reason and
-  cleanup receipt are mandatory so the daemon can show who closed what
-  and why.
+  --reason "<text>"`. If a task owner's tmux identity is lost and no live
+  master exists, a registered peer may close that orphaned task with the
+  same `--force --reason` command. These are the only allowed fallbacks;
+  the reason and cleanup receipt are mandatory so the daemon can show who
+  closed what and why.
 - Master may not delegate its accountability by passing the task back to
   the worker and waiting. Master either solves, re-dispatches, or force-
   closes. Doing nothing on a stuck task is a master failure, not a

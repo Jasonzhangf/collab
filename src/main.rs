@@ -269,9 +269,10 @@ enum TaskCmd {
         next: Option<String>,
     },
     /// Close a merged task and clean up its declared worktree/branch.
-    /// With --force the live master may close any task, or the owner may
-    /// close its own task when no live master exists. Force close stops
-    /// keepalives without deleting the worktree or branch and requires
+    /// With --force the live master may close any task. With no live master,
+    /// the owner may close its task, or a registered peer may close an
+    /// orphaned task after the owner's tmux identity is lost. Force close
+    /// stops keepalives without deleting the worktree or branch and requires
     /// a non-empty --reason.
     Close {
         id: String,

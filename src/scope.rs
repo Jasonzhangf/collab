@@ -334,6 +334,7 @@ collab task deliver <id> --evidence "commit=<sha>; gates=pass" --worktree <path>
 collab task block <id> --next "blocked: <evidence and next condition>"
 collab task update <id> --status merged
 collab task close <id>            # owner; verifies merged/clean, releases claim
+collab task close <id> --force --reason "..."  # master/approved fallback close
 ```
 
 Peers never share worktrees. Each task owner starts from latest main in one

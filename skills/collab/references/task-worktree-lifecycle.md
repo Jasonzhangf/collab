@@ -61,6 +61,9 @@ keepalive after the task is done is closed with `collab notify close`.
   priority, status, and next step before product edits.
 - Never share/reuse a worktree. Never depend on dirty main.
 - Only the owner may update, deliver, mark merged, cancel, or close.
+- Force close exceptions are explicit and audited: a live master may close
+  any task; with no live master the owner may self-close, or a registered
+  peer may close a task whose owner tmux identity is lost.
 - A bound worktree creates a mandatory cleanup obligation. Keep its exact path
   and branch bound until close.
 - `delivered`/`merged` are not cleanup. Close requires a clean, removed,

@@ -2142,8 +2142,16 @@ fn handle_task_close(
             return Resp::err("force close requires a non-empty --reason");
         };
         let live_master = live_master_id(server, &st);
+        let owner_identity_live = st
+            .workers
+            .get(&task.owner)
+            .and_then(|owner| owner.pane.as_deref())
+            .is_some_and(|pane| {
+                (server.pane_alive_check)(pane) && (server.pane_owner_check)(&task.owner, pane)
+            });
         let authorized = live_master.as_deref() == Some(worker_id.as_str())
-            || (live_master.is_none() && task.owner == worker_id);
+            || (live_master.is_none()
+                && (task.owner == worker_id || !owner_identity_live));
         if !authorized {
             return Resp::err_data(
                 "manual force close is not authorized for this caller",
@@ -2151,7 +2159,8 @@ fn handle_task_close(
                     "live_master": live_master,
                     "task_owner": task.owner,
                     "requester": worker_id,
-                    "rule": "live master may close any task; the owner may close its own task when no live master exists",
+                    "rule": "live master may close any task; with no live master, the owner may close its task or a registered peer may close an orphaned task whose owner identity is no longer live",
+                    "owner_identity_live": owner_identity_live,
                 }),
             );
         }
