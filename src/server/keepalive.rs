@@ -278,9 +278,6 @@ pub(crate) fn tick_with(
             state = server.state.lock().unwrap();
             continue;
         }
-        if tasks.is_empty() {
-            continue;
-        }
         let old = state
             .keepalives
             .get(&worker.id)
