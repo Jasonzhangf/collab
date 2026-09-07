@@ -265,6 +265,19 @@ fn notification_text(message: &Message) -> Option<String> {
     ))
 }
 
+const MAX_NOTIFICATION_CHARS: usize = 1024;
+
+fn truncate_notification(text: String) -> String {
+    if text.chars().count() <= MAX_NOTIFICATION_CHARS {
+        return text;
+    }
+    const SUFFIX: &str = "… [truncated; run collab inbox]";
+    let keep = MAX_NOTIFICATION_CHARS.saturating_sub(SUFFIX.chars().count());
+    let mut truncated = text.chars().take(keep).collect::<String>();
+    truncated.push_str(SUFFIX);
+    truncated
+}
+
 fn iso(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|d| d.to_rfc3339())
@@ -465,18 +478,10 @@ fn attempt_notification_with(
         );
         return false;
     }
-    let unacked_count = state
-        .msgs
-        .values()
-        .filter(|m| m.to == recipient && m.state == "delivered")
-        .count() as u32;
-    if unacked_count >= server.config.notifications.max_unacked {
+    if state_probe == crate::server::knock::AgentState::Unknown {
         crate::server::knock::append_log(
             &server.log_path(),
-            &format!(
-                "knock paused pane={pane} recipient={recipient} unacked={unacked_count}>={} awaiting ack",
-                server.config.notifications.max_unacked
-            ),
+            &format!("knock deferred pane={pane} recipient={recipient} agent state is unknown"),
         );
         return false;
     }
@@ -514,6 +519,13 @@ fn attempt_notification_with(
         })
         .collect::<Vec<_>>();
     batch.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    const MAX_BATCH_DELIVERY: usize = 3;
+    let total_pending = batch.len();
+    let remaining = total_pending.saturating_sub(MAX_BATCH_DELIVERY);
+    let attempted_ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
+    if remaining > 0 {
+        batch.drain(..remaining);
+    }
     let Some(first) = batch.first() else {
         return false;
     };
@@ -527,29 +539,12 @@ fn attempt_notification_with(
     if now - first.0 < delay || now - last_attempt < delay {
         return false;
     }
-    if state_probe == crate::server::knock::AgentState::Working {
-        crate::server::knock::append_log(
-            &server.log_path(),
-            &format!("knock deferred pane={pane} recipient={recipient} agent is working"),
-        );
-        return false;
-    }
-    const MAX_BATCH_DELIVERY: usize = 3;
-    let total_pending = batch.len();
-    let remaining = if total_pending > MAX_BATCH_DELIVERY {
-        total_pending - MAX_BATCH_DELIVERY
-    } else {
-        0
-    };
-    if total_pending > MAX_BATCH_DELIVERY {
-        batch.truncate(MAX_BATCH_DELIVERY);
-    }
     let ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
     if !can_receive(&pane) {
         server.commit_locked(
             &mut state,
             &[Event::WakeAttempted {
-                ids: ids.clone(),
+                ids: attempted_ids.clone(),
                 attempted_ms: now,
             }],
         );
@@ -562,7 +557,7 @@ fn attempt_notification_with(
     server.commit_locked(
         &mut state,
         &[Event::WakeAttempted {
-            ids: ids.clone(),
+            ids: attempted_ids,
             attempted_ms: now,
         }],
     );
@@ -572,15 +567,9 @@ fn attempt_notification_with(
         .map(|m| m.4.clone())
         .collect::<Vec<_>>();
     if remaining > 0 {
-        text_parts.push(format!("[+{} more pending in inbox; run collab ack / collab inbox]", remaining));
+        text_parts.push(format!("[+{} older messages remain in inbox; run collab inbox]", remaining));
     }
-    if unacked_count + (batch.len() as u32) >= server.config.notifications.max_unacked {
-        text_parts.push(format!(
-            "[ACK REQUIRED: {} unacked; run collab ack <id> to keep push notifications active]",
-            unacked_count + (batch.len() as u32)
-        ));
-    }
-    let text = text_parts.join(" | ");
+    let text = truncate_notification(text_parts.join(" | "));
     if !deliver(&pane, &text) {
         return false;
     }
@@ -603,7 +592,7 @@ fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str
         server,
         message_id,
         subscription_id,
-        &knock::pane_idle,
+        &|_| true,
         &|pane, text| knock_or_log(&server.log_path(), pane, text),
         &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
     )
@@ -2691,7 +2680,7 @@ fn worker_status_summary_with_maps(
         .values()
         .filter(|m| m.to == w.id && m.state == "pending")
         .count();
-    let notifications_paused = (unacked_notifications as u32) >= server.config.notifications.max_unacked;
+    let notifications_paused = false;
     let keepalive = keepalives.get(&w.id);
     let suspected_offline = keepalive.map(|k| k.suspected_offline).unwrap_or(false);
     let unacked_keepalives = keepalive.map(|k| k.unacked).unwrap_or(0);
@@ -2701,8 +2690,6 @@ fn worker_status_summary_with_maps(
         "identity-mismatch"
     } else if suspected_offline {
         "offline"
-    } else if notifications_paused {
-        "ack-required"
     } else {
         agent_state
     };
@@ -2710,8 +2697,8 @@ fn worker_status_summary_with_maps(
         Some("pane dead or not found; clean up task or restart pane")
     } else if status == "identity-mismatch" {
         Some("pane re-bound or owned by different process; verify pane ownership")
-    } else if suspected_offline || notifications_paused {
-        Some("unresponsive or unacked; run snapshot: collab subagent snapshot <id> --lines 40")
+    } else if suspected_offline {
+        Some("unresponsive; run snapshot: collab subagent snapshot <id> --lines 40")
     } else {
         None
     };

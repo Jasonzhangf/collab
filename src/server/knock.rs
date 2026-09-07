@@ -432,13 +432,13 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
         anyhow::bail!("pane {} not alive", pane);
     }
     let state = probe_agent_state(pane);
-    if state != AgentState::Waiting {
-        anyhow::bail!("pane {} is not a waiting agent (state: {:?})", pane, state);
+    if !matches!(state, AgentState::Waiting | AgentState::Working) {
+        anyhow::bail!("pane {} is not a known agent (state: {:?})", pane, state);
     }
     let kind = pane_view(pane)
         .map(|(command, _, screen)| submit_kind(&command, &screen))
         .unwrap_or(SubmitKind::BracketedPaste);
-    knock_kind(pane, text, kind, false)
+    knock_kind(pane, text, kind, state == AgentState::Working)
 }
 
 #[cfg(test)]
