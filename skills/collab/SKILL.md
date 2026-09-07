@@ -46,9 +46,16 @@ With a matching live subscription, the first pending message opens a fixed
 60-second window by default. `~/.appsdk/config.toml` can select immediate or
 batched delivery globally or per project; `appsdk config` shows effective
 policy. All eligible unsent messages for that recipient are combined
-into one single-line tmux write and one Enter. Cursor gets literal keys, a 250ms settle, then `C-m` in a second tmux process. A working Cursor pane gets one later empty `C-m` so the follow-up steers the active run instead of waiting in the queue. Codex keeps `paste-buffer -p` and `C-m` in the same tmux queue. Working Agents receive it
-without waiting for idle. Each batch has one attempt; the default window is
-one minute. Policy changes require controlled daemon restart, not task reset.
+into one single-line tmux write and one Enter (up to 3 previews per knock, with
+overflow retained in the inbox). Cursor gets literal keys, a 250ms settle, then
+`C-m` in a second tmux process. Codex keeps `paste-buffer -p` and `C-m` in the
+same tmux queue. Delivery requires the agent to be in safe waiting/idle state;
+actively working panes defer delivery without burning attempts so in-flight tasks
+are not polluted. If unacknowledged notifications reach the throttle threshold
+(default 3), further push knocks pause until `collab ack <id>` or `collab ack --all`
+is run, preventing terminal pollution and storms. Each batch has one attempt;
+the default window is one minute. Policy changes require controlled daemon restart,
+not task reset.
 
 Do not retry a failed send automatically. Return its exact error and durable
 status. Never call `tmux send-keys` directly.
@@ -64,14 +71,20 @@ Cursor health is `agent status --format json`, not snapshot. Then `status`,
 tools when this session lists them. The `collab` CLI is also valid.
 If MCP is missing, unsupported, aborted, or unknown, run the same
 actions with the CLI in the inherited project cwd:
-`collab init`, `collab ack <id>`, `collab msg <id>`, `collab inbox`,
-`collab subagent ready|working <id>`,
+`collab init`, `collab ack <id>` / `collab ack --all`, `collab msg <id>`,
+`collab inbox`, `collab worker status [id]`, `collab subagent ready|working <id>`,
 `collab sendmessage --to <parent> --subject <topic> "<body>"`.
 The CLI is a complete protocol path. Missing MCP is not a blocker and
 does not justify skipping ACK or waiting. Do not repeat `collab init`
 after it already succeeded. Child results go to the parent with
 `collab sendmessage`, not the parent-only `subagent send` action.
 No ACK loops, automatic respawn or redispatch.
+
+Acknowledge notifications promptly with `collab ack <id>` or `collab ack --all`.
+After 3 unacknowledged notifications, push knocks pause automatically to prevent
+notification storms and prompt pollution; workers must ack or read inbox (`collab inbox`)
+to resume. Inspect peer/worker health, identity validity, and throttle status at any
+time with `collab worker status [id]` or `collab who`.
 
 Task keepalive: only unfinished actionable tasks plus explicit idle qualify;
 one activation per 15 minutes, grouped per worker. ACK a keepalive once with
@@ -206,6 +219,8 @@ reach this observer. Screen text is diagnostic, never task/control truth.
 | Notify a peer now | `collab sendmessage --to <peer> --subject <short-topic> "<original message>"` |
 | Read one notification | `collab msg <notification-id>` |
 | List unread messages | `collab inbox` |
+| Acknowledge one or all notifications | `collab ack <id>` or `collab ack --all` |
+| Inspect worker health and notification status | `collab worker status [id]` |
 | Read own authoritative context | `collab context` |
 | List peers | `collab who` |
 | Check own subscriptions | `collab notify status` |
@@ -285,9 +300,11 @@ For subscription semantics or delivery diagnosis, read
   results—not routine progress, heartbeat, ACK, review, or completion reports.
 - A wake is only a signal. It cannot change task/resource truth, fabricate
   success, authorize maintenance, or create an ACK loop.
-- `absent` or `unknown` Agent state produces no tmux input. Each due batch is
-  reserved durably once; failed or uncertain attempts are never automatically
-  replayed, including after restart. Details remain readable in the inbox.
+- `absent` or `unknown` Agent state produces no tmux input. If the pane is dead,
+  reassigned, unowned, or mismatched, subscriptions transition to `pane-lost` to
+  prevent storms. Each due batch is reserved durably once; failed or uncertain
+  attempts are never automatically replayed, including after restart. Details remain
+  readable in the inbox.
 
 ## Load details only when needed
 
