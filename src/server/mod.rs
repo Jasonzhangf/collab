@@ -309,18 +309,81 @@ fn visible_body(body: &str) -> String {
     visible
 }
 
+/// Priority class and the one thing this notification obliges, keyed by the
+/// subject the server itself generates. Unknown subjects are peer traffic.
+fn notification_class(subject: &str) -> (&'static str, &'static str) {
+    if subject.starts_with("worker-unresponsive") {
+        return ("P1", "snapshot the pane, then recover or close it");
+    }
+    if subject.starts_with("worker-idle") {
+        return ("P1", "dispatch work to this idle capacity");
+    }
+    if subject.starts_with("subagent-status") {
+        return ("P1", "re-dispatch, close, or leave the child idle");
+    }
+    if subject.starts_with("task-keepalive") {
+        return ("P1", "continue your own task or record a real blocker");
+    }
+    if subject.starts_with("goal") || subject.starts_with("deadline") {
+        return ("P0", "run the long-horizon briefing and schedule");
+    }
+    if subject.contains("blocker") || subject.contains("unblock") {
+        return ("P0", "resolve the blocker; you own it");
+    }
+    if subject.starts_with("release") || subject.contains("released") {
+        return ("P1", "the resource is free; resume the task that waited on it");
+    }
+    if subject.contains("recorded") || subject.contains("receipt") || subject.contains("delivered")
+    {
+        return ("P2", "note it and go straight back to your current task");
+    }
+    ("P1", "do the in-scope action the message asks for")
+}
+
+/// A notification is an interrupt, not the turn's goal. Without an explicit
+/// resume instruction agents treat reading as the whole task and stop.
+const NOTIFY_PROTOCOL: &str =
+    "READ IS NOT DONE: never end your turn on an ACK, a read, or a summary. \
+     After handling, resume your current task; if you own none, run \
+     `appsdk longhorizon show` and take work.";
+
+const MAX_NOTIFICATION_CHARS: usize = 1024;
+
 fn notification_text(message: &Message) -> Option<String> {
-    let subject = abbreviated_subject(message.subject.as_deref()?)?;
-    Some(format!(
-        "COLLAB_NOTIFY {} [{}] {} | ACTION: weigh priority from the ID and subject. When selected, run collab msg {}, then execute the actionable in-scope request; do not stop at ACK or waiting.",
-        message.id,
-        subject,
-        visible_body(&message.body),
-        message.id
+    let subject_raw = message.subject.as_deref()?;
+    Some(compose_notification(
+        &message.id,
+        subject_raw,
+        &visible_body(&message.body),
     ))
 }
 
-const MAX_NOTIFICATION_CHARS: usize = 1024;
+/// Shared wake text for every channel. Keepalive and message delivery must not
+/// drift into different contracts.
+pub(super) fn compose_notification(id: &str, subject_raw: &str, body: &str) -> String {
+    let subject = abbreviated_subject(subject_raw).unwrap_or_else(|| "notice".to_string());
+    let (priority, action) = notification_class(subject_raw);
+
+    let head = format!("COLLAB_NOTIFY {} [{}] ", id, subject);
+    let tail = format!(
+        " | {} ACTION: {}. Details: collab msg {}. | {}",
+        priority, action, id, NOTIFY_PROTOCOL
+    );
+
+    // The protocol and action must survive a long body, so the body absorbs
+    // the truncation instead of the instructions being cut off the end.
+    let fixed = head.chars().count() + tail.chars().count();
+    let budget = MAX_NOTIFICATION_CHARS.saturating_sub(fixed);
+    let body = if body.chars().count() > budget {
+        const ELLIPSIS: &str = "… [collab inbox]";
+        let keep = budget.saturating_sub(ELLIPSIS.chars().count());
+        body.chars().take(keep).collect::<String>() + ELLIPSIS
+    } else {
+        body.to_string()
+    };
+
+    format!("{head}{body}{tail}")
+}
 
 fn truncate_notification(text: String) -> String {
     if text.chars().count() <= MAX_NOTIFICATION_CHARS {

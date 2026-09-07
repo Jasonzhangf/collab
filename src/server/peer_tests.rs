@@ -1901,10 +1901,68 @@ fn tmux_notification_contains_id_subject_and_original_body() {
     .unwrap();
     assert_eq!(
         text,
-        "COLLAB_NOTIFY message-id [release] RESOURCE_RELEASED feature=shared | ACTION: weigh priority from the ID and subject. When selected, run collab msg message-id, then execute the actionable in-scope request; do not stop at ACK or waiting."
+        "COLLAB_NOTIFY message-id [release] RESOURCE_RELEASED feature=shared | P1 ACTION: the resource is free; resume the task that waited on it. Details: collab msg message-id. | READ IS NOT DONE: never end your turn on an ACK, a read, or a summary. After handling, resume your current task; if you own none, run `appsdk longhorizon show` and take work."
     );
-    assert!(text.contains("execute the actionable in-scope request"));
-    assert!(text.contains("do not stop at ACK or waiting"));
+    assert!(!text.contains("ACK this notice"));
+    assert!(text.contains("READ IS NOT DONE"));
+}
+
+#[test]
+fn tmux_notification_classifies_priority_and_names_one_action() {
+    let notify = |subject: &str| {
+        notification_text(&Message {
+            id: "m1".into(),
+            from: "collab-server".into(),
+            to: "master".into(),
+            mtype: "notify".into(),
+            subject: Some(subject.into()),
+            body: "body".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        })
+        .unwrap()
+    };
+
+    assert!(notify("worker-idle: w1").contains("P1 ACTION: dispatch work to this idle capacity"));
+    assert!(notify("worker-unresponsive: w1").contains("P1 ACTION: snapshot the pane"));
+    assert!(notify("task-keepalive 1/3").contains("P1 ACTION: continue your own task"));
+    assert!(notify("goal:plan.md").contains("P0 ACTION: run the long-horizon briefing"));
+    assert!(notify("Settings delivery recorded").contains("P2 ACTION: note it"));
+
+    // Every class carries the resume protocol, not just the operational ones.
+    for subject in [
+        "worker-idle: w1",
+        "goal:plan.md",
+        "Settings delivery recorded",
+    ] {
+        assert!(notify(subject).contains("resume your current task"));
+    }
+}
+
+#[test]
+fn tmux_notification_truncates_body_without_dropping_the_action_contract() {
+    let text = notification_text(&Message {
+        id: "message-id".into(),
+        from: "sender".into(),
+        to: "recipient".into(),
+        mtype: "notify".into(),
+        subject: Some("release".into()),
+        body: "x".repeat(4000),
+        in_reply_to: None,
+        created_ms: now_ms(),
+        state: "pending".into(),
+        wake_attempt_count: 0,
+        last_wake_attempt_ms: 0,
+    })
+    .unwrap();
+
+    assert!(text.chars().count() <= 1024);
+    assert!(text.contains("P1 ACTION:"));
+    assert!(text.contains("READ IS NOT DONE"));
+    assert!(text.ends_with("run `appsdk longhorizon show` and take work."));
 }
 
 #[test]
@@ -1927,7 +1985,7 @@ fn tmux_notification_abbreviates_subject_and_escapes_body_controls() {
     .unwrap();
     assert_eq!(
         text,
-        "COLLAB_NOTIFY message-id [this subject is deliberately longer than forty …] line one\\nline two\\t中文 | ACTION: weigh priority from the ID and subject. When selected, run collab msg message-id, then execute the actionable in-scope request; do not stop at ACK or waiting."
+        "COLLAB_NOTIFY message-id [this subject is deliberately longer than forty …] line one\\nline two\\t中文 | P1 ACTION: do the in-scope action the message asks for. Details: collab msg message-id. | READ IS NOT DONE: never end your turn on an ACK, a read, or a summary. After handling, resume your current task; if you own none, run `appsdk longhorizon show` and take work."
     );
 }
 

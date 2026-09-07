@@ -446,7 +446,7 @@ pub(crate) fn tick_with(
             "task-keepalive {}/{}",
             record.unacked, server.config.keepalive.max_unacked
         );
-        let body = format!("Unfinished tasks: {}. Read task state, ACK this notice once with collab ack {}, then resume actionable work or record a real blocker. Do not reply with another ACK request.", tasks.join(", "), id);
+        let body = format!("Unfinished tasks: {}. Continue the named task now: read its state, do the next concrete step, and update it. If it is genuinely blocked, record the blocker and the concrete proposed fix. Reading this notice is not progress.", tasks.join(", "));
         record.last_notice_id = Some(id.clone());
         server.commit_locked(
             &mut state,
@@ -479,7 +479,7 @@ pub(crate) fn tick_with(
         // No WakeBound: this reserved one-shot must never join a delayed/replayed queue.
         drop(state);
         if probe(&pane) == AgentState::Waiting
-            && wake(&pane, &format!("COLLAB_NOTIFY {id} [{subject}] {body}"))
+            && wake(&pane, &super::compose_notification(&id, &subject, &body))
         {
             server.commit(&[Event::Delivered { ids: vec![id] }]);
         }
