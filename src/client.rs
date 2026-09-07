@@ -53,6 +53,23 @@ pub fn call<T: DeserializeOwned>(sock: &Path, req: &Req) -> anyhow::Result<T> {
     serde_json::from_value(resp.data).with_context(|| "unexpected response shape")
 }
 
+pub fn daemon_locked(server_dir: &Path) -> bool {
+    let lock_path = server_dir.join("daemon.lock");
+    if !lock_path.exists() {
+        return false;
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&lock_path) {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return true;
+        }
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+    }
+    false
+}
+
 pub fn ensure_server(sock: &Path) -> anyhow::Result<()> {
     let server_dir = sock
         .parent()
@@ -63,6 +80,21 @@ pub fn ensure_server(sock: &Path) -> anyhow::Result<()> {
     }
     if alive(sock) {
         return Ok(());
+    }
+    if daemon_locked(server_dir) {
+        for _ in 0..40 {
+            if alive(sock) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let pid_str = std::fs::read_to_string(server_dir.join("server.pid")).unwrap_or_default();
+        anyhow::bail!(
+            "collab daemon (pid {}) is unresponsive at {}; check {}",
+            pid_str.trim(),
+            sock.display(),
+            server_dir.join("log.txt").display()
+        );
     }
     let exe = std::env::current_exe()?;
     let log_path = server_dir.join("log.txt");

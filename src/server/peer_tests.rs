@@ -2282,3 +2282,77 @@ fn worker_unresponsive_notifies_live_master_with_snapshot_advice() {
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn closed_and_delivered_tasks_do_not_trigger_keepalives() {
+    let (server, root) = test_server();
+    register(&server, "worker-a", "%pane-a");
+    let server_arc = std::sync::Arc::new(server);
+    let base = now_ms();
+
+    // Create a task that is delivered
+    server_arc.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "task-delivered".into(),
+            owner: "worker-a".into(),
+            created_by: "worker-a".into(),
+            feature_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            priority: "p2".into(),
+            status: "delivered".into(),
+            next_step: None,
+            wait: None,
+            created_ms: base,
+            updated_ms: base,
+        },
+    }]);
+
+    // Tick scheduler - delivered task must NOT generate keepalive!
+    let sends = std::cell::Cell::new(0);
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        base + 900_000,
+        &|_| crate::server::knock::AgentState::Waiting,
+        &|_, _| {
+            sends.set(sends.get() + 1);
+            true
+        },
+        &|_, _| true,
+    );
+    assert_eq!(sends.get(), 0, "delivered task must not trigger keepalive");
+
+    // Now update task to closed
+    server_arc.commit(&[Event::TaskUpdated {
+        task: TaskRec {
+            id: "task-delivered".into(),
+            owner: "worker-a".into(),
+            created_by: "worker-a".into(),
+            feature_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            priority: "p2".into(),
+            status: "closed".into(),
+            next_step: None,
+            wait: None,
+            created_ms: base,
+            updated_ms: base,
+        },
+    }]);
+
+    // Tick scheduler - closed task must NOT generate keepalive!
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        base + 1_800_000,
+        &|_| crate::server::knock::AgentState::Waiting,
+        &|_, _| {
+            sends.set(sends.get() + 1);
+            true
+        },
+        &|_, _| true,
+    );
+    assert_eq!(sends.get(), 0, "closed task must not trigger keepalive");
+    std::fs::remove_dir_all(root).unwrap();
+}
