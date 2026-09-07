@@ -5,6 +5,7 @@ mod proto;
 mod scope;
 mod server;
 mod subagent;
+mod install_skills;
 
 use clap::{Parser, Subcommand};
 use identity::Identity;
@@ -142,6 +143,19 @@ enum Cmd {
     Migrate {
         #[command(subcommand)]
         cmd: MigrateCmd,
+    },
+    /// Install the embedded collab skill bundle into a global skills
+    /// directory. Default target is `~/.agents/skills/collab`; pass
+    /// `--target` to override. Existing files are skipped unless
+    /// `--force` is given.
+    InstallSkills {
+        /// Destination directory for the collab skill bundle.
+        /// Defaults to `~/.agents/skills/collab`.
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+        /// Overwrite existing files in the target instead of skipping them.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -829,6 +843,39 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             };
             let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
             out(&v);
+            Ok(())
+        }
+        Cmd::InstallSkills { target, force } => {
+            let target = match target {
+                Some(path) => path,
+                None => match std::env::var_os("HOME") {
+                    Some(home) => std::path::PathBuf::from(home)
+                        .join(".agents")
+                        .join("skills")
+                        .join("collab"),
+                    None => anyhow::bail!(
+                        "install-skills default target requires $HOME; pass --target"
+                    ),
+                },
+            };
+            let (outcomes, bytes, count) =
+                install_skills::install(&target, force)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            let written = outcomes
+                .iter()
+                .filter(|(_, o)| *o == install_skills::InstallOutcome::Written)
+                .count();
+            let skipped = count - written;
+            let files: Vec<&str> = outcomes.iter().map(|(r, _)| *r).collect();
+            out(&serde_json::json!({
+                "target": target,
+                "files": files,
+                "written": written,
+                "skipped": skipped,
+                "bytes": bytes,
+                "force": force,
+                "next": "the collab skill is now visible to any agent that loads ~/.agents/skills; restart the agent or rerun its skill discovery to pick up the bundle",
+            }));
             Ok(())
         }
     }

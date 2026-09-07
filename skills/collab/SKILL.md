@@ -1,0 +1,303 @@
+---
+name: collab
+description: Coordinate independent peers with reusable finite direct-message leases, one-shot event subscriptions, task/worktree ownership, resource waits, controlled daemon maintenance, and explicit user-approved master promotion when no live master exists. Ordinary peer notices use one direct command with no discovery or retry step. Codex/Cursor root is not Collab master.
+---
+
+# Collab
+
+Durable truth lives in the project server. tmux carries only a bounded wake
+preview. Production projects use the globally installed Collab v1.
+
+## Automatic multi-worker collaboration
+
+Keep Collab enabled. At multi-worker startup, run official `collab init` once
+in the inherited live peer environment unless AppSDK already initialized it.
+This registers the peer and default finite direct-message subscription.
+Once task scope and the independent worktree are known, automatically follow
+[task/worktree registration](references/task-worktree-lifecycle.md): bind the
+task, feature/resource and owned file scope before concurrent product edits.
+Use [resource coordination](references/resource-waits.md) for overlaps; never
+share a worktree or overwrite another peer's files.
+
+Registration, necessary coordination and subscriptions require no repeated
+user confirmation within an authorized multi-worker task. Send only messages
+authorized by the user's collaboration request; no unrelated external notices.
+Do not require a serial merge queue for communication or read-only work.
+
+If initialization fails, report collaboration unavailable and preserve its
+error. Shared writes and dependent coordination wait for reliable ownership;
+independent isolated work and AppSDK quality checks can continue. No invented
+peer, local substitute claim or fake successful registration.
+
+## Send an ordinary message
+
+Run exactly one command:
+
+```sh
+collab sendmessage --to <peer> --subject <short-topic> "<original message>"
+```
+
+`--to`, a non-empty short `--subject`, and the original body are required.
+
+Do not first run `notify methods`, `notify subscribe --help`, `whoami`, or
+choose `mailbox-only`. There is no separate mailbox-only send mode.
+`sendmessage` always commits the full subject/body to the durable mailbox.
+With a matching live subscription, the first pending message opens a fixed
+60-second window by default. `~/.appsdk/config.toml` can select immediate or
+batched delivery globally or per project; `appsdk config` shows effective
+policy. All eligible unsent messages for that recipient are combined
+into one single-line tmux write and one Enter. Cursor gets literal keys, a 250ms settle, then `C-m` in a second tmux process. A working Cursor pane gets one later empty `C-m` so the follow-up steers the active run instead of waiting in the queue. Codex keeps `paste-buffer -p` and `C-m` in the same tmux queue. Working Agents receive it
+without waiting for idle. Each batch has one attempt; the default window is
+one minute. Policy changes require controlled daemon restart, not task reset.
+
+Do not retry a failed send automatically. Return its exact error and durable
+status. Never call `tmux send-keys` directly.
+
+## Common command card
+
+For user-requested persistent subagents, run `appsdk subagent start --id <id>`.
+That starts Cursor CLI with `--model auto`. Override with `--runtime cursor|codex`.
+Do not look up `agent --help` or start Codex unless config/`--runtime` is `codex`.
+Cursor health is `agent status --format json`, not snapshot. Then `status`,
+`send <id> --subject <topic> "<task>"`, and explicit `close <id>`.
+`collab-mcp` is the shared Collab MCP for every agent. Use `collab_*`
+tools when this session lists them. The `collab` CLI is also valid.
+If MCP is missing, unsupported, aborted, or unknown, run the same
+actions with the CLI in the inherited project cwd:
+`collab init`, `collab ack <id>`, `collab msg <id>`, `collab inbox`,
+`collab subagent ready|working <id>`,
+`collab sendmessage --to <parent> --subject <topic> "<body>"`.
+The CLI is a complete protocol path. Missing MCP is not a blocker and
+does not justify skipping ACK or waiting. Do not repeat `collab init`
+after it already succeeded. Child results go to the parent with
+`collab sendmessage`, not the parent-only `subagent send` action.
+No ACK loops, automatic respawn or redispatch.
+
+Task keepalive: only unfinished actionable tasks plus explicit idle qualify;
+one activation per 15 minutes, grouped per worker. ACK a keepalive once with
+`collab ack <id>`, then work or record a blocker. Sending a message or positive
+working observation also counts as activity. Three unconfirmed attempts stop;
+never automatically `subagent rearm` to bypass exhaustion. Unknown stays unknown.
+`subagent status` includes tasks, parent mailbox, counters and notification/ACK
+history. `subagent snapshot <id> --lines 40` reads the screen only on request.
+
+Task liveness is an obligation, not an ACK ceremony. Every assigned task that
+has not reached verified cleanup/close is checked at least once per 15 minutes.
+When the check arrives, continue the task immediately if actionable; if it is
+blocked, find a concrete solution first, then report it to the live master
+in the same cycle. Do not leave a
+task at `assigned`, `working`, `blocked`, `waiting`, `delivered`, or
+`cleanup_pending` merely because the last wake was acknowledged. After delivery
+or merge, perform the real cleanup and close the task; a reminder does not
+create a second task or a duplicate dispatch.
+
+Escalation routing is explicit:
+
+- A managed subagent and an ordinary worker both report blockers to the live
+  Collab master immediately. Do not wait for the next liveness cycle or for
+  master to invent the fix. First find a concrete solution (root cause,
+  proposed change, authorization needed); escalate that, not a symptom.
+  Lazy thinking is forbidden: do not dump "I'm blocked" and idle. If the
+  assignment's delivery or test conditions are ambiguous, do not guess;
+  propose the missing conditions and send them to master. A subagent must
+  also copy its parent when parent is not the master, and may not decline a
+  master collaboration request. Independent peers may temporarily decline a
+  master collaboration invite to protect their own current task. If no live
+  master exists, report to the collaborator that initiated the task. Include
+  the task ID, exact blocker, proposed solution, attempted actions, and
+  requested decision.
+- A peer may promote itself to master only when no live master exists and the
+  user explicitly approves that exact peer for that exact project. Record the
+  approval with `collab master promote --approval "<user text>"` and verify the
+  promoted peer has a live registered identity/pane before treating it as
+  master. If a live master already exists, do not promote; only that master
+  may `collab master delegate <peer>`. `appsdk init` alone never proves master
+  ownership; a missing or dead master pane means there is no live master, not
+  permission to invent one. Codex/Cursor root is not Collab master.
+- If a blocker or wait cannot be executed locally after a real solution is
+  found, report that solution to the live master immediately instead of
+  silently waiting. Keep the durable wait/task state, continue any
+  independent work, and recheck the escalation on the next 15-minute
+  liveness cycle.
+
+## Master owns the outcome, not the excuse
+
+Collab master is accountable for the final result of every assigned task
+in the project. Once master accepts a dispatch, the master -- not the
+worker -- is the escalation target, and the master cannot hide behind the
+worker's blocker. Concretely:
+
+- A live master must close any task that cannot otherwise be closed,
+  including stuck or merged-but-unclean tasks, with `collab task close
+  <id> --force --reason "<text>"`. The reason is recorded in the cleanup
+  receipt so the manual close is auditable; keepalives for that task owner
+  are superseded and the worker pane stops waking.
+- When a worker reports a blocker the master must take over ownership of
+  the resolution: re-dispatch, close manually, or revise the assignment
+  conditions. Master is not allowed to send an "I'm waiting on you"
+  reply, mark the task blocked, and idle. If master cannot unblock the
+  worker within the same liveness cycle, master force-closes the task
+  with a reason so the wake loop stops and the worker's identity stays
+  clean.
+- An ordinary peer that cannot reach a live master within one escalation
+  cycle may self-close its own task with `collab task close <id> --force
+  --reason "<text>"`. This is the only allowed fallback; the reason and
+  cleanup receipt are mandatory so the daemon can show who closed what
+  and why.
+- Master may not delegate its accountability by passing the task back to
+  the worker and waiting. Master either solves, re-dispatches, or force-
+  closes. Doing nothing on a stuck task is a master failure, not a
+  worker failure.
+
+
+## Master splits and assigns
+
+The human remains the only final authority for goals, money, irreversible
+risk, and version promotion. Collab master is the user-approved project
+dispatcher, not the human 主脑 and not Codex/Cursor root. Master compiles
+the goal into a task graph, then assigns; it does not take another peer's
+task or worktree.
+
+Do not slice a large goal into equal shares. Find dependencies first, then
+parallel boundaries with non-overlapping ownership. Do not dispatch until
+delivery conditions and test conditions are explicit, concrete, and
+unambiguous: a third party could accept or reject without asking. Delivery
+conditions state done-iff, artifacts, in-scope vs out-of-scope, and
+forbidden edits. Test conditions state exact commands, expected results,
+and evidence location. "Run tests", "make sure it works", or a vague
+output list is not a contract. Also state goal, dependencies, role,
+read/write mode, unique write scope, input version, and timeout/rollback.
+The model name is not the business contract. Implementation and independent
+review go to different agents.
+
+Master keeps architecture, dispatch, integration, critical repair, and
+final acceptance. Bulk implementation does not stay on the master's own
+chain. Start a managed subagent with `appsdk subagent start --id <id>`
+(optional `--runtime cursor|codex`), then `send <id> --subject <topic>
+"<assignment>"`, or `collab sendmessage --to <peer>`. Give each child its
+own worktree and file scope. Subagents must obey master and parent;
+independent peers may decline an invite to protect their current task.
+Wait for evidence summaries, then integrate. Chat tone is not completion.
+
+A worker or subagent executes only the approved assignment, owns that
+task's full lifecycle, and returns evidence. It has no global schedule.
+On a blocker: find a concrete solution first, then report it to the live
+master immediately. Do not wait. Do not lazy-think (symptoms without a
+fix, or idle hoping master will design it). Copy parent if parent is not
+master. If delivery or test conditions are unclear, propose the missing
+conditions instead of guessing. Last owned `collab task close` cancels this
+peer's direct-message auto-notify. Explicit `collab notify close` does the
+same at any time. After the task is done, a leftover keepalive or other
+notice may be closed that way so tmux stops injecting wakes. Do not
+unsubscribe another peer's lease. Next collaboration re-arms with
+`collab init` or `collab notify subscribe --event direct-message`.
+
+AGY review is optional. If AGY is unavailable, use Codex review. If neither
+exists, the live master reviews. Missing AGY or Codex review is not a
+Collab blocker.
+
+Without tmux, initialization and observer queries report no notification channel.
+Use local `appsdk subagent list/status/snapshot` without fake registration;
+check the mailbox in status yourself. No automatic completion notification can
+reach this observer. Screen text is diagnostic, never task/control truth.
+
+| Intent | Command |
+|---|---|
+| Notify a peer now | `collab sendmessage --to <peer> --subject <short-topic> "<original message>"` |
+| Read one notification | `collab msg <notification-id>` |
+| List unread messages | `collab inbox` |
+| Read own authoritative context | `collab context` |
+| List peers | `collab who` |
+| Check own subscriptions | `collab notify status` |
+| Inspect live master | `collab master status` |
+| Promote this peer when no live master exists | `collab master promote --approval "<user text>"` |
+| Delegate live master to another peer | `collab master delegate <peer>` |
+| Split work to a managed subagent | `appsdk subagent start --id <id>` then `send <id> --subject <topic> "<assignment with delivery and test conditions>"` |
+| Report a blocker to live master | `collab sendmessage --to <master> --subject blocker "<task_id; cause; proposed fix; decision needed>"` |
+| Close own notifications after the task is done | `collab notify close` |
+
+After a tmux preview, use its notification ID and abbreviated subject to weigh
+urgency against the current task. When selecting the notice, run
+`collab msg <notification-id>`, read durable detail, and execute the actionable
+request inside this Agent's scope. Do not stop at ACK or waiting; mailbox truth
+persists.
+
+## Initialize once
+
+For an AppSDK-governed project, the only bootstrap command is:
+
+```sh
+appsdk init .
+```
+
+In a live tmux Agent this runs official `collab init`, starts/reuses the daemon,
+registers the current peer, and creates/refreshes the finite reusable default
+`direct-message` lease. Do not run a second `collab init`,
+`collab whoami`, or manual ordinary-message subscription.
+
+Only a standalone non-AppSDK project uses explicit `collab init`.
+
+## Subscribe to a future event
+
+Use subscriptions only when this Agent wants a later event to wake it:
+
+```sh
+collab notify subscribe --event resource-released --subject <resource-id> \
+  --ttl-seconds <bounded>
+collab notify subscribe --event async-result --subject <operation-id> \
+  --ttl-seconds <bounded>
+collab notify subscribe --event deadline --subject <timer-id> \
+  --ttl-seconds <bounded>
+```
+
+The sender never inspects or configures the recipient's subscription.
+For subscription semantics or delivery diagnosis, read
+[references/notifications.md](references/notifications.md).
+
+## Hard boundaries
+
+- Never attach production work to v2 or `.agent-collab-v2`.
+- Project scope comes only from inherited tmux pane cwd, or exact process cwd
+  for an explicit non-tmux operator. Never choose/search/hardcode a path. MCP
+  and child commands inherit the same environment.
+- Identities are equal peers by default. There is no implicit master from
+  first registration, automatic process recovery, or inferred `/goal`. Collab
+  master is explicit, user-approved project arbitration; it is not Codex or
+  Cursor root, and it does not take ownership of another peer's task. If a
+  live registered master exists, other peers cannot promote and only that
+  master may delegate. If no live master exists, a peer may promote itself
+  only with explicit user approval and a live pane. Independent peers may
+  decline a master collaboration invite; managed subagents must obey the
+  master. Master splits by dependency then unique write scope, assigns
+  subagents with unambiguous delivery and test conditions, and keeps
+  architecture/integration/acceptance; it does not take another peer's
+  task. Workers and subagents find a solution first, then report blockers
+  to master immediately; they do not wait or dump symptoms. Last owned
+  task close cancels that owner's auto-notify; `collab notify close` can
+  do the same after a leftover wake. AGY review is optional and may
+  degrade to Codex review or live master review; missing reviewers are
+  not a blocker. Explicit
+  managed subagent tasks may use the finite task-bound keepalive above;
+  it is not a free-form task queue.
+- Each peer owns its complete task/worktree/integration/resource/cleanup
+  lifecycle. Never mutate or close another peer's work.
+- Send only explicit notices, shared-resource coordination, or subscribed async
+  results—not routine progress, heartbeat, ACK, review, or completion reports.
+- A wake is only a signal. It cannot change task/resource truth, fabricate
+  success, authorize maintenance, or create an ACK loop.
+- `absent` or `unknown` Agent state produces no tmux input. Each due batch is
+  reserved durably once; failed or uncertain attempts are never automatically
+  replayed, including after restart. Details remain readable in the inbox.
+
+## Load details only when needed
+
+- Task/worktree registration, delivery, close, cleanup:
+  [references/task-worktree-lifecycle.md](references/task-worktree-lifecycle.md)
+- Resource conflicts and bounded waits:
+  [references/resource-waits.md](references/resource-waits.md)
+- Migration, daemon stop/start, deprecated commands:
+  [references/migration-daemon.md](references/migration-daemon.md)
+- Source/release/install/restart verification:
+  [references/verification.md](references/verification.md)
+
+Do not load references for ordinary `sendmessage`, `msg`, or `inbox`.
