@@ -759,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn working_agent_defers_wake_until_idle_without_burning_attempts() {
+    fn working_agent_receives_notification_immediately() {
         let (mut server, root) = test_server();
         Arc::get_mut(&mut server).unwrap().pane_state_check = |_| crate::server::knock::AgentState::Working;
         register(&server, "busy-worker");
@@ -774,25 +774,6 @@ mod tests {
             .unwrap()
             .created_ms = now_ms() - 60_001;
 
-        // When agent is Working, wake is deferred without burning wake_attempt_count.
-        assert!(!super::super::attempt_notification_with_default(
-            &server,
-            &id,
-            &sub,
-            &|_| true,
-            &|_, _| panic!("should not deliver while busy")
-        ));
-        assert_eq!(
-            server.state.lock().unwrap().msgs[&id].wake_attempt_count,
-            0
-        );
-        assert_eq!(
-            server.state.lock().unwrap().notification_subscriptions[&sub].status,
-            "armed"
-        );
-
-        // When agent transitions to idle (state becomes Waiting), wake succeeds.
-        Arc::get_mut(&mut server).unwrap().pane_state_check = |_| crate::server::knock::AgentState::Waiting;
         assert!(super::super::attempt_notification_with_default(
             &server,
             &id,
@@ -804,11 +785,38 @@ mod tests {
             server.state.lock().unwrap().msgs[&id].wake_attempt_count,
             1
         );
+        assert_eq!(
+            server.state.lock().unwrap().notification_subscriptions[&sub].status,
+            "armed"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn unacked_notifications_limit_pauses_wakes_and_resumes_after_ack() {
+    fn unknown_agent_keeps_notification_pending_without_burning_attempt() {
+        let (mut server, root) = test_server();
+        Arc::get_mut(&mut server).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Unknown;
+        register(&server, "unknown-worker");
+        let sub = subscribe(&server, "unknown-worker", "direct-message", None, None);
+        let id = bind_message_with_id(&server, "unknown-worker", &sub, "msg-unknown");
+
+        assert!(!super::super::attempt_notification_with_default(
+            &server,
+            &id,
+            &sub,
+            &|_| true,
+            &|_, _| panic!("unknown agent must not receive a notification"),
+        ));
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs[&id].state, "pending");
+        assert_eq!(state.msgs[&id].wake_attempt_count, 0);
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn delivered_but_unacked_messages_never_pause_new_notifications() {
         let (mut server, root) = test_server();
         Arc::get_mut(&mut server).unwrap().config.notifications.mode = "immediate".into();
         register(&server, "ack-worker");
@@ -841,37 +849,8 @@ mod tests {
             3
         );
 
-        // 4th notification arrives
         let id4 = bind_message_with_id(&server, "ack-worker", &sub, "msg-ack-4");
 
-        // Wake must be paused because unacked limit (3) is reached
-        assert!(!super::super::attempt_notification_with_default(
-            &server,
-            &id4,
-            &sub,
-            &|_| true,
-            &|_, _| panic!("should not deliver when unacked limit reached"),
-        ));
-        assert_eq!(
-            server.state.lock().unwrap().msgs[&id4].wake_attempt_count,
-            0
-        );
-
-        // Worker ACKs delivered messages (self-corrects)
-        server.commit(&[Event::Acked { ids: msg_ids }]);
-        assert_eq!(
-            server
-                .state
-                .lock()
-                .unwrap()
-                .msgs
-                .values()
-                .filter(|m| m.to == "ack-worker" && m.state == "delivered")
-                .count(),
-            0
-        );
-
-        // Now 4th message can be delivered successfully
         assert!(super::super::attempt_notification_with_default(
             &server,
             &id4,
@@ -883,11 +862,36 @@ mod tests {
             server.state.lock().unwrap().msgs[&id4].wake_attempt_count,
             1
         );
+
+        server.commit(&[Event::Acked { ids: msg_ids }]);
+        assert_eq!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .msgs
+                .values()
+                .filter(|m| m.to == "ack-worker" && m.state == "delivered")
+                .count(),
+            1
+        );
+
+        assert!(!super::super::attempt_notification_with_default(
+            &server,
+            &id4,
+            &sub,
+            &|_| true,
+            &|_, _| panic!("already delivered message must not replay"),
+        ));
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&id4].wake_attempt_count,
+            1
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn backlog_batch_capped_to_prevent_terminal_pollution() {
+    fn backlog_sends_latest_three_once_and_truncates_to_1024_chars() {
         let (server, root) = test_server();
         register(&server, "batch-worker");
         let sub = subscribe(&server, "batch-worker", "direct-message", None, None);
@@ -896,6 +900,14 @@ mod tests {
         for i in 0..5 {
             let _ = bind_message_with_id(&server, "batch-worker", &sub, &format!("msg-batch-{i}"));
         }
+        server
+            .state
+            .lock()
+            .unwrap()
+            .msgs
+            .get_mut("msg-batch-4")
+            .unwrap()
+            .body = "界".repeat(2_000);
 
         let first_id = "msg-batch-0";
         let delivered_text = std::sync::Mutex::new(String::new());
@@ -911,11 +923,14 @@ mod tests {
         ));
 
         let text = delivered_text.lock().unwrap().clone();
-        // Must cap at 3 messages in one knock, with [+2 more pending] indicator
-        assert!(text.contains("[+2 more pending in inbox"));
-        assert!(text.contains("[ACK REQUIRED:"));
+        assert_eq!(text.chars().count(), 1024);
+        assert!(!text.contains("msg-batch-0"));
+        assert!(!text.contains("msg-batch-1"));
+        assert!(text.contains("msg-batch-2"));
+        assert!(text.contains("msg-batch-3"));
+        assert!(text.contains("msg-batch-4"));
+        assert!(text.ends_with("… [truncated; run collab inbox]"));
 
-        // Exactly 3 messages were delivered, 2 remain pending
         let state = server.state.lock().unwrap();
         let delivered_count = state
             .msgs
@@ -929,7 +944,21 @@ mod tests {
             .count();
         assert_eq!(delivered_count, 3);
         assert_eq!(pending_count, 2);
+        assert_eq!(state.msgs["msg-batch-0"].state, "pending");
+        assert_eq!(state.msgs["msg-batch-1"].state, "pending");
+        assert_eq!(state.msgs["msg-batch-0"].wake_attempt_count, 1);
+        assert_eq!(state.msgs["msg-batch-1"].wake_attempt_count, 1);
+        assert_eq!(state.msgs["msg-batch-2"].state, "delivered");
+        assert_eq!(state.msgs["msg-batch-3"].state, "delivered");
+        assert_eq!(state.msgs["msg-batch-4"].state, "delivered");
         drop(state);
+        assert!(!super::super::attempt_notification_with_default(
+            &server,
+            "msg-batch-0",
+            &sub,
+            &|_| true,
+            &|_, _| panic!("older backlog must not be pushed later"),
+        ));
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -1355,7 +1355,8 @@ pub(crate) fn handle_register(
                     "identity_kind": "peer",
                     "runtime": runtime,
                     "recovered": true,
-                    "identity_source": "tmux_session"
+                    "identity_source": "tmux_session",
+                    "role_brief": role_brief(&st, &worker_id)
                 }));
             }
             return Resp::err(format!(
@@ -1392,7 +1393,13 @@ pub(crate) fn handle_register(
         }
         server.commit_locked(&mut st, &events);
         return Resp::data(
-            json!({"worker_id": worker_id, "identity_kind": "peer", "runtime": runtime, "reused": true}),
+            json!({
+                "worker_id": worker_id,
+                "identity_kind": "peer",
+                "runtime": runtime,
+                "reused": true,
+                "role_brief": role_brief(&st, &worker_id)
+            }),
         );
     }
     let rec = WorkerRec {
@@ -1418,8 +1425,50 @@ pub(crate) fn handle_register(
         "worker_id": worker_id,
         "identity_kind": "peer",
         "runtime": runtime,
-        "registered_at": iso(rec.registered_ms)
+        "registered_at": iso(rec.registered_ms),
+        "role_brief": role_brief(&st, &worker_id)
     }))
+}
+
+fn role_brief(state: &State, worker_id: &str) -> serde_json::Value {
+    if state.master_worker_id.as_deref() == Some(worker_id) {
+        return json!({
+            "role": "master",
+            "role_task": "Orchestrate the project; implementation is not your primary job.",
+            "responsibilities": [
+                "Run `appsdk longhorizon show` to reconstruct goal, tasks, workers, blockers, and bugs.",
+                "Split work into independent scopes; assign tasks and resources; keep useful worker capacity loaded.",
+                "Own worker blockers: investigate, unblock, reassign, or close. Do not wait for someone else.",
+                "Drive test, verification, commit, merge, worktree cleanup, and task closure.",
+                "Continue under the standing goal without waiting for user input; hold wakes only for a true external approval or dependency gate."
+            ],
+            "notification_rule": "A notification is an interrupt, not completion. Do its P0/P1/P2 action, then resume scheduling; never stop on ACK/read/summary."
+        });
+    }
+    if is_managed_subagent(state, worker_id) {
+        return json!({
+            "role": "managed-subagent",
+            "role_task": "Execute the assigned independent task and return evidence to parent/master.",
+            "responsibilities": [
+                "Stay inside the assigned task, worktree, file scope, delivery conditions, and tests.",
+                "Accept and execute master/parent instructions for this assignment; do not create a global schedule.",
+                "On trouble, investigate first. Send root cause, attempted actions, proposed fix, and any required decision to the live master; copy parent when different.",
+                "Complete implementation, tests, commit, delivery evidence, and resource cleanup; do not stop at code-written or ACK."
+            ],
+            "notification_rule": "Handle the named priority action, then resume your assigned task. Reading or ACK is never task progress."
+        });
+    }
+    json!({
+        "role": "worker",
+        "role_task": "Own and complete your independent task; collaborate with the master without abandoning existing ownership.",
+        "responsibilities": [
+            "Execute your registered task end to end within its worktree and file scope: implement, test, commit, deliver evidence, and close resources.",
+            "Evaluate master collaboration requests against current ownership and capacity. Accept ready non-conflicting work; decline or negotiate conflicts explicitly instead of silently ignoring them.",
+            "On trouble, investigate first. Report root cause, attempted actions, proposed fix, and the exact decision needed to the live master.",
+            "Do not wait passively and do not stop on ACK/read/summary; after handling a notification, resume your current task."
+        ],
+        "notification_rule": "P0 preempts P1, P1 preempts P2. Higher priority interrupts but does not cancel your owned task."
+    })
 }
 
 pub(crate) fn live_master_id(server: &Server, state: &State) -> Option<String> {
@@ -1497,7 +1546,11 @@ fn handle_master_promote(
             assigned_ms: now_ms(),
         }],
     );
-    Resp::data(json!({"master": worker_id, "mode": "user_approved_self_promotion"}))
+    Resp::data(json!({
+        "master": worker_id,
+        "mode": "user_approved_self_promotion",
+        "role_brief": role_brief(&state, &worker_id)
+    }))
 }
 
 fn handle_master_delegate(
@@ -1529,7 +1582,11 @@ fn handle_master_delegate(
             assigned_ms: now_ms(),
         }],
     );
-    Resp::data(json!({"master": target_id, "delegated_by": worker_id}))
+    Resp::data(json!({
+        "master": target_id,
+        "delegated_by": worker_id,
+        "role_brief": role_brief(&state, &target_id)
+    }))
 }
 
 fn handle_worker_close(

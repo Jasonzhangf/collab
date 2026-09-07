@@ -288,7 +288,6 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
 }
 
 #[test]
-#[test]
 fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
     let (server, root) = test_server();
     register(&server, "peer-a", "%a");
@@ -409,8 +408,13 @@ fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
 #[test]
 fn master_promotion_requires_user_approval_and_existing_master_delegates() {
     let (server, root) = test_server();
-    register(&server, "peer-a", "%a");
+    let worker_registration = register(&server, "peer-a", "%a");
     register(&server, "peer-b", "%b");
+    assert_eq!(worker_registration.data["role_brief"]["role"], "worker");
+    assert!(worker_registration.data["role_brief"]["role_task"]
+        .as_str()
+        .unwrap()
+        .contains("independent task"));
 
     let missing =
         super::handle_master_promote(&server, "peer-a".into(), "token-peer-a".into(), "".into());
@@ -425,6 +429,12 @@ fn master_promotion_requires_user_approval_and_existing_master_delegates() {
     );
     assert!(promoted.ok, "{}", promoted.error.unwrap_or_default());
     assert_eq!(promoted.data["mode"], "user_approved_self_promotion");
+    assert_eq!(promoted.data["role_brief"]["role"], "master");
+    assert!(promoted.data["role_brief"]["responsibilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| line.as_str().unwrap().contains("assign tasks")));
     let context = handle_context(&server, "peer-a".into(), "token-peer-a".into());
     assert_eq!(context.data["master"]["worker_id"], "peer-a");
     let status = super::handle_master_status(&server);

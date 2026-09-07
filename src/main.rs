@@ -368,9 +368,9 @@ fn out<T: serde::Serialize>(v: &T) {
 }
 
 /// Register an identity with the server (idempotent for the same token).
-fn register(scope: &Scope, ident: &Identity) -> anyhow::Result<()> {
+fn register(scope: &Scope, ident: &Identity) -> anyhow::Result<serde_json::Value> {
     let cwd = scope.root.display().to_string();
-    let _: serde_json::Value = client::call(
+    client::call(
         &scope.sock_path(),
         &Req::Register {
             worker_id: ident.worker_id.clone(),
@@ -378,15 +378,14 @@ fn register(scope: &Scope, ident: &Identity) -> anyhow::Result<()> {
             pane: ident.pane.clone(),
             cwd,
         },
-    )?;
-    Ok(())
+    )
 }
 
 /// Identity bootstrap used by every command that acts as a worker.
 fn me(scope: &Scope, worker: Option<String>) -> anyhow::Result<Identity> {
     let worker = worker.or_else(|| std::env::var("COLLAB_WORKER").ok());
     let ident = identity::load_or_create(scope, worker, None)?;
-    register(scope, &ident)?;
+    let _ = register(scope, &ident)?;
     Ok(ident)
 }
 
@@ -465,7 +464,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let scope = Scope { root: project_root };
             let started = !client::alive(&scope.sock_path());
             client::ensure_server(&scope.sock_path())?;
-            let ident = me(&scope, None)?;
+            let ident = identity::load_or_create(&scope, None, None)?;
+            let registration = register(&scope, &ident)?;
             let task_board: serde_json::Value =
                 client::call(&scope.sock_path(), &Req::TaskStatus { task_id: None })?;
             out(&json!({
@@ -474,6 +474,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 "worker_id": ident.worker_id,
                 "identity_kind": "peer",
                 "daemon_started": started,
+                "role_brief": registration["role_brief"],
                 "task_board": task_board["tasks"],
                 "recovery_action": "inspect your own tasks, conflicts, and inbox through collab context"
             }));
@@ -743,8 +744,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Whoami { worker, pane } => {
             let scope = Scope::resolve()?;
             let ident = identity::load_or_create(&scope, worker, pane)?;
-            register(&scope, &ident)?;
-            out(&ident);
+            let registration = register(&scope, &ident)?;
+            let mut response = serde_json::to_value(&ident)?;
+            response["role_brief"] = registration["role_brief"].clone();
+            out(&response);
             Ok(())
         }
         Cmd::Send {

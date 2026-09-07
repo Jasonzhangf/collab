@@ -97,6 +97,22 @@ does not close the bug.
 Keep Collab enabled. At multi-worker startup, run official `collab init` once
 in the inherited live peer environment unless AppSDK already initialized it.
 This registers the peer and default finite direct-message subscription.
+Registration also returns `role_brief`. Read it as the active operating
+contract:
+
+- `master`: dispatch and allocate resources, keep workers loaded, own blockers,
+  and drive verify/merge/cleanup/close. Implementation is not the primary job.
+- `worker`: complete the independently owned task end to end, evaluate master
+  collaboration requests against current ownership/capacity, and explicitly
+  accept or negotiate rather than ignore.
+- `managed-subagent`: execute the assigned scoped task, obey master/parent for
+  that assignment, and return root-cause/evidence rather than build a global
+  schedule.
+
+On trouble, every non-master investigates first and reports the live master:
+root cause, attempted actions, proposed fix, and exact decision needed. A role
+change via `master promote` or `master delegate` returns the new master brief;
+the old worker brief no longer governs that peer.
 Once task scope and the independent worktree are known, automatically follow
 [task/worktree registration](references/task-worktree-lifecycle.md): bind the
 task, feature/resource and owned file scope before concurrent product edits.
