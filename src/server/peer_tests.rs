@@ -631,6 +631,63 @@ fn daemon_replay_restores_default_lease_for_registered_peer() {
 }
 
 #[test]
+fn daemon_restart_rebinds_stale_pane_before_restoring_default_lease() {
+    let mut state = State::default();
+    state.apply(&Event::Registered {
+        worker: WorkerRec {
+            id: "peer".into(),
+            token: "token-peer".into(),
+            pane: Some("%stale".into()),
+            cwd: "/tmp".into(),
+            registered_ms: 1,
+        },
+    });
+
+    let events = registered_peer_rebind_events(
+        &state,
+        &|worker| (worker == "peer").then(|| "%current".into()),
+        &|worker, pane| worker == "peer" && pane == "%current",
+    );
+    assert_eq!(events.len(), 1);
+    for event in events {
+        state.apply(&event);
+    }
+    assert_eq!(state.workers["peer"].pane.as_deref(), Some("%current"));
+
+    let lease_events = registered_peer_default_events(&state, 10_000, &|worker, pane| {
+        worker == "peer" && pane == "%current"
+    });
+    assert!(lease_events.iter().any(|event| matches!(
+        event,
+        Event::NotificationSubscribed { subscription }
+            if subscription.worker_id == "peer" && subscription.pane == "%current"
+    )));
+}
+
+#[test]
+fn daemon_restart_does_not_guess_between_multiple_or_unowned_panes() {
+    let mut state = State::default();
+    state.apply(&Event::Registered {
+        worker: WorkerRec {
+            id: "peer".into(),
+            token: "token-peer".into(),
+            pane: Some("%stale".into()),
+            cwd: "/tmp".into(),
+            registered_ms: 1,
+        },
+    });
+
+    assert!(registered_peer_rebind_events(&state, &|_| None, &|_, _| true).is_empty());
+    assert!(registered_peer_rebind_events(
+        &state,
+        &|_| Some("%foreign".into()),
+        &|_, _| false,
+    )
+    .is_empty());
+    assert_eq!(state.workers["peer"].pane.as_deref(), Some("%stale"));
+}
+
+#[test]
 fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
     let mut state = State::default();
     for event in default_direct_message_events(&state, "peer", "%one", 1000) {

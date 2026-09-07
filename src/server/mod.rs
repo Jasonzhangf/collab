@@ -355,7 +355,45 @@ fn registered_peer_default_events(
         .collect()
 }
 
+fn registered_peer_rebind_events(
+    state: &State,
+    pane_for_worker: &dyn Fn(&str) -> Option<String>,
+    owns_pane: &dyn Fn(&str, &str) -> bool,
+) -> Vec<Event> {
+    state
+        .workers
+        .values()
+        .filter_map(|worker| {
+            if worker
+                .pane
+                .as_deref()
+                .is_some_and(|pane| owns_pane(&worker.id, pane))
+            {
+                return None;
+            }
+            let pane = pane_for_worker(&worker.id)?;
+            if !owns_pane(&worker.id, &pane) {
+                return None;
+            }
+            let mut rebound = worker.clone();
+            rebound.pane = Some(pane);
+            Some(Event::Registered { worker: rebound })
+        })
+        .collect()
+}
+
 fn restore_registered_peer_default_leases(server: &Server) {
+    let rebind_events = {
+        let state = server.state.lock().unwrap();
+        registered_peer_rebind_events(
+            &state,
+            &tmux_pane_for_session,
+            &|worker_id, pane| tmux_session_for_pane(pane).as_deref() == Some(worker_id),
+        )
+    };
+    if !rebind_events.is_empty() {
+        server.commit(&rebind_events);
+    }
     let events = {
         let state = server.state.lock().unwrap();
         registered_peer_default_events(&state, now_ms(), &|worker_id, pane| {
@@ -1945,6 +1983,25 @@ fn tmux_session_for_pane(pane: &str) -> Option<String> {
     }
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!name.is_empty()).then_some(name)
+}
+
+fn tmux_pane_for_session(session: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{session_name}\t#{pane_id}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let output = String::from_utf8_lossy(&output.stdout);
+    let mut panes = output
+        .lines()
+        .filter_map(|line| {
+            let (name, pane) = line.split_once('\t')?;
+            (name == session && pane.starts_with('%')).then(|| pane.to_owned())
+        });
+    let pane = panes.next()?;
+    panes.next().is_none().then_some(pane)
 }
 
 /// A peer owns its tmux pane only when the live session name matches the
