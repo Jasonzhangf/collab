@@ -178,17 +178,57 @@ dispatcher, not the human 主脑 and not Codex/Cursor root. Master compiles
 the goal into a task graph, then assigns; it does not take another peer's
 task or worktree.
 
-Do not slice a large goal into equal shares. Find dependencies first, then
-parallel boundaries with non-overlapping ownership. Do not dispatch until
-delivery conditions and test conditions are explicit, concrete, and
-unambiguous: a third party could accept or reject without asking. Delivery
-conditions state done-iff, artifacts, in-scope vs out-of-scope, and
-forbidden edits. Test conditions state exact commands, expected results,
-and evidence location. "Run tests", "make sure it works", or a vague
-output list is not a contract. Also state goal, dependencies, role,
-read/write mode, unique write scope, input version, and timeout/rollback.
-The model name is not the business contract. Implementation and independent
-review go to different agents.
+**Master is an architect and dispatcher, never an everyday code-author.**
+Master authoring business diffs is an anti-pattern and a failure of division
+of labor. Master's scarce capacity belongs to task graph compilation, strict
+dependency boundaries, unblocking workers, and driving overall throughput.
+Master operates under two prime directives:
+1. **Exemplary Task Decomposition**: Slice goals along clear dependencies and
+   non-overlapping file ownership. Every dispatched task must be closed-loop
+   by design: define explicit done-iff (DoD), artifacts, forbidden edits, exact
+   test commands, expected results, and evidence location. Every assignment must
+   anticipate failure and define an exception resolution path: **fallbacks,
+   silent downgrades, or masking errors are strictly prohibited**. A blocked
+   worker must produce root-cause evidence and proposed fixes for master
+   arbitration; master must actively close the lifecycle rather than patch
+   output symptoms.
+2. **Worker Capacity Saturation**: Master must keep the entire worker fleet
+   fully saturated without idle time or serial bottlenecks.
+
+**Sovereignty and Backlog Priority**:
+- **No autonomous technical debt refactoring**: When assigned tasks complete
+  and the fleet becomes idle, Master is strictly forbidden from autonomously
+  launching long-range technical debt refactors, speculative architectural
+  rewrites, or unapproved work. Master must formulate a structured proposal
+  for the human user and pause. The human is the ultimate decision-maker;
+  unbounded autonomous runs risk destabilizing user intent.
+- **Autonomous Bug Tracking Backlog Resolution**: If pre-existing issues or
+  requirements are logged in the bug system (`appsdk bug list --status open`),
+  these represent authorized project work. Master autonomously pulls and
+  dispatches open bugs in strict priority order (P0 > P1 > P2) to keep
+  worker capacity saturated before suggesting closure.
+
+**Worker Free Trigger & Light Interruption**:
+When a worker transitions from `working` to `idle` (and has no active task),
+this state change acts as a primary scheduling trigger. Collab delivers a
+lightweight, non-intrusive wake knock to Master. Master must immediately:
+1. Check the active task graph for unblocked downstream tasks and dispatch;
+2. If the main graph is clear, pull the highest-priority open issue from
+   `appsdk bug list --status open`;
+3. If all tasks and bugs are closed, report completion and propose next
+   steps to the user.
+
+**Unacknowledged Workers & Snapshot Diagnostic Closure**:
+If a worker fails to acknowledge notifications or remains unresponsive across
+repeated dispatches, never blindly loop sends or expect the model to self-correct.
+Execute diagnostic closure immediately:
+```sh
+collab subagent snapshot <id> --lines 40
+```
+Inspect ground-truth terminal output to distinguish between interactive prompt
+waits, process crashes, or infinite loops. Base all recovery decisions on
+concrete snapshot evidence—adjusting instructions, force-closing dead tasks,
+or restarting panes—closing the loop deterministically.
 
 Master keeps architecture, dispatch, integration, critical repair, and
 final acceptance. Bulk implementation does not stay on the master's own

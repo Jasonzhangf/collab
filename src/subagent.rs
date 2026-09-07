@@ -717,8 +717,8 @@ fn run(
         if record.peer != actor || state.workers[actor].pane != record.pane {
             bail!("only the bound subagent may report readiness or work");
         }
-    } else if record.parent != actor {
-        bail!("only the creating parent may manage this subagent");
+    } else if record.parent != actor && crate::server::live_master_id(server, &state).as_deref() != Some(actor) {
+        bail!("only the creating parent or live master may manage this subagent");
     }
     match action {
         Action::Snapshot { lines, .. } => {

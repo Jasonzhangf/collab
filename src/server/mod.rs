@@ -1213,7 +1213,7 @@ pub(crate) fn handle_register(
     }))
 }
 
-fn live_master_id(server: &Server, state: &State) -> Option<String> {
+pub(crate) fn live_master_id(server: &Server, state: &State) -> Option<String> {
     let worker_id = state.master_worker_id.as_deref()?;
     let worker = state.workers.get(worker_id)?;
     let pane = worker.pane.as_deref()?;
@@ -1416,15 +1416,12 @@ pub(crate) fn handle_send_with_task(
     {
         return Resp::err("managed task requires an authorized assigned subagent");
     }
-    let Some(sender) = st.workers.get(&from) else {
-        return Resp::err(format!("sender {} not registered", from));
-    };
+    if from.trim().is_empty() {
+        return Resp::err("sender cannot be empty");
+    }
     let Some(recipient) = st.workers.get(&to) else {
         return Resp::err(format!("recipient {} not registered", to));
     };
-    if runtime_for_pane(sender.pane.as_deref()).is_none() {
-        return Resp::err("sender has no valid tmux pane");
-    }
     if runtime_for_pane(recipient.pane.as_deref()).is_none() {
         return Resp::err("recipient has no valid tmux pane");
     }
@@ -2555,6 +2552,15 @@ fn worker_status_summary(server: &Server, st: &State, w: &WorkerRec) -> serde_js
     } else {
         agent_state
     };
+    let diagnostic = if status == "lost" {
+        Some("pane dead or not found; clean up task or restart pane")
+    } else if status == "identity-mismatch" {
+        Some("pane re-bound or owned by different process; verify pane ownership")
+    } else if suspected_offline || notifications_paused {
+        Some("unresponsive or unacked; run snapshot: collab subagent snapshot <id> --lines 40")
+    } else {
+        None
+    };
     json!({
         "id": w.id,
         "pane": w.pane,
@@ -2567,6 +2573,7 @@ fn worker_status_summary(server: &Server, st: &State, w: &WorkerRec) -> serde_js
         "notifications_paused": notifications_paused,
         "unacked_keepalives": unacked_keepalives,
         "suspected_offline": suspected_offline,
+        "diagnostic": diagnostic,
         "active_task": active.map(|task| task.id.as_str()),
         "active_status": active.map(|task| task.status.as_str()),
     })

@@ -89,6 +89,9 @@ enum Cmd {
     /// Send a message to another worker
     #[command(alias = "sendmessage")]
     Send {
+        /// Sender identity; defaults to current collab identity, COLLAB_WORKER, or 'operator'
+        #[arg(long)]
+        from: Option<String>,
         #[arg(long)]
         to: String,
         /// Short topic shown in the tmux notification preview
@@ -666,6 +669,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Send {
+            from,
             to,
             subject,
             r#type,
@@ -674,7 +678,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             body,
         } => {
             let scope = Scope::resolve()?;
-            let ident = me(&scope, None)?;
+            let sender_id = if let Some(from_id) = from {
+                from_id
+            } else if let Ok(ident) = me(&scope, None) {
+                ident.worker_id
+            } else if let Ok(worker) = std::env::var("COLLAB_WORKER") {
+                worker
+            } else {
+                "operator".to_string()
+            };
             let body = body.join(" ");
             if body.is_empty() {
                 anyhow::bail!("empty message body");
@@ -682,7 +694,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let v: serde_json::Value = client::call(
                 &scope.sock_path(),
                 &Req::Send {
-                    from: ident.worker_id,
+                    from: sender_id,
                     to,
                     mtype: r#type,
                     subject: Some(subject),
