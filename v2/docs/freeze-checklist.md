@@ -12,6 +12,6 @@
 - [ ] Isolated release install, real tmux, AppSDK compile/review/freeze are verified.
 
 This remains a candidate checklist. It is not a production freeze. Production
-v1 stays installed for zterm, OneStop, RouteCodex, and dsh-plugins until the
+v1 stays installed for downstream projects until the
 candidate has source, contracts, maps, tests, artifact, installation, restart,
 live replay, review, regression, and canonical AppSDK freeze evidence.

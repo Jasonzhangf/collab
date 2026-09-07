@@ -86,8 +86,8 @@ and must not copy, reset, clean, merge, or overwrite another peer's changes.
   existing role-based v2 beta state in place.
 - Replacing or stopping the verified production v1 daemon before the isolated
   v2 artifact passes every gate and an explicit deployment step is reached.
-- Starting, attaching, installing, or exposing a v2 daemon to zterm, OneStop,
-  RouteCodex, or dsh-plugins before full v2 production admission. Those four
+- Starting, attaching, installing, or exposing a v2 daemon to downstream
+  projects before full v2 production admission. Those projects
   projects remain v1-only throughout this milestone.
 - Editing v1 `src/**`, v1 `.agent-collab/**`, another peer's worktree, or
   protected/frozen AppSDK artifacts by hand.
@@ -355,7 +355,7 @@ review and affected evidence.
 - Active v2 worktree conflict: wait or coordinate using durable resource
   occupancy/release; never reset, stash, copy, or clean another peer's files.
 - Production regression: v2 remains isolated until exact-artifact black-box and
-  review pass; zterm, OneStop, RouteCodex, and dsh-plugins remain on verified
+  review pass; downstream projects remain on verified
   v1, and no persistent v2 process may exist before explicit v2 deployment.
 
 ## Definition of done

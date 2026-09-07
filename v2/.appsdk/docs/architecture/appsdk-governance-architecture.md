@@ -49,6 +49,6 @@ Claim + issue
 
 Protected + Git provide traceability, change detection, and recovery. They do not prevent a generic agent sharing the repository shell from reading Protected source. True read prevention requires a separate worktree/container or host mount policy.
 
-## RouteCodex adapter boundary
+## Project adapter boundary
 
-RouteCodex will later provide a project adapter containing its resource, function, mainline, verification, and runtime contracts. AppSDK must not absorb RouteCodex protocol, provider, continuation, tool-governance, or pipeline node semantics.
+Each downstream project provides its own adapter containing resource, function, mainline, verification, and runtime contracts. AppSDK must not absorb project-specific protocol, provider, continuation, tool-governance, or pipeline-node semantics.
