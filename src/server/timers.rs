@@ -128,6 +128,7 @@ fn tick_with_idle(server: &Arc<Server>, is_idle: &dyn Fn(&str) -> bool) {
             &subscription_id,
             is_idle,
             &|pane, text| super::knock_or_log(&server.log_path(), pane, text),
+            &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
         );
     }
 }
@@ -159,6 +160,7 @@ mod tests {
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
                 pane_alive_check: |_| true,
+                pane_owner_check: |_, _| true,
             }),
             root,
         )
@@ -282,9 +284,13 @@ mod tests {
                 .unwrap()
                 .created_ms = now_ms();
             assert_eq!(
-                super::super::attempt_notification_with(&server, &id, &sub, &|_| true, &|_, _| {
-                    true
-                }),
+                super::super::attempt_notification_with_default(
+                    &server,
+                    &id,
+                    &sub,
+                    &|_| true,
+                    &|_, _| { true }
+                ),
                 expected
             );
             assert_eq!(
@@ -329,7 +335,7 @@ mod tests {
         let subscription_id = subscribe(&server, "owner", "resource-released", Some("held"), None);
         let message_id = bind_message(&server, "owner", &subscription_id);
         for _ in 0..4 {
-            super::super::attempt_notification_with(
+            super::super::attempt_notification_with_default(
                 &server,
                 &message_id,
                 &subscription_id,
@@ -357,7 +363,7 @@ mod tests {
         let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
         let message_id = bind_message(&server, "owner", &subscription_id);
         for _ in 0..MAX_WAKE_ATTEMPTS {
-            super::super::attempt_notification_with(
+            super::super::attempt_notification_with_default(
                 &server,
                 &message_id,
                 &subscription_id,
@@ -385,7 +391,7 @@ mod tests {
         let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
         let message_id = bind_message(&server, "owner", &subscription_id);
         for _ in 0..MAX_WAKE_ATTEMPTS {
-            super::super::attempt_notification_with(
+            super::super::attempt_notification_with_default(
                 &server,
                 &message_id,
                 &subscription_id,
@@ -406,9 +412,10 @@ mod tests {
             state: Mutex::new(replayed),
             journal: Mutex::new(journal),
             pane_alive_check: |_| true,
+            pane_owner_check: |_, _| true,
         };
         let sent = std::sync::atomic::AtomicBool::new(false);
-        assert!(!super::super::attempt_notification_with(
+        assert!(!super::super::attempt_notification_with_default(
             &restarted,
             &message_id,
             &subscription_id,
@@ -438,7 +445,7 @@ mod tests {
         register(&server, "owner");
         let subscription_id = subscribe(&server, "owner", "resource-released", Some("held"), None);
         let message_id = bind_message(&server, "owner", &subscription_id);
-        assert!(super::super::attempt_notification_with(
+        assert!(super::super::attempt_notification_with_default(
             &server,
             &message_id,
             &subscription_id,
@@ -461,7 +468,7 @@ mod tests {
         register(&server, "owner");
         let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
         let first_id = bind_message(&server, "owner", &subscription_id);
-        assert!(super::super::attempt_notification_with(
+        assert!(super::super::attempt_notification_with_default(
             &server,
             &first_id,
             &subscription_id,
@@ -491,7 +498,7 @@ mod tests {
                 subscription_id: subscription_id.clone(),
             },
         ]);
-        assert!(!super::super::attempt_notification_with(
+        assert!(!super::super::attempt_notification_with_default(
             &server,
             &second_id,
             &subscription_id,
@@ -513,7 +520,7 @@ mod tests {
             state.msgs.get_mut(&second_id).unwrap().created_ms = now_ms() - 60_001;
             state.msgs.get_mut(&first_id).unwrap().last_wake_attempt_ms = now_ms() - 60_001;
         }
-        assert!(super::super::attempt_notification_with(
+        assert!(super::super::attempt_notification_with_default(
             &server,
             &second_id,
             &subscription_id,
@@ -549,7 +556,7 @@ mod tests {
             },
         ]);
         let calls = std::cell::RefCell::new(Vec::new());
-        assert!(super::super::attempt_notification_with(
+        assert!(super::super::attempt_notification_with_default(
             &server,
             &first,
             &subscription,
@@ -566,7 +573,7 @@ mod tests {
             server.state.lock().unwrap().msgs["second"].state,
             "delivered"
         );
-        assert!(!super::super::attempt_notification_with(
+        assert!(!super::super::attempt_notification_with_default(
             &server,
             &first,
             &subscription,
@@ -590,7 +597,7 @@ mod tests {
             .get_mut(&id)
             .unwrap()
             .created_ms = now_ms();
-        assert!(!super::super::attempt_notification_with(
+        assert!(!super::super::attempt_notification_with_default(
             &server,
             &id,
             &sub,
@@ -605,14 +612,14 @@ mod tests {
             .get_mut(&id)
             .unwrap()
             .created_ms -= 60_001;
-        assert!(!super::super::attempt_notification_with(
+        assert!(!super::super::attempt_notification_with_default(
             &server,
             &id,
             &sub,
             &|_| false,
             &|_, _| panic!("absent delivery")
         ));
-        assert!(!super::super::attempt_notification_with(
+        assert!(!super::super::attempt_notification_with_default(
             &server,
             &id,
             &sub,

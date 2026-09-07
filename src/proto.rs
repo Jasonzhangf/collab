@@ -124,6 +124,8 @@ pub enum Req {
         worker_id: String,
         token: String,
         task_id: String,
+        force: bool,
+        reason: Option<String>,
     },
     TaskDispatch {
         worker_id: String,
