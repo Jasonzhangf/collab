@@ -143,7 +143,7 @@ Do not first run `notify methods`, `notify subscribe --help`, `whoami`, or
 choose `mailbox-only`. There is no separate mailbox-only send mode.
 `sendmessage` always commits the full subject/body to the durable mailbox.
 With a matching live subscription, the first pending message opens a fixed
-60-second window by default. `~/.appsdk/config.toml` can select immediate or
+120-second window by default. `~/.appsdk/config.toml` can select immediate or
 batched delivery globally or per project; `appsdk config` shows effective
 policy. All eligible unsent messages for that recipient are combined
 into one single-line tmux write and one Enter (up to 3 previews per knock, with
@@ -154,7 +154,7 @@ actively working panes defer delivery without burning attempts so in-flight task
 are not polluted. If delivered-but-unconsumed notifications reach the throttle
 threshold (default 3), further push knocks pause until `collab recv` consumes
 them, preventing terminal pollution and storms. Each batch has one attempt;
-the default window is one minute. Policy changes require controlled daemon restart,
+the default window is 120 seconds. Daemon-generated notifications batch in this window; explicit `collab sendmessage` remains immediate. Policy changes require controlled daemon restart,
 not task reset.
 
 Do not retry a failed send automatically. Return its exact error and durable
