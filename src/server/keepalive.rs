@@ -279,10 +279,22 @@ pub(crate) fn tick_with(
             };
             if idle_notification_due && server.config.notifications.enabled {
                 if let Some(master_id) = master_id {
+                    // An armed subscription can still name the master's old
+                    // pane. Validate its current delivery target before the
+                    // idle transition is consumed by Sent/WakeBound.
+                    let subscription = state
+                        .matching_subscription(&master_id, "direct-message", None, now)
+                        .filter(|sub| {
+                            state
+                                .workers
+                                .get(&master_id)
+                                .and_then(|master| master.pane.as_deref())
+                                == Some(sub.pane.as_str())
+                                && (server.pane_alive_check)(&sub.pane)
+                                && (server.pane_owner_check)(&master_id, &sub.pane)
+                        });
                     if master_id == worker.id {
-                        if let Some(sub) =
-                            state.matching_subscription(&worker.id, "direct-message", None, now)
-                        {
+                        if let Some(sub) = subscription {
                             let alert_id = super::gen_msg_id();
                             events.push(Event::Sent {
                                 msg: Message {
@@ -310,9 +322,7 @@ pub(crate) fn tick_with(
                             record.idle_episode_notices =
                                 record.idle_episode_notices.saturating_add(1);
                         }
-                    } else if let Some(sub) =
-                        state.matching_subscription(&master_id, "direct-message", None, now)
-                    {
+                    } else if let Some(sub) = subscription {
                         let alert_id = super::gen_msg_id();
                         events.push(Event::Sent {
                             msg: Message {
@@ -927,6 +937,102 @@ mod tests {
         assert!(state.wake_bindings.contains_key(&notice.id));
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn stale_master_subscription_preserves_episode(observed_worker: &str, managed: bool) {
+        for stale_kind in ["mismatched", "dead", "unowned"] {
+            let (mut server, root, base) = episode_server();
+            if stale_kind == "dead" {
+                server.pane_alive_check = |pane| pane != "%stale";
+            }
+            if stale_kind == "unowned" {
+                server.pane_owner_check = |_, pane| pane != "%stale";
+            }
+            if managed {
+                server.commit(&[Event::SubagentUpdated {
+                    subagent: crate::subagent::Record {
+                        id: "managed".into(),
+                        parent: "master".into(),
+                        peer: "worker".into(),
+                        status: "working".into(),
+                        session: Some("session".into()),
+                        pane: Some("%worker".into()),
+                        profile: None,
+                        created_ms: base,
+                        ready_deadline_ms: base + 90_000,
+                        last_message: None,
+                        error: None,
+                        probe_failures: Vec::new(),
+                        runtime: Some("cursor".into()),
+                    },
+                }]);
+            }
+            let valid = server
+                .state
+                .lock()
+                .unwrap()
+                .matching_subscription("master", "direct-message", None, base)
+                .unwrap()
+                .clone();
+            let mut stale = valid.clone();
+            stale.pane = "%stale".into();
+            server.commit(&[Event::NotificationSubscribed {
+                subscription: stale,
+            }]);
+
+            observe(&server, base, observed_worker, AgentState::Working);
+            observe(&server, base + 1_000, observed_worker, AgentState::Waiting);
+            observe(&server, base + 62_000, observed_worker, AgentState::Waiting);
+            {
+                let state = server.state.lock().unwrap();
+                assert_eq!(
+                    state.msgs.len(),
+                    0,
+                    "{stale_kind} subscription must not create a notice"
+                );
+                assert!(state.wake_bindings.is_empty());
+                let record = &state.keepalives[observed_worker];
+                assert_eq!(
+                    record.idle_episode_notices, 0,
+                    "{stale_kind} subscription cannot consume the episode"
+                );
+                assert!(record.working_seen, "real transition remains pending");
+                assert!(record.notified_state.is_empty());
+            }
+
+            server.commit(&[Event::NotificationSubscribed {
+                subscription: valid.clone(),
+            }]);
+            observe(&server, base + 63_000, observed_worker, AgentState::Waiting);
+            observe(&server, base + 64_000, observed_worker, AgentState::Waiting);
+            let state = server.state.lock().unwrap();
+            assert_eq!(
+                state.msgs.len(),
+                1,
+                "valid subscription recovers the same transition once"
+            );
+            let message = state.msgs.values().next().unwrap();
+            assert_eq!(message.to, "master");
+            assert_eq!(state.wake_bindings.get(&message.id), Some(&valid.id));
+            assert_eq!(state.keepalives[observed_worker].idle_episode_notices, 1);
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn stale_subscription_preserves_worker_idle_until_rebound() {
+        stale_master_subscription_preserves_episode("worker", false);
+    }
+
+    #[test]
+    fn stale_subscription_preserves_master_idle_until_rebound() {
+        stale_master_subscription_preserves_episode("master", false);
+    }
+
+    #[test]
+    fn stale_subscription_preserves_managed_idle_until_rebound() {
+        stale_master_subscription_preserves_episode("worker", true);
     }
 
     #[test]
