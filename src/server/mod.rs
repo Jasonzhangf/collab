@@ -22,7 +22,7 @@ use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
 const MAX_POLL_MS: u64 = 3_600_000;
-const TASK_STATUSES: [&str; 11] = [
+const TASK_STATUSES: [&str; 12] = [
     "assigned",
     "working",
     "blocked",
@@ -30,6 +30,7 @@ const TASK_STATUSES: [&str; 11] = [
     "verifying",
     "reviewed",
     "delivered",
+    "accepted",
     "rework",
     "merged",
     "closed",
@@ -84,7 +85,14 @@ fn validate_worktree_path(root: &Path, raw: &str) -> Result<(), String> {
 fn task_claim_held(status: &str) -> bool {
     matches!(
         status,
-        "working" | "blocked" | "verifying" | "reviewed" | "delivered" | "rework" | "merged"
+        "working"
+            | "blocked"
+            | "verifying"
+            | "reviewed"
+            | "delivered"
+            | "accepted"
+            | "rework"
+            | "merged"
     )
 }
 
@@ -100,7 +108,8 @@ fn task_transition_allowed(current: &str, next: &str) -> bool {
                 )
                 | ("reviewed", "blocked" | "rework" | "cancelled")
                 | ("rework", "working" | "blocked" | "verifying" | "cancelled")
-                | ("delivered", "rework" | "merged" | "cancelled")
+                | ("delivered", "accepted" | "rework" | "cancelled")
+                | ("accepted", "merged" | "rework" | "cancelled")
         )
 }
 
@@ -2921,6 +2930,11 @@ fn handle_task_update(
                 "use collab task deliver to complete a claim; direct status mutation is rejected",
             );
         }
+        if matches!(new_status.as_str(), "accepted" | "merged") {
+            return Resp::err(
+                "use collab task review/integrated for integration-owned lifecycle transitions",
+            );
+        }
         if new_status == "waiting" {
             return Resp::err("use collab task wait so responsibility and deadline are durable");
         }
@@ -3170,14 +3184,27 @@ fn handle_task_deliver(
     {
         return Resp::err("task deliver --worktree must match the registered task worktree");
     }
+    let now = now_ms();
     task.status = "delivered".to_string();
     task.wait = None;
     task.next_step = Some(
-        "sync latest main, verify the exact candidate, integrate to main, then mark merged"
+        "task owner or live master reviews delivery with collab task review --accept or --rework"
             .to_string(),
     );
-    task.updated_ms = now_ms();
-    server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
+    task.updated_ms = now;
+    let mut lifecycle = st.task_lifecycle.get(&task.id).cloned().unwrap_or_default();
+    lifecycle.delivery_evidence = Some(evidence.clone());
+    lifecycle.delivered_ms = Some(now);
+    server.commit_locked(
+        &mut st,
+        &[
+            Event::TaskUpdated { task: task.clone() },
+            Event::TaskLifecycleUpdated {
+                task_id: task.id.clone(),
+                record: lifecycle,
+            },
+        ],
+    );
 
     Resp::data(json!({
         "delivered": task.id,
@@ -3187,6 +3214,193 @@ fn handle_task_deliver(
         "notification": "none",
         "next_action": task.next_step,
         "identity": {"worker_id": worker.id, "kind": "peer"},
+    }))
+}
+
+fn task_integration_authorized(
+    server: &Server,
+    state: &State,
+    task: &TaskRec,
+    worker_id: &str,
+) -> bool {
+    task.owner == worker_id
+        || live_master_id(server, state).ok().flatten().as_deref() == Some(worker_id)
+}
+
+fn resolve_authoritative_main_head(root: &Path) -> Result<String, Resp> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--verify", "refs/heads/main^{commit}"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if head.is_empty() {
+                Err(Resp::err_data(
+                    "TASK_INTEGRATION_MAIN_UNRESOLVED",
+                    json!({"root": root, "ref": "refs/heads/main"}),
+                ))
+            } else {
+                Ok(head)
+            }
+        }
+        Ok(output) => {
+            let dirty = Command::new("git")
+                .current_dir(root)
+                .args(["status", "--porcelain", "--untracked-files=all"])
+                .output()
+                .map(|status| status.status.success() && !status.stdout.is_empty())
+                .unwrap_or(false);
+            Err(Resp::err_data(
+                "TASK_INTEGRATION_MAIN_UNRESOLVED",
+                json!({
+                    "root": root,
+                    "dirty": dirty,
+                    "ref": "refs/heads/main",
+                    "detail": String::from_utf8_lossy(&output.stderr).trim(),
+                }),
+            ))
+        }
+        Err(error) => Err(Resp::err_data(
+            "TASK_INTEGRATION_MAIN_UNRESOLVED",
+            json!({"root": root, "ref": "refs/heads/main", "detail": error.to_string()}),
+        )),
+    }
+}
+
+fn handle_task_review(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    task_id: String,
+    accept: bool,
+    rework: bool,
+    evidence: String,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    if let Err(error) = verify(&st, &worker_id, &token) {
+        return error;
+    }
+    if accept == rework {
+        return Resp::err("task review requires exactly one of --accept or --rework");
+    }
+    let evidence = evidence.trim();
+    if evidence.is_empty() {
+        return Resp::err("task review requires non-empty --evidence");
+    }
+    let Some(task) = st.tasks.get(&task_id).cloned() else {
+        return Resp::err(format!("task {} not found", task_id));
+    };
+    if task.status != "delivered" {
+        return Resp::err(format!(
+            "task {} must be delivered before review (current: {})",
+            task_id, task.status
+        ));
+    }
+    if !task_integration_authorized(server, &st, &task, &worker_id) {
+        return Resp::err("task review requires task owner or live master authority");
+    }
+    let now = now_ms();
+    let mut reviewed = task;
+    reviewed.status = if accept { "accepted" } else { "rework" }.into();
+    reviewed.next_step = Some(if accept {
+        "integrate the accepted candidate on refs/heads/main, then record collab task integrated"
+            .into()
+    } else {
+        format!("address review evidence: {evidence}")
+    });
+    reviewed.updated_ms = now;
+    let mut lifecycle = st.task_lifecycle.get(&task_id).cloned().unwrap_or_default();
+    lifecycle.review_evidence = Some(evidence.to_owned());
+    lifecycle.reviewer = Some(worker_id.clone());
+    lifecycle.reviewed_ms = Some(now);
+    server.commit_locked(
+        &mut st,
+        &[
+            Event::TaskUpdated {
+                task: reviewed.clone(),
+            },
+            Event::TaskLifecycleUpdated {
+                task_id: task_id.clone(),
+                record: lifecycle,
+            },
+        ],
+    );
+    Resp::data(json!({
+        "task": task_id,
+        "status": reviewed.status,
+        "reviewer": worker_id,
+        "evidence": evidence,
+        "next_action": reviewed.next_step,
+    }))
+}
+
+fn handle_task_integrated(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    task_id: String,
+    commit: String,
+    evidence: String,
+) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    if let Err(error) = verify(&st, &worker_id, &token) {
+        return error;
+    }
+    let commit = commit.trim();
+    let evidence = evidence.trim();
+    if commit.is_empty() || evidence.is_empty() {
+        return Resp::err("task integrated requires non-empty --commit and --evidence");
+    }
+    let Some(task) = st.tasks.get(&task_id).cloned() else {
+        return Resp::err(format!("task {} not found", task_id));
+    };
+    if task.status != "accepted" {
+        return Resp::err(format!(
+            "task {} must be accepted before integration (current: {})",
+            task_id, task.status
+        ));
+    }
+    if !task_integration_authorized(server, &st, &task, &worker_id) {
+        return Resp::err("task integrated requires task owner or live master authority");
+    }
+    let head = match resolve_authoritative_main_head(&server.root) {
+        Ok(head) => head,
+        Err(error) => return error,
+    };
+    if commit != head {
+        return Resp::err_data(
+            "TASK_INTEGRATION_COMMIT_MISMATCH",
+            json!({"provided": commit, "main_head": head}),
+        );
+    }
+    let now = now_ms();
+    let mut integrated = task;
+    integrated.status = "merged".into();
+    integrated.next_step = Some("owner cleans the worktree/branch and closes the task".into());
+    integrated.updated_ms = now;
+    let mut lifecycle = st.task_lifecycle.get(&task_id).cloned().unwrap_or_default();
+    lifecycle.integration_commit = Some(commit.to_owned());
+    lifecycle.integration_evidence = Some(evidence.to_owned());
+    lifecycle.integrated_ms = Some(now);
+    server.commit_locked(
+        &mut st,
+        &[
+            Event::TaskUpdated {
+                task: integrated.clone(),
+            },
+            Event::TaskLifecycleUpdated {
+                task_id: task_id.clone(),
+                record: lifecycle,
+            },
+        ],
+    );
+    Resp::data(json!({
+        "task": task_id,
+        "status": integrated.status,
+        "commit": commit,
+        "evidence": evidence,
+        "next_action": integrated.next_step,
     }))
 }
 
@@ -3491,6 +3705,7 @@ fn handle_task_close(
 fn task_view(state: &State, task: &TaskRec) -> serde_json::Value {
     let cleanup_required = task.worktree_path.is_some();
     let cleanup_receipt = state.cleanup_receipts.get(&task.id);
+    let lifecycle = state.task_lifecycle.get(&task.id);
     json!({
         "id": task.id,
         "owner": task.owner,
@@ -3503,6 +3718,20 @@ fn task_view(state: &State, task: &TaskRec) -> serde_json::Value {
         "status": task.status,
         "next_step": task.next_step,
         "wait": task.wait,
+        "delivery": {
+            "evidence": lifecycle.and_then(|record| record.delivery_evidence.clone()),
+            "at": lifecycle.and_then(|record| record.delivered_ms.map(iso)),
+        },
+        "review": {
+            "evidence": lifecycle.and_then(|record| record.review_evidence.clone()),
+            "reviewer": lifecycle.and_then(|record| record.reviewer.clone()),
+            "at": lifecycle.and_then(|record| record.reviewed_ms.map(iso)),
+        },
+        "integration": {
+            "commit": lifecycle.and_then(|record| record.integration_commit.clone()),
+            "evidence": lifecycle.and_then(|record| record.integration_evidence.clone()),
+            "at": lifecycle.and_then(|record| record.integrated_ms.map(iso)),
+        },
         "cleanup": {
             "required": cleanup_required,
             "status": if !cleanup_required {
@@ -3668,7 +3897,7 @@ fn handle_task_wait(
     }
     if matches!(
         task.status.as_str(),
-        "delivered" | "merged" | "closed" | "cancelled"
+        "delivered" | "accepted" | "merged" | "closed" | "cancelled"
     ) {
         return Resp::err("terminal or delivered task may not enter waiting");
     }
@@ -3827,6 +4056,8 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::TaskClaim { .. }
         | Req::TaskWait { .. }
         | Req::TaskDeliver { .. }
+        | Req::TaskReview { .. }
+        | Req::TaskIntegrated { .. }
         | Req::TaskClose { .. }
         | Req::TaskDispatch { .. }
         | Req::MigrationPlan { .. }
@@ -4174,6 +4405,21 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             evidence,
             worktree,
         } => handle_task_deliver(server, worker_id, token, task_id, evidence, worktree),
+        Req::TaskReview {
+            worker_id,
+            token,
+            task_id,
+            accept,
+            rework,
+            evidence,
+        } => handle_task_review(server, worker_id, token, task_id, accept, rework, evidence),
+        Req::TaskIntegrated {
+            worker_id,
+            token,
+            task_id,
+            commit,
+            evidence,
+        } => handle_task_integrated(server, worker_id, token, task_id, commit, evidence),
         Req::TaskClose {
             worker_id,
             token,

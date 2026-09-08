@@ -302,7 +302,7 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
 
 ```
 working -> verifying -> reviewed -> delivered
-        -> owner sync/verify/integrate -> merged -> cleanup_pending
+        -> accepted -> integrated/merged -> cleanup_pending
         -> cleanup_verified -> closed
         -> rework -> working
 blocked -> bounded waiting -> resource release/timeout -> owner recheck
@@ -311,7 +311,8 @@ blocked -> bounded waiting -> resource release/timeout -> owner recheck
 Task records use a fixed shape:
 `id / owner / feature_id / worktree_path / branch / base_commit / priority /
  status`. Normal statuses are `working`, `blocked`, `waiting`, `verifying`,
- `reviewed`, `delivered`, `rework`, `merged`, `closed`, and `cancelled`.
+`reviewed`, `delivered`, `accepted`, `rework`, `merged`, `closed`, and
+`cancelled`.
 
 ## Common commands
 
@@ -332,7 +333,8 @@ collab task register <id> --feature <feature-id> --worktree <path> \
 collab task wait <id> --for <blocking-task>
 collab task deliver <id> --evidence "commit=<sha>; gates=pass" --worktree <path>
 collab task block <id> --next "blocked: <evidence and next condition>"
-collab task update <id> --status merged
+collab task review <id> --accept --evidence "review gates=pass"
+collab task integrated <id> --commit <main-sha> --evidence "main gates=pass"
 collab task close <id>            # owner; verifies merged/clean, releases claim
 collab task close <id> --force --reason "..."  # master/approved fallback close
 ```

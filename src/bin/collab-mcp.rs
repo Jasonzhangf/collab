@@ -87,6 +87,18 @@ fn tools() -> Value {
             &["id", "evidence", "worktree"]
         ),
         tool(
+            "collab_task_review",
+            "Accept a delivered task or return it for rework with durable evidence.",
+            json!({"id":{"type":"string"},"accept":{"type":"boolean"},"rework":{"type":"boolean"},"evidence":{"type":"string"}}),
+            &["id", "evidence"]
+        ),
+        tool(
+            "collab_task_integrated",
+            "Record exact integration of an accepted task on refs/heads/main.",
+            json!({"id":{"type":"string"},"commit":{"type":"string"},"evidence":{"type":"string"}}),
+            &["id", "commit", "evidence"]
+        ),
+        tool(
             "collab_task_relocate",
             "Relocate the calling peer's task to a short ./playground worktree.",
             json!({"id":{"type":"string"},"worktree":{"type":"string"},"branch":{"type":"string"},"base_commit":{"type":"string"}}),
@@ -253,6 +265,21 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
             argv.extend(["task".into(), "deliver".into(), required(args, "id")?]);
             argv.extend(["--evidence".into(), required(args, "evidence")?]);
             argv.extend(["--worktree".into(), required(args, "worktree")?]);
+        }
+        "collab_task_review" => {
+            argv.extend(["task".into(), "review".into(), required(args, "id")?]);
+            if args.get("accept").and_then(Value::as_bool).unwrap_or(false) {
+                argv.push("--accept".into());
+            }
+            if args.get("rework").and_then(Value::as_bool).unwrap_or(false) {
+                argv.push("--rework".into());
+            }
+            argv.extend(["--evidence".into(), required(args, "evidence")?]);
+        }
+        "collab_task_integrated" => {
+            argv.extend(["task".into(), "integrated".into(), required(args, "id")?]);
+            argv.extend(["--commit".into(), required(args, "commit")?]);
+            argv.extend(["--evidence".into(), required(args, "evidence")?]);
         }
         "collab_task_relocate" => {
             argv.extend(["task".into(), "relocate".into(), required(args, "id")?]);
@@ -552,5 +579,25 @@ mod tests {
             master["inputSchema"]["properties"]["action"]["enum"],
             json!(["status", "promote", "delegate"])
         );
+    }
+
+    #[test]
+    fn lifecycle_review_and_integration_tools_are_exposed() {
+        let definitions = tools();
+        for (name, required) in [
+            ("collab_task_review", json!(["id", "evidence"])),
+            (
+                "collab_task_integrated",
+                json!(["id", "commit", "evidence"]),
+            ),
+        ] {
+            let tool = definitions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing MCP tool {name}"));
+            assert_eq!(tool["inputSchema"]["required"], required);
+        }
     }
 }

@@ -137,6 +137,21 @@ pub enum Req {
         evidence: Option<String>,
         worktree: Option<String>,
     },
+    TaskReview {
+        worker_id: String,
+        token: String,
+        task_id: String,
+        accept: bool,
+        rework: bool,
+        evidence: String,
+    },
+    TaskIntegrated {
+        worker_id: String,
+        token: String,
+        task_id: String,
+        commit: String,
+        evidence: String,
+    },
     TaskClose {
         worker_id: String,
         token: String,

@@ -101,16 +101,18 @@ collab task update <id> --status verifying --next "run gates"
 collab task update <id> --status reviewed --next "record delivery"
 collab task deliver <id> --evidence "commit=<sha>; gates=pass" \
   --worktree ./playground/<short-slug>
-collab task update <id> --status merged --next "main verified and pushed"
+collab task review <id> --accept --evidence "review gates=pass"
+collab task integrated <id> --commit <main-sha> --evidence "main gates=pass"
 collab task close <id>
 ```
 
 Normal states are `working`, `blocked`, `waiting`, `verifying`, `reviewed`,
-`delivered`, `rework`, `merged`, `closed`, and `cancelled`. `waiting` must be
-entered through `collab task wait`; `delivered` through `task deliver`; and
-`closed` through `task close`. `reviewed` cannot transition directly to
-`merged`: successful delivery evidence is mandatory. Only the task owner may
-mutate or close it.
+`delivered`, `accepted`, `rework`, `merged`, `closed`, and `cancelled`.
+`waiting` must be entered through `collab task wait`; `delivered` through
+`task deliver`; `accepted` through `task review --accept`; `merged` through
+`task integrated`; and `closed` through `task close`. Review and integration
+require the task owner or live master, and both persist their evidence. Direct
+status mutation cannot bypass these gates.
 
 Delivery is a local durable milestone. It sends no peer message. Every task
 with a declared worktree carries a cleanup obligation. Close fails before

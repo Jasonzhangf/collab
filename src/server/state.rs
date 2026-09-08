@@ -148,6 +148,28 @@ pub struct TaskRec {
     pub updated_ms: i64,
 }
 
+/// Lifecycle evidence is separate from TaskRec so older producers and journal
+/// events remain replayable as the task contract gains new milestones.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskLifecycleRecord {
+    #[serde(default)]
+    pub delivery_evidence: Option<String>,
+    #[serde(default)]
+    pub delivered_ms: Option<i64>,
+    #[serde(default)]
+    pub review_evidence: Option<String>,
+    #[serde(default)]
+    pub reviewer: Option<String>,
+    #[serde(default)]
+    pub reviewed_ms: Option<i64>,
+    #[serde(default)]
+    pub integration_commit: Option<String>,
+    #[serde(default)]
+    pub integration_evidence: Option<String>,
+    #[serde(default)]
+    pub integrated_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupReceipt {
     pub id: String,
@@ -262,6 +284,10 @@ pub enum Event {
     TaskUpdated {
         task: TaskRec,
     },
+    TaskLifecycleUpdated {
+        task_id: String,
+        record: TaskLifecycleRecord,
+    },
     CleanupVerified {
         receipt: CleanupReceipt,
     },
@@ -284,6 +310,7 @@ pub struct State {
     pub workers: HashMap<String, WorkerRec>,
     pub msgs: HashMap<String, Message>,
     pub tasks: HashMap<String, TaskRec>,
+    pub task_lifecycle: HashMap<String, TaskLifecycleRecord>,
     pub cleanup_receipts: HashMap<String, CleanupReceipt>,
     pub delivery_modes: HashMap<String, String>,
     pub notification_subscriptions: HashMap<String, NotificationSubscription>,
@@ -453,6 +480,9 @@ impl State {
             Event::TaskCreated { task } | Event::TaskUpdated { task } => {
                 self.tasks.insert(task.id.clone(), task.clone());
             }
+            Event::TaskLifecycleUpdated { task_id, record } => {
+                self.task_lifecycle.insert(task_id.clone(), record.clone());
+            }
             Event::CleanupVerified { receipt } => {
                 self.cleanup_receipts
                     .insert(receipt.task_id.clone(), receipt.clone());
@@ -503,6 +533,16 @@ impl State {
         let mut tasks: Vec<_> = self.tasks.values().cloned().collect();
         tasks.sort_by(|a, b| a.id.cmp(&b.id));
         events.extend(tasks.into_iter().map(|task| Event::TaskCreated { task }));
+        let mut lifecycle: Vec<_> = self.task_lifecycle.iter().collect();
+        lifecycle.sort_by(|a, b| a.0.cmp(b.0));
+        events.extend(
+            lifecycle
+                .into_iter()
+                .map(|(task_id, record)| Event::TaskLifecycleUpdated {
+                    task_id: task_id.clone(),
+                    record: record.clone(),
+                }),
+        );
         let mut receipts: Vec<_> = self.cleanup_receipts.values().cloned().collect();
         receipts.sort_by(|a, b| a.task_id.cmp(&b.task_id));
         events.extend(

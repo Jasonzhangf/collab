@@ -27,6 +27,8 @@
     {"id": "task-register", "owner_feature": "task.self-lifecycle"},
     {"id": "resource-wait", "owner_feature": "wait.liveness"},
     {"id": "task-deliver", "owner_feature": "task.self-lifecycle"},
+    {"id": "task-review", "owner_feature": "task.self-lifecycle"},
+    {"id": "task-integrated", "owner_feature": "task.self-lifecycle"},
     {"id": "task-close-release", "owner_feature": "resource.p2p-conflict"},
     {"id": "notification-subscribe", "owner_feature": "notification.subscription"},
     {"id": "subscribed-resource-event", "owner_feature": "notification.subscription"},
