@@ -296,6 +296,37 @@ pub struct State {
 }
 
 impl State {
+    fn consume_notification(&mut self, subscription_id: &str, consumed_ms: Option<i64>) {
+        let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id) else {
+            return;
+        };
+        subscription.fired_count = subscription.fired_count.saturating_add(1);
+        let total = if subscription.interval_ms.is_some() {
+            subscription.repeat_count
+        } else {
+            subscription.trigger_times_ms.len().max(1) as u32
+        };
+        if subscription.fired_count >= total {
+            subscription.status = "consumed".into();
+        } else if let Some(interval) = subscription.interval_ms {
+            let next_trigger = subscription
+                .trigger_ms
+                .map(|trigger| trigger.saturating_add(interval))
+                .unwrap_or_else(|| {
+                    subscription.created_ms.saturating_add(
+                        interval.saturating_mul(subscription.fired_count.saturating_add(1) as i64),
+                    )
+                });
+            subscription.trigger_ms = Some(next_trigger);
+            subscription.status = "armed".into();
+        } else {
+            subscription.status = "armed".into();
+        }
+        if let Some(consumed_ms) = consumed_ms {
+            subscription.updated_ms = consumed_ms;
+        }
+    }
+
     pub fn apply(&mut self, ev: &Event) {
         match ev {
             Event::KeepaliveUpdated { worker_id, record } => {
@@ -349,20 +380,7 @@ impl State {
                 message_id: _,
                 consumed_ms,
             } => {
-                if let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id)
-                {
-                    subscription.fired_count = subscription.fired_count.saturating_add(1);
-                    let total = if subscription.interval_ms.is_some() { subscription.repeat_count } else { subscription.trigger_times_ms.len().max(1) as u32 };
-                    if subscription.fired_count >= total {
-                        subscription.status = "consumed".into();
-                    } else if let Some(interval) = subscription.interval_ms {
-                        subscription.trigger_ms = subscription.trigger_ms.map(|start| start.saturating_add(interval.saturating_mul(subscription.fired_count as i64)));
-                        subscription.status = "armed".into();
-                    } else {
-                        subscription.status = "armed".into();
-                    }
-                    subscription.updated_ms = *consumed_ms;
-                }
+                self.consume_notification(subscription_id, Some(*consumed_ms));
             }
             Event::WakeBound {
                 message_id,
@@ -384,6 +402,38 @@ impl State {
                 for id in ids {
                     if let Some(m) = self.msgs.get_mut(id) {
                         m.state = "read".into();
+                    }
+                    let Some(subscription_id) = self.wake_bindings.get(id).cloned() else {
+                        continue;
+                    };
+                    let Some(subscription) = self.notification_subscriptions.get(&subscription_id)
+                    else {
+                        continue;
+                    };
+                    let consumes_on_read = subscription.event != "direct-message"
+                        || subscription.trigger_ms.is_some()
+                        || !subscription.trigger_times_ms.is_empty()
+                        || subscription.interval_ms.is_some();
+                    if !consumes_on_read {
+                        continue;
+                    }
+                    let fired_count = subscription.fired_count;
+                    let read_count = self
+                        .wake_bindings
+                        .iter()
+                        .filter(|(_, bound)| *bound == &subscription_id)
+                        .filter(|(message_id, _)| {
+                            self.msgs
+                                .get(*message_id)
+                                .is_some_and(|message| message.state == "read")
+                        })
+                        .count() as u32;
+                    // recv records Delivered + Acked without a separate
+                    // NotificationConsumed event. Compare durable read
+                    // occurrences with the cursor so timer delivery, which
+                    // already records NotificationConsumed, remains idempotent.
+                    if read_count > fired_count {
+                        self.consume_notification(&subscription_id, None);
                     }
                 }
             }
@@ -837,5 +887,276 @@ mod tests {
         }
         assert_eq!(state.notification_subscriptions["sub-periodic"].status, "consumed");
         assert_eq!(state.notification_subscriptions["sub-periodic"].fired_count, 3);
+    }
+
+    #[test]
+    fn periodic_subscription_persists_fixed_absolute_cursor_across_replay() {
+        let subscription = |id: &str, trigger_ms: Option<i64>| NotificationSubscription {
+            id: id.into(),
+            worker_id: "master".into(),
+            event: "deadline".into(),
+            subject: Some("periodic".into()),
+            pane: "%7".into(),
+            method: "tmux".into(),
+            trigger_ms,
+            trigger_times_ms: Vec::new(),
+            interval_ms: Some(1_000),
+            repeat_count: 3,
+            fired_count: 0,
+            expires_ms: 20_000,
+            status: "armed".into(),
+            created_ms: 1_000,
+            updated_ms: 1_000,
+        };
+
+        let mut none_state = State::default();
+        none_state.apply(&Event::NotificationSubscribed {
+            subscription: subscription("sub-periodic-none", None),
+        });
+        let mut none_cursor = Vec::new();
+        for count in 1..=3 {
+            none_state.apply(&Event::NotificationConsumed {
+                subscription_id: "sub-periodic-none".into(),
+                message_id: format!("none-{count}"),
+                consumed_ms: 1_000 + (count as i64 * 1_000),
+            });
+            if count < 3 {
+                none_cursor
+                    .push(none_state.notification_subscriptions["sub-periodic-none"].trigger_ms);
+            }
+        }
+        assert_eq!(none_cursor, vec![Some(3_000), Some(4_000)]);
+
+        let mut seeded_state = State::default();
+        seeded_state.apply(&Event::NotificationSubscribed {
+            subscription: subscription("sub-periodic-seeded", Some(2_000)),
+        });
+        for count in 1..=2 {
+            seeded_state.apply(&Event::NotificationConsumed {
+                subscription_id: "sub-periodic-seeded".into(),
+                message_id: format!("seeded-{count}"),
+                consumed_ms: 1_000 + (count as i64 * 1_000),
+            });
+            assert_eq!(
+                seeded_state.notification_subscriptions["sub-periodic-seeded"].trigger_ms,
+                Some(2_000 + count as i64 * 1_000)
+            );
+        }
+
+        let mut replayed = State::default();
+        for event in seeded_state.snapshot_events() {
+            replayed.apply(&event);
+        }
+        assert_eq!(
+            replayed.notification_subscriptions["sub-periodic-seeded"].trigger_ms,
+            seeded_state.notification_subscriptions["sub-periodic-seeded"].trigger_ms
+        );
+        assert_eq!(
+            replayed.notification_subscriptions["sub-periodic-seeded"].fired_count,
+            seeded_state.notification_subscriptions["sub-periodic-seeded"].fired_count
+        );
+    }
+
+    #[test]
+    fn ack_consumes_scheduled_occurrence_once_and_replay_preserves_cursor() {
+        let subscription_id = "sub-ack-periodic";
+        let message_id = "message-ack-periodic";
+        let mut state = State::default();
+        state.apply(&Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: subscription_id.into(),
+                worker_id: "master".into(),
+                event: "deadline".into(),
+                subject: Some("ack-periodic".into()),
+                pane: "%7".into(),
+                method: "tmux".into(),
+                trigger_ms: None,
+                trigger_times_ms: Vec::new(),
+                interval_ms: Some(1_000),
+                repeat_count: 3,
+                fired_count: 0,
+                expires_ms: 20_000,
+                status: "armed".into(),
+                created_ms: 1_000,
+                updated_ms: 1_000,
+            },
+        });
+        state.apply(&Event::Sent {
+            msg: Message {
+                id: message_id.into(),
+                from: "collab-server".into(),
+                to: "master".into(),
+                mtype: "notification".into(),
+                subject: Some("deadline:ack-periodic".into()),
+                body: "scheduled occurrence".into(),
+                in_reply_to: None,
+                created_ms: 2_000,
+                state: "pending".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        });
+        state.apply(&Event::WakeBound {
+            message_id: message_id.into(),
+            subscription_id: subscription_id.into(),
+        });
+        state.apply(&Event::Delivered {
+            ids: vec![message_id.into()],
+        });
+        state.apply(&Event::Acked {
+            ids: vec![message_id.into()],
+        });
+
+        let subscription = &state.notification_subscriptions[subscription_id];
+        assert_eq!(subscription.fired_count, 1);
+        assert_eq!(subscription.trigger_ms, Some(3_000));
+        assert_eq!(subscription.status, "armed");
+
+        // A duplicate ACK sees the same read occurrence and cannot advance the
+        // durable cursor a second time.
+        state.apply(&Event::Acked {
+            ids: vec![message_id.into()],
+        });
+        let subscription = &state.notification_subscriptions[subscription_id];
+        assert_eq!(subscription.fired_count, 1);
+        assert_eq!(subscription.trigger_ms, Some(3_000));
+
+        let mut replayed = State::default();
+        for event in state.snapshot_events() {
+            replayed.apply(&event);
+        }
+        let replayed_subscription = &replayed.notification_subscriptions[subscription_id];
+        assert_eq!(replayed_subscription.fired_count, 1);
+        assert_eq!(replayed_subscription.trigger_ms, Some(3_000));
+        assert_eq!(replayed.msgs[message_id].state, "read");
+    }
+
+    #[test]
+    fn ack_after_timer_consumption_does_not_double_consume() {
+        let subscription_id = "sub-ack-timer";
+        let message_id = "message-ack-timer";
+        let mut state = State::default();
+        state.apply(&Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: subscription_id.into(),
+                worker_id: "master".into(),
+                event: "deadline".into(),
+                subject: Some("ack-timer".into()),
+                pane: "%7".into(),
+                method: "tmux".into(),
+                trigger_ms: Some(2_000),
+                trigger_times_ms: Vec::new(),
+                interval_ms: Some(1_000),
+                repeat_count: 3,
+                fired_count: 0,
+                expires_ms: 20_000,
+                status: "armed".into(),
+                created_ms: 1_000,
+                updated_ms: 1_000,
+            },
+        });
+        state.apply(&Event::Sent {
+            msg: Message {
+                id: message_id.into(),
+                from: "collab-server".into(),
+                to: "master".into(),
+                mtype: "notification".into(),
+                subject: Some("deadline:ack-timer".into()),
+                body: "timer occurrence".into(),
+                in_reply_to: None,
+                created_ms: 2_000,
+                state: "pending".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        });
+        state.apply(&Event::WakeBound {
+            message_id: message_id.into(),
+            subscription_id: subscription_id.into(),
+        });
+        state.apply(&Event::Delivered {
+            ids: vec![message_id.into()],
+        });
+        state.apply(&Event::NotificationConsumed {
+            subscription_id: subscription_id.into(),
+            message_id: message_id.into(),
+            consumed_ms: 2_001,
+        });
+        assert_eq!(
+            state.notification_subscriptions[subscription_id].fired_count,
+            1
+        );
+        assert_eq!(
+            state.notification_subscriptions[subscription_id].trigger_ms,
+            Some(3_000)
+        );
+
+        state.apply(&Event::Acked {
+            ids: vec![message_id.into()],
+        });
+        assert_eq!(
+            state.notification_subscriptions[subscription_id].fired_count,
+            1
+        );
+        assert_eq!(
+            state.notification_subscriptions[subscription_id].trigger_ms,
+            Some(3_000)
+        );
+    }
+
+    #[test]
+    fn ack_on_reusable_direct_message_does_not_consume_subscription() {
+        let subscription_id = "sub-ack-direct";
+        let message_id = "message-ack-direct";
+        let mut state = State::default();
+        state.apply(&Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: subscription_id.into(),
+                worker_id: "worker".into(),
+                event: "direct-message".into(),
+                subject: None,
+                pane: "%7".into(),
+                method: "tmux".into(),
+                trigger_ms: None,
+                trigger_times_ms: Vec::new(),
+                interval_ms: None,
+                repeat_count: 1,
+                fired_count: 0,
+                expires_ms: 20_000,
+                status: "armed".into(),
+                created_ms: 1_000,
+                updated_ms: 1_000,
+            },
+        });
+        state.apply(&Event::Sent {
+            msg: Message {
+                id: message_id.into(),
+                from: "peer".into(),
+                to: "worker".into(),
+                mtype: "notify".into(),
+                subject: Some("direct".into()),
+                body: "reusable message".into(),
+                in_reply_to: None,
+                created_ms: 2_000,
+                state: "pending".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        });
+        state.apply(&Event::WakeBound {
+            message_id: message_id.into(),
+            subscription_id: subscription_id.into(),
+        });
+        state.apply(&Event::Delivered {
+            ids: vec![message_id.into()],
+        });
+        state.apply(&Event::Acked {
+            ids: vec![message_id.into()],
+        });
+
+        let subscription = &state.notification_subscriptions[subscription_id];
+        assert_eq!(subscription.fired_count, 0);
+        assert_eq!(subscription.status, "armed");
+        assert_eq!(state.msgs[message_id].state, "read");
     }
 }

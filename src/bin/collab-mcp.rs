@@ -46,8 +46,8 @@ fn tools() -> Value {
         ),
         tool(
             "collab_notify_subscribe",
-            "Register one owner-scoped finite subscription; deadline uses either absolute at_ms values or a periodic interval, with at most three active subscriptions per Agent.",
-            json!({"event":{"type":"string","enum":["direct-message","resource-released","deadline","async-result"]},"subject":{"type":"string"},"at_ms":{"type":"array","items":{"type":"integer"}},"every_ms":{"type":"integer","minimum":1},"repeat_count":{"type":"integer","minimum":1,"maximum":100},"ttl_seconds":{"type":"integer","minimum":1}}),
+            "Register one owner-scoped finite subscription; deadline uses either absolute at_ms values or a periodic interval, master-idle uses a recurring 15- or 60-minute interval for the live master, and at most three active subscriptions are allowed per Agent.",
+            json!({"event":{"type":"string","enum":["direct-message","resource-released","deadline","async-result","master-idle"]},"subject":{"type":"string"},"at_ms":{"type":"array","items":{"type":"integer"}},"every_ms":{"type":"integer","minimum":1},"trigger_ms":{"type":"integer"},"repeat_count":{"type":"integer","minimum":1,"maximum":100},"ttl_seconds":{"type":"integer","minimum":1}}),
             &["event", "ttl_seconds"]
         ),
         tool(
@@ -500,6 +500,42 @@ mod tests {
             json!(["to", "subject", "body"])
         );
         assert!(send["inputSchema"]["properties"]["subject"].is_object());
+    }
+
+    #[test]
+    fn master_idle_event_is_public_in_mcp_schema() {
+        let definitions = tools();
+        let subscribe = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "collab_notify_subscribe")
+            .unwrap();
+        assert!(subscribe["inputSchema"]["properties"]["event"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("master-idle")));
+    }
+
+    #[test]
+    fn notification_schedule_fields_match_mcp_call_arguments() {
+        let definitions = tools();
+        let subscribe = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "collab_notify_subscribe")
+            .unwrap();
+        let properties = subscribe["inputSchema"]["properties"].as_object().unwrap();
+        for field in [
+            "at_ms",
+            "every_ms",
+            "trigger_ms",
+            "repeat_count",
+            "ttl_seconds",
+        ] {
+            assert!(properties.contains_key(field), "missing MCP field {field}");
+        }
     }
 
     #[test]

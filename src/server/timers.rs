@@ -1,5 +1,6 @@
 use crate::server::state::{now_ms, Event, Message, MAX_WAKE_ATTEMPTS};
 use crate::server::Server;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const WAKE_ATTEMPT_LEASE_MS: i64 = 10_000;
@@ -91,6 +92,7 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 }
             }
         }
+        let live_master = super::live_master_id(server, &state);
         for task in state.tasks.values() {
             let Some(wait) = task.wait.as_ref() else {
                 continue;
@@ -101,12 +103,47 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
             let mut expired = task.clone();
             expired.status = "blocked".into();
             expired.next_step = Some(format!(
-                "WAIT_TIMEOUT waiting_for={} responsible_actor={} escalation={}",
-                wait.waiting_for, wait.responsible_actor, wait.escalation
+                "WAIT_TIMEOUT waiting_for={} responsible_actor={} reason={} escalation={}",
+                wait.waiting_for, wait.responsible_actor, wait.reason, wait.escalation
             ));
             expired.wait = None;
             expired.updated_ms = now;
             lifecycle_events.push(Event::TaskUpdated { task: expired });
+
+            if let Some(master_id) = live_master.as_ref() {
+                let message_id = super::gen_msg_id();
+                lifecycle_events.push(Event::Sent {
+                    msg: Message {
+                        id: message_id.clone(),
+                        from: "collab-server".into(),
+                        to: master_id.clone(),
+                        mtype: "notify".into(),
+                        subject: Some(format!("wait-timeout:{}", task.id)),
+                        body: format!(
+                            "Task {} is blocked after WAIT_TIMEOUT: waiting_for={} responsible_actor={} reason={} escalation={} resume_on={}. Inspect the blocker and task graph, then resolve or reassign it.",
+                            task.id,
+                            wait.waiting_for,
+                            wait.responsible_actor,
+                            wait.reason,
+                            wait.escalation,
+                            wait.resume_on.join(",")
+                        ),
+                        in_reply_to: None,
+                        created_ms: now,
+                        state: "pending".into(),
+                        wake_attempt_count: 0,
+                        last_wake_attempt_ms: 0,
+                    },
+                });
+                if let Some(subscription) =
+                    state.matching_subscription(master_id, "direct-message", None, now)
+                {
+                    lifecycle_events.push(Event::WakeBound {
+                        message_id,
+                        subscription_id: subscription.id.clone(),
+                    });
+                }
+            }
         }
     }
     if !lifecycle_events.is_empty() {
@@ -116,20 +153,14 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
     let mut due_events = Vec::new();
     {
         let state = server.state.lock().unwrap();
+        let mut idle_gate_records = HashMap::new();
         for subscription in state.notification_subscriptions.values() {
             let next_trigger = subscription
                 .interval_ms
                 .map(|interval| {
-                    let trigger = subscription
+                    subscription
                         .trigger_ms
-                        .unwrap_or(subscription.created_ms.saturating_add(interval));
-                    if subscription.event == "master-idle" {
-                        trigger
-                    } else {
-                        trigger.saturating_add(
-                            interval.saturating_mul(subscription.fired_count as i64),
-                        )
-                    }
+                        .unwrap_or(subscription.created_ms.saturating_add(interval))
                 })
                 .or_else(|| {
                     subscription
@@ -138,6 +169,30 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                         .copied()
                 })
                 .or(subscription.trigger_ms);
+            let master_idle_gate_open = if subscription.event == "master-idle" {
+                match state.keepalives.get(&subscription.worker_id) {
+                    None => false,
+                    Some(record) => {
+                        let record = idle_gate_records
+                            .entry(subscription.worker_id.clone())
+                            .or_insert_with(|| record.clone());
+                        let pending_keepalive_notice = state.msgs.values().any(|message| {
+                            message.to == subscription.worker_id
+                                && message.state == "pending"
+                                && message
+                                    .subject
+                                    .as_deref()
+                                    .is_some_and(|subject| subject.starts_with("master-idle"))
+                        });
+                        record.idle_episode_notices < 3
+                            && record.idle_since_ms > subscription.created_ms
+                            && record.last_notice_ms != now
+                            && !pending_keepalive_notice
+                    }
+                }
+            } else {
+                true
+            };
             let master_idle_ready = if subscription.event == "master-idle" {
                 matches!(super::live_master_id(server, &state), Ok(Some(id)) if id == subscription.worker_id)
                     && state
@@ -158,6 +213,7 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 || !server.config.timers.enabled
                 || !matches!(subscription.event.as_str(), "deadline" | "master-idle")
                 || !master_idle_ready
+                || !master_idle_gate_open
                 || next_trigger.is_none_or(|trigger| trigger > now)
                 || state.wake_bindings.iter().any(|(message_id, bound)| {
                     bound == &subscription.id
@@ -170,6 +226,17 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 continue;
             }
             let message_id = super::gen_msg_id();
+            if subscription.event == "master-idle" {
+                let record = idle_gate_records
+                    .get_mut(&subscription.worker_id)
+                    .expect("master-idle gate record");
+                record.idle_episode_notices = record.idle_episode_notices.saturating_add(1);
+                record.last_notice_ms = now;
+                due_events.push(Event::KeepaliveUpdated {
+                    worker_id: subscription.worker_id.clone(),
+                    record: record.clone(),
+                });
+            }
             due_events.extend([
                 Event::Sent {
                     msg: Message {
@@ -863,6 +930,14 @@ mod tests {
         let (server, root) = test_server();
         register_master(&server);
         let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+        let created_ms =
+            server.state.lock().unwrap().notification_subscriptions[&subscription_id].created_ms;
+        let mut record = server.state.lock().unwrap().keepalives["master"].clone();
+        record.idle_since_ms = created_ms + 1;
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "master".into(),
+            record,
+        }]);
 
         tick_with_idle(&server, &|_| false);
         tick_with_idle(&server, &|_| false);
@@ -892,6 +967,14 @@ mod tests {
         let (server, root) = test_server();
         register_master(&server);
         let subscription_id = master_idle_subscription(&server, 60 * 60 * 1000);
+        let created_ms =
+            server.state.lock().unwrap().notification_subscriptions[&subscription_id].created_ms;
+        let mut record = server.state.lock().unwrap().keepalives["master"].clone();
+        record.idle_since_ms = created_ms + 1;
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "master".into(),
+            record,
+        }]);
 
         tick_with_idle(&server, &|_| false);
         let state = server.state.lock().unwrap();
@@ -969,6 +1052,12 @@ mod tests {
             .get_mut(&subscription_id)
             .unwrap()
             .trigger_ms = Some(now - 15 * 60 * 1000 - 1);
+        let mut record = server.state.lock().unwrap().keepalives["master"].clone();
+        record.idle_since_ms = now.saturating_add(1);
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "master".into(),
+            record,
+        }]);
 
         tick_with_idle(&server, &|_| false);
         let first_message_id = server
@@ -1007,7 +1096,93 @@ mod tests {
     }
 
     #[test]
-    fn wait_expiry_changes_task_without_unsolicited_messages() {
+    fn master_idle_timer_respects_keepalive_episode_notice_budget() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+        let mut record = server.state.lock().unwrap().keepalives["master"].clone();
+        record.idle_episode_notices = 3;
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "master".into(),
+            record,
+        }]);
+
+        tick_with_idle(&server, &|_| false);
+
+        let state = server.state.lock().unwrap();
+        assert!(
+            state.msgs.is_empty(),
+            "three keepalive notices stop timer wakes"
+        );
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].fired_count,
+            0
+        );
+        assert_eq!(state.keepalives["master"].idle_episode_notices, 3);
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_idle_timer_counts_its_wake_in_keepalive_episode_gate() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+        let created_ms =
+            server.state.lock().unwrap().notification_subscriptions[&subscription_id].created_ms;
+        let mut record = server.state.lock().unwrap().keepalives["master"].clone();
+        record.idle_since_ms = created_ms + 1;
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "master".into(),
+            record,
+        }]);
+
+        tick_with_idle(&server, &|_| false);
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs.len(), 1);
+        assert_eq!(state.keepalives["master"].idle_episode_notices, 1);
+        assert_eq!(
+            state
+                .wake_bindings
+                .values()
+                .filter(|bound| *bound == &subscription_id)
+                .count(),
+            1
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_idle_timer_does_not_wake_an_episode_seen_before_subscription() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+        let created_ms =
+            server.state.lock().unwrap().notification_subscriptions[&subscription_id].created_ms;
+        let mut record = server.state.lock().unwrap().keepalives["master"].clone();
+        record.idle_since_ms = created_ms - 1;
+        record.idle_episode_notices = 1;
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "master".into(),
+            record,
+        }]);
+
+        tick_with_idle(&server, &|_| false);
+
+        let state = server.state.lock().unwrap();
+        assert!(state.msgs.is_empty());
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].fired_count,
+            0
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wait_expiry_without_live_master_does_not_fabricate_a_recipient() {
         let (server, root) = test_server();
         register(&server, "waiter");
         working_task(&server, "waiter");
@@ -1027,8 +1202,141 @@ mod tests {
         tick_with_idle(&server, &|_| false);
         let state = server.state.lock().unwrap();
         assert_eq!(state.tasks["task"].status, "blocked");
+        // There is no live owner for a scheduling reason, so the timeout is
+        // still durable in the blocked task and does not invent a mailbox
+        // recipient or wake the waiting worker.
+        assert!(state.tasks["task"]
+            .next_step
+            .as_deref()
+            .unwrap()
+            .contains("reason=resource_conflict"));
         assert!(state.msgs.is_empty());
         drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wait_timeout_without_direct_subscription_stays_in_master_mailbox() {
+        let (server, root) = test_server();
+        register_master(&server);
+        register(&server, "waiter");
+        working_task(&server, "waiter");
+        let now = now_ms();
+        let mut task = server.state.lock().unwrap().tasks["task"].clone();
+        task.status = "waiting".into();
+        task.wait = Some(WaitSpec {
+            waiter: "waiter".into(),
+            waiting_for: "holder".into(),
+            responsible_actor: "holder-owner".into(),
+            reason: "resource_conflict".into(),
+            deadline_ms: now - 1,
+            resume_on: vec!["resource_released".into()],
+            escalation: "resource_owner_and_waiter_recheck".into(),
+        });
+        server.commit(&[Event::TaskUpdated { task }]);
+
+        tick_with_idle(&server, &|_| false);
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.tasks["task"].status, "blocked");
+        assert_eq!(state.msgs.len(), 1);
+        let message = state.msgs.values().next().unwrap();
+        assert_eq!(message.to, "master");
+        assert_eq!(message.state, "pending");
+        assert!(state.wake_bindings.is_empty());
+        assert!(!state.msgs.values().any(|message| message.to == "waiter"));
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wait_timeout_reason_is_durable_and_visible_only_to_live_master() {
+        let (mut server, root) = test_server();
+        Arc::get_mut(&mut server).unwrap().config.notifications.mode = "immediate".into();
+        Arc::get_mut(&mut server).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Working;
+        register_master(&server);
+        register(&server, "waiter");
+        working_task(&server, "waiter");
+        let subscription_id = subscribe(&server, "master", "direct-message", None, None);
+        let now = now_ms();
+        let mut task = server.state.lock().unwrap().tasks["task"].clone();
+        task.status = "waiting".into();
+        task.wait = Some(WaitSpec {
+            waiter: "waiter".into(),
+            waiting_for: "holder".into(),
+            responsible_actor: "holder-owner".into(),
+            reason: "resource_conflict".into(),
+            deadline_ms: now - 1,
+            resume_on: vec!["resource_released".into()],
+            escalation: "resource_owner_and_waiter_recheck".into(),
+        });
+        server.commit(&[Event::TaskUpdated { task }]);
+
+        // A timeout is recorded while the live master is working. Its reason
+        // stays pending in the durable mailbox and no worker is notified.
+        tick_with_idle(&server, &|_| false);
+        let (message_id, message) = {
+            let state = server.state.lock().unwrap();
+            assert_eq!(state.tasks["task"].status, "blocked");
+            assert_eq!(
+                state.tasks["task"].next_step.as_deref(),
+                Some(
+                    "WAIT_TIMEOUT waiting_for=holder responsible_actor=holder-owner reason=resource_conflict escalation=resource_owner_and_waiter_recheck"
+                )
+            );
+            assert_eq!(state.msgs.len(), 1);
+            let (message_id, message) = state.msgs.iter().next().unwrap();
+            assert_eq!(message.to, "master");
+            assert_eq!(message.subject.as_deref(), Some("wait-timeout:task"));
+            assert!(message.body.contains("reason=resource_conflict"));
+            assert!(message.body.contains("WAIT_TIMEOUT"));
+            assert_eq!(message.state, "pending");
+            assert_eq!(message.wake_attempt_count, 0);
+            assert_eq!(state.wake_bindings.get(message_id), Some(&subscription_id));
+            assert!(!state.msgs.values().any(|message| message.to == "waiter"));
+            (message_id.clone(), message.clone())
+        };
+
+        // A repeated tick observes the blocked task and cannot create a second
+        // scheduling reason. Switching the master to Waiting lets the existing
+        // notification batch path deliver the pending occurrence.
+        tick_with_idle(&server, &|_| false);
+        assert_eq!(server.state.lock().unwrap().msgs.len(), 1);
+        Arc::get_mut(&mut server).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Waiting;
+        assert!(super::super::attempt_notification_with_default(
+            &server,
+            &message_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| true,
+        ));
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs[&message_id].to, message.to);
+        assert_eq!(state.msgs[&message_id].subject, message.subject);
+        assert_eq!(state.msgs[&message_id].body, message.body);
+        assert_eq!(state.msgs[&message_id].state, "delivered");
+        assert_eq!(state.msgs[&message_id].wake_attempt_count, 1);
+        assert_eq!(state.msgs.len(), 1);
+        drop(state);
+
+        // Snapshot replay retains the blocked task and its single mailbox
+        // reason; another timer tick still has no timeout transition to emit.
+        let snapshot = server.state.lock().unwrap().snapshot_events();
+        let (mut replayed, replay_root) = test_server();
+        Arc::get_mut(&mut replayed).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Working;
+        for event in &snapshot {
+            replayed.commit(std::slice::from_ref(event));
+        }
+        tick_with_idle(&replayed, &|_| false);
+        let replayed_state = replayed.state.lock().unwrap();
+        assert_eq!(replayed_state.tasks["task"].status, "blocked");
+        assert_eq!(replayed_state.msgs.len(), 1);
+        assert_eq!(replayed_state.msgs[&message_id].to, "master");
+        drop(replayed_state);
+        std::fs::remove_dir_all(replay_root).ok();
         std::fs::remove_dir_all(root).ok();
     }
 
