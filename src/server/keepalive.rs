@@ -68,9 +68,15 @@ pub fn view(state: &State, worker: &str) -> serde_json::Value {
 }
 
 pub fn tick(server: &Server) {
+    tick_at(server, super::state::now_ms());
+}
+
+/// Run the keepalive coordinator against the scheduler's tick timestamp so
+/// timer and liveness producers share one state snapshot boundary.
+pub(crate) fn tick_at(server: &Server, now: i64) {
     tick_with(
         server,
-        super::state::now_ms(),
+        now,
         &super::knock::probe_agent_state,
         &|pane, text| super::knock_or_log(&server.log_path(), pane, text),
         &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
@@ -153,6 +159,12 @@ pub(crate) fn tick_with(
                 if let Ok(Some(master_id)) = super::live_master_id(server, &state) {
                     if master_id != worker.id {
                         let alert_id = super::gen_msg_id();
+                        events.push(Event::MasterWakeSignal {
+                            signal: super::state::MasterWakeSignal::WorkerUnresponsive {
+                                worker_id: worker.id.clone(),
+                            },
+                            at_ms: now,
+                        });
                         events.push(Event::Sent {
                             msg: Message {
                                 id: alert_id.clone(),
@@ -235,7 +247,8 @@ pub(crate) fn tick_with(
                 "actionable-tasks-idle"
             };
             let observed_str = observed_label(agent);
-            if record.observed != observed_str {
+            let observed_changed = record.observed != observed_str;
+            if observed_changed {
                 record.observed = observed_str.into();
                 record.idle_since_ms = now;
                 if agent == AgentState::Working {
@@ -245,6 +258,32 @@ pub(crate) fn tick_with(
             record.unacked = 0;
             record.last_notice_id = None;
             let mut events = Vec::new();
+            if observed_changed {
+                let signal = if is_idle {
+                    if is_live_master {
+                        super::state::MasterWakeSignal::MasterIdle {
+                            worker_id: worker.id.clone(),
+                        }
+                    } else if let Some(child) = &managed {
+                        super::state::MasterWakeSignal::SubagentStatus {
+                            subagent_id: child.id.clone(),
+                        }
+                    } else {
+                        super::state::MasterWakeSignal::WorkerIdle {
+                            worker_id: worker.id.clone(),
+                        }
+                    }
+                } else if let Some(child) = &managed {
+                    super::state::MasterWakeSignal::SubagentWorking {
+                        subagent_id: child.id.clone(),
+                    }
+                } else {
+                    super::state::MasterWakeSignal::WorkerWorking {
+                        worker_id: worker.id.clone(),
+                    }
+                };
+                events.push(Event::MasterWakeSignal { signal, at_ms: now });
+            }
             if let Some(mut child) = managed.clone() {
                 if matches!(agent, AgentState::Working | AgentState::Waiting)
                     && child.status != observed_str

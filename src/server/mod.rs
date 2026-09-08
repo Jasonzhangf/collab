@@ -249,21 +249,32 @@ impl Server {
         std::fs::write(&path, data).map_err(|error| format!("message snapshot: {error}"))?;
         let jsonl_path = dir.join(format!("recipient-{}.jsonl", msg.to));
         if jsonl_path.exists() {
-            let projection = read_recipient_mailbox(&jsonl_path, &msg.to)?;
-            if projection.partial_tail {
-                let content = std::fs::read(&jsonl_path)
-                    .map_err(|error| format!("read partial mailbox: {error}"))?;
-                let valid_len = content
-                    .iter()
-                    .rposition(|byte| *byte == b'\n')
-                    .map(|index| index + 1)
-                    .unwrap_or(0);
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&jsonl_path)
-                    .map_err(|error| format!("open partial mailbox: {error}"))?;
-                file.set_len(valid_len as u64)
-                    .map_err(|error| format!("truncate partial mailbox: {error}"))?;
+            match read_recipient_mailbox(&jsonl_path, &msg.to) {
+                Ok(projection) if projection.partial_tail => {
+                    let content = std::fs::read(&jsonl_path)
+                        .map_err(|error| format!("read partial mailbox: {error}"))?;
+                    let valid_len = content
+                        .iter()
+                        .rposition(|byte| *byte == b'\n')
+                        .map(|index| index + 1)
+                        .unwrap_or(0);
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&jsonl_path)
+                        .map_err(|error| format!("open partial mailbox: {error}"))?;
+                    file.set_len(valid_len as u64)
+                        .map_err(|error| format!("truncate partial mailbox: {error}"))?;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // Journal state is authoritative. A projection error is
+                    // queryable and recoverable; it must not prevent a later
+                    // durable message from being appended to the mailbox.
+                    append_log(
+                        &self.log_path(),
+                        &format!("MAILBOX_JSONL_RECOVERABLE: {error}"),
+                    );
+                }
             }
         }
         let mut file = std::fs::OpenOptions::new()
@@ -518,20 +529,19 @@ struct RecipientMailboxRead {
 fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailboxRead, String> {
     let content = std::fs::read_to_string(path).map_err(|error| format!("read: {error}"))?;
     let lines = content.lines().collect::<Vec<_>>();
-    let partial_tail = !content.is_empty() && !content.ends_with('\n');
+    let has_unterminated_tail = !content.is_empty() && !content.ends_with('\n');
+    let mut partial_tail = false;
     let mut records = Vec::new();
     for (index, line) in lines.into_iter().enumerate() {
         match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(record) => {
-                if record["schema_version"] != 1
-                    || record["record_type"] != "message"
-                    || record["recipient"] != recipient
-                {
-                    return Err(format!("invalid mailbox envelope at record {}", index + 1));
-                }
-                records.push(record)
+            Ok(record) => match normalize_mailbox_record(record, recipient, index + 1) {
+                Ok(record) => records.push(record),
+                Err(error) => return Err(error),
+            },
+            Err(_error) if has_unterminated_tail && index + 1 == content.lines().count() => {
+                partial_tail = true;
+                break;
             }
-            Err(_error) if partial_tail && index + 1 == content.lines().count() => break,
             Err(error) => return Err(format!("malformed JSONL record {}: {error}", index + 1)),
         }
     }
@@ -539,6 +549,46 @@ fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailb
         records,
         partial_tail,
     })
+}
+
+fn normalize_mailbox_record(
+    record: serde_json::Value,
+    recipient: &str,
+    index: usize,
+) -> Result<serde_json::Value, String> {
+    if record["schema_version"] == 1
+        && record["record_type"] == "message"
+        && record["recipient"] == recipient
+    {
+        return Ok(record);
+    }
+
+    // Before schema_version=1, recipient JSONL stored the bare Message. Keep
+    // those durable records readable and project them into the current shape
+    // in memory. New writes remain append-only v1 envelopes.
+    let message: Message = serde_json::from_value(record)
+        .map_err(|error| format!("invalid mailbox envelope at record {index}: {error}"))?;
+    if message.to != recipient {
+        return Err(format!("invalid mailbox envelope at record {index}"));
+    }
+    let subject = message.subject.as_deref().unwrap_or("notice");
+    let (priority, action) = notification_class(subject);
+    Ok(json!({
+        "schema_version": 1,
+        "record_type": "message",
+        "recipient": recipient,
+        "category": semantic_notification_category(subject, &message.mtype),
+        "priority": priority,
+        "action": action,
+        "task_ids": [],
+        "created_ms": message.created_ms,
+        "window_start_ms": serde_json::Value::Null,
+        "window_end_ms": serde_json::Value::Null,
+        "window_source": "legacy-message",
+        "state": message.state,
+        "exact_error": serde_json::Value::Null,
+        "message": message,
+    }))
 }
 
 fn missing_recipient_projection_messages(
@@ -2383,6 +2433,7 @@ fn master_assignment_view(
         "assigned_by": state.master_assigned_by,
         "approval": state.master_approval,
         "assigned_ms": state.master_assigned_ms,
+        "master_wake": state.master_wake,
     })
 }
 
@@ -3652,7 +3703,15 @@ fn handle_task_close(
         let subscription = st
             .matching_subscription(&waiter, "resource-released", Some(&closed.id), now_ms())
             .cloned();
-        let mut events = vec![Event::TaskUpdated { task: waiter_task }];
+        let mut events = vec![
+            Event::TaskUpdated { task: waiter_task },
+            Event::MasterWakeSignal {
+                signal: state::MasterWakeSignal::TaskFreed {
+                    task_id: closed.id.clone(),
+                },
+                at_ms: now_ms(),
+            },
+        ];
         if let Some(subscription) = subscription {
             let message_id = gen_msg_id();
             events.extend([
@@ -4569,7 +4628,17 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             }))
         }
         Req::StatusAll => {
-            let (workers_rec, tasks, subagents, msgs_len, tasks_map, msgs_map, keepalives_map, now) = {
+            let (
+                workers_rec,
+                tasks,
+                subagents,
+                msgs_len,
+                tasks_map,
+                msgs_map,
+                keepalives_map,
+                master_wake,
+                now,
+            ) = {
                 let st = server.state.lock().unwrap();
                 let workers_rec: Vec<WorkerRec> = st.workers.values().cloned().collect();
                 let mut tasks: Vec<serde_json::Value> =
@@ -4588,6 +4657,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                     st.tasks.clone(),
                     st.msgs.clone(),
                     st.keepalives.clone(),
+                    st.master_wake.clone(),
                     now,
                 )
             };
@@ -4613,6 +4683,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                     "subagents": subagents.len(),
                     "now": iso(now),
                 },
+                "master_wake": master_wake,
                 "workers": workers,
                 "tasks": tasks,
                 "subagents": subagents,

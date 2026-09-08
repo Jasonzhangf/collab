@@ -123,6 +123,140 @@ pub struct Message {
 
 pub const REQUEST_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 
+/// Durable, project-level scheduling signals.  The sets contain identifiers
+/// only; task, bug, and mailbox truth remains in their respective stores and
+/// is materialized when the master reads its briefing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MasterWakeAccumulator {
+    pub generation: u64,
+    pub goal_due: bool,
+    #[serde(default)]
+    pub idle_workers: Vec<String>,
+    #[serde(default)]
+    pub unresponsive_workers: Vec<String>,
+    #[serde(default)]
+    pub blocked_or_timed_out_tasks: Vec<String>,
+    #[serde(default)]
+    pub completed_or_freed_tasks: Vec<String>,
+    #[serde(default)]
+    pub highest_bug_revision: Option<u64>,
+    #[serde(default)]
+    pub active_goal_revision: Option<u64>,
+    pub ready_authorized_work: bool,
+    pub scheduling_decision_revision: u64,
+    pub first_pending_ms: i64,
+    pub last_updated_ms: i64,
+    #[serde(default)]
+    pub wake_hold: Option<WakeHold>,
+    #[serde(default = "default_delivery_state")]
+    pub delivery_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WakeHold {
+    pub reason: String,
+    pub held_by: String,
+    pub held_ms: i64,
+    pub until_ms: i64,
+}
+
+fn default_delivery_state() -> String {
+    "clean".into()
+}
+
+impl MasterWakeAccumulator {
+    fn add_unique(items: &mut Vec<String>, value: String) -> bool {
+        if items.contains(&value) {
+            return false;
+        }
+        items.push(value);
+        items.sort();
+        true
+    }
+
+    fn note_signal(&mut self, signal: &MasterWakeSignal, created_ms: i64) {
+        let changed = match signal {
+            MasterWakeSignal::GoalDue { revision } => {
+                let changed = !self.goal_due
+                    || self
+                        .active_goal_revision
+                        .is_none_or(|current| *revision > current);
+                self.goal_due = true;
+                if changed {
+                    self.active_goal_revision = Some(*revision);
+                }
+                changed
+            }
+            MasterWakeSignal::WorkerIdle { worker_id }
+            | MasterWakeSignal::MasterIdle { worker_id } => {
+                let added = Self::add_unique(&mut self.idle_workers, worker_id.clone());
+                let recovered = self
+                    .unresponsive_workers
+                    .iter()
+                    .position(|id| id == worker_id)
+                    .map(|index| self.unresponsive_workers.remove(index))
+                    .is_some();
+                added || recovered
+            }
+            MasterWakeSignal::WorkerUnresponsive { worker_id } => {
+                Self::add_unique(&mut self.unresponsive_workers, worker_id.clone())
+            }
+            MasterWakeSignal::WorkerRecovered { worker_id }
+            | MasterWakeSignal::WorkerWorking { worker_id } => {
+                let idle_removed = self.idle_workers.iter().position(|id| id == worker_id);
+                if let Some(index) = idle_removed {
+                    self.idle_workers.remove(index);
+                }
+                let unresponsive_removed =
+                    self.unresponsive_workers.iter().position(|id| id == worker_id);
+                if let Some(index) = unresponsive_removed {
+                    self.unresponsive_workers.remove(index);
+                }
+                idle_removed.is_some() || unresponsive_removed.is_some()
+            }
+            MasterWakeSignal::TaskBlocked { task_id } => {
+                Self::add_unique(&mut self.blocked_or_timed_out_tasks, task_id.clone())
+            }
+            MasterWakeSignal::TaskFreed { task_id } => {
+                Self::add_unique(&mut self.completed_or_freed_tasks, task_id.clone())
+            }
+            MasterWakeSignal::SubagentStatus { subagent_id } => {
+                Self::add_unique(&mut self.idle_workers, format!("subagent:{subagent_id}"))
+            }
+            MasterWakeSignal::SubagentWorking { subagent_id } => {
+                let id = format!("subagent:{subagent_id}");
+                self.idle_workers
+                    .iter()
+                    .position(|existing| existing == &id)
+                    .map(|index| self.idle_workers.remove(index))
+                    .is_some()
+            }
+        };
+        if changed {
+            if self.generation == 0 {
+                self.generation = 1;
+                self.first_pending_ms = created_ms;
+            }
+            self.last_updated_ms = created_ms;
+            self.delivery_state = "pending".into();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MasterWakeSignal {
+    GoalDue { revision: u64 },
+    WorkerIdle { worker_id: String },
+    MasterIdle { worker_id: String },
+    WorkerUnresponsive { worker_id: String },
+    WorkerRecovered { worker_id: String },
+    WorkerWorking { worker_id: String },
+    TaskBlocked { task_id: String },
+    TaskFreed { task_id: String },
+    SubagentStatus { subagent_id: String },
+    SubagentWorking { subagent_id: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRec {
     pub id: String,
@@ -208,6 +342,13 @@ pub fn wait_cycle(tasks: &HashMap<String, TaskRec>, task_id: &str, waiting_for: 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ev")]
 pub enum Event {
+    MasterWakeSignal {
+        signal: MasterWakeSignal,
+        at_ms: i64,
+    },
+    MasterWakeUpdated {
+        accumulator: MasterWakeAccumulator,
+    },
     KeepaliveUpdated {
         worker_id: String,
         record: super::keepalive::Record,
@@ -305,6 +446,7 @@ pub enum Event {
 
 #[derive(Default)]
 pub struct State {
+    pub master_wake: MasterWakeAccumulator,
     pub keepalives: HashMap<String, super::keepalive::Record>,
     pub subagents: HashMap<String, crate::subagent::Record>,
     pub workers: HashMap<String, WorkerRec>,
@@ -356,8 +498,14 @@ impl State {
 
     pub fn apply(&mut self, ev: &Event) {
         match ev {
+            Event::MasterWakeSignal { signal, at_ms } => {
+                self.master_wake.note_signal(signal, *at_ms);
+            }
             Event::KeepaliveUpdated { worker_id, record } => {
                 self.keepalives.insert(worker_id.clone(), record.clone());
+            }
+            Event::MasterWakeUpdated { accumulator } => {
+                self.master_wake = accumulator.clone();
             }
             Event::SubagentUpdated { subagent } => {
                 self.subagents.insert(subagent.id.clone(), subagent.clone());
@@ -423,6 +571,19 @@ impl State {
                             m.state = "delivered".into();
                         }
                     }
+                }
+                if ids.iter().any(|id| {
+                    self.wake_bindings.contains_key(id)
+                        && self
+                            .msgs
+                            .get(id)
+                            .is_some_and(|message| {
+                                message.from == "collab-server"
+                                    && self.master_worker_id.as_deref()
+                                        == Some(message.to.as_str())
+                            })
+                }) {
+                    self.master_wake.delivery_state = "notified_unconsumed".into();
                 }
             }
             Event::Acked { ids } => {
@@ -512,6 +673,11 @@ impl State {
 
     pub fn snapshot_events(&self) -> Vec<Event> {
         let mut events = Vec::new();
+        if self.master_wake.generation > 0 {
+            events.push(Event::MasterWakeUpdated {
+                accumulator: self.master_wake.clone(),
+            });
+        }
         let mut workers: Vec<_> = self.workers.values().cloned().collect();
         workers.sort_by(|a, b| a.id.cmp(&b.id));
         events.extend(workers.into_iter().map(|worker| Event::Registered { worker }));
@@ -682,6 +848,91 @@ mod tests {
         assert_eq!(runtime_for_pane(Some("herdr:w4:p1")), None);
         assert_eq!(runtime_for_pane(None), None);
         assert_eq!(runtime_for_pane(Some("w4:p1")), None);
+    }
+
+    #[test]
+    fn master_wake_accumulator_coalesces_generated_signals_until_decision() {
+        let mut state = State::default();
+        state.apply(&Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("approved".into()),
+            assigned_ms: 1,
+        });
+        let generated = |id: &str, subject: &str, created_ms: i64| Message {
+            id: id.into(),
+            from: "collab-server".into(),
+            to: "master".into(),
+            mtype: "notify".into(),
+            subject: Some(subject.into()),
+            body: "durable detail".into(),
+            in_reply_to: None,
+            created_ms,
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        };
+        state.apply(&Event::MasterWakeSignal {
+            signal: MasterWakeSignal::WorkerIdle {
+                worker_id: "worker".into(),
+            },
+            at_ms: 10,
+        });
+        state.apply(&Event::Sent {
+            msg: generated("idle-1", "worker-idle: worker", 10),
+        });
+        state.apply(&Event::MasterWakeSignal {
+            signal: MasterWakeSignal::WorkerIdle {
+                worker_id: "worker".into(),
+            },
+            at_ms: 20,
+        });
+        state.apply(&Event::Sent {
+            msg: generated("idle-duplicate", "worker-idle: worker", 20),
+        });
+        state.apply(&Event::MasterWakeSignal {
+            signal: MasterWakeSignal::WorkerUnresponsive {
+                worker_id: "offline".into(),
+            },
+            at_ms: 30,
+        });
+        state.apply(&Event::Sent {
+            msg: generated("unresponsive", "worker-unresponsive: offline", 30),
+        });
+        assert_eq!(state.master_wake.generation, 1);
+        assert_eq!(state.master_wake.first_pending_ms, 10);
+        assert_eq!(state.master_wake.last_updated_ms, 30);
+        assert_eq!(state.master_wake.idle_workers, vec!["worker"]);
+        assert_eq!(state.master_wake.unresponsive_workers, vec!["offline"]);
+        assert_eq!(state.master_wake.delivery_state, "pending");
+
+        let explicit = Message {
+            from: "peer".into(),
+            ..generated("explicit", "worker-idle: ignored", 40)
+        };
+        state.apply(&Event::Sent { msg: explicit });
+        assert_eq!(state.master_wake.idle_workers, vec!["worker"]);
+        state.apply(&Event::WakeBound {
+            message_id: "idle-1".into(),
+            subscription_id: "sub-master".into(),
+        });
+        state.apply(&Event::Delivered {
+            ids: vec!["idle-1".into()],
+        });
+        assert_eq!(state.master_wake.delivery_state, "notified_unconsumed");
+        state.apply(&Event::Acked {
+            ids: vec!["idle-1".into()],
+        });
+        assert_eq!(state.master_wake.generation, 1);
+        assert_eq!(state.master_wake.delivery_state, "notified_unconsumed");
+        state.apply(&Event::MasterWakeSignal {
+            signal: MasterWakeSignal::WorkerWorking {
+                worker_id: "worker".into(),
+            },
+            at_ms: 50,
+        });
+        assert!(state.master_wake.idle_workers.is_empty());
+        assert_eq!(state.master_wake.delivery_state, "pending");
     }
 
     fn msg(id: &str, to: &str, mtype: &str) -> Message {

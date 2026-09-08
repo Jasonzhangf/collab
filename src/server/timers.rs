@@ -8,8 +8,9 @@ const WAKE_ATTEMPT_LEASE_MS: i64 = 10_000;
 /// Server-side scheduler for finite subscriptions and bounded waits. It never
 /// creates task continuations or infers that ordinary work needs a wake.
 pub fn tick(server: &Arc<Server>) {
-    super::keepalive::tick(server);
-    super::purge_expired_storage(server, now_ms());
+    let now = now_ms();
+    super::keepalive::tick_at(server, now);
+    super::purge_expired_storage(server, now);
     tick_with_idle(server, &|_| true);
 }
 
@@ -112,6 +113,12 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
             expired.wait = None;
             expired.updated_ms = now;
             lifecycle_events.push(Event::TaskUpdated { task: expired });
+            lifecycle_events.push(Event::MasterWakeSignal {
+                signal: crate::server::state::MasterWakeSignal::TaskBlocked {
+                    task_id: task.id.clone(),
+                },
+                at_ms: now,
+            });
 
             if let Some(master_id) = live_master.as_ref() {
                 let message_id = super::gen_msg_id();

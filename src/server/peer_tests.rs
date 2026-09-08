@@ -2687,6 +2687,83 @@ fn recipient_jsonl_failure_is_logged_without_panicking() {
 }
 
 #[test]
+fn recipient_jsonl_accepts_legacy_bare_message_before_new_append() {
+    let (server, root) = test_server();
+    register(&server, "recipient", "%recipient");
+    let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let legacy = Message {
+        id: "legacy-message".into(),
+        from: "sender".into(),
+        to: "recipient".into(),
+        mtype: "notify".into(),
+        subject: Some("progress".into()),
+        body: "legacy record".into(),
+        in_reply_to: None,
+        created_ms: now_ms(),
+        state: "pending".into(),
+        wake_attempt_count: 0,
+        last_wake_attempt_ms: 0,
+    };
+    std::fs::write(&path, format!("{}\n", serde_json::to_string(&legacy).unwrap())).unwrap();
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "new-message".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("progress".into()),
+            body: "new record".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    let projection = read_recipient_mailbox(&path, "recipient").unwrap();
+    assert_eq!(projection.records.len(), 2);
+    assert_eq!(projection.records[0]["schema_version"], 1);
+    assert_eq!(projection.records[0]["window_source"], "legacy-message");
+    assert_eq!(projection.records[1]["message"]["id"], "new-message");
+    assert_eq!(replay(&root).unwrap().msgs["new-message"].state, "pending");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn malformed_recipient_jsonl_does_not_block_future_append_or_journal_replay() {
+    let (server, root) = test_server();
+    register(&server, "recipient", "%recipient");
+    let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "{\"bad\":true}\n").unwrap();
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "after-malformed".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("progress".into()),
+            body: "journal remains authoritative".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.lines().any(|line| line.contains("after-malformed")));
+    assert!(
+        std::fs::read_to_string(root.join(".agent-collab/server/log.txt"))
+            .unwrap()
+            .contains("MAILBOX_JSONL_RECOVERABLE")
+    );
+    assert_eq!(replay(&root).unwrap().msgs["after-malformed"].state, "pending");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn removed_role_and_dispatch_commands_fail_fast() {
     let (server, root) = test_server();
     register(&server, "peer", "%peer");
