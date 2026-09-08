@@ -2919,14 +2919,14 @@ fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
     let mut new_reason = crate::server::keepalive::Record::default();
     new_reason.observed = "idle".into();
     new_reason.idle_episode_reason = "different-reason".into();
-    new_reason.idle_episode_notices = 3;
+    new_reason.idle_episode_notices = 1;
     server_arc.commit(&[Event::KeepaliveUpdated {
         worker_id: "master-worker".into(),
         record: new_reason,
     }]);
     crate::server::keepalive::tick_with(
         &server_arc,
-        4000,
+        122000,
         &|_pane| crate::server::knock::AgentState::Waiting,
         &|_pane, _text| true,
         &|_worker_id, _pane| true,
@@ -2937,7 +2937,26 @@ fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
             m.to == "master-worker" && m.subject == Some("master-idle: master-worker".into())
         }).count(),
         2,
-        "new idle reason starts a new bounded episode"
+        "same episode reminder is windowed and new reason does not reset budget"
+    );
+    drop(state);
+
+    for now in [242000, 362000] {
+        crate::server::keepalive::tick_with(
+            &server_arc,
+            now,
+            &|_pane| crate::server::knock::AgentState::Waiting,
+            &|_pane, _text| true,
+            &|_worker_id, _pane| true,
+        );
+    }
+    let state = server_arc.state.lock().unwrap();
+    assert_eq!(
+        state.msgs.values().filter(|m| {
+            m.to == "master-worker" && m.subject == Some("master-idle: master-worker".into())
+        }).count(),
+        3,
+        "idle episode suppresses after three reminders"
     );
     drop(state);
     std::fs::remove_dir_all(root).unwrap();

@@ -139,10 +139,6 @@ fn handle_managed_subagent(
                     last_wake_attempt_ms: 0,
                 },
             });
-            events.push(Event::DeliveryMode {
-                msg_id: id.clone(),
-                mode: "explicit-notification".into(),
-            });
             if let Some(subscription) = &subscription {
                 events.push(Event::WakeBound {
                     message_id: id,
@@ -352,7 +348,7 @@ pub(crate) fn tick_with(
             if record.observed != observed_str {
                 record.observed = observed_str.into();
                 record.idle_since_ms = now;
-                if is_idle {
+                if is_idle && was_working {
                     record.idle_episode_notices = 0;
                     record.idle_episode_reason = idle_reason.into();
                 }
@@ -363,10 +359,11 @@ pub(crate) fn tick_with(
             let new_idle_reason = is_idle && record.idle_episode_reason != idle_reason;
             if new_idle_reason {
                 record.idle_episode_reason = idle_reason.into();
-                record.idle_episode_notices = 0;
             }
             if is_idle
-                && (was_working || new_idle_reason)
+                && (was_working
+                    || (record.idle_episode_notices < 3
+                        && now.saturating_sub(record.last_notice_ms) >= 120_000))
                 && record.idle_episode_notices < 3
             {
                 if let Some(master_id) = super::live_master_id(server, &state) {
@@ -395,6 +392,7 @@ pub(crate) fn tick_with(
                                 message_id: alert_id,
                                 subscription_id: sub.id.clone(),
                             });
+                            record.last_notice_ms = now;
                             record.idle_episode_notices = record.idle_episode_notices.saturating_add(1);
                         }
                     } else {

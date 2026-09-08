@@ -130,10 +130,6 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                     message_id: message_id.clone(),
                     subscription_id: subscription.id.clone(),
                 },
-                Event::DeliveryMode {
-                    msg_id: message_id,
-                    mode: "explicit-notification".into(),
-                },
             ]);
         }
     }
