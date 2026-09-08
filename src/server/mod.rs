@@ -216,7 +216,15 @@ impl Server {
                 }
             }
         }
-        if evs.iter().any(|event| matches!(event, Event::Sent { .. })) {
+        let has_pending_scheduler_admission = evs.iter().any(|event| {
+            matches!(
+                event,
+                Event::SchedulerAdmission { admission } if admission.status == "pending"
+            )
+        });
+        if evs.iter().any(|event| matches!(event, Event::Sent { .. }))
+            && !has_pending_scheduler_admission
+        {
             self.mailbox_notify.notify_waiters();
         }
     }
@@ -914,6 +922,9 @@ fn attempt_notification_with_at(
         let Some(seed) = state.msgs.get(message_id) else {
             return false;
         };
+        if !state.scheduler_message_deliverable(message_id) {
+            return false;
+        }
         let recipient = seed.to.clone();
         let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
             return false;
@@ -1008,6 +1019,7 @@ fn attempt_notification_with_at(
             let sub = state.notification_subscriptions.get(binding)?;
             let message_explicit = is_explicit_notification(&state, message);
             (message.to == recipient
+                && state.scheduler_message_deliverable(&message.id)
                 && message_explicit == explicit
                 && state
                     .delivery_modes
@@ -6733,6 +6745,149 @@ mod scheduler_admission_tests {
         assert_eq!(state.msgs.len(), 1);
         assert_eq!(
             state.scheduler_admissions["req-audit-failure-1"].status,
+            "failed"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_dispatch_audit_failure_cannot_be_accepted_by_managed_child() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "managed-peer", "%managed-peer");
+        server.commit(&[
+            Event::MasterAssigned {
+                worker_id: "master".into(),
+                assigned_by: "operator".into(),
+                approval: Some("scheduler test".into()),
+                assigned_ms: now_ms(),
+            },
+            Event::SubagentUpdated {
+                subagent: crate::subagent::Record {
+                    id: "managed-child-failed-audit".into(),
+                    parent: "master".into(),
+                    peer: "managed-peer".into(),
+                    status: "idle".into(),
+                    session: Some("$managed-peer".into()),
+                    pane: Some("%managed-peer".into()),
+                    profile: None,
+                    created_ms: now_ms(),
+                    ready_deadline_ms: 0,
+                    last_message: None,
+                    error: None,
+                    probe_failures: Vec::new(),
+                    runtime: Some("cursor".into()),
+                },
+            },
+        ]);
+        std::fs::create_dir(
+            root.join(".agent-collab/server/events.jsonl"),
+        )
+        .unwrap();
+        let server = Arc::new(server);
+        let dispatch_result = dispatch(
+            &server,
+            Req::Subagent {
+                worker_id: "master".into(),
+                token: "token-master".into(),
+                command: crate::subagent::Action::Dispatch {
+                    request_id: "req-managed-failed-audit-1".into(),
+                    subject: "Failed managed task".into(),
+                    body: "Must not execute".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p2".into(),
+                    next_step: None,
+                },
+                launch_env: Default::default(),
+            },
+        );
+        assert!(!dispatch_result.ok, "{dispatch_result:?}");
+        let working = crate::subagent::handle_with_env(
+            &server,
+            "managed-peer",
+            "token-managed-peer",
+            crate::subagent::Action::Working {
+                id: "managed-child-failed-audit".into(),
+            },
+            Default::default(),
+        );
+        assert!(!working.ok, "{working:?}");
+        assert!(working
+            .error
+            .unwrap_or_default()
+            .contains("scheduler assignment admission is failed"));
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.scheduler_admissions["req-managed-failed-audit-1"].status,
+            "failed"
+        );
+        assert_eq!(state.subagents["managed-child-failed-audit"].status, "assigned");
+        assert_eq!(
+            state.tasks["task-scheduler-req-managed-failed-audit-1"].status,
+            "assigned"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_dispatch_audit_failure_does_not_wake_long_poll_or_recv() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        std::fs::create_dir(root.join(".agent-collab/server/events.jsonl")).unwrap();
+        let server = Arc::new(server);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (poll_result, dispatch_result) = runtime.block_on(async {
+            let poll = handle_poll_async(Arc::clone(&server), "peer".into(), 100);
+            let dispatch_server = Arc::clone(&server);
+            let dispatch = tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                dispatch(
+                    &dispatch_server,
+                    Req::Subagent {
+                        worker_id: "master".into(),
+                        token: "token-master".into(),
+                        command: crate::subagent::Action::Dispatch {
+                            request_id: "req-long-poll-failed-audit-1".into(),
+                            subject: "Failed long poll task".into(),
+                            body: "Must not be consumed".into(),
+                            feature_id: None,
+                            worktree_path: None,
+                            branch: None,
+                            base_commit: None,
+                            priority: "p2".into(),
+                            next_step: None,
+                        },
+                        launch_env: Default::default(),
+                    },
+                )
+            });
+            let (poll_result, dispatch_result) = tokio::join!(poll, dispatch);
+            (poll_result, dispatch_result.unwrap())
+        });
+        assert!(poll_result.ok, "{poll_result:?}");
+        assert_eq!(poll_result.data["count"], 0);
+        assert_eq!(poll_result.data["timeout"], true);
+        assert!(!dispatch_result.ok, "{dispatch_result:?}");
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs["scheduler-req-long-poll-failed-audit-1"].wake_attempt_count, 0);
+        assert_eq!(state.inbox_of("peer").len(), 0);
+        assert_eq!(
+            state.scheduler_admissions["req-long-poll-failed-audit-1"].status,
             "failed"
         );
         drop(state);

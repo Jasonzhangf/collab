@@ -898,10 +898,21 @@ impl State {
         let mut v: Vec<&Message> = self
             .msgs
             .values()
-            .filter(|m| m.to == worker_id && m.state != "read" && m.state != "superseded")
+            .filter(|m| {
+                m.to == worker_id
+                    && m.state != "read"
+                    && m.state != "superseded"
+                    && self.scheduler_message_deliverable(&m.id)
+            })
             .collect();
         v.sort_by_key(|m| m.created_ms);
         v
+    }
+
+    pub fn scheduler_message_deliverable(&self, message_id: &str) -> bool {
+        !self.scheduler_admissions.values().any(|admission| {
+            admission.message_id == message_id && admission.status != "succeeded"
+        })
     }
 
     /// True when some other message is a reply to `msg`.

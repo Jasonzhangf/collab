@@ -852,6 +852,22 @@ fn run(
                 if task.owner != actor {
                     bail!("task owner mismatch");
                 }
+                if let Some(admission) = state
+                    .scheduler_admissions
+                    .values()
+                    .find(|admission| admission.task_id == task.id)
+                {
+                    if admission.status != "succeeded" {
+                        bail!(
+                            "scheduler assignment admission is {}; cannot accept task {}",
+                            admission.status,
+                            task_id
+                        );
+                    }
+                    if admission.managed_subagent_id.as_deref() != Some(record.id.as_str()) {
+                        bail!("managed subagent does not own scheduler task {}", task_id);
+                    }
+                }
                 if task.status != "assigned"
                     && !(record.status == "working" && task.status == "working")
                 {
