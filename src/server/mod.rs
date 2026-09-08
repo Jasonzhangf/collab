@@ -972,6 +972,14 @@ fn handle_notification_subscribe(
     if let Err(error) = verify(&state, &worker_id, &token) {
         return error;
     }
+    let live_master = live_master_id(server, &state);
+    if event == "deadline" && live_master.as_deref() != Some(worker_id.as_str()) {
+        return Resp::err(if live_master.is_some() {
+            "master authority required for deadline subscriptions"
+        } else {
+            "no live master; deadline subscriptions require an approved live master"
+        });
+    }
     if event == "master-idle"
         && live_master_id(server, &state).as_deref() != Some(worker_id.as_str())
     {

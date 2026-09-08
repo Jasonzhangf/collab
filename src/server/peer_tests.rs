@@ -170,6 +170,49 @@ fn cancelling_master_idle_subscription_supersedes_pending_wake() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn deadline_subscription_requires_live_master_authority() {
+    let (server, root) = test_server();
+    register(&server, "worker", "%worker");
+    register(&server, "master", "%master");
+
+    let denied = handle_notification_subscribe(
+        &server,
+        "worker".into(),
+        "token-worker".into(),
+        "deadline".into(),
+        Some("goal:test".into()),
+        None,
+        vec![now_ms() + 10_000],
+        None,
+        1,
+        60,
+    );
+    assert!(!denied.ok);
+    assert!(denied.error.unwrap().contains("deadline subscriptions"));
+
+    server.commit(&[Event::MasterAssigned {
+        worker_id: "master".into(),
+        assigned_by: "master".into(),
+        approval: Some("user approved test master".into()),
+        assigned_ms: now_ms(),
+    }]);
+    let accepted = handle_notification_subscribe(
+        &server,
+        "master".into(),
+        "token-master".into(),
+        "deadline".into(),
+        Some("goal:test".into()),
+        None,
+        vec![now_ms() + 10_000],
+        None,
+        1,
+        60,
+    );
+    assert!(accepted.ok, "master should be allowed: {accepted:?}");
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn create_task(server: &Server, owner: &str, id: &str, feature: &str) -> Resp {
     handle_task_register(
         server,
