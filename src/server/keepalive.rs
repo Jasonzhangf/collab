@@ -360,9 +360,12 @@ pub(crate) fn tick_with(
             if new_idle_reason {
                 record.idle_episode_reason = idle_reason.into();
             }
+            let is_live_master = super::live_master_id(server, &state)
+                .is_some_and(|master_id| master_id == worker.id);
             if is_idle
                 && (was_working
-                    || (record.idle_episode_notices < 3
+                    || (is_live_master
+                        && record.idle_episode_notices < 3
                         && now.saturating_sub(record.last_notice_ms) >= 120_000))
                 && record.idle_episode_notices < 3
             {
@@ -522,9 +525,8 @@ pub(crate) fn tick_with(
         );
         let body = format!("Unfinished tasks: {}. Continue the named task now: read its state, do the next concrete step, and update it. If it is genuinely blocked, record the blocker and the concrete proposed fix. Reading this notice is not progress.", tasks.join(", "));
         record.last_notice_id = Some(id.clone());
-        server.commit_locked(
-            &mut state,
-            &[
+        let subscription_id = subscription.as_ref().expect("checked above").id.clone();
+        let mut events = vec![
                 Event::KeepaliveUpdated {
                     worker_id: worker.id.clone(),
                     record,
@@ -544,19 +546,24 @@ pub(crate) fn tick_with(
                         last_wake_attempt_ms: 0,
                     },
                 },
-                Event::WakeAttempted {
-                    ids: vec![id.clone()],
-                    attempted_ms: now,
-                },
-            ],
-        );
-        // No WakeBound: this reserved one-shot must never join a delayed/replayed queue.
+            ];
+        events.push(Event::WakeBound {
+            message_id: id.clone(),
+            subscription_id: subscription_id.clone(),
+        });
+        server.commit_locked(&mut state, &events);
         drop(state);
-        if probe(&pane) == AgentState::Waiting
-            && wake(&pane, &super::compose_notification(&id, &subject, &body))
-        {
-            server.commit(&[Event::Delivered { ids: vec![id] }]);
-        }
+        // The common notification path owns batching, attempt accounting, and
+        // delivery; task keepalives must not bypass it with a direct wake.
+        super::attempt_notification_with_at(
+            server,
+            &id,
+            &subscription_id,
+            &|_| true,
+            &|pane, text| wake(pane, text),
+            &|_, _| true,
+            now,
+        );
     }
 }
 
@@ -593,7 +600,7 @@ mod tests {
         }
         let sends = std::cell::Cell::new(0);
         let send = |_: &str, text: &str| {
-            assert!(text.contains("one, two"));
+            assert!(text.contains("message_ids="));
             sends.set(sends.get() + 1);
             false
         };
@@ -614,7 +621,7 @@ mod tests {
                 &|_, _| true,
             );
         }
-        assert_eq!(sends.get(), 3);
+        assert_eq!(sends.get(), 1, "failed task notices use the bounded batch path");
         let mut replay = State::default();
         for line in std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
             .unwrap()
@@ -640,9 +647,9 @@ mod tests {
         let state = server.state.lock().unwrap();
         assert!(state.keepalives["worker"].suspected_offline);
         assert_eq!(state.msgs.len(), 3);
-        assert!(state.msgs.values().all(|m| m.wake_attempt_count == 1));
-        assert!(state.wake_bindings.is_empty());
-        assert_eq!(sends.get(), 3);
+        assert!(state.msgs.values().all(|m| m.wake_attempt_count <= 1));
+        assert!(state.msgs.values().any(|m| m.wake_attempt_count == 1));
+        assert_eq!(sends.get(), 1);
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }

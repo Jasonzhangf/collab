@@ -181,15 +181,15 @@ impl Server {
         for ev in evs {
             st.apply(ev);
             if let Event::Sent { msg } = ev {
-                    if let Err(error) = self.backup_message(msg) {
-                        append_log(&self.log_path(), &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"));
-                    }
+                if let Err(error) = self.backup_message(msg) {
+                    self.report_mailbox_projection_error(error);
+                }
             }
             if let Event::Delivered { ids } = ev {
                 for id in ids {
                     if let Some(msg) = st.msgs.get(id) {
                         if let Err(error) = self.backup_message(msg) {
-                            append_log(&self.log_path(), &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"));
+                            self.report_mailbox_projection_error(error);
                         }
                     }
                 }
@@ -198,7 +198,7 @@ impl Server {
                 for id in ids {
                     if let Some(msg) = st.msgs.get(id) {
                         if let Err(error) = self.backup_message(msg) {
-                            append_log(&self.log_path(), &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"));
+                            self.report_mailbox_projection_error(error);
                         }
                     }
                 }
@@ -209,23 +209,52 @@ impl Server {
         }
     }
 
+    fn report_mailbox_projection_error(&self, error: String) {
+        // Journal truth is already durable. Keep projection failure explicit
+        // and queryable without turning it into a false delivery result.
+        append_log(
+            &self.log_path(),
+            &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"),
+        );
+        record_activity(
+            &self.root,
+            "mailbox_projection_error",
+            json!({"exact_error": error, "recoverable": true}),
+        );
+    }
+
     fn backup_message(&self, msg: &Message) -> Result<(), String> {
         let dir = self.root.join(".agent-collab").join("mailbox");
         std::fs::create_dir_all(&dir).map_err(|error| format!("create directory: {error}"))?;
         let path = dir.join(format!("{}.json", msg.id));
-        if let Ok(data) = serde_json::to_string_pretty(msg) {
-            let _ = std::fs::write(&path, data);
-        }
+        let data = serde_json::to_string_pretty(msg).map_err(|error| format!("message serialize: {error}"))?;
+        std::fs::write(&path, data).map_err(|error| format!("message snapshot: {error}"))?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join(format!("recipient-{}.jsonl", msg.to)))
             .map_err(|error| format!("open: {error}"))?;
         use std::io::Write;
+        let subject = msg.subject.as_deref().unwrap_or("notice");
+        let (priority, action) = notification_class(subject);
+        let task_ids = msg.body.split_whitespace()
+            .filter(|token| token.starts_with("task-"))
+            .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+            .filter(|token| !token.is_empty())
+            .collect::<std::collections::BTreeSet<_>>();
         let record = json!({
             "schema_version": 1,
             "record_type": "message",
             "recipient": msg.to,
+            "category": subject,
+            "priority": priority,
+            "action": action,
+            "task_ids": task_ids,
+            "created_ms": msg.created_ms,
+            "window_start_ms": msg.created_ms,
+            "window_end_ms": msg.created_ms.saturating_add(120_000),
+            "state": msg.state,
+            "exact_error": serde_json::Value::Null,
             "message": msg,
         });
         let data = serde_json::to_string(&record).map_err(|error| format!("serialize: {error}"))?;
@@ -401,20 +430,32 @@ fn batch_notification_text(
     format!("Batch wake: message_ids={message_ids} task_ids={} action_categories={actions}. Read full durable details from collab inbox; execute the actions, do not ACK-only.{older}", if task_ids.is_empty() { "none" } else { &task_ids })
 }
 
-#[cfg(test)]
-fn read_recipient_mailbox(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+struct RecipientMailboxRead {
+    records: Vec<serde_json::Value>,
+    partial_tail: bool,
+}
+
+fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailboxRead, String> {
     let content = std::fs::read_to_string(path).map_err(|error| format!("read: {error}"))?;
     let lines = content.lines().collect::<Vec<_>>();
     let partial_tail = !content.ends_with('\n');
     let mut records = Vec::new();
     for (index, line) in lines.into_iter().enumerate() {
-        match serde_json::from_str(line) {
-            Ok(record) => records.push(record),
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(record) => {
+                if record["schema_version"] != 1
+                    || record["record_type"] != "message"
+                    || record["recipient"] != recipient
+                {
+                    return Err(format!("invalid mailbox envelope at record {}", index + 1));
+                }
+                records.push(record)
+            }
             Err(_error) if partial_tail && index + 1 == content.lines().count() => break,
             Err(error) => return Err(format!("malformed JSONL record {}: {error}", index + 1)),
         }
     }
-    Ok(records)
+    Ok(RecipientMailboxRead { records, partial_tail })
 }
 
 /// Shared wake text for every channel. Keepalive and message delivery must not
@@ -601,7 +642,26 @@ fn attempt_notification_with(
     deliver: &dyn Fn(&str, &str) -> bool,
     owns_pane: &dyn Fn(&str, &str) -> bool,
 ) -> bool {
-    let now = now_ms();
+    attempt_notification_with_at(
+        server,
+        message_id,
+        subscription_id,
+        can_receive,
+        deliver,
+        owns_pane,
+        now_ms(),
+    )
+}
+
+fn attempt_notification_with_at(
+    server: &Server,
+    message_id: &str,
+    subscription_id: &str,
+    can_receive: &dyn Fn(&str) -> bool,
+    deliver: &dyn Fn(&str, &str) -> bool,
+    owns_pane: &dyn Fn(&str, &str) -> bool,
+    now: i64,
+) -> bool {
     if !server.config.notifications.enabled {
         return false;
     }
@@ -680,7 +740,7 @@ fn attempt_notification_with(
                     .unwrap_or_else(|| server.config.notifications.delay_ms(&sub.event))
                     == delay
                 && message.state == "pending"
-                && message.wake_attempt_count == 0
+                && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
                 && sub.worker_id == recipient
                 && sub.pane == pane
                 && sub.status == "armed"
@@ -3702,11 +3762,31 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 msgs.sort_by(|a, b| a.created_ms.cmp(&b.created_ms));
             }
             let count = msgs.len();
-            Resp::data(json!({
+            let projection = worker_id.as_deref().and_then(|recipient| {
+                let path = server.root.join(".agent-collab/mailbox")
+                    .join(format!("recipient-{recipient}.jsonl"));
+                match read_recipient_mailbox(&path, recipient) {
+                    Ok(read) => Some(json!({
+                        "status": if read.partial_tail { "partial-tail" } else { "ok" },
+                        "partial_tail": read.partial_tail,
+                        "records": read.records,
+                    })),
+                    Err(error) => Some(json!({
+                        "status": "error",
+                        "exact_error": error,
+                        "records": [],
+                    })),
+                }
+            });
+            let mut response = json!({
                 "count": count,
                 "sort": sort_order,
                 "messages": msgs,
-            }))
+            });
+            if let Some(projection) = projection {
+                response["recipient_jsonl"] = projection;
+            }
+            Resp::data(response)
         }
     }
 }

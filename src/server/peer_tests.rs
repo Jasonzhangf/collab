@@ -2181,7 +2181,17 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
     let jsonl = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
     assert!(std::fs::read_to_string(&jsonl).unwrap().lines().any(|line| {
         serde_json::from_str::<serde_json::Value>(line)
-            .map(|record| record["schema_version"] == 1 && record["record_type"] == "message" && record["recipient"] == "recipient" && record["message"]["id"] == message_id)
+            .map(|record| record["schema_version"] == 1
+                && record["record_type"] == "message"
+                && record["recipient"] == "recipient"
+                && record["category"] == "occupied"
+                && record["task_ids"].is_array()
+                && record["created_ms"].is_i64()
+                && record["window_start_ms"].is_i64()
+                && record["window_end_ms"].is_i64()
+                && record["state"] == "pending"
+                && record["exact_error"].is_null()
+                && record["message"]["id"] == message_id)
             .unwrap_or(false)
     }));
     assert_eq!(replay(&root).unwrap().msgs[&message_id].body, "RESOURCE_OCCUPIED feature=shared");
@@ -2270,15 +2280,28 @@ fn recipient_jsonl_records_latest_delivery_and_journal_replay() {
         .filter(|record| record["message"]["id"] == id)
         .collect::<Vec<_>>();
     assert_eq!(records.len(), 3, "Sent/Delivered/Acked append snapshots");
+    for record in &records {
+        assert_eq!(record["schema_version"], 1);
+        assert_eq!(record["record_type"], "message");
+        assert_eq!(record["recipient"], "recipient");
+        assert_eq!(record["category"], "progress");
+        assert!(record["task_ids"].is_array());
+        assert!(record["created_ms"].is_i64());
+        assert!(record["window_start_ms"].is_i64());
+        assert!(record["window_end_ms"].is_i64());
+        assert!(record["exact_error"].is_null());
+    }
     assert_eq!(records.last().unwrap()["message"]["state"], "read");
     assert_eq!(replay(&root).unwrap().msgs[id].state, "read");
     let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
     std::fs::OpenOptions::new().append(true).open(&path).unwrap();
     std::fs::OpenOptions::new().append(true).open(&path).unwrap();
     std::fs::write(&path, format!("{}{{\"partial\":", std::fs::read_to_string(&path).unwrap())).unwrap();
-    assert_eq!(read_recipient_mailbox(&path).unwrap().len(), 3);
+    let projection = read_recipient_mailbox(&path, "recipient").unwrap();
+    assert_eq!(projection.records.len(), 3);
+    assert!(projection.partial_tail);
     std::fs::write(&path, "{\"bad\":true}\nnot-json\n").unwrap();
-    assert!(read_recipient_mailbox(&path).is_err());
+    assert!(read_recipient_mailbox(&path, "recipient").is_err());
     std::fs::remove_dir_all(root).ok();
 }
 
