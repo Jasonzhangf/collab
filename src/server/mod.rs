@@ -222,8 +222,33 @@ impl Server {
                 Event::SchedulerAdmission { admission } if admission.status == "pending"
             )
         });
-        if evs.iter().any(|event| matches!(event, Event::Sent { .. }))
-            && !has_pending_scheduler_admission
+        let has_succeeded_scheduler_admission = evs.iter().any(|event| {
+            let Event::SchedulerAdmissionStatus {
+                request_id,
+                status,
+                ..
+            } = event
+            else {
+                return false;
+            };
+            status == "succeeded"
+                && st
+                    .scheduler_admissions
+                    .get(request_id)
+                    .is_some_and(|admission| {
+                        admission.status == "succeeded"
+                            && st
+                                .msgs
+                                .get(&admission.message_id)
+                                .is_some_and(|message| {
+                                    message.state == "pending"
+                                        && st.scheduler_message_deliverable(&message.id)
+                                })
+                    })
+        });
+        if (evs.iter().any(|event| matches!(event, Event::Sent { .. }))
+            && !has_pending_scheduler_admission)
+            || has_succeeded_scheduler_admission
         {
             self.mailbox_notify.notify_waiters();
         }
@@ -6895,12 +6920,76 @@ mod scheduler_admission_tests {
     }
 
     #[test]
+    fn scheduler_dispatch_success_wakes_long_poll() {
+        let (mut server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.config.notifications.enabled = false;
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let server = Arc::new(server);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (poll_result, dispatch_result) = runtime.block_on(async {
+            let poll = handle_poll_async(Arc::clone(&server), "peer".into(), 1_000);
+            let dispatch_server = Arc::clone(&server);
+            let dispatch = tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                dispatch(
+                    &dispatch_server,
+                    Req::Subagent {
+                        worker_id: "master".into(),
+                        token: "token-master".into(),
+                        command: crate::subagent::Action::Dispatch {
+                            request_id: "req-long-poll-success-1".into(),
+                            subject: "Successful long poll task".into(),
+                            body: "Must wake recv".into(),
+                            feature_id: None,
+                            worktree_path: None,
+                            branch: None,
+                            base_commit: None,
+                            priority: "p2".into(),
+                            next_step: None,
+                        },
+                        launch_env: Default::default(),
+                    },
+                )
+            });
+            let (poll_result, dispatch_result) = tokio::join!(poll, dispatch);
+            (poll_result, dispatch_result.unwrap())
+        });
+        assert!(poll_result.ok, "{poll_result:?}");
+        assert_eq!(poll_result.data["count"], 1);
+        assert!(!poll_result.data["timeout"].as_bool().unwrap_or(false));
+        assert_eq!(
+            poll_result.data["messages"][0]["id"],
+            "scheduler-req-long-poll-success-1"
+        );
+        assert!(dispatch_result.ok, "{dispatch_result:?}");
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.scheduler_admissions["req-long-poll-success-1"].status,
+            "succeeded"
+        );
+        assert_eq!(state.msgs["scheduler-req-long-poll-success-1"].state, "read");
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scheduler_dispatch_recovers_pending_reservation_without_duplicates() {
         // Simulate a process interruption after the reservation and audit write,
         // but before the durable succeeded status commit.
-        let (server, root) = test_server();
+        let (mut server, root) = test_server();
         register(&server, "master", "%master");
         register(&server, "peer", "%peer");
+        server.config.notifications.enabled = false;
         server.commit(&[
             Event::MasterAssigned {
                 worker_id: "master".into(),
@@ -6981,28 +7070,47 @@ mod scheduler_admission_tests {
         read_only.set_mode(original_mode & !0o222);
         std::fs::set_permissions(&audit_path, read_only).unwrap();
         let server = Arc::new(server);
-        let recovered = dispatch(
-            &server,
-            Req::Subagent {
-                worker_id: "master".into(),
-                token: "token-master".into(),
-                command: crate::subagent::Action::Dispatch {
-                    request_id: "req-pending-recovery-1".into(),
-                    subject: "Changed subject is ignored".into(),
-                    body: "Changed body is ignored".into(),
-                    feature_id: None,
-                    worktree_path: None,
-                    branch: None,
-                    base_commit: None,
-                    priority: "p2".into(),
-                    next_step: None,
-                },
-                launch_env: Default::default(),
-            },
-        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (poll_result, recovered) = runtime.block_on(async {
+            let poll = handle_poll_async(Arc::clone(&server), "peer".into(), 1_000);
+            let recovery_server = Arc::clone(&server);
+            let recovery = tokio::task::spawn_blocking(move || {
+                dispatch(
+                    &recovery_server,
+                    Req::Subagent {
+                        worker_id: "master".into(),
+                        token: "token-master".into(),
+                        command: crate::subagent::Action::Dispatch {
+                            request_id: "req-pending-recovery-1".into(),
+                            subject: "Changed subject is ignored".into(),
+                            body: "Changed body is ignored".into(),
+                            feature_id: None,
+                            worktree_path: None,
+                            branch: None,
+                            base_commit: None,
+                            priority: "p2".into(),
+                            next_step: None,
+                        },
+                        launch_env: Default::default(),
+                    },
+                )
+            });
+            let (poll_result, recovered) = tokio::join!(poll, recovery);
+            (poll_result, recovered.unwrap())
+        });
         let mut restored = std::fs::metadata(&audit_path).unwrap().permissions();
         restored.set_mode(original_mode);
         std::fs::set_permissions(&audit_path, restored).unwrap();
+        assert!(poll_result.ok, "{poll_result:?}");
+        assert_eq!(poll_result.data["count"], 1);
+        assert!(!poll_result.data["timeout"].as_bool().unwrap_or(false));
+        assert_eq!(
+            poll_result.data["messages"][0]["id"],
+            "scheduler-req-pending-recovery-1"
+        );
         assert!(recovered.ok, "{recovered:?}");
         assert_eq!(recovered.data["recovered"], true);
         assert_eq!(recovered.data["decision"], "use-registered-peer");
