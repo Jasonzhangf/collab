@@ -2340,7 +2340,7 @@ pub(crate) fn registered_idle_peer_for_admission(
                 !state
                     .tasks
                     .values()
-                    .any(|task| task.owner == worker.id && task_claim_held(&task.status))
+                    .any(|task| task.owner == worker.id && task_resource_active(&task.status))
             })
             .cloned()
             .collect();
@@ -2377,11 +2377,85 @@ pub(crate) fn registered_idle_peer_for_admission(
             && !state
                 .tasks
                 .values()
-                .any(|task| task.owner == worker.id && task_claim_held(&task.status))
+                .any(|task| task.owner == worker.id && task_resource_active(&task.status))
         {
             return Some((
                 worker.id,
                 "live registered peer is idle, owned, and has no actionable task".into(),
+            ));
+        }
+    }
+    None
+}
+
+pub(crate) fn idle_managed_subagent_for_admission(
+    server: &Server,
+    requester: &str,
+) -> Option<(String, String, String)> {
+    let candidates: Vec<(crate::subagent::Record, WorkerRec)> = {
+        let state = server.state.lock().unwrap();
+        let mut candidates = state
+            .subagents
+            .values()
+            .filter(|record| record.parent == requester && record.status == "idle")
+            .filter_map(|record| {
+                state
+                    .workers
+                    .get(&record.peer)
+                    .cloned()
+                    .map(|worker| (record.clone(), worker))
+            })
+            .filter(|(_, worker)| {
+                !state
+                    .tasks
+                    .values()
+                    .any(|task| task.owner == worker.id && task_resource_active(&task.status))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.0.id.cmp(&right.0.id));
+        candidates
+    };
+
+    let probed: Vec<(crate::subagent::Record, WorkerRec)> = candidates
+        .into_iter()
+        .filter(|(_, worker)| {
+            matches!(
+                worker_identity_presence(server, worker),
+                PanePresence::Present
+            ) && worker
+                .pane
+                .as_deref()
+                .map(|pane| (server.pane_state_check)(pane) == knock::AgentState::Waiting)
+                == Some(true)
+        })
+        .collect();
+
+    let state = server.state.lock().unwrap();
+    for (record, worker) in probed {
+        let Some(current) = state.subagents.get(&record.id) else {
+            continue;
+        };
+        let Some(current_worker) = state.workers.get(&worker.id) else {
+            continue;
+        };
+        if current.parent == requester
+            && current.status == "idle"
+            && current.peer == worker.id
+            && current.pane == worker.pane
+            && current_worker.id == worker.id
+            && current_worker.token == worker.token
+            && current_worker.pane == worker.pane
+            && current_worker.cwd == worker.cwd
+            && current_worker.registered_ms == worker.registered_ms
+            && !state
+                .tasks
+                .values()
+                .any(|task| task.owner == worker.id && task_resource_active(&task.status))
+        {
+            return Some((
+                record.id,
+                worker.id,
+                "live managed subagent is idle, owned, and has no active task".into(),
             ));
         }
     }
@@ -2422,45 +2496,87 @@ pub(crate) fn scheduler_admit_subagent_start(
     server: &Server,
     worker_id: &str,
     token: &str,
-) -> Option<Resp> {
+    requested_id: Option<&str>,
+    requested_runtime: Option<&str>,
+) -> Result<Option<Resp>, Resp> {
+    if requested_id.is_some_and(|id| !crate::subagent::valid_id(id))
+        || requested_runtime.is_some_and(|runtime| !crate::subagent::valid_runtime(runtime))
+    {
+        return Ok(None);
+    }
     let authenticated = {
         let state = server.state.lock().unwrap();
         verify(&state, worker_id, token).is_ok()
     };
     if !authenticated {
-        return None;
+        return Ok(None);
+    }
+
+    if requested_id.is_some_and(|id| server.state.lock().unwrap().subagents.contains_key(id)) {
+        return Ok(None);
     }
 
     // Snapshot the master identity, then probe outside the state mutex for the
     // same reason as registered_idle_peer_for_admission.
-    let master = {
+    let Some(master) = ({
         let state = server.state.lock().unwrap();
         state
             .master_worker_id
             .as_ref()
             .and_then(|id| state.workers.get(id))
             .cloned()
-    }?;
-    if master.id != worker_id || worker_identity_presence(server, &master) != PanePresence::Present {
-        return None;
+    }) else {
+        return Ok(None);
+    };
+    if master.id != worker_id || worker_identity_presence(server, &master) != PanePresence::Present
+    {
+        return Ok(None);
     }
 
-    let (peer_id, reason) = registered_idle_peer_for_admission(server, worker_id)?;
+    let (decision, peer_id, managed_subagent_id, reason) =
+        if let Some((peer_id, reason)) = registered_idle_peer_for_admission(server, worker_id) {
+            ("use-registered-peer", peer_id, None, reason)
+        } else if let Some((id, peer_id, reason)) =
+            idle_managed_subagent_for_admission(server, worker_id)
+        {
+            ("reuse-idle-managed-subagent", peer_id, Some(id), reason)
+        } else {
+            let admission = json!({
+                "decision": "create-managed-subagent",
+                "managed_subagent_id": serde_json::Value::Null,
+                "reason": "no eligible live registered peer or idle managed subagent capacity",
+            });
+            record_scheduler_admission(server, admission)?;
+            return Ok(None);
+        };
+    let managed_subagent = managed_subagent_id
+        .as_ref()
+        .map(|id| json!({"id": id, "worker_id": peer_id}))
+        .unwrap_or(serde_json::Value::Null);
     let admission = json!({
-        "decision": "use-registered-peer",
+        "decision": decision,
         "worker_id": peer_id,
+        "managed_subagent_id": managed_subagent_id,
         "reason": reason,
     });
-    if let Err(error) = record_activity(&server.root, "scheduler_admission", admission.clone()) {
+    record_scheduler_admission(server, admission.clone())?;
+    Ok(Some(Resp::data(json!({
+        "admission": admission,
+        "managed_subagent": managed_subagent,
+    }))))
+}
+
+fn record_scheduler_admission(server: &Server, admission: serde_json::Value) -> Result<(), Resp> {
+    if let Err(error) = record_activity(&server.root, "scheduler_admission", admission) {
         append_log(
             &server.log_path(),
             &format!("SCHEDULER_ADMISSION_RECORD_FAILED: {error}"),
         );
+        return Err(Resp::err(format!(
+            "scheduler admission audit failed: {error}"
+        )));
     }
-    Some(Resp::data(json!({
-        "admission": admission,
-        "managed_subagent": serde_json::Value::Null,
-    })))
+    Ok(())
 }
 
 fn verify_master_actor(
@@ -5557,7 +5673,7 @@ mod scheduler_admission_tests {
                 branch: None,
                 base_commit: None,
                 priority: "p1".into(),
-                status: "working".into(),
+                status: "assigned".into(),
                 next_step: None,
                 wait: None,
                 created_ms: now_ms(),
@@ -5590,6 +5706,105 @@ mod scheduler_admission_tests {
             },
         }]);
         assert!(registered_idle_peer_for_admission(&server, "master").is_none());
+        assert_eq!(
+            idle_managed_subagent_for_admission(&server, "master")
+                .map(|(id, _, _)| id)
+                .as_deref(),
+            Some("existing-child")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_idle_capacity_is_reused_and_existing_start_semantics_are_preserved() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "managed-peer", "%managed-peer");
+        server.commit(&[
+            Event::MasterAssigned {
+                worker_id: "master".into(),
+                assigned_by: "operator".into(),
+                approval: Some("scheduler test".into()),
+                assigned_ms: now_ms(),
+            },
+            Event::SubagentUpdated {
+                subagent: crate::subagent::Record {
+                    id: "existing-child".into(),
+                    parent: "master".into(),
+                    peer: "managed-peer".into(),
+                    status: "idle".into(),
+                    session: Some("$managed-peer".into()),
+                    pane: Some("%managed-peer".into()),
+                    profile: None,
+                    created_ms: now_ms(),
+                    ready_deadline_ms: 0,
+                    last_message: None,
+                    error: None,
+                    probe_failures: Vec::new(),
+                    runtime: Some("cursor".into()),
+                },
+            },
+        ]);
+        let server = Arc::new(server);
+        let reused = dispatch(
+            &server,
+            Req::Subagent {
+                worker_id: "master".into(),
+                token: "token-master".into(),
+                command: crate::subagent::Action::Start {
+                    id: Some("new-child".into()),
+                    runtime: Some("cursor".into()),
+                },
+                launch_env: Default::default(),
+            },
+        );
+        assert!(reused.ok, "{reused:?}");
+        assert_eq!(
+            reused.data["admission"]["decision"],
+            "reuse-idle-managed-subagent"
+        );
+        assert_eq!(reused.data["managed_subagent"]["id"], "existing-child");
+
+        let existing = crate::subagent::handle_with_env(
+            &server,
+            "master",
+            "token-master",
+            crate::subagent::Action::Start {
+                id: Some("existing-child".into()),
+                runtime: Some("codex".into()),
+            },
+            Default::default(),
+        );
+        assert!(existing.ok, "{existing:?}");
+        assert_eq!(existing.data["reused"], true);
+
+        let invalid_id = crate::subagent::handle_with_env(
+            &server,
+            "master",
+            "token-master",
+            crate::subagent::Action::Start {
+                id: Some("invalid id".into()),
+                runtime: Some("cursor".into()),
+            },
+            Default::default(),
+        );
+        assert!(!invalid_id.ok);
+        assert!(invalid_id.error.unwrap().contains("invalid subagent ID"));
+        let invalid_runtime = crate::subagent::handle_with_env(
+            &server,
+            "master",
+            "token-master",
+            crate::subagent::Action::Start {
+                id: Some("existing-child".into()),
+                runtime: Some("unknown".into()),
+            },
+            Default::default(),
+        );
+        assert!(!invalid_runtime.ok);
+        assert!(invalid_runtime
+            .error
+            .unwrap()
+            .contains("runtime must be cursor or codex"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5617,6 +5832,67 @@ mod scheduler_admission_tests {
         assert!(PROBE_STARTED.load(Ordering::Acquire));
         assert!(lock_available, "pane probe held the scheduler state lock");
         assert_eq!(selected.map(|(id, _)| id).as_deref(), Some("idle-peer"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn admission_audit_failure_is_explicit_and_does_not_create_child() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "idle-peer", "%idle-peer");
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let events = root.join(".agent-collab/server/events.jsonl");
+        std::fs::create_dir(&events).unwrap();
+        let server = Arc::new(server);
+        let result = dispatch(
+            &server,
+            Req::Subagent {
+                worker_id: "master".into(),
+                token: "token-master".into(),
+                command: crate::subagent::Action::Start {
+                    id: Some("audit-failure-child".into()),
+                    runtime: Some("cursor".into()),
+                },
+                launch_env: Default::default(),
+            },
+        );
+        assert!(!result.ok);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("scheduler admission audit failed"));
+        assert!(server.state.lock().unwrap().subagents.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_capacity_records_explicit_create_admission() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let decision = scheduler_admit_subagent_start(
+            &server,
+            "master",
+            "token-master",
+            Some("new-child"),
+            Some("cursor"),
+        )
+        .unwrap();
+        assert!(decision.is_none());
+        let audit =
+            std::fs::read_to_string(root.join(".agent-collab/server/events.jsonl")).unwrap();
+        assert!(audit.contains("create-managed-subagent"));
+        assert!(audit.contains("no eligible live registered peer"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

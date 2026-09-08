@@ -167,12 +167,15 @@ fn follow_up(record: &Record, reused: bool) -> serde_json::Value {
     value
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 80
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+pub(crate) fn valid_runtime(runtime: &str) -> bool {
+    matches!(runtime, "cursor" | "codex")
 }
 fn is_cursor(runtime: &str) -> bool {
     runtime == "cursor"
@@ -587,10 +590,21 @@ pub fn handle_with_env(
     action: Action,
     environment: std::collections::BTreeMap<String, String>,
 ) -> Resp {
-    if matches!(action, Action::Start { .. }) {
-        if let Some(response) = crate::server::scheduler_admit_subagent_start(server, actor, token)
-        {
-            return response;
+    if let Action::Start {
+        ref id,
+        ref runtime,
+    } = action
+    {
+        match crate::server::scheduler_admit_subagent_start(
+            server,
+            actor,
+            token,
+            id.as_deref(),
+            runtime.as_deref(),
+        ) {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(response) => return response,
         }
     }
     match run(server, actor, token, action, environment) {
@@ -615,7 +629,7 @@ fn run(
         config::ensure_written()?;
         let mut config = config::load(&server.root)?;
         if let Some(runtime) = runtime {
-            if !matches!(runtime.as_str(), "cursor" | "codex") {
+            if !valid_runtime(runtime.as_str()) {
                 bail!("subagent.runtime must be cursor or codex");
             }
             config.subagent.runtime = runtime;
