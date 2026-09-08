@@ -915,13 +915,15 @@ mod tests {
 
         let (server, root) = test_server();
         register(&server, "master", "%master");
-        assert!(super::super::handle_master_promote(
-            &server,
-            "master".into(),
-            "token-master".into(),
-            "user approved master".into(),
-        )
-        .ok);
+        assert!(
+            super::super::handle_master_promote(
+                &server,
+                "master".into(),
+                "token-master".into(),
+                "user approved master".into(),
+            )
+            .ok
+        );
 
         let base = super::super::state::now_ms();
         tick_with(
@@ -940,7 +942,10 @@ mod tests {
         );
 
         let state = server.state.lock().unwrap();
-        let record = state.keepalives.get("master").expect("idle observation persists");
+        let record = state
+            .keepalives
+            .get("master")
+            .expect("idle observation persists");
         assert_eq!(record.observed, "idle");
         assert_eq!(record.idle_episode_notices, 0);
         assert_eq!(record.idle_episode_reason, "no-actionable-tasks");
