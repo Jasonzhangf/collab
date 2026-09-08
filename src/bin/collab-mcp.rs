@@ -13,7 +13,7 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 fn tools() -> Value {
     json!([
         tool("collab_msg", "Read a durable notification by ID.", json!({"id":{"type":"string"}}), &["id"]),
-        tool("collab_subagent", "Parent manages children; child uses ready/working and sends results via collab_sendmessage. status includes mailbox, keepalive and notification history. snapshot is explicit screen-tail read only, not a health probe. Cursor health is official `agent status --format json`. Non-tmux observers get no push channel and must check status/mailbox themselves. rearm requires an explicit operator request after exhaustion. start accepts optional runtime=cursor|codex to override ~/.appsdk/config.toml.", json!({"action":{"type":"string","enum":["start","list","status","snapshot","rearm","send","ready","working","close"]},"id":{"type":"string"},"runtime":{"type":"string","enum":["cursor","codex"]},"lines":{"type":"integer","minimum":1,"maximum":200},"subject":{"type":"string"},"body":{"type":"string"}}), &["action"]),
+        tool("collab_subagent", "Parent manages children; child uses ready/working and sends results via collab_sendmessage. status includes mailbox, keepalive and notification history. snapshot is explicit screen-tail read only, not a health probe. Cursor health is official `agent status --format json`. Non-tmux observers get no push channel and must check status/mailbox themselves. rearm requires an explicit operator request after exhaustion. start accepts optional runtime=cursor|codex to override ~/.appsdk/config.toml. dispatch assigns a real task through the live master scheduler and is idempotent by request_id.", json!({"action":{"type":"string","enum":["start","dispatch","list","status","snapshot","rearm","send","ready","working","close"]},"id":{"type":"string"},"request_id":{"type":"string"},"runtime":{"type":"string","enum":["cursor","codex"]},"lines":{"type":"integer","minimum":1,"maximum":200},"subject":{"type":"string"},"body":{"type":"string"},"feature_id":{"type":"string"},"worktree_path":{"type":"string"},"branch":{"type":"string"},"base_commit":{"type":"string"},"priority":{"type":"string","enum":["p0","p1","p2","p3","p4"]},"next_step":{"type":"string"}}), &["action"]),
         tool(
             "collab_init",
             "Initialize/register this live project identity.",
@@ -172,7 +172,8 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
         "collab_subagent" => {
             let action = required(args, "action")?;
             if ![
-                "start", "list", "status", "snapshot", "rearm", "send", "ready", "working", "close",
+                "start", "dispatch", "list", "status", "snapshot", "rearm", "send", "ready",
+                "working", "close",
             ]
             .contains(&action.as_str())
             {
@@ -182,6 +183,20 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
             if action == "start" {
                 optional_flag(&mut argv, args, "id", "--id")?;
                 optional_flag(&mut argv, args, "runtime", "--runtime")?;
+            } else if action == "dispatch" {
+                argv.extend([
+                    "--request-id".into(),
+                    required(args, "request_id")?,
+                    "--subject".into(),
+                    required(args, "subject")?,
+                    required(args, "body")?,
+                ]);
+                optional_flag(&mut argv, args, "feature_id", "--feature-id")?;
+                optional_flag(&mut argv, args, "worktree_path", "--worktree-path")?;
+                optional_flag(&mut argv, args, "branch", "--branch")?;
+                optional_flag(&mut argv, args, "base_commit", "--base-commit")?;
+                optional_flag(&mut argv, args, "priority", "--priority")?;
+                optional_flag(&mut argv, args, "next_step", "--next-step")?;
             } else if action != "list" {
                 argv.push(required(args, "id")?);
             }
@@ -527,6 +542,25 @@ mod tests {
             json!(["to", "subject", "body"])
         );
         assert!(send["inputSchema"]["properties"]["subject"].is_object());
+    }
+
+    #[test]
+    fn subagent_dispatch_schema_exposes_stable_request_and_task_fields() {
+        let definitions = tools();
+        let subagent = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "collab_subagent")
+            .unwrap();
+        assert!(subagent["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("dispatch")));
+        let properties = subagent["inputSchema"]["properties"].as_object().unwrap();
+        for field in ["request_id", "subject", "body", "feature_id", "priority"] {
+            assert!(properties.contains_key(field), "missing MCP field {field}");
+        }
     }
 
     #[test]

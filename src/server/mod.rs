@@ -2579,6 +2579,243 @@ fn record_scheduler_admission(server: &Server, admission: serde_json::Value) -> 
     Ok(())
 }
 
+fn scheduler_dispatch_deduplicated(
+    server: &Server,
+    worker_id: &str,
+    request_id: &str,
+) -> Option<Resp> {
+    let message_id = format!("scheduler-{request_id}");
+    let task_id = format!("task-{message_id}");
+    let state = server.state.lock().unwrap();
+    let (Some(message), Some(task)) = (
+        state.msgs.get(&message_id).cloned(),
+        state.tasks.get(&task_id).cloned(),
+    ) else {
+        return None;
+    };
+    let managed_subagent_id = state
+        .subagents
+        .values()
+        .find(|record| record.parent == worker_id && record.peer == task.owner)
+        .map(|record| record.id.clone());
+    Some(Resp::data(json!({
+        "request_id": request_id,
+        "decision": "deduplicated",
+        "message_id": message.id,
+        "task_id": task.id,
+        "target": task.owner,
+        "status": task.status,
+        "managed_subagent_id": managed_subagent_id,
+        "managed_subagent": managed_subagent_id
+            .as_ref()
+            .map(|id| json!({"id": id, "worker_id": task.owner}))
+            .unwrap_or(serde_json::Value::Null),
+        "deduplicated": true,
+    })))
+}
+
+pub(crate) fn handle_scheduler_dispatch(
+    server: &Server,
+    worker_id: String,
+    token: String,
+    request_id: String,
+    subject: String,
+    body: String,
+    feature_id: Option<String>,
+    worktree_path: Option<String>,
+    branch: Option<String>,
+    base_commit: Option<String>,
+    priority: String,
+    next_step: Option<String>,
+) -> Resp {
+    if !crate::subagent::valid_id(&request_id) {
+        return Resp::err("scheduler request_id must be a valid non-empty ID");
+    }
+    if subject.trim().is_empty() || body.trim().is_empty() {
+        return Resp::err("scheduler dispatch requires a non-empty subject and body");
+    }
+    if !matches!(priority.as_str(), "p0" | "p1" | "p2" | "p3" | "p4") {
+        return Resp::err(format!(
+            "invalid priority {}; must be p0, p1, p2, p3, or p4",
+            priority
+        ));
+    }
+    if let Some(path) = &worktree_path {
+        if let Err(error) = validate_worktree_path(&server.root, path) {
+            return Resp::err(error);
+        }
+    }
+
+    let authenticated = {
+        let state = server.state.lock().unwrap();
+        verify(&state, &worker_id, &token).is_ok()
+    };
+    if !authenticated {
+        return Resp::err("scheduler dispatch authentication failed");
+    }
+    let Some(master) = ({
+        let state = server.state.lock().unwrap();
+        state
+            .master_worker_id
+            .as_ref()
+            .and_then(|id| state.workers.get(id))
+            .cloned()
+    }) else {
+        return Resp::err("scheduler dispatch requires a live master");
+    };
+    if master.id != worker_id || worker_identity_presence(server, &master) != PanePresence::Present
+    {
+        return Resp::err("scheduler dispatch requires the live registered master");
+    }
+
+    let message_id = format!("scheduler-{request_id}");
+    let task_id = format!("task-{message_id}");
+    for _ in 0..3 {
+        if let Some(response) = scheduler_dispatch_deduplicated(server, &worker_id, &request_id) {
+            return response;
+        }
+        let candidate = registered_idle_peer_for_admission(server, &worker_id)
+            .map(|(peer, reason)| (peer, None, reason, "use-registered-peer"))
+            .or_else(|| {
+                idle_managed_subagent_for_admission(server, &worker_id).map(
+                    |(managed_id, peer, reason)| {
+                        (
+                            peer,
+                            Some(managed_id),
+                            reason,
+                            "reuse-idle-managed-subagent",
+                        )
+                    },
+                )
+            });
+        let Some((peer_id, managed_id, reason, decision)) = candidate else {
+            if let Some(response) = scheduler_dispatch_deduplicated(server, &worker_id, &request_id)
+            {
+                return response;
+            }
+            return Resp::err(
+                "scheduler dispatch has no eligible live peer or idle managed subagent capacity",
+            );
+        };
+
+        let mut state = server.state.lock().unwrap();
+        let Some(worker) = state.workers.get(&peer_id).cloned() else {
+            continue;
+        };
+        if state
+            .tasks
+            .values()
+            .any(|task| task.owner == peer_id && task_resource_active(&task.status))
+        {
+            continue;
+        }
+        let mut managed_child = None;
+        if let Some(managed_id) = &managed_id {
+            let Some(child) = state.subagents.get(managed_id).cloned() else {
+                continue;
+            };
+            if child.parent != worker_id
+                || child.peer != peer_id
+                || child.status != "idle"
+                || child.pane != worker.pane
+            {
+                continue;
+            }
+            managed_child = Some(child);
+        } else if is_managed_subagent(&state, &peer_id) {
+            continue;
+        }
+        if state.msgs.contains_key(&message_id) || state.tasks.contains_key(&task_id) {
+            continue;
+        }
+
+        let now = now_ms();
+        let message = Message {
+            id: message_id.clone(),
+            from: worker_id.clone(),
+            to: peer_id.clone(),
+            mtype: "notify".into(),
+            subject: Some(subject.clone()),
+            body: body.clone(),
+            in_reply_to: None,
+            created_ms: now,
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        };
+        let task = TaskRec {
+            id: task_id.clone(),
+            owner: peer_id.clone(),
+            created_by: worker_id.clone(),
+            feature_id: feature_id.clone(),
+            worktree_path: worktree_path.clone(),
+            branch: branch.clone(),
+            base_commit: base_commit.clone(),
+            priority: priority.clone(),
+            status: "assigned".into(),
+            next_step: next_step.clone().or_else(|| {
+                Some(format!(
+                    "Read scheduler message {message_id}; mark task working before execution"
+                ))
+            }),
+            wait: None,
+            created_ms: now,
+            updated_ms: now,
+        };
+        let mut events = vec![Event::Sent { msg: message }];
+        events.push(Event::TaskCreated { task: task.clone() });
+        if let Some(mut child) = managed_child {
+            child.status = "assigned".into();
+            child.last_message = Some(message_id.clone());
+            events.push(Event::SubagentUpdated { subagent: child });
+        }
+        server.commit_locked(&mut state, &events);
+        drop(state);
+
+        let admission = json!({
+            "request_id": request_id,
+            "decision": decision,
+            "worker_id": peer_id,
+            "managed_subagent_id": managed_id,
+            "message_id": message_id,
+            "task_id": task_id,
+            "reason": reason,
+        });
+        if let Err(error) = record_scheduler_admission(server, admission.clone()) {
+            return Resp::err_data(
+                error
+                    .error
+                    .unwrap_or_else(|| "scheduler admission audit failed".into()),
+                json!({
+                    "request_id": request_id,
+                    "reservation": true,
+                    "message_id": message_id,
+                    "task_id": task_id,
+                    "admission": admission,
+                }),
+            );
+        }
+        return Resp::data(json!({
+            "request_id": request_id,
+            "decision": decision,
+            "admission": admission,
+            "message_id": message_id,
+            "task_id": task_id,
+            "target": peer_id,
+            "status": "assigned",
+            "managed_subagent_id": managed_id,
+            "managed_subagent": managed_id
+                .as_ref()
+                .map(|id| json!({"id": id, "worker_id": peer_id}))
+                .unwrap_or(serde_json::Value::Null),
+            "notification": "none; peer must accept the assigned task",
+        }));
+    }
+    Resp::err(
+        "scheduler dispatch capacity changed during admission; retry with the same request_id",
+    )
+}
+
 fn verify_master_actor(
     server: &Server,
     state: &State,
@@ -5581,7 +5818,7 @@ mod scheduler_admission_tests {
     use super::*;
     use crate::server::peer_tests::{register, test_server};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -5900,6 +6137,190 @@ mod scheduler_admission_tests {
             std::fs::read_to_string(root.join(".agent-collab/server/events.jsonl")).unwrap();
         assert!(audit.contains("create-managed-subagent"));
         assert!(audit.contains("no eligible live registered peer"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_dispatch_assigns_ordinary_peer_and_deduplicates_request() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let server = Arc::new(server);
+        let dispatch_request = |subject: &str, body: &str| {
+            dispatch(
+                &server,
+                Req::Subagent {
+                    worker_id: "master".into(),
+                    token: "token-master".into(),
+                    command: crate::subagent::Action::Dispatch {
+                        request_id: "req-ordinary-1".into(),
+                        subject: subject.into(),
+                        body: body.into(),
+                        feature_id: Some("feature-1".into()),
+                        worktree_path: None,
+                        branch: None,
+                        base_commit: None,
+                        priority: "p1".into(),
+                        next_step: None,
+                    },
+                    launch_env: Default::default(),
+                },
+            )
+        };
+        assert_eq!(
+            registered_idle_peer_for_admission(&server, "master")
+                .map(|(id, _)| id)
+                .as_deref(),
+            Some("peer")
+        );
+        let first = dispatch_request("Implement feature", "Do the work");
+        assert!(first.ok, "{first:?}");
+        assert_eq!(first.data["decision"], "use-registered-peer");
+        assert_eq!(first.data["target"], "peer");
+        assert_eq!(first.data["status"], "assigned");
+        let second = dispatch_request("different retry text", "ignored by request key");
+        assert!(second.ok, "{second:?}");
+        assert_eq!(second.data["decision"], "deduplicated");
+        assert_eq!(second.data["task_id"], first.data["task_id"]);
+        assert_eq!(second.data["message_id"], first.data["message_id"]);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.msgs.len(), 1);
+        assert_eq!(state.tasks["task-scheduler-req-ordinary-1"].owner, "peer");
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_dispatch_reuses_managed_child_and_deduplicates_request() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "managed-peer", "%managed-peer");
+        server.commit(&[
+            Event::MasterAssigned {
+                worker_id: "master".into(),
+                assigned_by: "operator".into(),
+                approval: Some("scheduler test".into()),
+                assigned_ms: now_ms(),
+            },
+            Event::SubagentUpdated {
+                subagent: crate::subagent::Record {
+                    id: "managed-child".into(),
+                    parent: "master".into(),
+                    peer: "managed-peer".into(),
+                    status: "idle".into(),
+                    session: Some("$managed-peer".into()),
+                    pane: Some("%managed-peer".into()),
+                    profile: None,
+                    created_ms: now_ms(),
+                    ready_deadline_ms: 0,
+                    last_message: None,
+                    error: None,
+                    probe_failures: Vec::new(),
+                    runtime: Some("cursor".into()),
+                },
+            },
+        ]);
+        let server = Arc::new(server);
+        let request = || {
+            dispatch(
+                &server,
+                Req::Subagent {
+                    worker_id: "master".into(),
+                    token: "token-master".into(),
+                    command: crate::subagent::Action::Dispatch {
+                        request_id: "req-managed-1".into(),
+                        subject: "Managed task".into(),
+                        body: "Use existing child".into(),
+                        feature_id: None,
+                        worktree_path: None,
+                        branch: None,
+                        base_commit: None,
+                        priority: "p2".into(),
+                        next_step: None,
+                    },
+                    launch_env: Default::default(),
+                },
+            )
+        };
+        let first = request();
+        assert!(first.ok, "{first:?}");
+        assert_eq!(first.data["decision"], "reuse-idle-managed-subagent");
+        assert_eq!(first.data["managed_subagent_id"], "managed-child");
+        let second = request();
+        assert!(second.ok, "{second:?}");
+        assert_eq!(second.data["decision"], "deduplicated");
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.msgs.len(), 1);
+        assert_eq!(state.subagents["managed-child"].status, "assigned");
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_dispatch_concurrent_same_request_reserves_once() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let server = Arc::new(server);
+        let barrier = Arc::new(Barrier::new(2));
+        let request = |server: Arc<Server>, barrier: Arc<Barrier>| {
+            thread::spawn(move || {
+                barrier.wait();
+                dispatch(
+                    &server,
+                    Req::Subagent {
+                        worker_id: "master".into(),
+                        token: "token-master".into(),
+                        command: crate::subagent::Action::Dispatch {
+                            request_id: "req-concurrent-1".into(),
+                            subject: "Concurrent task".into(),
+                            body: "Reserve exactly once".into(),
+                            feature_id: None,
+                            worktree_path: None,
+                            branch: None,
+                            base_commit: None,
+                            priority: "p2".into(),
+                            next_step: None,
+                        },
+                        launch_env: Default::default(),
+                    },
+                )
+            })
+        };
+        let first = request(Arc::clone(&server), Arc::clone(&barrier));
+        let second = request(Arc::clone(&server), Arc::clone(&barrier));
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(first.ok, "{first:?}");
+        assert!(second.ok, "{second:?}");
+        assert_eq!(first.data["task_id"], second.data["task_id"]);
+        assert_eq!(first.data["message_id"], second.data["message_id"]);
+        assert!(["use-registered-peer", "deduplicated"]
+            .contains(&first.data["decision"].as_str().unwrap()));
+        assert!(["use-registered-peer", "deduplicated"]
+            .contains(&second.data["decision"].as_str().unwrap()));
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.msgs.len(), 1);
+        assert_eq!(
+            state.tasks["task-scheduler-req-concurrent-1"].status,
+            "assigned"
+        );
+        drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

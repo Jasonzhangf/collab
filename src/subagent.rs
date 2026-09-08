@@ -25,6 +25,26 @@ pub enum Action {
         #[serde(default)]
         runtime: Option<String>,
     },
+    /// Dispatch a task through the live master scheduler.
+    Dispatch {
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        subject: String,
+        body: String,
+        #[arg(long)]
+        feature_id: Option<String>,
+        #[arg(long)]
+        worktree_path: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        base_commit: Option<String>,
+        #[arg(long, default_value = "p2")]
+        priority: String,
+        #[arg(long)]
+        next_step: Option<String>,
+    },
     List,
     Status {
         id: String,
@@ -590,6 +610,33 @@ pub fn handle_with_env(
     action: Action,
     environment: std::collections::BTreeMap<String, String>,
 ) -> Resp {
+    if let Action::Dispatch {
+        request_id,
+        subject,
+        body,
+        feature_id,
+        worktree_path,
+        branch,
+        base_commit,
+        priority,
+        next_step,
+    } = action
+    {
+        return crate::server::handle_scheduler_dispatch(
+            server,
+            actor.into(),
+            token.into(),
+            request_id,
+            subject,
+            body,
+            feature_id,
+            worktree_path,
+            branch,
+            base_commit,
+            priority,
+            next_step,
+        );
+    }
     if let Action::Start {
         ref id,
         ref runtime,
