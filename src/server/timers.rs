@@ -951,6 +951,7 @@ mod tests {
         assert!(text.contains("msg-batch-3"));
         assert!(text.contains("msg-batch-4"));
         assert!(text.contains("message_ids="));
+        assert!(text.contains("task_ids=none"));
         assert!(text.contains("action_categories="));
         assert!(text.contains("collab inbox"));
 

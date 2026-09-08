@@ -463,13 +463,11 @@ fn batch_notification_text(
     let actions = batch.iter().map(|(_, _, _, _, text)| {
         text.split_once('[').and_then(|(_, rest)| rest.split_once(']')).map(|(subject, _)| subject).unwrap_or("notification")
     }).collect::<Vec<_>>().join(",");
-    let task_ids = batch.iter().flat_map(|(_, _, _, _, text)| text.split_whitespace())
-        .filter(|token| token.starts_with("task-"))
-        .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
-        .filter(|token| !token.is_empty())
-        .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(",");
+    // Message does not carry a typed task association. Do not infer one from
+    // preview text; the durable inbox remains the source for task details.
+    let task_ids = "none";
     let older = (remaining > 0).then(|| format!(" older_messages={remaining}; run collab inbox")).unwrap_or_default();
-    format!("Batch wake: message_ids={message_ids} task_ids={} action_categories={actions}. Read full durable details from collab inbox; execute the actions, do not ACK-only.{older}", if task_ids.is_empty() { "none" } else { &task_ids })
+    format!("Batch wake: message_ids={message_ids} task_ids={task_ids} action_categories={actions}. Read full durable details from collab inbox; execute the actions, do not ACK-only.{older}")
 }
 
 struct RecipientMailboxRead {
