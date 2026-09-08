@@ -2327,35 +2327,63 @@ pub(crate) fn registered_idle_peer_for_admission(
     server: &Server,
     requester: &str,
 ) -> Option<(String, String)> {
-    let state = server.state.lock().unwrap();
-    let mut workers: Vec<_> = state
-        .workers
-        .values()
-        .filter(|worker| worker.id != requester)
-        .collect();
-    workers.sort_by(|a, b| a.id.cmp(&b.id));
-    for worker in workers {
-        if is_managed_subagent(&state, &worker.id)
-            || !matches!(
+    // Snapshot only state-owned data while holding the mutex. Pane probes may
+    // invoke tmux and must never run while the scheduler state is locked.
+    let candidates: Vec<WorkerRec> = {
+        let state = server.state.lock().unwrap();
+        let mut workers: Vec<_> = state
+            .workers
+            .values()
+            .filter(|worker| worker.id != requester)
+            .filter(|worker| !is_managed_subagent(&state, &worker.id))
+            .filter(|worker| {
+                !state
+                    .tasks
+                    .values()
+                    .any(|task| task.owner == worker.id && task_claim_held(&task.status))
+            })
+            .cloned()
+            .collect();
+        workers.sort_by(|a, b| a.id.cmp(&b.id));
+        workers
+    };
+
+    let probed: Vec<WorkerRec> = candidates
+        .into_iter()
+        .filter(|worker| {
+            matches!(
                 worker_identity_presence(server, worker),
                 PanePresence::Present
-            )
-            || worker
+            ) && worker
                 .pane
                 .as_deref()
                 .map(|pane| (server.pane_state_check)(pane) == knock::AgentState::Waiting)
-                != Some(true)
-            || state
+                == Some(true)
+        })
+        .collect();
+
+    let state = server.state.lock().unwrap();
+    for worker in probed {
+        let Some(current) = state.workers.get(&worker.id) else {
+            continue;
+        };
+        let unchanged = current.id == worker.id
+            && current.token == worker.token
+            && current.pane == worker.pane
+            && current.cwd == worker.cwd
+            && current.registered_ms == worker.registered_ms;
+        if unchanged
+            && !is_managed_subagent(&state, &worker.id)
+            && !state
                 .tasks
                 .values()
                 .any(|task| task.owner == worker.id && task_claim_held(&task.status))
         {
-            continue;
+            return Some((
+                worker.id,
+                "live registered peer is idle, owned, and has no actionable task".into(),
+            ));
         }
-        return Some((
-            worker.id.clone(),
-            "live registered peer is idle, owned, and has no actionable task".into(),
-        ));
     }
     None
 }
@@ -2385,6 +2413,54 @@ fn is_managed_subagent(state: &State, worker_id: &str) -> bool {
         .subagents
         .values()
         .any(|record| record.peer == worker_id)
+}
+
+/// Admit a Start request to an already registered idle peer when the caller is
+/// the live master. This is shared by the daemon dispatch path and the direct
+/// subagent handler so neither entry point can bypass scheduler admission.
+pub(crate) fn scheduler_admit_subagent_start(
+    server: &Server,
+    worker_id: &str,
+    token: &str,
+) -> Option<Resp> {
+    let authenticated = {
+        let state = server.state.lock().unwrap();
+        verify(&state, worker_id, token).is_ok()
+    };
+    if !authenticated {
+        return None;
+    }
+
+    // Snapshot the master identity, then probe outside the state mutex for the
+    // same reason as registered_idle_peer_for_admission.
+    let master = {
+        let state = server.state.lock().unwrap();
+        state
+            .master_worker_id
+            .as_ref()
+            .and_then(|id| state.workers.get(id))
+            .cloned()
+    }?;
+    if master.id != worker_id || worker_identity_presence(server, &master) != PanePresence::Present {
+        return None;
+    }
+
+    let (peer_id, reason) = registered_idle_peer_for_admission(server, worker_id)?;
+    let admission = json!({
+        "decision": "use-registered-peer",
+        "worker_id": peer_id,
+        "reason": reason,
+    });
+    if let Err(error) = record_activity(&server.root, "scheduler_admission", admission.clone()) {
+        append_log(
+            &server.log_path(),
+            &format!("SCHEDULER_ADMISSION_RECORD_FAILED: {error}"),
+        );
+    }
+    Some(Resp::data(json!({
+        "admission": admission,
+        "managed_subagent": serde_json::Value::Null,
+    })))
 }
 
 fn verify_master_actor(
@@ -4373,40 +4449,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             token,
             command,
             launch_env,
-        } => {
-            if matches!(command, crate::subagent::Action::Start { .. }) {
-                let authorized = {
-                    let state = server.state.lock().unwrap();
-                    verify(&state, &worker_id, &token).is_ok()
-                        && live_master_id(server, &state).ok().flatten().as_deref()
-                            == Some(worker_id.as_str())
-                };
-                if authorized {
-                    if let Some((peer_id, reason)) =
-                        registered_idle_peer_for_admission(server, &worker_id)
-                    {
-                        let admission = json!({
-                            "decision": "use-registered-peer",
-                            "worker_id": peer_id,
-                            "reason": reason,
-                        });
-                        if let Err(error) =
-                            record_activity(&server.root, "scheduler_admission", admission.clone())
-                        {
-                            append_log(
-                                &server.log_path(),
-                                &format!("SCHEDULER_ADMISSION_RECORD_FAILED: {error}"),
-                            );
-                        }
-                        return Resp::data(json!({
-                            "admission": admission,
-                            "managed_subagent": serde_json::Value::Null,
-                        }));
-                    }
-                }
-            }
-            crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env)
-        }
+        } => crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env),
         Req::Register {
             worker_id,
             token,
@@ -5421,7 +5464,21 @@ mod ownership_probe_tests {
 mod scheduler_admission_tests {
     use super::*;
     use crate::server::peer_tests::{register, test_server};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    static PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+    static PROBE_RELEASE: AtomicBool = AtomicBool::new(false);
+
+    fn blocking_pane_probe(_pane: &str) -> PanePresence {
+        PROBE_STARTED.store(true, Ordering::Release);
+        while !PROBE_RELEASE.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        PanePresence::Present
+    }
 
     #[test]
     fn start_admits_registered_idle_peer_before_managed_child_without_duplicates() {
@@ -5457,13 +5514,25 @@ mod scheduler_admission_tests {
         let second = start("unneeded-child-2", "token-master");
         assert!(second.ok, "{second:?}");
         assert_eq!(second.data["admission"], first.data["admission"]);
+        let direct = crate::subagent::handle_with_env(
+            &server,
+            "master",
+            "token-master",
+            crate::subagent::Action::Start {
+                id: Some("direct-child".into()),
+                runtime: Some("cursor".into()),
+            },
+            Default::default(),
+        );
+        assert!(direct.ok, "{direct:?}");
+        assert_eq!(direct.data["admission"], first.data["admission"]);
         assert!(server.state.lock().unwrap().subagents.is_empty());
         assert_eq!(
             std::fs::read_to_string(root.join(".agent-collab/server/events.jsonl"))
                 .unwrap()
                 .matches("scheduler_admission")
                 .count(),
-            2
+            3
         );
 
         let denied = start("denied-child", "wrong-token");
@@ -5521,6 +5590,33 @@ mod scheduler_admission_tests {
             },
         }]);
         assert!(registered_idle_peer_for_admission(&server, "master").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn admission_probes_do_not_hold_state_lock() {
+        PROBE_STARTED.store(false, Ordering::Release);
+        PROBE_RELEASE.store(false, Ordering::Release);
+        let (mut server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "idle-peer", "%idle-peer");
+        server.pane_alive_check = blocking_pane_probe;
+        let server = Arc::new(server);
+        let probe_server = server.clone();
+        let join =
+            thread::spawn(move || registered_idle_peer_for_admission(&probe_server, "master"));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !PROBE_STARTED.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let lock_available = server.state.try_lock().is_ok();
+        PROBE_RELEASE.store(true, Ordering::Release);
+        let selected = join.join().unwrap();
+
+        assert!(PROBE_STARTED.load(Ordering::Acquire));
+        assert!(lock_available, "pane probe held the scheduler state lock");
+        assert_eq!(selected.map(|(id, _)| id).as_deref(), Some("idle-peer"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

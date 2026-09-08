@@ -587,6 +587,12 @@ pub fn handle_with_env(
     action: Action,
     environment: std::collections::BTreeMap<String, String>,
 ) -> Resp {
+    if matches!(action, Action::Start { .. }) {
+        if let Some(response) = crate::server::scheduler_admit_subagent_start(server, actor, token)
+        {
+            return response;
+        }
+    }
     match run(server, actor, token, action, environment) {
         Ok(value) => Resp::data(value),
         Err(e) => Resp::err(e.to_string()),
