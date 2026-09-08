@@ -1,6 +1,6 @@
 use super::{
     knock::AgentState,
-    state::{Event, Message, State, WorkerRec},
+    state::{Event, Message, State},
     Server,
 };
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,16 @@ pub struct Record {
     pub idle_episode_notices: u8,
     #[serde(default)]
     pub idle_episode_reason: String,
+    /// A valid Working observation survives inconclusive probes and an
+    /// unavailable master subscription until its idle transition is reported.
+    #[serde(default)]
+    pub working_seen: bool,
+    #[serde(default)]
+    pub idle_episode_stopped: bool,
+    /// Scheduler-owned actionable task identities/statuses delimit episodes;
+    /// ACKs, monitoring messages, and runtime flaps do not.
+    #[serde(default)]
+    pub idle_episode_tasks: Vec<(String, String)>,
 }
 
 /// A starting agent legitimately flaps between idle and working while it boots
@@ -46,181 +56,6 @@ fn observed_label(agent: AgentState) -> &'static str {
         AgentState::Unknown => "unknown",
         AgentState::Absent => "absent",
     }
-}
-
-fn managed_subagent_target(state: &State, server: &Server) -> Option<String> {
-    let Ok(Some(target)) = super::live_master_id(server, state) else {
-        return None;
-    };
-    let worker = state.workers.get(&target)?;
-    let pane = worker.pane.as_deref()?;
-    ((server.pane_alive_check)(pane) == super::knock::PanePresence::Present
-        && (server.pane_owner_check)(&target, pane) == Ok(true))
-    .then_some(target)
-}
-
-fn handle_managed_subagent(
-    server: &Server,
-    state: &mut State,
-    worker: &WorkerRec,
-    tasks: &[String],
-    agent: AgentState,
-    now: i64,
-) -> (bool, Option<(String, String)>) {
-    let Some(subagent) = state
-        .subagents
-        .values()
-        .find(|subagent| subagent.peer == worker.id)
-        .cloned()
-    else {
-        return (false, None);
-    };
-    if !matches!(agent, AgentState::Waiting | AgentState::Working) {
-        return (false, None);
-    }
-    let observed = observed_label(agent);
-    let old = state
-        .keepalives
-        .get(&worker.id)
-        .cloned()
-        .unwrap_or_default();
-    let changed = old.observed != observed || subagent.status != observed;
-    let mut record = old;
-    record.observed = observed.into();
-    if changed {
-        record.idle_since_ms = now;
-        record.activity_ms = now;
-        record.unacked = 0;
-        record.last_notice_id = None;
-    }
-
-    // Durable state follows every observation; the master hears only settled,
-    // genuinely new states. A flap that returns to what the master already
-    // knows produces no message at all.
-    let notify_due = if observed == record.notified_state {
-        record.pending_since_ms = 0;
-        false
-    } else {
-        if record.pending_since_ms == 0 || changed {
-            record.pending_since_ms = now;
-        }
-        now - record.pending_since_ms >= SUBAGENT_STATE_SETTLE_MS
-    };
-    if notify_due {
-        record.notified_state = observed.into();
-        record.pending_since_ms = 0;
-    }
-
-    let mut current = subagent.clone();
-    current.status = observed.into();
-    let target = notify_due
-        .then(|| managed_subagent_target(state, server))
-        .flatten();
-    let subscription = target.as_ref().and_then(|target| {
-        state
-            .matching_subscription(target, "direct-message", None, now)
-            .cloned()
-    });
-    let mut events = vec![Event::KeepaliveUpdated {
-        worker_id: worker.id.clone(),
-        record,
-    }];
-    if changed {
-        events.push(Event::SubagentUpdated { subagent: current });
-    }
-    if notify_due {
-        if let Some(target) = &target {
-            let id = super::gen_msg_id();
-            let body = format!(
-                "subagent={} state={} tasks={}",
-                subagent.id,
-                observed,
-                tasks.join(",")
-            );
-            events.push(Event::Sent {
-                msg: Message {
-                    id: id.clone(),
-                    from: "collab-server".into(),
-                    to: target.clone(),
-                    mtype: "subagent-status".into(),
-                    subject: Some("subagent-status".into()),
-                    body,
-                    in_reply_to: None,
-                    created_ms: now,
-                    state: "pending".into(),
-                    wake_attempt_count: 0,
-                    last_wake_attempt_ms: 0,
-                },
-            });
-            if let Some(subscription) = &subscription {
-                events.push(Event::WakeBound {
-                    message_id: id,
-                    subscription_id: subscription.id.clone(),
-                });
-            }
-        }
-    } else if !changed {
-        return (true, None);
-    }
-    server.commit_locked(state, &events);
-    let notification = if let (Some(target), Some(subscription)) = (target, subscription) {
-        let message_id = events.iter().find_map(|event| match event {
-            Event::Sent { msg } if msg.to == target => Some(msg.id.clone()),
-            _ => None,
-        });
-        message_id.map(|message_id| (message_id, subscription.id))
-    } else {
-        None
-    };
-    (true, notification)
-}
-
-fn advance(
-    record: &mut Record,
-    now: i64,
-    agent: AgentState,
-    activity: i64,
-    acked: bool,
-    interval: i64,
-    limit: u8,
-) -> bool {
-    let observed = match agent {
-        AgentState::Waiting => "idle",
-        AgentState::Working => "working",
-        AgentState::Unknown => "unknown",
-        AgentState::Absent => "absent",
-    };
-    if record.observed != observed {
-        record.observed = observed.into();
-        record.idle_since_ms = now;
-    }
-    if record.suspected_offline {
-        return false;
-    }
-    if activity > record.activity_ms || acked || agent == AgentState::Working {
-        if activity > record.activity_ms || acked || record.unacked > 0 {
-            record.activity_ms = now.max(activity);
-            record.unacked = 0;
-            record.last_notice_id = None;
-            record.idle_since_ms = now;
-        }
-        return false;
-    }
-    if record.unacked >= limit {
-        if now - record.last_notice_ms >= interval {
-            record.suspected_offline = true;
-        }
-        return false;
-    }
-    if agent != AgentState::Waiting
-        || now - record.idle_since_ms < interval
-        || (record.unacked > 0 && now - record.last_notice_ms < interval)
-    {
-        return false;
-    }
-    record.unacked += 1;
-    record.last_notice_ms = now;
-    true
 }
 
 pub fn view(state: &State, worker: &str) -> serde_json::Value {
@@ -246,7 +81,7 @@ pub(crate) fn tick_with(
     server: &Server,
     now: i64,
     probe: &dyn Fn(&str) -> AgentState,
-    wake: &dyn Fn(&str, &str) -> bool,
+    _wake: &dyn Fn(&str, &str) -> bool,
     owns_pane: &dyn Fn(&str, &str) -> Result<bool, ()>,
 ) {
     if !server.config.keepalive.enabled || !server.config.timers.enabled {
@@ -281,8 +116,8 @@ pub(crate) fn tick_with(
         } else {
             AgentState::Absent
         };
-        // Failed observation must not erase the working -> idle edge or an
-        // existing idle episode, including managed-subagent observations.
+        // Failed observation must not erase a working -> idle edge or an
+        // existing idle episode.
         if agent == AgentState::Unknown {
             continue;
         }
@@ -350,15 +185,6 @@ pub(crate) fn tick_with(
             }
             continue;
         }
-        let (managed, notification) =
-            handle_managed_subagent(server, &mut state, &worker, &tasks, agent, now);
-        if managed {
-            drop(state);
-            if let Some((message_id, subscription_id)) = notification {
-                super::attempt_notification(server, &message_id, &subscription_id);
-            }
-            continue;
-        }
         let old = state
             .keepalives
             .get(&worker.id)
@@ -366,54 +192,93 @@ pub(crate) fn tick_with(
             .unwrap_or_default();
         let mut record = old.clone();
 
-        // An actionable task is the only scheduler-owned transition that
-        // starts a fresh idle episode. A monitor/ACK round can make an idle
-        // worker briefly appear working while it handles the message; that
-        // probe flap must not re-arm the same worker-idle observation.
-        if !tasks.is_empty()
-            && (record.idle_episode_notices != 0 || !record.idle_episode_reason.is_empty())
-        {
+        let task_revision: Vec<_> = tasks
+            .iter()
+            .map(|id| (id.clone(), state.tasks[id].status.clone()))
+            .collect();
+        if record.idle_episode_tasks != task_revision {
             record.idle_episode_notices = 0;
             record.idle_episode_reason.clear();
+            record.idle_episode_stopped = false;
+            record.idle_episode_tasks = task_revision;
+            if !tasks.is_empty() {
+                record.working_seen = false;
+            }
         }
-
-        if tasks.is_empty() {
-            let was_working = old.observed == "working";
+        let managed = state
+            .subagents
+            .values()
+            .find(|child| child.peer == worker.id)
+            .cloned();
+        let master_id = match super::live_master_id(server, &state) {
+            Ok(master_id) => master_id,
+            Err(_) => continue,
+        };
+        let is_live_master = master_id.as_deref() == Some(worker.id.as_str());
+        if old.observed == "working"
+            || agent == AgentState::Working
+            || (old.observed.is_empty()
+                && managed
+                    .as_ref()
+                    .is_some_and(|child| child.status == "working"))
+        {
+            record.working_seen = true;
+        }
+        if is_live_master && agent == AgentState::Working && record.idle_episode_notices > 0 {
+            record.idle_episode_stopped = true;
+        }
+        {
             let is_idle = agent == AgentState::Waiting;
-            let idle_reason = "no-actionable-tasks";
-            let observed_str = match agent {
-                AgentState::Waiting => "idle",
-                AgentState::Working => "working",
-                AgentState::Unknown => "unknown",
-                AgentState::Absent => "absent",
+            let idle_reason = if tasks.is_empty() {
+                "no-actionable-tasks"
+            } else {
+                "actionable-tasks-idle"
             };
+            let observed_str = observed_label(agent);
             if record.observed != observed_str {
                 record.observed = observed_str.into();
                 record.idle_since_ms = now;
+                if agent == AgentState::Working {
+                    record.activity_ms = now;
+                }
             }
             record.unacked = 0;
             record.last_notice_id = None;
             let mut events = Vec::new();
+            if let Some(mut child) = managed.clone() {
+                if matches!(agent, AgentState::Working | AgentState::Waiting)
+                    && child.status != observed_str
+                {
+                    child.status = observed_str.into();
+                    events.push(Event::SubagentUpdated { subagent: child });
+                }
+            }
+            if !is_idle {
+                record.pending_since_ms = 0;
+            } else if record.pending_since_ms == 0 {
+                record.pending_since_ms = now;
+            }
             let new_idle_reason = is_idle && record.idle_episode_reason != idle_reason;
             if new_idle_reason {
                 record.idle_episode_reason = idle_reason.into();
             }
-            let master = match super::live_master_id(server, &state) {
-                Ok(master) => master,
-                Err(_) => continue,
-            };
-            let is_live_master = master.as_deref() == Some(worker.id.as_str());
             let idle_notification_due = if is_live_master {
                 is_idle
+                    && tasks.is_empty()
+                    && !record.idle_episode_stopped
                     && record.idle_episode_notices < 3
-                    && ((was_working && record.idle_episode_notices == 0)
+                    && ((record.working_seen && record.idle_episode_notices == 0)
                         || (record.idle_episode_notices > 0
                             && now.saturating_sub(record.last_notice_ms) >= 120_000))
             } else {
-                is_idle && was_working && record.idle_episode_notices == 0
+                is_idle
+                    && record.working_seen
+                    && record.idle_episode_notices == 0
+                    && (managed.is_none()
+                        || now.saturating_sub(record.pending_since_ms) >= SUBAGENT_STATE_SETTLE_MS)
             };
-            if idle_notification_due {
-                if let Some(master_id) = master {
+            if idle_notification_due && server.config.notifications.enabled {
+                if let Some(master_id) = master_id {
                     if master_id == worker.id {
                         if let Some(sub) =
                             state.matching_subscription(&worker.id, "direct-message", None, now)
@@ -445,19 +310,24 @@ pub(crate) fn tick_with(
                             record.idle_episode_notices =
                                 record.idle_episode_notices.saturating_add(1);
                         }
-                    } else {
+                    } else if let Some(sub) =
+                        state.matching_subscription(&master_id, "direct-message", None, now)
+                    {
                         let alert_id = super::gen_msg_id();
                         events.push(Event::Sent {
                             msg: Message {
                                 id: alert_id.clone(),
                                 from: "collab-server".into(),
                                 to: master_id.clone(),
-                                mtype: "notify".into(),
-                                subject: Some(format!("worker-idle: {}", worker.id)),
-                                body: format!(
-                                    "Worker {} is now idle with no active task. Action required: check task graph for unblocked downstream tasks, or pull from appsdk bug list --status open (P0/P1). If all work is complete, propose next steps to user and pause.",
-                                    worker.id
-                                ),
+                                mtype: if managed.is_some() { "subagent-status" } else { "notify" }.into(),
+                                subject: Some(if managed.is_some() { "subagent-status".into() } else { format!("worker-idle: {}", worker.id) }),
+                                body: if let Some(child) = &managed {
+                                    format!("subagent={} state=idle tasks={}", child.id, tasks.join(","))
+                                } else if tasks.is_empty() {
+                                    format!("Worker {} is now idle with no active task. Action required: check task graph for unblocked downstream tasks, or pull from appsdk bug list --status open (P0/P1). If all work is complete, propose next steps to user and pause.", worker.id)
+                                } else {
+                                    format!("Worker {} is now idle. Actionable tasks: {}. Action required: inspect these tasks and the task graph for unblocked downstream work, or pull from appsdk bug list --status open (P0/P1). If all work is complete, propose next steps to user and pause.", worker.id, tasks.join(","))
+                                },
                                 in_reply_to: None,
                                 created_ms: now,
                                 state: "pending".into(),
@@ -466,14 +336,13 @@ pub(crate) fn tick_with(
                             },
                         });
                         record.idle_episode_notices = record.idle_episode_notices.saturating_add(1);
-                        if let Some(sub) =
-                            state.matching_subscription(&master_id, "direct-message", None, now)
-                        {
-                            events.push(Event::WakeBound {
-                                message_id: alert_id,
-                                subscription_id: sub.id.clone(),
-                            });
-                        }
+                        record.last_notice_ms = now;
+                        record.notified_state = "idle".into();
+                        record.working_seen = false;
+                        events.push(Event::WakeBound {
+                            message_id: alert_id,
+                            subscription_id: sub.id.clone(),
+                        });
                     }
                 }
             }
@@ -489,271 +358,22 @@ pub(crate) fn tick_with(
             if !events.is_empty() {
                 server.commit_locked(&mut state, &events);
             }
-            continue;
         }
-        let activity = state
-            .msgs
-            .values()
-            .filter(|m| m.from == worker.id)
-            .map(|m| m.created_ms)
-            .chain(
-                state
-                    .tasks
-                    .values()
-                    .filter(|t| t.owner == worker.id)
-                    .map(|t| t.updated_ms),
-            )
-            .max()
-            .unwrap_or(0);
-        let acked = record
-            .last_notice_id
-            .as_ref()
-            .and_then(|id| state.msgs.get(id))
-            .is_some_and(|m| m.state == "read");
-        let subscription = state
-            .matching_subscription(&worker.id, "direct-message", None, now)
-            .cloned();
-        let due = advance(
-            &mut record,
-            now,
-            agent,
-            activity,
-            acked,
-            server.config.keepalive.interval_seconds as i64 * 1000,
-            server.config.keepalive.max_unacked,
-        );
-        if !old.suspected_offline && record.suspected_offline {
-            if let Ok(Some(master_id)) = super::live_master_id(server, &state) {
-                if master_id != worker.id {
-                    let alert_id = super::gen_msg_id();
-                    let mut alert_events = vec![Event::Sent {
-                        msg: Message {
-                            id: alert_id.clone(),
-                            from: "collab-server".into(),
-                            to: master_id.clone(),
-                            mtype: "notify".into(),
-                            subject: Some(format!("worker-unresponsive: {}", worker.id)),
-                            body: format!(
-                                "Worker {} is unresponsive ({} unacked keepalives). Diagnostic closure required: run collab subagent snapshot {} --lines 40 to inspect ground truth and determine recovery action.",
-                                worker.id, server.config.keepalive.max_unacked, worker.id
-                            ),
-                            in_reply_to: None,
-                            created_ms: now,
-                            state: "pending".into(),
-                            wake_attempt_count: 0,
-                            last_wake_attempt_ms: 0,
-                        },
-                    }];
-                    if let Some(sub) =
-                        state.matching_subscription(&master_id, "direct-message", None, now)
-                    {
-                        alert_events.push(Event::WakeBound {
-                            message_id: alert_id,
-                            subscription_id: sub.id.clone(),
-                        });
-                    }
-                    server.commit_locked(&mut state, &alert_events);
-                }
-            }
-        }
-        // Missing subscription/disabled notifications never consumes a send or queues one.
-        if due && (subscription.is_none() || !server.config.notifications.enabled) {
-            record.unacked = old.unacked;
-            record.last_notice_ms = old.last_notice_ms;
-        }
-        if !due || subscription.is_none() || !server.config.notifications.enabled {
-            if record != old {
-                server.commit_locked(
-                    &mut state,
-                    &[Event::KeepaliveUpdated {
-                        worker_id: worker.id.clone(),
-                        record,
-                    }],
-                );
-            }
-            continue;
-        }
-        let id = super::gen_msg_id();
-        let subject = format!(
-            "task-keepalive {}/{}",
-            record.unacked, server.config.keepalive.max_unacked
-        );
-        let body = format!("Unfinished tasks: {}. Continue the named task now: read its state, do the next concrete step, and update it. If it is genuinely blocked, record the blocker and the concrete proposed fix. Reading this notice is not progress.", tasks.join(", "));
-        record.last_notice_id = Some(id.clone());
-        let subscription_id = subscription.as_ref().expect("checked above").id.clone();
-        let mut events = vec![
-            Event::KeepaliveUpdated {
-                worker_id: worker.id.clone(),
-                record,
-            },
-            Event::Sent {
-                msg: Message {
-                    id: id.clone(),
-                    from: "collab-server".into(),
-                    to: worker.id.clone(),
-                    mtype: "keepalive".into(),
-                    subject: Some(subject.clone()),
-                    body: body.clone(),
-                    in_reply_to: None,
-                    created_ms: now,
-                    state: "pending".into(),
-                    wake_attempt_count: 0,
-                    last_wake_attempt_ms: 0,
-                },
-            },
-        ];
-        events.push(Event::WakeBound {
-            message_id: id.clone(),
-            subscription_id: subscription_id.clone(),
-        });
-        server.commit_locked(&mut state, &events);
-        drop(state);
-        // The common notification path owns batching, attempt accounting, and
-        // delivery; task keepalives must not bypass it with a direct wake.
-        super::attempt_notification_with_at(
-            server,
-            &id,
-            &subscription_id,
-            &|_| true,
-            &|pane, text| wake(pane, text),
-            &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
-            now,
-        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn unknown_prechecks_preserve_working_edge_and_idle_episode_without_worker_wake() {
-        use super::super::knock::PanePresence;
-        use super::super::peer_tests::{register, test_server};
-        for failure in ["presence", "ownership", "view"] {
-            let (mut server, root) = test_server();
-            register(&server, "master", "%master");
-            register(&server, "worker", "%worker");
-            assert!(
-                super::super::handle_master_promote(
-                    &server,
-                    "master".into(),
-                    "token-master".into(),
-                    "approved".into()
-                )
-                .ok
-            );
-            let base = super::super::state::now_ms();
-            let initial = Record {
-                observed: "working".into(),
-                idle_since_ms: base,
-                ..Record::default()
-            };
-            server.commit(&[Event::KeepaliveUpdated {
-                worker_id: "worker".into(),
-                record: initial.clone(),
-            }]);
-            for episode in 0..2 {
-                let before = server.state.lock().unwrap().keepalives["worker"].clone();
-                let message_count = server.state.lock().unwrap().msgs.len();
-                match failure {
-                    "presence" => {
-                        server.pane_alive_check = |pane| {
-                            if pane == "%worker" {
-                                PanePresence::Unknown
-                            } else {
-                                PanePresence::Present
-                            }
-                        }
-                    }
-                    "ownership" => {
-                        server.pane_owner_check = |worker, _| {
-                            if worker == "worker" {
-                                Err(())
-                            } else {
-                                Ok(true)
-                            }
-                        }
-                    }
-                    _ => {
-                        server.pane_state_check = |pane| {
-                            if pane == "%worker" {
-                                AgentState::Unknown
-                            } else {
-                                AgentState::Waiting
-                            }
-                        }
-                    }
-                }
-                tick_with(
-                    &server,
-                    base + episode * 10_000 + 1,
-                    &server.pane_state_check,
-                    &|_, _| panic!("unknown never wakes a worker"),
-                    &server.pane_owner_check,
-                );
-                {
-                    let state = server.state.lock().unwrap();
-                    assert_eq!(
-                        state.keepalives["worker"], before,
-                        "{failure} must preserve the episode"
-                    );
-                    assert_eq!(state.msgs.len(), message_count, "unknown must not notify");
-                }
-                server.pane_alive_check = |_| PanePresence::Present;
-                server.pane_owner_check = |_, _| Ok(true);
-                server.pane_state_check = |_| AgentState::Waiting;
-                tick_with(
-                    &server,
-                    base + episode * 10_000 + 2,
-                    &server.pane_state_check,
-                    &|_, _| panic!("idle observation never wakes the worker"),
-                    &server.pane_owner_check,
-                );
-                let state = server.state.lock().unwrap();
-                assert_eq!(
-                    state
-                        .msgs
-                        .values()
-                        .filter(|m| m.subject.as_deref() == Some("worker-idle: worker"))
-                        .count(),
-                    1
-                );
-                assert!(!state.msgs.values().any(|m| m.to == "worker"));
-                assert!(!state.keepalives["worker"].suspected_offline);
-            }
-            std::fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
-    fn confirmed_missing_precheck_still_records_absence() {
-        use super::super::peer_tests::{register, test_server};
-        let (mut server, root) = test_server();
-        register(&server, "worker", "%worker");
-        server.pane_alive_check = |_| super::super::knock::PanePresence::Missing;
-        tick_with(
-            &server,
-            super::super::state::now_ms(),
-            &|_| panic!("missing pane is not probed"),
-            &|_, _| panic!("missing pane is not woken"),
-            &|_, _| panic!("missing pane ownership is not queried"),
-        );
-        let state = server.state.lock().unwrap();
-        assert!(state.keepalives["worker"].suspected_offline);
-        assert_eq!(state.keepalives["worker"].observed, "absent");
-        drop(state);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn scheduler_groups_tasks_and_persists_failed_attempts() {
+    fn actionable_worker_never_self_wakes_across_replay() {
         use super::super::{
             peer_tests::{register, test_server},
             state::TaskRec,
         };
         let (server, root) = test_server();
-        // This regression preserves the immediate legacy keepalive contract;
-        // batch behavior is covered by the timer notification tests.
+        // Even immediate notification mode cannot turn task observation into
+        // an unsolicited worker wake.
         let mut server = server;
         server.config.notifications.mode = "immediate".into();
         register(&server, "worker", "%fake");
@@ -783,9 +403,7 @@ mod tests {
             sends.set(sends.get() + 1);
             false
         };
-        tick_with(&server, base, &|_| AgentState::Waiting, &send, &|_, _| {
-            Ok(true)
-        });
+        tick_with(&server, base, &|_| AgentState::Waiting, &send, &|_, _| Ok(true));
         for n in 1..=3 {
             tick_with(
                 &server,
@@ -802,7 +420,7 @@ mod tests {
                 &|_, _| Ok(true),
             );
         }
-        assert_eq!(sends.get(), 3);
+        assert_eq!(sends.get(), 0, "actionable worker must never self-wake");
         let mut replay = State::default();
         for line in std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
             .unwrap()
@@ -826,83 +444,12 @@ mod tests {
             &|_, _| Ok(true),
         );
         let state = server.state.lock().unwrap();
-        assert!(state.keepalives["worker"].suspected_offline);
-        assert_eq!(state.msgs.len(), 3);
-        assert!(state.msgs.values().all(|m| m.wake_attempt_count == 1));
-        assert!(state
-            .wake_bindings
-            .keys()
-            .all(|id| state.msgs.get(id).is_some_and(|m| m.state == "pending")));
-        assert_eq!(sends.get(), 3);
+        assert!(!state.keepalives["worker"].suspected_offline);
+        assert_eq!(state.msgs.len(), 0);
+        assert!(state.wake_bindings.is_empty());
+        assert_eq!(sends.get(), 0);
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn three_unanswered_attempts_stop_across_replay() {
-        let mut r = Record::default();
-        assert!(!advance(&mut r, 1, AgentState::Waiting, 0, false, 900, 3));
-        for t in [901, 1801, 2701] {
-            assert!(advance(&mut r, t, AgentState::Waiting, 0, false, 900, 3));
-            r = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        }
-        assert!(!advance(
-            &mut r,
-            3601,
-            AgentState::Waiting,
-            0,
-            false,
-            900,
-            3
-        ));
-        assert!(r.suspected_offline);
-        assert!(!advance(
-            &mut r,
-            4501,
-            AgentState::Working,
-            4501,
-            true,
-            900,
-            3
-        ));
-        assert_eq!(r.unacked, 3);
-    }
-    #[test]
-    fn ack_or_sending_rearms_only_before_exhaustion() {
-        let mut r = Record::default();
-        advance(&mut r, 1, AgentState::Waiting, 0, false, 900, 3);
-        assert!(advance(&mut r, 901, AgentState::Waiting, 0, false, 900, 3));
-        assert!(!advance(&mut r, 902, AgentState::Waiting, 0, true, 900, 3));
-        assert_eq!(r.unacked, 0);
-        assert!(!advance(
-            &mut r,
-            1801,
-            AgentState::Waiting,
-            0,
-            false,
-            900,
-            3
-        ));
-        assert!(advance(&mut r, 1802, AgentState::Waiting, 0, false, 900, 3));
-        assert!(!advance(
-            &mut r,
-            1803,
-            AgentState::Waiting,
-            1803,
-            false,
-            900,
-            3
-        ));
-        assert_eq!(r.unacked, 0);
-    }
-    #[test]
-    fn working_unknown_absent_never_wake() {
-        for agent in [AgentState::Working, AgentState::Unknown, AgentState::Absent] {
-            let mut r = Record::default();
-            for t in [1, 901, 1801, 9001] {
-                assert!(!advance(&mut r, t, agent, 0, false, 900, 3));
-            }
-            assert_eq!(r.unacked, 0);
-        }
     }
 
     #[test]
@@ -1114,6 +661,41 @@ mod tests {
         );
         assert_eq!(status_count(&server), 1, "settled state reports once");
 
+        // Even a long monitoring round is not a new task episode.
+        tick_with(
+            &server,
+            now + 500_000,
+            &|_| AgentState::Working,
+            &wake,
+            &|_, _| Ok(true),
+        );
+        tick_with(
+            &server,
+            now + 600_000,
+            &|_| AgentState::Working,
+            &wake,
+            &|_, _| Ok(true),
+        );
+        tick_with(
+            &server,
+            now + 700_000,
+            &|_| AgentState::Waiting,
+            &wake,
+            &|_, _| Ok(true),
+        );
+        tick_with(
+            &server,
+            now + 800_000,
+            &|_| AgentState::Waiting,
+            &wake,
+            &|_, _| Ok(true),
+        );
+        assert_eq!(
+            status_count(&server),
+            1,
+            "monitoring cannot open another managed idle episode"
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1161,6 +743,261 @@ mod tests {
             .msgs
             .values()
             .any(|message| message.subject == Some("master-idle: master".into())));
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn episode_server() -> (Server, std::path::PathBuf, i64) {
+        use super::super::peer_tests::{register, test_server};
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "worker", "%worker");
+        assert!(
+            super::super::handle_master_promote(
+                &server,
+                "master".into(),
+                "token-master".into(),
+                "user approved master".into(),
+            )
+            .ok
+        );
+        let base = super::super::state::now_ms();
+        (server, root, base)
+    }
+
+    fn observe(server: &Server, at: i64, worker: &str, agent: AgentState) {
+        tick_with(
+            server,
+            at,
+            &|pane| {
+                if pane == format!("%{worker}") {
+                    agent
+                } else {
+                    AgentState::Waiting
+                }
+            },
+            &|_, _| panic!("observation must not wake workers"),
+            &|_, _| Ok(true),
+        );
+    }
+
+    fn idle_count(server: &Server, worker: &str) -> usize {
+        let subject = format!(
+            "{}-idle: {worker}",
+            if worker == "master" {
+                "master"
+            } else {
+                "worker"
+            }
+        );
+        server
+            .state
+            .lock()
+            .unwrap()
+            .msgs
+            .values()
+            .filter(|message| message.subject.as_deref() == Some(subject.as_str()))
+            .count()
+    }
+
+    #[test]
+    fn unknown_observation_preserves_working_to_idle_transition() {
+        let (server, root, base) = episode_server();
+        observe(&server, base, "worker", AgentState::Working);
+        observe(&server, base + 1_000, "worker", AgentState::Unknown);
+        observe(&server, base + 2_000, "worker", AgentState::Waiting);
+        assert_eq!(
+            idle_count(&server, "worker"),
+            1,
+            "Unknown cannot erase real Working"
+        );
+        observe(&server, base + 3_000, "worker", AgentState::Waiting);
+        assert_eq!(idle_count(&server, "worker"), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn actionable_worker_reports_only_once_to_master() {
+        let (server, root, base) = episode_server();
+        server.commit(&[Event::TaskCreated {
+            task: crate::server::state::TaskRec {
+                id: "assigned-work".into(),
+                owner: "worker".into(),
+                created_by: "master".into(),
+                feature_id: None,
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: "p0".into(),
+                status: "working".into(),
+                next_step: None,
+                wait: None,
+                created_ms: base,
+                updated_ms: base,
+            },
+        }]);
+        observe(&server, base, "worker", AgentState::Working);
+        observe(&server, base + 1_000, "worker", AgentState::Waiting);
+        observe(&server, base + 2_000, "worker", AgentState::Working);
+        observe(&server, base + 3_000, "worker", AgentState::Waiting);
+        observe(&server, base + 9_000_000, "worker", AgentState::Waiting);
+        assert_eq!(
+            idle_count(&server, "worker"),
+            1,
+            "unchanged actionable tasks do not re-arm"
+        );
+        let state = server.state.lock().unwrap();
+        assert!(state.msgs.values().all(|message| message.to == "master"));
+        assert!(state
+            .msgs
+            .values()
+            .any(|message| message.body.contains("assigned-work")));
+        drop(state);
+        let mut task = server.state.lock().unwrap().tasks["assigned-work"].clone();
+        task.status = "verifying".into();
+        server.commit(&[Event::TaskUpdated { task }]);
+        observe(&server, base + 9_001_000, "worker", AgentState::Waiting);
+        assert_eq!(
+            idle_count(&server, "worker"),
+            1,
+            "task revision alone is not a Working-to-idle transition"
+        );
+        observe(&server, base + 9_002_000, "worker", AgentState::Working);
+        observe(&server, base + 9_003_000, "worker", AgentState::Waiting);
+        assert_eq!(
+            idle_count(&server, "worker"),
+            2,
+            "new work permits the next idle episode"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn master_three_reminders_are_bounded_across_replay() {
+        let (server, root, base) = episode_server();
+        observe(&server, base, "master", AgentState::Working);
+        for offset in [1_000, 121_000, 241_000] {
+            observe(&server, base + offset, "master", AgentState::Waiting);
+        }
+        assert_eq!(idle_count(&server, "master"), 3);
+        let mut replay = State::default();
+        for line in std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+        {
+            replay.apply(&serde_json::from_str::<Event>(line).unwrap());
+        }
+        *server.state.lock().unwrap() = replay;
+        observe(&server, base + 9_000_000, "master", AgentState::Waiting);
+        assert_eq!(idle_count(&server, "master"), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_subscription_does_not_consume_worker_idle_episode() {
+        let (server, root, base) = episode_server();
+        let subscriptions = {
+            let mut state = server.state.lock().unwrap();
+            std::mem::take(&mut state.notification_subscriptions)
+        };
+        observe(&server, base, "worker", AgentState::Working);
+        observe(&server, base + 1_000, "worker", AgentState::Waiting);
+        assert_eq!(
+            idle_count(&server, "worker"),
+            0,
+            "no unbound scheduling notice"
+        );
+        assert_eq!(
+            server.state.lock().unwrap().keepalives["worker"].idle_episode_notices,
+            0
+        );
+        server.state.lock().unwrap().notification_subscriptions = subscriptions;
+        observe(&server, base + 2_000, "worker", AgentState::Waiting);
+        assert_eq!(
+            idle_count(&server, "worker"),
+            1,
+            "available subscription binds pending transition"
+        );
+        let state = server.state.lock().unwrap();
+        let notice = state
+            .msgs
+            .values()
+            .find(|message| message.subject.as_deref() == Some("worker-idle: worker"))
+            .unwrap();
+        assert!(state.wake_bindings.contains_key(&notice.id));
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn master_working_stops_reminders_across_replay() {
+        let (server, root, base) = episode_server();
+        observe(&server, base, "master", AgentState::Working);
+        observe(&server, base + 1_000, "master", AgentState::Waiting);
+        assert_eq!(idle_count(&server, "master"), 1);
+        observe(&server, base + 2_000, "master", AgentState::Working);
+        let mut replay = State::default();
+        for line in std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+        {
+            replay.apply(&serde_json::from_str::<Event>(line).unwrap());
+        }
+        *server.state.lock().unwrap() = replay;
+        observe(&server, base + 130_000, "master", AgentState::Waiting);
+        observe(&server, base + 260_000, "master", AgentState::Waiting);
+        assert_eq!(
+            idle_count(&server, "master"),
+            1,
+            "Working ends the reminder episode durably"
+        );
+        assert_eq!(
+            server.state.lock().unwrap().keepalives["master"].idle_episode_notices,
+            1,
+            "count remains truthful"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_idle_waits_for_master_subscription() {
+        let (server, root, base) = episode_server();
+        server.commit(&[Event::SubagentUpdated {
+            subagent: crate::subagent::Record {
+                id: "managed".into(),
+                parent: "master".into(),
+                peer: "worker".into(),
+                status: "working".into(),
+                session: Some("session".into()),
+                pane: Some("%worker".into()),
+                profile: None,
+                created_ms: base,
+                ready_deadline_ms: base + 90_000,
+                last_message: None,
+                error: None,
+                probe_failures: Vec::new(),
+                runtime: Some("cursor".into()),
+            },
+        }]);
+        let subscriptions =
+            std::mem::take(&mut server.state.lock().unwrap().notification_subscriptions);
+        observe(&server, base + 1_000, "worker", AgentState::Waiting);
+        observe(&server, base + 62_000, "worker", AgentState::Waiting);
+        assert_eq!(
+            server.state.lock().unwrap().keepalives["worker"].notified_state,
+            "",
+            "unbound managed notice is not reported"
+        );
+        server.state.lock().unwrap().notification_subscriptions = subscriptions;
+        observe(&server, base + 63_000, "worker", AgentState::Waiting);
+        let state = server.state.lock().unwrap();
+        let notices: Vec<_> = state
+            .msgs
+            .values()
+            .filter(|message| message.mtype == "subagent-status")
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(state.wake_bindings.contains_key(&notices[0].id));
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
