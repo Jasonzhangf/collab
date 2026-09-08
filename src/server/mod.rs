@@ -2575,6 +2575,7 @@ pub(crate) fn handle_send(
         in_reply_to,
         delivery_mode,
         false,
+        None,
     )
 }
 
@@ -2588,6 +2589,7 @@ pub(crate) fn handle_send_with_task(
     in_reply_to: Option<String>,
     delivery_mode: String,
     assign_task: bool,
+    managed_subagent_id: Option<&str>,
 ) -> Resp {
     if mtype != "notify" {
         return Resp::err("peer messaging requires type notify");
@@ -2607,14 +2609,26 @@ pub(crate) fn handle_send_with_task(
         ));
     }
     let mut st = server.state.lock().unwrap();
-    if assign_task
-        && !st
-            .subagents
-            .values()
-            .any(|s| s.parent == from && s.peer == to && s.status == "assigned")
-    {
-        return Resp::err("managed task requires an authorized assigned subagent");
-    }
+    let managed_child = if assign_task {
+        let Some(id) = managed_subagent_id else {
+            return Resp::err("managed task requires an explicit subagent binding");
+        };
+        let Some(child) = st.subagents.get(id).cloned() else {
+            return Resp::err(format!("unknown managed subagent {}", id));
+        };
+        if child.parent != from || child.peer != to {
+            return Resp::err("managed subagent owner mismatch");
+        }
+        if child.status != "idle" {
+            return Resp::err("subagent is not idle; query status instead of resending");
+        }
+        Some(child)
+    } else {
+        if managed_subagent_id.is_some() {
+            return Resp::err("unassigned peer message cannot bind a managed subagent");
+        }
+        None
+    };
     if from.trim().is_empty() {
         return Resp::err("sender cannot be empty");
     }
@@ -2678,12 +2692,8 @@ pub(crate) fn handle_send_with_task(
             next_step:Some(format!("Read collab msg {mid}; accept via subagent working; bind a worktree with task relocate before code edits.")),
             wait:None,created_ms:now_ms(),updated_ms:now_ms(),
         }});
-        let mut child = st
-            .subagents
-            .values()
-            .find(|s| s.parent == from && s.peer == to && s.status == "assigned")
-            .unwrap()
-            .clone();
+        let mut child = managed_child.expect("managed child validated above");
+        child.status = "assigned".into();
         child.last_message = Some(mid.clone());
         events.push(Event::SubagentUpdated { subagent: child });
     }

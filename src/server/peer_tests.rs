@@ -496,6 +496,25 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
         .ok
     );
     assert_eq!(server.state.lock().unwrap().msgs.len(), count);
+    let no_assigned = crate::subagent::handle(
+        &server,
+        "child",
+        "token-child",
+        Action::Working {
+            id: "managed".into(),
+        },
+    );
+    assert!(!no_assigned.ok);
+    assert_eq!(no_assigned.error.as_deref(), Some("no assigned task to accept"));
+    let unknown = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Status {
+            id: "missing-managed".into(),
+        },
+    );
+    assert!(!unknown.ok);
     assert!(
         crate::subagent::handle(
             &server,
@@ -603,6 +622,179 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
             }
         )
         .ok
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn managed_subagent_send_binds_the_selected_child_when_multiple_children_are_assigned() {
+    use crate::subagent::{Action, Record};
+    let (server, root) = test_server();
+    register(&server, "parent", "%parent");
+    register(&server, "child-a", "%child-a");
+    register(&server, "child-b", "%child-b");
+    let now = now_ms();
+    server.commit(&[
+        Event::SubagentUpdated {
+            subagent: Record {
+                id: "managed-a".into(),
+                parent: "parent".into(),
+                peer: "child-a".into(),
+                status: "idle".into(),
+                session: Some("$child-a".into()),
+                pane: Some("%child-a".into()),
+                profile: None,
+                created_ms: now,
+                ready_deadline_ms: now + 90_000,
+                last_message: None,
+                error: None,
+                probe_failures: Vec::new(),
+                runtime: None,
+            },
+        },
+        Event::SubagentUpdated {
+            subagent: Record {
+                id: "managed-b".into(),
+                parent: "parent".into(),
+                peer: "child-b".into(),
+                status: "idle".into(),
+                session: Some("$child-b".into()),
+                pane: Some("%child-b".into()),
+                profile: None,
+                created_ms: now,
+                ready_deadline_ms: now + 90_000,
+                last_message: None,
+                error: None,
+                probe_failures: Vec::new(),
+                runtime: None,
+            },
+        },
+    ]);
+
+    let wrong_binding = handle_send_with_task(
+        &server,
+        "parent".into(),
+        "child-a".into(),
+        "notify".into(),
+        Some("wrong-binding".into()),
+        "must fail".into(),
+        None,
+        "immediate".into(),
+        true,
+        Some("managed-b"),
+    );
+    assert!(!wrong_binding.ok);
+    assert_eq!(
+        wrong_binding.error.as_deref(),
+        Some("managed subagent owner mismatch")
+    );
+    let unknown_binding = handle_send_with_task(
+        &server,
+        "parent".into(),
+        "child-a".into(),
+        "notify".into(),
+        Some("unknown-binding".into()),
+        "must fail".into(),
+        None,
+        "immediate".into(),
+        true,
+        Some("missing"),
+    );
+    assert!(!unknown_binding.ok);
+    assert_eq!(
+        unknown_binding.error.as_deref(),
+        Some("unknown managed subagent missing")
+    );
+
+    let first = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Send {
+            id: "managed-a".into(),
+            subject: "first-task".into(),
+            body: "first body".into(),
+        },
+    );
+    assert!(first.ok, "{}", first.error.unwrap_or_default());
+    let second = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Send {
+            id: "managed-b".into(),
+            subject: "second-task".into(),
+            body: "second body".into(),
+        },
+    );
+    assert!(second.ok, "{}", second.error.unwrap_or_default());
+
+    let journal: Vec<serde_json::Value> =
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let first_sent_index = journal
+        .iter()
+        .position(|event| event["ev"] == "Sent" && event["msg"]["body"] == "first body")
+        .unwrap();
+    let second_sent_index = journal
+        .iter()
+        .position(|event| event["ev"] == "Sent" && event["msg"]["body"] == "second body")
+        .unwrap();
+    assert!(!journal[first_sent_index..second_sent_index]
+        .iter()
+        .any(|event| event["ev"] == "SubagentUpdated" && event["subagent"]["id"] == "managed-b"),
+        "the selected child must be bound only in the message commit");
+
+    let state = server.state.lock().unwrap();
+    let first_message = state.subagents["managed-a"].last_message.clone().unwrap();
+    let second_message = state.subagents["managed-b"].last_message.clone().unwrap();
+    assert_ne!(first_message, second_message);
+    assert_eq!(state.tasks.len(), 2);
+    assert_eq!(
+        state.tasks[&format!("task-{first_message}")].owner,
+        "child-a"
+    );
+    assert_eq!(
+        state.tasks[&format!("task-{second_message}")].owner,
+        "child-b"
+    );
+    drop(state);
+
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "child-a",
+            "token-child-a",
+            Action::Working {
+                id: "managed-a".into(),
+            },
+        )
+        .ok
+    );
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "child-b",
+            "token-child-b",
+            Action::Working {
+                id: "managed-b".into(),
+            },
+        )
+        .ok
+    );
+    let replayed = replay(&root).unwrap();
+    assert_eq!(replayed.subagents["managed-a"].status, "working");
+    assert_eq!(replayed.subagents["managed-b"].status, "working");
+    assert_eq!(
+        replayed.tasks[&format!("task-{first_message}")].status,
+        "working"
+    );
+    assert_eq!(
+        replayed.tasks[&format!("task-{second_message}")].status,
+        "working"
     );
     std::fs::remove_dir_all(root).unwrap();
 }

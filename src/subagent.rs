@@ -391,6 +391,7 @@ fn notify(
     subject: &str,
     body: String,
     assign_task: bool,
+    managed_subagent_id: Option<&str>,
 ) -> Result<serde_json::Value> {
     let response = crate::server::handle_send_with_task(
         server,
@@ -402,6 +403,7 @@ fn notify(
         None,
         "immediate".into(),
         assign_task,
+        managed_subagent_id,
     );
     if !response.ok {
         bail!("{}", response.error.unwrap_or_default());
@@ -793,6 +795,7 @@ fn run(
                     "subagent-idle",
                     format!("subagent={} is idle and available", record.id),
                     false,
+                    None,
                 )?;
             }
         }
@@ -803,37 +806,31 @@ fn run(
             if subject.trim().is_empty() || body.trim().is_empty() {
                 bail!("subject and task body are required");
             }
-            record.status = "assigned".into();
-            server.commit_locked(
-                &mut state,
-                &[Event::SubagentUpdated {
-                    subagent: record.clone(),
-                }],
-            );
             drop(state);
-            let result = match notify(server, actor, &record.peer, &subject, body, true) {
+            let result = match notify(
+                server,
+                actor,
+                &record.peer,
+                &subject,
+                body,
+                true,
+                Some(&record.id),
+            ) {
                 Ok(value) => value,
                 Err(error) => {
                     let mut state = server.state.lock().unwrap();
-                    if state.subagents[&record.id].status == "assigned" {
-                        record.status = "idle".into();
-                        record.error = Some(error.to_string());
-                        server.commit_locked(
-                            &mut state,
-                            &[Event::SubagentUpdated { subagent: record }],
-                        );
+                    if let Some(mut current) = state.subagents.get(&record.id).cloned() {
+                        if current.status == "idle" {
+                            current.error = Some(error.to_string());
+                            server.commit_locked(
+                                &mut state,
+                                &[Event::SubagentUpdated { subagent: current }],
+                            );
+                        }
                     }
                     return Err(error);
                 }
             };
-            let mut state = server.state.lock().unwrap();
-            let mut current = state.subagents[&record.id].clone();
-            current.last_message = result
-                .get("msg_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
-            server.commit_locked(&mut state, &[Event::SubagentUpdated { subagent: current }]);
-            // Message history is the task request truth; do not create a second queue.
             return Ok(json!({"subagent_id": record.id, "message": result}));
         }
         Action::Close { .. } => {
