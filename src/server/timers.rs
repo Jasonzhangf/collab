@@ -127,8 +127,14 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 || next_trigger.is_none_or(|trigger| trigger > now)
                 || state
                     .wake_bindings
-                    .values()
-                    .any(|bound| bound == &subscription.id)
+                    .iter()
+                    .any(|(message_id, bound)| {
+                        bound == &subscription.id
+                            && state
+                                .msgs
+                                .get(message_id)
+                                .is_some_and(|message| message.state == "pending")
+                    })
             {
                 continue;
             }
@@ -913,6 +919,55 @@ mod tests {
             .values()
             .all(|bound| bound != &subscription_id));
         assert!(state.msgs.is_empty());
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn recurring_master_idle_wake_advances_after_consumed_binding() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+        let now = now_ms();
+        server
+            .state
+            .lock()
+            .unwrap()
+            .notification_subscriptions
+            .get_mut(&subscription_id)
+            .unwrap()
+            .trigger_ms = Some(now - 15 * 60 * 1000 - 1);
+
+        tick_with_idle(&server, &|_| false);
+        let first_message_id = server
+            .state
+            .lock()
+            .unwrap()
+            .wake_bindings
+            .iter()
+            .find_map(|(message_id, bound)| (bound == &subscription_id).then_some(message_id.clone()))
+            .expect("first master idle wake");
+        server.commit(&[
+            Event::Delivered {
+                ids: vec![first_message_id.clone()],
+            },
+            Event::NotificationConsumed {
+                subscription_id: subscription_id.clone(),
+                message_id: first_message_id,
+                consumed_ms: now_ms(),
+            },
+        ]);
+
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .wake_bindings
+                .values()
+                .filter(|bound| *bound == &subscription_id)
+                .count(),
+            2
+        );
         drop(state);
         std::fs::remove_dir_all(root).ok();
     }
