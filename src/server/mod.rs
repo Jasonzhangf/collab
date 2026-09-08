@@ -455,6 +455,14 @@ fn notification_text(message: &Message) -> Option<String> {
     ))
 }
 
+fn is_explicit_notification(state: &State, message: &Message) -> bool {
+    message.mtype == "notify"
+        && state
+            .delivery_modes
+            .get(&message.id)
+            .is_some_and(|mode| mode == "explicit-notification")
+}
+
 fn batch_notification_text(
     batch: &[(i64, String, String, String, String)],
     remaining: usize,
@@ -478,7 +486,7 @@ struct RecipientMailboxRead {
 fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailboxRead, String> {
     let content = std::fs::read_to_string(path).map_err(|error| format!("read: {error}"))?;
     let lines = content.lines().collect::<Vec<_>>();
-    let partial_tail = !content.ends_with('\n');
+    let partial_tail = !content.is_empty() && !content.ends_with('\n');
     let mut records = Vec::new();
     for (index, line) in lines.into_iter().enumerate() {
         match serde_json::from_str::<serde_json::Value>(line) {
@@ -496,6 +504,26 @@ fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailb
         }
     }
     Ok(RecipientMailboxRead { records, partial_tail })
+}
+
+fn missing_recipient_projection_messages(
+    state: &State,
+    recipient: &str,
+    projection: &RecipientMailboxRead,
+) -> Vec<String> {
+    let recorded = projection
+        .records
+        .iter()
+        .filter_map(|record| record["message"]["id"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut missing = state
+        .msgs
+        .values()
+        .filter(|message| message.to == recipient && !recorded.contains(message.id.as_str()))
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing
 }
 
 /// Shared wake text for every channel. Keepalive and message delivery must not
@@ -726,10 +754,7 @@ fn attempt_notification_with_at(
             .map(|_| 0)
             .unwrap_or_else(|| server.config.notifications.delay_ms(&subscription.event));
         let worker_pane = state.workers.get(&recipient).and_then(|w| w.pane.clone());
-        let explicit = state
-            .delivery_modes
-            .get(message_id)
-            .is_some_and(|mode| mode == "explicit-notification");
+        let explicit = is_explicit_notification(&state, seed);
         (recipient, pane, delay, worker_pane, explicit)
     };
 
@@ -792,7 +817,9 @@ fn attempt_notification_with_at(
         .filter_map(|message| {
             let binding = state.wake_bindings.get(&message.id)?;
             let sub = state.notification_subscriptions.get(binding)?;
+            let message_explicit = is_explicit_notification(&state, message);
             (message.to == recipient
+                && message_explicit == explicit
                 && state
                     .delivery_modes
                     .get(&message.id)
@@ -826,6 +853,11 @@ fn attempt_notification_with_at(
         })
         .collect::<Vec<_>>();
     batch.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let Some(first) = batch.first() else {
+        return false;
+    };
+    let window_end = first.0.saturating_add(delay);
+    batch.retain(|candidate| candidate.0 <= window_end);
     const MAX_BATCH_DELIVERY: usize = 3;
     let total_pending = batch.len();
     let remaining = total_pending.saturating_sub(MAX_BATCH_DELIVERY);
@@ -838,11 +870,20 @@ fn attempt_notification_with_at(
     let last_attempt = state
         .msgs
         .values()
-        .filter(|m| m.to == recipient)
-        .map(|m| m.last_wake_attempt_ms)
+        .filter_map(|message| {
+            let binding = state.wake_bindings.get(&message.id)?;
+            let sub = state.notification_subscriptions.get(binding)?;
+            let message_explicit = is_explicit_notification(&state, message);
+            (message.to == recipient
+                && message_explicit == explicit
+                && (message_explicit || server.config.notifications.delay_ms(&sub.event) == delay)
+                && sub.worker_id == recipient
+                && sub.pane == pane)
+                .then_some(message.last_wake_attempt_ms)
+        })
         .max()
         .unwrap_or(0);
-    if now - first.0 < delay || now - last_attempt < delay {
+    if now.saturating_sub(first.0) < delay || now.saturating_sub(last_attempt) < delay {
         return false;
     }
     let ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
@@ -900,6 +941,298 @@ fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str
         &|pane, text| knock_or_log(&server.log_path(), pane, text),
         &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
     )
+}
+
+#[cfg(test)]
+mod notification_batch_tests {
+    use super::*;
+    use crate::server::state::{Event, NotificationSubscription, State, WorkerRec};
+    use std::sync::{Arc, Mutex};
+
+    fn test_server() -> (Arc<Server>, std::path::PathBuf) {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "collab-notification-batch-{}-{sequence}",
+            std::process::id()
+        ));
+        let server_dir = root.join(".agent-collab/server");
+        std::fs::create_dir_all(&server_dir).unwrap();
+        let journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(server_dir.join("journal.jsonl"))
+            .unwrap();
+        (
+            Arc::new(Server {
+                config: crate::config::Config::default(),
+                root: root.clone(),
+                state: Mutex::new(State::default()),
+                journal: Mutex::new(journal),
+                pane_alive_check: |_| true,
+                pane_owner_check: |_, _| true,
+                pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+                mailbox_notify: tokio::sync::Notify::new(),
+            }),
+            root,
+        )
+    }
+
+    fn register_and_subscribe(server: &Server, worker_id: &str) -> String {
+        let now = now_ms();
+        let pane = format!("%test-{worker_id}");
+        let subscription_id = format!("sub-{worker_id}");
+        server.commit(&[
+            Event::Registered {
+                worker: WorkerRec {
+                    id: worker_id.into(),
+                    token: format!("token-{worker_id}"),
+                    pane: Some(pane.clone()),
+                    cwd: "/tmp".into(),
+                    registered_ms: now,
+                },
+            },
+            Event::NotificationSubscribed {
+                subscription: NotificationSubscription {
+                    id: subscription_id.clone(),
+                    worker_id: worker_id.into(),
+                    event: "direct-message".into(),
+                    subject: None,
+                    pane,
+                    method: "tmux".into(),
+                    trigger_ms: None,
+                    trigger_times_ms: Vec::new(),
+                    interval_ms: None,
+                    repeat_count: 1,
+                    fired_count: 0,
+                    expires_ms: now + 300_000,
+                    status: "armed".into(),
+                    created_ms: now,
+                    updated_ms: now,
+                },
+            },
+        ]);
+        subscription_id
+    }
+
+    fn queue_message(
+        server: &Server,
+        worker_id: &str,
+        subscription_id: &str,
+        message_id: &str,
+        created_ms: i64,
+    ) {
+        server.commit(&[
+            Event::Sent {
+                msg: Message {
+                    id: message_id.into(),
+                    from: "peer".into(),
+                    to: worker_id.into(),
+                    mtype: "notify".into(),
+                    subject: Some(format!("topic-{message_id}")),
+                    body: format!("DETAIL-{message_id}"),
+                    in_reply_to: None,
+                    created_ms,
+                    state: "pending".into(),
+                    wake_attempt_count: 0,
+                    last_wake_attempt_ms: 0,
+                },
+            },
+            Event::WakeBound {
+                message_id: message_id.into(),
+                subscription_id: subscription_id.into(),
+            },
+        ]);
+    }
+
+    #[test]
+    fn automatic_batch_does_not_cross_the_first_notice_window() {
+        let (server, root) = test_server();
+        let subscription_id = register_and_subscribe(&server, "recipient");
+        let now = now_ms();
+        queue_message(
+            &server,
+            "recipient",
+            &subscription_id,
+            "old-notice",
+            now - 120_001,
+        );
+        queue_message(&server, "recipient", &subscription_id, "late-notice", now);
+
+        let delivered = Mutex::new(Vec::new());
+        assert!(attempt_notification_with_at(
+            &server,
+            "old-notice",
+            &subscription_id,
+            &|_| true,
+            &|_, text| {
+                delivered.lock().unwrap().push(text.to_string());
+                true
+            },
+            &|_, _| true,
+            now,
+        ));
+
+        let text = delivered.lock().unwrap().join("\n");
+        assert!(text.contains("old-notice"));
+        assert!(
+            !text.contains("late-notice"),
+            "a notice arriving after the first 120-second window must remain pending"
+        );
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs["old-notice"].state, "delivered");
+        assert_eq!(state.msgs["late-notice"].state, "pending");
+        drop(state);
+        let mailbox =
+            std::fs::read_to_string(root.join(".agent-collab/mailbox/recipient-recipient.jsonl"))
+                .unwrap();
+        assert!(mailbox.contains("DETAIL-old-notice"));
+        assert!(mailbox.contains("DETAIL-late-notice"));
+        assert!(
+            !text.contains("DETAIL-old-notice") && !text.contains("DETAIL-late-notice"),
+            "batch wake must carry task summary while full details stay in JSONL"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_notice_is_immediate_and_isolated_from_automatic_batching() {
+        let (server, root) = test_server();
+        let subscription_id = register_and_subscribe(&server, "recipient");
+        let now = now_ms();
+        queue_message(
+            &server,
+            "recipient",
+            &subscription_id,
+            "automatic-notice",
+            now - 120_001,
+        );
+        queue_message(
+            &server,
+            "recipient",
+            &subscription_id,
+            "explicit-notice",
+            now,
+        );
+        server.commit(&[Event::DeliveryMode {
+            msg_id: "explicit-notice".into(),
+            mode: "explicit-notification".into(),
+        }]);
+
+        let delivered = Mutex::new(Vec::new());
+        assert!(attempt_notification_with_at(
+            &server,
+            "explicit-notice",
+            &subscription_id,
+            &|_| true,
+            &|_, text| {
+                delivered.lock().unwrap().push(text.to_string());
+                true
+            },
+            &|_, _| true,
+            now,
+        ));
+        let text = delivered.lock().unwrap().join("\n");
+        assert!(text.contains("explicit-notice"));
+        assert!(!text.contains("automatic-notice"));
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs["explicit-notice"].state, "delivered");
+        assert_eq!(state.msgs["automatic-notice"].state, "pending");
+        drop(state);
+        assert!(attempt_notification_with_at(
+            &server,
+            "automatic-notice",
+            &subscription_id,
+            &|_| true,
+            &|_, text| {
+                delivered.lock().unwrap().push(text.to_string());
+                true
+            },
+            &|_, _| true,
+            now,
+        ));
+        assert!(delivered.lock().unwrap().iter().any(|text| {
+            text.contains("automatic-notice")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mailbox_status_reports_a_valid_but_incomplete_projection() {
+        let (server, root) = test_server();
+        let subscription_id = register_and_subscribe(&server, "recipient");
+        queue_message(
+            &server,
+            "recipient",
+            &subscription_id,
+            "projection-gap",
+            now_ms(),
+        );
+        std::fs::write(
+            root.join(".agent-collab/mailbox/recipient-recipient.jsonl"),
+            "",
+        )
+        .unwrap();
+
+        let response = dispatch(
+            &server,
+            Req::MailboxRead {
+                all: false,
+                sort: Some("time-asc".into()),
+                worker_id: Some("recipient".into()),
+            },
+        );
+        assert!(response.ok);
+        assert_eq!(response.data["recipient_jsonl"]["status"], "incomplete");
+        assert_eq!(
+            response.data["recipient_jsonl"]["missing_message_ids"],
+            serde_json::json!(["projection-gap"])
+        );
+        assert!(response.data["recipient_jsonl"]["exact_error"]
+            .as_str()
+            .unwrap()
+            .contains("projection-gap"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_reservation_is_durable_and_is_never_replayed() {
+        let (server, root) = test_server();
+        let subscription_id = register_and_subscribe(&server, "recipient");
+        let now = now_ms();
+        queue_message(
+            &server,
+            "recipient",
+            &subscription_id,
+            "reserved-once",
+            now - 120_001,
+        );
+
+        assert!(!attempt_notification_with_at(
+            &server,
+            "reserved-once",
+            &subscription_id,
+            &|_| false,
+            &|_, _| panic!("a failed reservation must not send"),
+            &|_, _| true,
+            now,
+        ));
+        assert_eq!(server.state.lock().unwrap().msgs["reserved-once"].state, "pending");
+        assert_eq!(
+            server.state.lock().unwrap().msgs["reserved-once"].wake_attempt_count,
+            1
+        );
+        assert!(!attempt_notification_with_at(
+            &server,
+            "reserved-once",
+            &subscription_id,
+            &|_| true,
+            &|_, _| panic!("a reserved message must never be replayed"),
+            &|_, _| true,
+            now + 300_000,
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// Test and migration helper: assume every pane is authoritative so
@@ -3871,11 +4204,29 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 let path = server.root.join(".agent-collab/mailbox")
                     .join(format!("recipient-{recipient}.jsonl"));
                 match read_recipient_mailbox(&path, recipient) {
-                    Ok(read) => Some(json!({
-                        "status": if read.partial_tail { "partial-tail" } else { "ok" },
-                        "partial_tail": read.partial_tail,
-                        "records": read.records,
-                    })),
+                    Ok(read) => {
+                        let missing = missing_recipient_projection_messages(&st, recipient, &read);
+                        let status = if read.partial_tail {
+                            "partial-tail"
+                        } else if missing.is_empty() {
+                            "ok"
+                        } else {
+                            "incomplete"
+                        };
+                        let exact_error = (!missing.is_empty()).then(|| {
+                            format!(
+                                "recipient JSONL is missing message records: {}",
+                                missing.join(",")
+                            )
+                        });
+                        Some(json!({
+                            "status": status,
+                            "partial_tail": read.partial_tail,
+                            "missing_message_ids": missing,
+                            "exact_error": exact_error,
+                            "records": read.records,
+                        }))
+                    }
                     Err(error) => Some(json!({
                         "status": "error",
                         "exact_error": error,
