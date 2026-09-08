@@ -335,6 +335,17 @@ pub(crate) fn tick_with(
             .unwrap_or_default();
         let mut record = old.clone();
 
+        // An actionable task is the only scheduler-owned transition that
+        // starts a fresh idle episode. A monitor/ACK round can make an idle
+        // worker briefly appear working while it handles the message; that
+        // probe flap must not re-arm the same worker-idle observation.
+        if !tasks.is_empty()
+            && (record.idle_episode_notices != 0 || !record.idle_episode_reason.is_empty())
+        {
+            record.idle_episode_notices = 0;
+            record.idle_episode_reason.clear();
+        }
+
         if tasks.is_empty() {
             let was_working = old.observed == "working";
             let is_idle = agent == AgentState::Waiting;
@@ -348,10 +359,6 @@ pub(crate) fn tick_with(
             if record.observed != observed_str {
                 record.observed = observed_str.into();
                 record.idle_since_ms = now;
-                if is_idle && was_working {
-                    record.idle_episode_notices = 0;
-                    record.idle_episode_reason = idle_reason.into();
-                }
             }
             record.unacked = 0;
             record.last_notice_id = None;
@@ -362,13 +369,15 @@ pub(crate) fn tick_with(
             }
             let is_live_master = super::live_master_id(server, &state)
                 .is_some_and(|master_id| master_id == worker.id);
-            if is_idle
-                && (was_working
-                    || (is_live_master
-                        && record.idle_episode_notices < 3
-                        && now.saturating_sub(record.last_notice_ms) >= 120_000))
-                && record.idle_episode_notices < 3
-            {
+            let idle_notification_due = if is_live_master {
+                is_idle
+                    && (record.idle_episode_notices == 0
+                        || (record.idle_episode_notices < 3
+                            && now.saturating_sub(record.last_notice_ms) >= 120_000))
+            } else {
+                is_idle && was_working && record.idle_episode_notices == 0
+            };
+            if idle_notification_due {
                 if let Some(master_id) = super::live_master_id(server, &state) {
                     if master_id == worker.id {
                         if let Some(sub) = state.matching_subscription(&worker.id, "direct-message", None, now) {
@@ -418,6 +427,7 @@ pub(crate) fn tick_with(
                                 last_wake_attempt_ms: 0,
                             },
                         });
+                        record.idle_episode_notices = record.idle_episode_notices.saturating_add(1);
                         if let Some(sub) = state.matching_subscription(&master_id, "direct-message", None, now) {
                             events.push(Event::WakeBound {
                                 message_id: alert_id,
@@ -895,6 +905,197 @@ mod tests {
         tick_with(&server, now + 400_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
         assert_eq!(status_count(&server), 1, "settled state reports once");
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_worker_episode_stays_one_shot_until_actionable_task_changes() {
+        use super::super::peer_tests::{register, test_server};
+        use std::cell::Cell;
+        use std::sync::Arc;
+
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "worker", "%worker");
+        register(&server, "initial-idle", "%initial-idle");
+        let server = Arc::new(server);
+        assert!(super::super::handle_master_promote(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "user approved master".into(),
+        )
+        .ok);
+
+        let base = super::super::state::now_ms();
+        let mut initial = Record::default();
+        initial.observed = "working".into();
+        initial.idle_since_ms = base;
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "worker".into(),
+            record: initial,
+        }]);
+
+        let wakes = Cell::new(0);
+        let wake = |_: &str, _: &str| {
+            wakes.set(wakes.get() + 1);
+            true
+        };
+        let tick = |server: &Server, at: i64, agent: AgentState| {
+            tick_with(server, at, &|_| agent, &wake, &|_, _| true);
+        };
+
+        tick(&server, base, AgentState::Waiting);
+        assert!(!server.state.lock().unwrap().msgs.values().any(|message| {
+            message.to == "master" && message.subject == Some("worker-idle: initial-idle".into())
+        }));
+        tick(&server, base + 1_000, AgentState::Waiting);
+        tick(&server, base + 2_000, AgentState::Waiting);
+        tick(&server, base + 3_000, AgentState::Working);
+        tick(&server, base + 4_000, AgentState::Waiting);
+        tick(&server, base + 5_000, AgentState::Waiting);
+
+        let state = server.state.lock().unwrap();
+        let idle_alerts: Vec<_> = state
+            .msgs
+            .values()
+            .filter(|message| {
+                message.to == "master"
+                    && message.subject == Some("worker-idle: worker".into())
+            })
+            .collect();
+        assert_eq!(idle_alerts.len(), 1, "monitor probe flaps do not re-arm idle");
+        assert_eq!(
+            state
+                .msgs
+                .values()
+                .filter(|message| message.to == "worker")
+                .count(),
+            0,
+            "idle observation never wakes the worker"
+        );
+        assert_eq!(
+            wakes.get(),
+            0,
+            "idle observation does not call the worker wake path"
+        );
+        drop(state);
+
+        // A real master dispatch remains an explicit, immediate message and
+        // is the only worker notification in this sequence.
+        let dispatch = super::super::handle_send(
+            &server,
+            "master".into(),
+            "worker".into(),
+            "notify".into(),
+            Some("monitor-open-p0p1-worker".into()),
+            "dispatch the assigned work".into(),
+            None,
+            "immediate".into(),
+        );
+        assert!(dispatch.ok, "master dispatch must remain accepted");
+        let dispatch_id = dispatch.data["msg_id"].as_str().unwrap().to_owned();
+        let duplicate = super::super::handle_send(
+            &server,
+            "master".into(),
+            "worker".into(),
+            "notify".into(),
+            Some("monitor-open-p0p1-worker".into()),
+            "dispatch the assigned work".into(),
+            None,
+            "immediate".into(),
+        );
+        assert!(duplicate.ok);
+        assert_eq!(duplicate.data["deduplicated"], true);
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .msgs
+                .values()
+                .filter(|message| {
+                    message.to == "worker"
+                        && message.subject == Some("monitor-open-p0p1-worker".into())
+                })
+                .count(),
+            1,
+            "unchanged monitor is one durable dispatch"
+        );
+        drop(state);
+
+        // Reading/ACKing the explicit dispatch and a restart preserve the
+        // already reported idle revision; neither is a new capacity event.
+        server.commit(&[
+            Event::Delivered {
+                ids: vec![dispatch_id.clone()],
+            },
+            Event::Acked {
+                ids: vec![dispatch_id],
+            },
+        ]);
+        tick(&server, base + 6_000, AgentState::Working);
+        tick(&server, base + 7_000, AgentState::Waiting);
+        let mut replay = State::default();
+        for line in std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+        {
+            replay.apply(&serde_json::from_str::<Event>(line).unwrap());
+        }
+        *server.state.lock().unwrap() = replay;
+        tick(&server, base + 8_000, AgentState::Waiting);
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .msgs
+                .values()
+                .filter(|message| {
+                    message.to == "master"
+                        && message.subject == Some("worker-idle: worker".into())
+                })
+                .count(),
+            1,
+            "ACK/read and replay do not reset the idle revision"
+        );
+        drop(state);
+
+        // Only an actionable task changes the observation revision and permits
+        // a later worker-idle signal.
+        let task = crate::server::state::TaskRec {
+            id: "task-worker".into(),
+            owner: "worker".into(),
+            created_by: "master".into(),
+            feature_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            priority: "p2".into(),
+            status: "working".into(),
+            next_step: Some("work".into()),
+            wait: None,
+            created_ms: base,
+            updated_ms: base,
+        };
+        server.commit(&[Event::TaskCreated { task: task.clone() }]);
+        tick(&server, base + 9_000, AgentState::Working);
+        let mut closed = task;
+        closed.status = "closed".into();
+        closed.updated_ms = base + 10_000;
+        server.commit(&[Event::TaskUpdated { task: closed }]);
+        tick(&server, base + 11_000, AgentState::Waiting);
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .msgs
+                .values()
+                .filter(|message| {
+                    message.to == "master"
+                        && message.subject == Some("worker-idle: worker".into())
+                })
+                .count(),
+            2,
+            "task assignment and release permit a new idle revision"
+        );
+        drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
