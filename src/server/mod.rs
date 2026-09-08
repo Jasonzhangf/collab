@@ -5642,7 +5642,11 @@ mod scheduler_admission_tests {
         );
         assert!(direct.ok, "{direct:?}");
         assert_eq!(direct.data["admission"], first.data["admission"]);
-        assert!(server.state.lock().unwrap().subagents.is_empty());
+        let state = server.state.lock().unwrap();
+        assert!(state.subagents.is_empty());
+        assert!(state.tasks.is_empty());
+        assert!(state.msgs.is_empty());
+        drop(state);
         assert_eq!(
             std::fs::read_to_string(root.join(".agent-collab/server/events.jsonl"))
                 .unwrap()
@@ -5654,7 +5658,10 @@ mod scheduler_admission_tests {
         let denied = start("denied-child", "wrong-token");
         assert!(!denied.ok);
         assert!(denied.error.unwrap().contains("authentication failed"));
-        assert!(server.state.lock().unwrap().subagents.is_empty());
+        let state = server.state.lock().unwrap();
+        assert!(state.subagents.is_empty());
+        assert!(state.tasks.is_empty());
+        assert!(state.msgs.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
