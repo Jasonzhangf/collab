@@ -2056,6 +2056,7 @@ fn tmux_notification_classifies_priority_and_names_one_action() {
     };
 
     assert!(notify("worker-idle: w1").contains("P1 ACTION: dispatch work to this idle capacity"));
+    assert!(notify("master-idle: master").contains("P1 ACTION: run the scheduling pass"));
     assert!(notify("worker-unresponsive: w1").contains("P1 ACTION: snapshot the pane"));
     assert!(notify("task-keepalive 1/3").contains("P1 ACTION: continue your own task"));
     assert!(notify("goal:plan.md").contains("P0 ACTION: run the long-horizon briefing"));
@@ -2177,6 +2178,23 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
         .join(".agent-collab/mailbox")
         .join(format!("{message_id}.json"))
         .exists());
+    let jsonl = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    assert!(std::fs::read_to_string(&jsonl).unwrap().lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .map(|record| record["schema_version"] == 1
+                && record["record_type"] == "message"
+                && record["recipient"] == "recipient"
+                && record["category"] == "direct"
+                && record["task_ids"].is_array()
+                && record["created_ms"].is_i64()
+                && record["window_start_ms"].is_null()
+                && record["window_end_ms"].is_null()
+                && record["state"] == "pending"
+                && record["exact_error"].is_null()
+                && record["message"]["id"] == message_id)
+            .unwrap_or(false)
+    }));
+    assert_eq!(replay(&root).unwrap().msgs[&message_id].body, "RESOURCE_OCCUPIED feature=shared");
     assert_eq!(first.data["notification"], "mailbox-only-no-subscription");
     assert_eq!(
         server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
@@ -2224,9 +2242,93 @@ fn explicit_peer_notification_accepts_arbitrary_durable_body() {
         "The candidate is ready for your review."
     );
     assert_eq!(state.msgs[message_id].subject.as_deref(), Some("review"));
-    assert_eq!(state.msgs[message_id].wake_attempt_count, 0);
+    assert_eq!(state.msgs[message_id].wake_attempt_count, 1);
     assert_eq!(response.data["notification"], "subscribed-not-sent");
     drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn recipient_jsonl_records_latest_delivery_and_journal_replay() {
+    let (server, root) = test_server();
+    register(&server, "recipient", "%recipient");
+    let id = "jsonl-message";
+    server.commit(&[
+        Event::Sent {
+            msg: Message {
+                id: id.into(),
+                from: "sender".into(),
+                to: "recipient".into(),
+                mtype: "notify".into(),
+                subject: Some("progress".into()),
+                body: "task-jsonl progress".into(),
+                in_reply_to: None,
+                created_ms: now_ms(),
+                state: "pending".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        },
+        Event::Delivered { ids: vec![id.into()] },
+        Event::Acked { ids: vec![id.into()] },
+    ]);
+    let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    let records = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["message"]["id"] == id)
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 3, "Sent/Delivered/Acked append snapshots");
+    for record in &records {
+        assert_eq!(record["schema_version"], 1);
+        assert_eq!(record["record_type"], "message");
+        assert_eq!(record["recipient"], "recipient");
+        assert_eq!(record["category"], "progress");
+        assert!(record["task_ids"].is_array());
+        assert!(record["created_ms"].is_i64());
+        assert!(record["window_start_ms"].is_null());
+        assert!(record["window_end_ms"].is_null());
+        assert!(record["exact_error"].is_null());
+    }
+    assert_eq!(records.last().unwrap()["message"]["state"], "read");
+    assert_eq!(replay(&root).unwrap().msgs[id].state, "read");
+    let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    std::fs::write(&path, format!("{}{{\"partial\":", std::fs::read_to_string(&path).unwrap())).unwrap();
+    let projection = read_recipient_mailbox(&path, "recipient").unwrap();
+    assert_eq!(projection.records.len(), 3);
+    assert!(projection.partial_tail);
+    std::fs::write(&path, "{\"bad\":true}\nnot-json\n").unwrap();
+    assert!(read_recipient_mailbox(&path, "recipient").is_err());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn recipient_jsonl_failure_is_logged_without_panicking() {
+    let (server, root) = test_server();
+    register(&server, "recipient", "%recipient");
+    std::fs::create_dir_all(root.join(".agent-collab/mailbox/recipient-recipient.jsonl")).unwrap();
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "jsonl-failure".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("failure".into()),
+            body: "preserve journal truth".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    assert!(std::fs::read_to_string(root.join(".agent-collab/server/log.txt"))
+        .unwrap()
+        .contains("MAILBOX_JSONL_WRITE_FAILED"));
+    assert_eq!(replay(&root).unwrap().msgs["jsonl-failure"].state, "pending");
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -2799,6 +2901,192 @@ fn worker_freed_transitions_notify_live_master() {
     let alert = idle_alert.unwrap();
     assert!(alert.body.contains("now idle with no active task"));
     drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
+    let (server, root) = test_server();
+    register(&server, "master-worker", "%master");
+    let server_arc = std::sync::Arc::new(server);
+    let promote_resp = dispatch(
+        &server_arc,
+        Req::MasterPromote {
+            worker_id: "master-worker".into(),
+            token: "token-master-worker".into(),
+            approval: "approved".into(),
+        },
+    );
+    assert!(promote_resp.ok);
+
+    let mut initial_rec = crate::server::keepalive::Record::default();
+    initial_rec.observed = "working".into();
+    initial_rec.idle_since_ms = 1000;
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "master-worker".into(),
+        record: initial_rec,
+    }]);
+
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        2000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+
+    let state = server_arc.state.lock().unwrap();
+    let idle_alerts: Vec<_> = state
+        .msgs
+        .values()
+        .filter(|m| m.to == "master-worker" && m.subject == Some("master-idle: master-worker".into()))
+        .collect();
+    assert_eq!(idle_alerts.len(), 1, "one scheduling wake per transition");
+    let alert = idle_alerts[0];
+    assert!(alert.body.contains("task graph"));
+    assert!(alert.body.contains("saturation"));
+    assert!(alert.body.contains("Scheduling continues"));
+    assert!(alert.body.contains("no actionable task, dependency, resolvable blocker, or authorized open bug remains"));
+    assert!(alert.body.contains("collab notify unsubscribe sub-default-direct-message-master-worker"));
+    assert!(alert.body.contains("record the receipt"));
+    let subscription_id = state.wake_bindings.get(&alert.id).expect("master wake must bind once");
+    let subscription = state.notification_subscriptions.get(subscription_id).unwrap();
+    assert_eq!(subscription.worker_id, "master-worker");
+    assert_eq!(subscription.event, "direct-message");
+    assert_eq!(subscription.status, "armed");
+    drop(state);
+
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        3000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    let state = server_arc.state.lock().unwrap();
+    assert_eq!(
+        state.msgs.values().filter(|m| {
+            m.to == "master-worker" && m.subject == Some("master-idle: master-worker".into())
+        }).count(),
+        1,
+        "duplicate idle observation must not wake again"
+    );
+    drop(state);
+
+    let mut new_reason = crate::server::keepalive::Record::default();
+    new_reason.observed = "idle".into();
+    new_reason.idle_episode_reason = "different-reason".into();
+    new_reason.idle_episode_notices = 1;
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "master-worker".into(),
+        record: new_reason,
+    }]);
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        122000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    let state = server_arc.state.lock().unwrap();
+    assert_eq!(
+        state.msgs.values().filter(|m| {
+            m.to == "master-worker" && m.subject == Some("master-idle: master-worker".into())
+        }).count(),
+        2,
+        "same episode reminder is windowed and new reason does not reset budget"
+    );
+    drop(state);
+
+    for now in [242000, 362000] {
+        crate::server::keepalive::tick_with(
+            &server_arc,
+            now,
+            &|_pane| crate::server::knock::AgentState::Waiting,
+            &|_pane, _text| true,
+            &|_worker_id, _pane| true,
+        );
+    }
+    let state = server_arc.state.lock().unwrap();
+    assert_eq!(
+        state.msgs.values().filter(|m| {
+            m.to == "master-worker" && m.subject == Some("master-idle: master-worker".into())
+        }).count(),
+        3,
+        "idle episode suppresses after three reminders"
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_idle_requires_live_master_armed_subscription_and_empty_backlog() {
+    let (server, root) = test_server();
+    register(&server, "unpromoted", "%unpromoted");
+    let server_arc = std::sync::Arc::new(server);
+    let mut initial_rec = crate::server::keepalive::Record::default();
+    initial_rec.observed = "working".into();
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "unpromoted".into(),
+        record: initial_rec.clone(),
+    }]);
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        2000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    assert!(!server_arc.state.lock().unwrap().msgs.values().any(|m| m.subject == Some("master-idle: unpromoted".into())));
+
+    let promote_resp = dispatch(
+        &server_arc,
+        Req::MasterPromote {
+            worker_id: "unpromoted".into(),
+            token: "token-unpromoted".into(),
+            approval: "approved".into(),
+        },
+    );
+    assert!(promote_resp.ok);
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "unpromoted".into(),
+        record: initial_rec.clone(),
+    }, Event::NotificationStatus {
+        subscription_id: "sub-default-direct-message-unpromoted".into(),
+        status: "consumed".into(),
+        updated_ms: 2001,
+    }]);
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        3000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    assert!(!server_arc.state.lock().unwrap().msgs.values().any(|m| m.subject == Some("master-idle: unpromoted".into())));
+    std::fs::remove_dir_all(root).unwrap();
+
+    let (server, root) = test_server();
+    register(&server, "busy-master", "%master");
+    let server_arc = std::sync::Arc::new(server);
+    assert!(dispatch(&server_arc, Req::MasterPromote {
+        worker_id: "busy-master".into(),
+        token: "token-busy-master".into(),
+        approval: "approved".into(),
+    }).ok);
+    create_task(&server_arc, "busy-master", "task-actionable", "feature");
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "busy-master".into(),
+        record: initial_rec,
+    }]);
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        4000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    assert!(!server_arc.state.lock().unwrap().msgs.values().any(|m| m.subject == Some("master-idle: busy-master".into())));
     std::fs::remove_dir_all(root).unwrap();
 }
 

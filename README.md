@@ -200,12 +200,12 @@ one command queue. The Agent first weighs the id and
 subject against current work. When it selects the notice, it runs
 `collab msg <message-id>`, reads durable detail, and executes actionable
 in-scope work; it must not stop at ACK or waiting. The first pending notice opens
-a fixed 60-second window. At its end all eligible unsent notices for that peer
+a fixed 120-second window. At its end all eligible unsent notices for that peer
 are combined into one paste with one Enter, including notices arriving later
 in the window. Working Agents receive the batch without waiting for idle.
 Attempts are reserved durably before tmux; failure, unknown/absent Agent, and
 restart never replay an attempted batch. Details remain in the inbox.
-Each recipient has at most one batch attempt per minute. The daemon never creates periodic
+Each recipient has at most one batch attempt per 120-second window. The daemon never creates periodic
 `CONTINUE_TASK` messages.
 
 ## Existing-project migration

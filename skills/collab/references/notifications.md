@@ -49,12 +49,12 @@ collab notify close
   storms and terminal pollution, push knocks pause when unacknowledged notifications
   reach `max_unacked` (default 3, range 1-5). Run `collab ack <id>` or `collab ack --all`
   to resume push delivery. Messages remain safely buffered in the durable mailbox.
-- First pending message starts a fixed 60-second window. At dispatch, include
+- First pending daemon message starts a fixed 120-second window. At dispatch, include
   eligible unsent messages for the recipient, capped at 3 previews per batch knock.
   Excess messages remain in the inbox with `[+N more pending in inbox]`. When unacked
   notifications reach the throttle cap, the batch preview appends an
   `[ACK REQUIRED: ...]` notice. Combine previews into one line with one final Enter;
-  at most one batch attempt per recipient per minute. Reserve attempts before sending;
+  at most one batch attempt per recipient per 120-second window. Reserve attempts before sending;
   failed, absent, unknown, or uncertain delivery does not cause later automatic replay.
 - One safe preview contains notification ID, abbreviated subject, and one-line
   original body. Control characters are escaped. Cursor delivery is two tmux

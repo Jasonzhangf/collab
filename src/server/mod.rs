@@ -113,23 +113,22 @@ pub struct Server {
     pub mailbox_notify: Notify,
 }
 
-fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) {
+fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) -> Result<(), String> {
     let path = root.join(".agent-collab/server/events.jsonl");
     let record = json!({
         "ts": now_ms(),
         "kind": kind,
         "detail": detail,
     });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-    {
-        use std::io::Write;
-        let mut line = serde_json::to_vec(&record).unwrap_or_default();
-        line.push(b'\n');
-        let _ = file.write_all(&line);
-    }
+        .map_err(|error| format!("open events: {error}"))?;
+    use std::io::Write;
+    let mut line = serde_json::to_vec(&record).map_err(|error| format!("serialize events: {error}"))?;
+    line.push(b'\n');
+    file.write_all(&line).map_err(|error| format!("append events: {error}"))
 }
 
 fn request_activity(req: &Req, resp: &Resp) -> serde_json::Value {
@@ -181,19 +180,25 @@ impl Server {
         for ev in evs {
             st.apply(ev);
             if let Event::Sent { msg } = ev {
-                self.backup_message(msg);
+                if let Err(error) = self.backup_message(msg) {
+                    self.report_mailbox_projection_error(error);
+                }
             }
             if let Event::Delivered { ids } = ev {
                 for id in ids {
                     if let Some(msg) = st.msgs.get(id) {
-                        self.backup_message(msg);
+                        if let Err(error) = self.backup_message(msg) {
+                            self.report_mailbox_projection_error(error);
+                        }
                     }
                 }
             }
             if let Event::Acked { ids } = ev {
                 for id in ids {
                     if let Some(msg) = st.msgs.get(id) {
-                        self.backup_message(msg);
+                        if let Err(error) = self.backup_message(msg) {
+                            self.report_mailbox_projection_error(error);
+                        }
                     }
                 }
             }
@@ -203,13 +208,79 @@ impl Server {
         }
     }
 
-    fn backup_message(&self, msg: &Message) {
-        let dir = self.root.join(".agent-collab").join("mailbox");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!("{}.json", msg.id));
-        if let Ok(data) = serde_json::to_string_pretty(msg) {
-            let _ = std::fs::write(&path, data);
+    fn report_mailbox_projection_error(&self, error: String) {
+        // Journal truth is already durable. Keep projection failure explicit
+        // and queryable without turning it into a false delivery result.
+        append_log(
+            &self.log_path(),
+            &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"),
+        );
+        if let Err(activity_error) = record_activity(
+            &self.root,
+            "mailbox_projection_error",
+            json!({"exact_error": error, "recoverable": true}),
+        ) {
+            append_log(
+                &self.log_path(),
+                &format!("MAILBOX_PROJECTION_ERROR_RECORD_FAILED: {activity_error}"),
+            );
         }
+    }
+
+    fn backup_message(&self, msg: &Message) -> Result<(), String> {
+        let dir = self.root.join(".agent-collab").join("mailbox");
+        std::fs::create_dir_all(&dir).map_err(|error| format!("create directory: {error}"))?;
+        let path = dir.join(format!("{}.json", msg.id));
+        let data = serde_json::to_string_pretty(msg).map_err(|error| format!("message serialize: {error}"))?;
+        std::fs::write(&path, data).map_err(|error| format!("message snapshot: {error}"))?;
+        let jsonl_path = dir.join(format!("recipient-{}.jsonl", msg.to));
+        if jsonl_path.exists() {
+            let projection = read_recipient_mailbox(&jsonl_path, &msg.to)?;
+            if projection.partial_tail {
+                let content = std::fs::read(&jsonl_path)
+                    .map_err(|error| format!("read partial mailbox: {error}"))?;
+                let valid_len = content
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&jsonl_path)
+                    .map_err(|error| format!("open partial mailbox: {error}"))?;
+                file.set_len(valid_len as u64)
+                    .map_err(|error| format!("truncate partial mailbox: {error}"))?;
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&jsonl_path)
+            .map_err(|error| format!("open: {error}"))?;
+        use std::io::Write;
+        let subject = msg.subject.as_deref().unwrap_or("notice");
+        let (priority, action) = notification_class(subject);
+        let record = json!({
+            "schema_version": 1,
+            "record_type": "message",
+            "recipient": msg.to,
+            "category": semantic_notification_category(subject, &msg.mtype),
+            "priority": priority,
+            "action": action,
+            "task_ids": [],
+            "created_ms": msg.created_ms,
+            "window_start_ms": serde_json::Value::Null,
+            "window_end_ms": serde_json::Value::Null,
+            "window_source": "not-attached-to-message-event",
+            "state": msg.state,
+            "exact_error": serde_json::Value::Null,
+            "message": msg,
+        });
+        let data = serde_json::to_string(&record).map_err(|error| format!("serialize: {error}"))?;
+        file.write_all(data.as_bytes()).map_err(|error| format!("append: {error}"))?;
+        file.write_all(b"\n").map_err(|error| format!("newline: {error}"))?;
+        file.sync_data().map_err(|error| format!("sync: {error}"))?;
+        Ok(())
     }
 
     fn rewrite_journal_locked(&self, st: &State) {
@@ -318,6 +389,9 @@ fn notification_class(subject: &str) -> (&'static str, &'static str) {
     if subject.starts_with("worker-idle") {
         return ("P1", "dispatch work to this idle capacity");
     }
+    if subject.starts_with("master-idle") {
+        return ("P1", "run the scheduling pass: inspect graph/load/liveness, dispatch authorized work, and resolve blockers");
+    }
     if subject.starts_with("subagent-status") {
         return ("P1", "re-dispatch, close, or leave the child idle");
     }
@@ -340,6 +414,29 @@ fn notification_class(subject: &str) -> (&'static str, &'static str) {
     ("P1", "do the in-scope action the message asks for")
 }
 
+fn semantic_notification_category(subject: &str, mtype: &str) -> &'static str {
+    if subject.starts_with("master-idle") || subject.starts_with("worker-idle") {
+        return "idle";
+    }
+    if subject.starts_with("task-keepalive")
+        || subject.starts_with("subagent-status")
+        || subject.starts_with("progress")
+        || subject.starts_with("delivery")
+    {
+        return "progress";
+    }
+    if subject.starts_with("resource")
+        || subject.starts_with("deadline")
+        || subject.starts_with("worker-unresponsive")
+    {
+        return "system";
+    }
+    if mtype == "notify" {
+        return "direct";
+    }
+    "system"
+}
+
 /// A notification is an interrupt, not the turn's goal. Without an explicit
 /// resume instruction agents treat reading as the whole task and stop.
 const NOTIFY_PROTOCOL: &str =
@@ -356,6 +453,49 @@ fn notification_text(message: &Message) -> Option<String> {
         subject_raw,
         &visible_body(&message.body),
     ))
+}
+
+fn batch_notification_text(
+    batch: &[(i64, String, String, String, String)],
+    remaining: usize,
+) -> String {
+    let message_ids = batch.iter().map(|(_, id, _, _, _)| id.as_str()).collect::<Vec<_>>().join(",");
+    let actions = batch.iter().map(|(_, _, _, _, text)| {
+        text.split_once('[').and_then(|(_, rest)| rest.split_once(']')).map(|(subject, _)| subject).unwrap_or("notification")
+    }).collect::<Vec<_>>().join(",");
+    // Message does not carry a typed task association. Do not infer one from
+    // preview text; the durable inbox remains the source for task details.
+    let task_ids = "none";
+    let older = (remaining > 0).then(|| format!(" older_messages={remaining}; run collab inbox")).unwrap_or_default();
+    format!("Batch wake: message_ids={message_ids} task_ids={task_ids} action_categories={actions}. Read full durable details from collab inbox; execute the actions, do not ACK-only.{older}")
+}
+
+struct RecipientMailboxRead {
+    records: Vec<serde_json::Value>,
+    partial_tail: bool,
+}
+
+fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailboxRead, String> {
+    let content = std::fs::read_to_string(path).map_err(|error| format!("read: {error}"))?;
+    let lines = content.lines().collect::<Vec<_>>();
+    let partial_tail = !content.ends_with('\n');
+    let mut records = Vec::new();
+    for (index, line) in lines.into_iter().enumerate() {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(record) => {
+                if record["schema_version"] != 1
+                    || record["record_type"] != "message"
+                    || record["recipient"] != recipient
+                {
+                    return Err(format!("invalid mailbox envelope at record {}", index + 1));
+                }
+                records.push(record)
+            }
+            Err(_error) if partial_tail && index + 1 == content.lines().count() => break,
+            Err(error) => return Err(format!("malformed JSONL record {}: {error}", index + 1)),
+        }
+    }
+    Ok(RecipientMailboxRead { records, partial_tail })
 }
 
 /// Shared wake text for every channel. Keepalive and message delivery must not
@@ -542,7 +682,26 @@ fn attempt_notification_with(
     deliver: &dyn Fn(&str, &str) -> bool,
     owns_pane: &dyn Fn(&str, &str) -> bool,
 ) -> bool {
-    let now = now_ms();
+    attempt_notification_with_at(
+        server,
+        message_id,
+        subscription_id,
+        can_receive,
+        deliver,
+        owns_pane,
+        now_ms(),
+    )
+}
+
+fn attempt_notification_with_at(
+    server: &Server,
+    message_id: &str,
+    subscription_id: &str,
+    can_receive: &dyn Fn(&str) -> bool,
+    deliver: &dyn Fn(&str, &str) -> bool,
+    owns_pane: &dyn Fn(&str, &str) -> bool,
+    now: i64,
+) -> bool {
     if !server.config.notifications.enabled {
         return false;
     }
@@ -559,7 +718,12 @@ fn attempt_notification_with(
             return false;
         }
         let pane = subscription.pane.clone();
-        let delay = server.config.notifications.delay_ms(&subscription.event);
+        let delay = state
+            .delivery_modes
+            .get(message_id)
+            .filter(|mode| mode.as_str() == "explicit-notification")
+            .map(|_| 0)
+            .unwrap_or_else(|| server.config.notifications.delay_ms(&subscription.event));
         let worker_pane = state.workers.get(&recipient).and_then(|w| w.pane.clone());
         (recipient, pane, delay, worker_pane)
     };
@@ -601,6 +765,13 @@ fn attempt_notification_with(
         );
         return false;
     }
+    if state_probe == crate::server::knock::AgentState::Working {
+        crate::server::knock::append_log(
+            &server.log_path(),
+            &format!("knock deferred pane={pane} recipient={recipient} agent is working"),
+        );
+        return false;
+    }
     let mut batch = state
         .msgs
         .values()
@@ -608,9 +779,15 @@ fn attempt_notification_with(
             let binding = state.wake_bindings.get(&message.id)?;
             let sub = state.notification_subscriptions.get(binding)?;
             (message.to == recipient
-                && server.config.notifications.delay_ms(&sub.event) == delay
+                && state
+                    .delivery_modes
+                    .get(&message.id)
+                    .filter(|mode| mode.as_str() == "explicit-notification")
+                    .map(|_| 0)
+                    .unwrap_or_else(|| server.config.notifications.delay_ms(&sub.event))
+                    == delay
                 && message.state == "pending"
-                && message.wake_attempt_count == 0
+                && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
                 && sub.worker_id == recipient
                 && sub.pane == pane
                 && sub.status == "armed"
@@ -638,7 +815,6 @@ fn attempt_notification_with(
     const MAX_BATCH_DELIVERY: usize = 3;
     let total_pending = batch.len();
     let remaining = total_pending.saturating_sub(MAX_BATCH_DELIVERY);
-    let attempted_ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
     if remaining > 0 {
         batch.drain(..remaining);
     }
@@ -656,6 +832,7 @@ fn attempt_notification_with(
         return false;
     }
     let ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
+    let attempted_ids = ids.clone();
     if !can_receive(&pane) {
         server.commit_locked(
             &mut state,
@@ -678,14 +855,11 @@ fn attempt_notification_with(
         }],
     );
     drop(state);
-    let mut text_parts = batch.iter().map(|m| m.4.clone()).collect::<Vec<_>>();
-    if remaining > 0 {
-        text_parts.push(format!(
-            "[+{} older messages remain in inbox; run collab inbox]",
-            remaining
-        ));
-    }
-    let text = truncate_notification(text_parts.join(" | "));
+    let text = truncate_notification(compose_notification(
+        &first.1,
+        "notification-batch",
+        &batch_notification_text(&batch, remaining),
+    ));
     if !deliver(&pane, &text) {
         return false;
     }
@@ -1959,7 +2133,13 @@ fn handle_cross_project_send(
         "cross_project": true,
         "source_master": from,
         "target_master": to,
-        "notification": if notified { "sent" } else { "mailbox-only-no-subscription" }
+        "notification": if subscription.is_none() {
+            "mailbox-only-no-subscription"
+        } else if notified {
+            "sent"
+        } else {
+            "subscribed-not-sent"
+        }
     }))
 }
 
@@ -2719,10 +2899,6 @@ fn handle_task_close(
                 Event::WakeBound {
                     message_id: message_id.clone(),
                     subscription_id: subscription.id.clone(),
-                },
-                Event::DeliveryMode {
-                    msg_id: message_id.clone(),
-                    mode: "explicit-notification".into(),
                 },
             ]);
             subscribed_notifications.push((message_id, subscription.id));
@@ -3639,11 +3815,31 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 msgs.sort_by(|a, b| a.created_ms.cmp(&b.created_ms));
             }
             let count = msgs.len();
-            Resp::data(json!({
+            let projection = worker_id.as_deref().and_then(|recipient| {
+                let path = server.root.join(".agent-collab/mailbox")
+                    .join(format!("recipient-{recipient}.jsonl"));
+                match read_recipient_mailbox(&path, recipient) {
+                    Ok(read) => Some(json!({
+                        "status": if read.partial_tail { "partial-tail" } else { "ok" },
+                        "partial_tail": read.partial_tail,
+                        "records": read.records,
+                    })),
+                    Err(error) => Some(json!({
+                        "status": "error",
+                        "exact_error": error,
+                        "records": [],
+                    })),
+                }
+            });
+            let mut response = json!({
                 "count": count,
                 "sort": sort_order,
                 "messages": msgs,
-            }))
+            });
+            if let Some(projection) = projection {
+                response["recipient_jsonl"] = projection;
+            }
+            Resp::data(response)
         }
     }
 }
@@ -3687,7 +3883,7 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
                             .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e)))
                     }
                 };
-                record_activity(
+                let _ = record_activity(
                     &server.root,
                     "request",
                     request_activity(&activity_req, &resp),
@@ -3696,7 +3892,7 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
             }
             Err(e) => {
                 let resp = Resp::err(format!("bad request: {}", e));
-                record_activity(&server.root, "protocol_error", json!({"error": resp.error}));
+                let _ = record_activity(&server.root, "protocol_error", json!({"error": resp.error}));
                 resp
             }
         };
@@ -3834,7 +4030,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         server_dir.join("server.pid"),
         std::process::id().to_string(),
     )?;
-    record_activity(
+    let _ = record_activity(
         &scope.root,
         "daemon_start",
         json!({"pid": std::process::id()}),

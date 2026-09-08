@@ -63,7 +63,7 @@ impl Default for Notifications {
         Self {
             enabled: true,
             mode: "batch".into(),
-            batch_window_seconds: 60,
+            batch_window_seconds: 120,
             transport: "tmux".into(),
             submit_enter: true,
             max_unacked: 3,
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(c.retention.ttl_days, 7);
         assert_eq!(c.subagent.runtime, "cursor");
         assert_eq!(c.subagent.health.timeout_seconds, 90);
-        assert_eq!(c.notifications.delay_ms("direct-message"), 60000);
+        assert_eq!(c.notifications.delay_ms("direct-message"), 120000);
         assert_eq!(c.notifications.delay_ms("deadline"), 0);
         let c = parse("[[projects]]\nroot='/project'\n[projects.notifications]\nmode='immediate'\n[projects.subagent]\nprofile_priority=['oauth']", Path::new("/project")).unwrap();
         assert_eq!(c.notifications.delay_ms("direct-message"), 0);
