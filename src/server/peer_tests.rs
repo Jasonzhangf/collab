@@ -2180,8 +2180,8 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
         .exists());
     let jsonl = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
     assert!(std::fs::read_to_string(&jsonl).unwrap().lines().any(|line| {
-        serde_json::from_str::<Message>(line)
-            .map(|message| message.id == message_id)
+        serde_json::from_str::<serde_json::Value>(line)
+            .map(|record| record["schema_version"] == 1 && record["record_type"] == "message" && record["recipient"] == "recipient" && record["message"]["id"] == message_id)
             .unwrap_or(false)
     }));
     assert_eq!(replay(&root).unwrap().msgs[&message_id].body, "RESOURCE_OCCUPIED feature=shared");
@@ -2266,11 +2266,11 @@ fn recipient_jsonl_records_latest_delivery_and_journal_replay() {
     let records = std::fs::read_to_string(path)
         .unwrap()
         .lines()
-        .map(|line| serde_json::from_str::<Message>(line).unwrap())
-        .filter(|message| message.id == id)
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["message"]["id"] == id)
         .collect::<Vec<_>>();
     assert_eq!(records.len(), 3, "Sent/Delivered/Acked append snapshots");
-    assert_eq!(records.last().unwrap().state, "read");
+    assert_eq!(records.last().unwrap()["message"]["state"], "read");
     assert_eq!(replay(&root).unwrap().msgs[id].state, "read");
     std::fs::remove_dir_all(root).ok();
 }
@@ -2913,6 +2913,31 @@ fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
         }).count(),
         1,
         "duplicate idle observation must not wake again"
+    );
+    drop(state);
+
+    let mut new_reason = crate::server::keepalive::Record::default();
+    new_reason.observed = "idle".into();
+    new_reason.idle_episode_reason = "different-reason".into();
+    new_reason.idle_episode_notices = 3;
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "master-worker".into(),
+        record: new_reason,
+    }]);
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        4000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    let state = server_arc.state.lock().unwrap();
+    assert_eq!(
+        state.msgs.values().filter(|m| {
+            m.to == "master-worker" && m.subject == Some("master-idle: master-worker".into())
+        }).count(),
+        2,
+        "new idle reason starts a new bounded episode"
     );
     drop(state);
     std::fs::remove_dir_all(root).unwrap();

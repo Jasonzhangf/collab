@@ -210,18 +210,22 @@ impl Server {
         if let Ok(data) = serde_json::to_string_pretty(msg) {
             let _ = std::fs::write(&path, data);
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join(format!("recipient-{}.jsonl", msg.to)))
-        {
-            use std::io::Write;
-            if let Ok(data) = serde_json::to_string(msg) {
-                let _ = file.write_all(data.as_bytes());
-                let _ = file.write_all(b"\n");
-                let _ = file.sync_data();
-            }
-        }
+            .expect("recipient mailbox JSONL open failed");
+        use std::io::Write;
+        let record = json!({
+            "schema_version": 1,
+            "record_type": "message",
+            "recipient": msg.to,
+            "message": msg,
+        });
+        let data = serde_json::to_string(&record).expect("recipient mailbox JSONL serialize failed");
+        file.write_all(data.as_bytes()).expect("recipient mailbox JSONL append failed");
+        file.write_all(b"\n").expect("recipient mailbox JSONL newline failed");
+        file.sync_data().expect("recipient mailbox JSONL sync failed");
     }
 
     fn rewrite_journal_locked(&self, st: &State) {
@@ -681,7 +685,6 @@ fn attempt_notification_with(
     const MAX_BATCH_DELIVERY: usize = 3;
     let total_pending = batch.len();
     let remaining = total_pending.saturating_sub(MAX_BATCH_DELIVERY);
-    let attempted_ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
     if remaining > 0 {
         batch.drain(..remaining);
     }
@@ -699,6 +702,7 @@ fn attempt_notification_with(
         return false;
     }
     let ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
+    let attempted_ids = ids.clone();
     if !can_receive(&pane) {
         server.commit_locked(
             &mut state,

@@ -21,6 +21,10 @@ pub struct Record {
     /// When the current not-yet-reported observation first appeared.
     #[serde(default)]
     pub pending_since_ms: i64,
+    #[serde(default)]
+    pub idle_episode_notices: u8,
+    #[serde(default)]
+    pub idle_episode_reason: String,
 }
 
 /// A starting agent legitimately flaps between idle and working while it boots
@@ -338,6 +342,7 @@ pub(crate) fn tick_with(
         if tasks.is_empty() {
             let was_working = old.observed == "working";
             let is_idle = agent == AgentState::Waiting;
+            let idle_reason = "no-actionable-tasks";
             let observed_str = match agent {
                 AgentState::Waiting => "idle",
                 AgentState::Working => "working",
@@ -347,11 +352,23 @@ pub(crate) fn tick_with(
             if record.observed != observed_str {
                 record.observed = observed_str.into();
                 record.idle_since_ms = now;
+                if is_idle {
+                    record.idle_episode_notices = 0;
+                    record.idle_episode_reason = idle_reason.into();
+                }
             }
             record.unacked = 0;
             record.last_notice_id = None;
             let mut events = Vec::new();
-            if was_working && is_idle {
+            let new_idle_reason = is_idle && record.idle_episode_reason != idle_reason;
+            if new_idle_reason {
+                record.idle_episode_reason = idle_reason.into();
+                record.idle_episode_notices = 0;
+            }
+            if is_idle
+                && (was_working || new_idle_reason)
+                && record.idle_episode_notices < 3
+            {
                 if let Some(master_id) = super::live_master_id(server, &state) {
                     if master_id == worker.id {
                         if let Some(sub) = state.matching_subscription(&worker.id, "direct-message", None, now) {
@@ -378,6 +395,7 @@ pub(crate) fn tick_with(
                                 message_id: alert_id,
                                 subscription_id: sub.id.clone(),
                             });
+                            record.idle_episode_notices = record.idle_episode_notices.saturating_add(1);
                         }
                     } else {
                         let alert_id = super::gen_msg_id();

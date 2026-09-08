@@ -976,8 +976,8 @@ mod tests {
         assert_eq!(pending_count, 2);
         assert_eq!(state.msgs["msg-batch-0"].state, "pending");
         assert_eq!(state.msgs["msg-batch-1"].state, "pending");
-        assert_eq!(state.msgs["msg-batch-0"].wake_attempt_count, 1);
-        assert_eq!(state.msgs["msg-batch-1"].wake_attempt_count, 1);
+        assert_eq!(state.msgs["msg-batch-0"].wake_attempt_count, 0);
+        assert_eq!(state.msgs["msg-batch-1"].wake_attempt_count, 0);
         assert_eq!(state.msgs["msg-batch-2"].state, "delivered");
         assert_eq!(state.msgs["msg-batch-3"].state, "delivered");
         assert_eq!(state.msgs["msg-batch-4"].state, "delivered");
