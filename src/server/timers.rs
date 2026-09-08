@@ -185,6 +185,7 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                                     .is_some_and(|subject| subject.starts_with("master-idle"))
                         });
                         record.idle_episode_notices < 3
+                            && !record.idle_episode_stopped
                             && record.idle_since_ms > subscription.created_ms
                             && record.last_notice_ms != now
                             && !pending_keepalive_notice
@@ -1148,6 +1149,222 @@ mod tests {
                 .values()
                 .filter(|bound| *bound == &subscription_id)
                 .count(),
+            1
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_idle_timer_stops_after_keepalive_working_to_waiting() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+        let now = now_ms();
+        let created_ms =
+            server.state.lock().unwrap().notification_subscriptions[&subscription_id].created_ms;
+        server
+            .state
+            .lock()
+            .unwrap()
+            .notification_subscriptions
+            .get_mut(&subscription_id)
+            .unwrap()
+            .trigger_ms = Some(now - 15 * 60 * 1000 - 1);
+        let mut record = server.state.lock().unwrap().keepalives["master"].clone();
+        record.idle_since_ms = created_ms + 1;
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "master".into(),
+            record,
+        }]);
+
+        tick_with_idle(&server, &|_| false);
+        let first_message_id = server
+            .state
+            .lock()
+            .unwrap()
+            .wake_bindings
+            .iter()
+            .find_map(|(message_id, bound)| {
+                (bound == &subscription_id).then_some(message_id.clone())
+            })
+            .expect("first master idle timer wake");
+        server.commit(&[
+            Event::Delivered {
+                ids: vec![first_message_id.clone()],
+            },
+            Event::NotificationConsumed {
+                subscription_id: subscription_id.clone(),
+                message_id: first_message_id,
+                consumed_ms: now_ms(),
+            },
+        ]);
+
+        let working_at = now_ms();
+        super::super::keepalive::tick_with(
+            &server,
+            working_at,
+            &|_| crate::server::knock::AgentState::Working,
+            &|_, _| true,
+            &|_, _| true,
+        );
+        super::super::keepalive::tick_with(
+            &server,
+            working_at + 1,
+            &|_| crate::server::knock::AgentState::Waiting,
+            &|_, _| true,
+            &|_, _| true,
+        );
+        tick_with_idle(&server, &|_| false);
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .wake_bindings
+                .values()
+                .filter(|bound| *bound == &subscription_id)
+                .count(),
+            1,
+            "Working -> Waiting must not reopen the consumed timer occurrence"
+        );
+        assert_eq!(state.msgs.len(), 1);
+        assert_eq!(state.keepalives["master"].idle_episode_notices, 1);
+        assert!(state.keepalives["master"].idle_episode_stopped);
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].fired_count,
+            1
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_idle_timer_and_keepalive_share_episode_notice_budget() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let timer_subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+        let direct_subscription_id = subscribe(&server, "master", "direct-message", None, None);
+        let now = now_ms();
+        let mut direct_subscription = server.state.lock().unwrap().notification_subscriptions
+            [&direct_subscription_id]
+            .clone();
+        direct_subscription.expires_ms = now + 86_400_000;
+        server.commit(&[Event::NotificationSubscribed {
+            subscription: direct_subscription,
+        }]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .notification_subscriptions
+            .get_mut(&timer_subscription_id)
+            .unwrap()
+            .trigger_ms = Some(now - 15 * 60 * 1000 - 1);
+
+        let base = now_ms();
+        super::super::keepalive::tick_with(
+            &server,
+            base,
+            &|_| crate::server::knock::AgentState::Working,
+            &|_, _| true,
+            &|_, _| true,
+        );
+        super::super::keepalive::tick_with(
+            &server,
+            base + 1,
+            &|_| crate::server::knock::AgentState::Waiting,
+            &|_, _| true,
+            &|_, _| true,
+        );
+        let first_keepalive_message_id = server
+            .state
+            .lock()
+            .unwrap()
+            .wake_bindings
+            .iter()
+            .find_map(|(message_id, bound)| {
+                (bound == &direct_subscription_id).then_some(message_id.clone())
+            })
+            .expect("first keepalive idle notice");
+        server.commit(&[
+            Event::Delivered {
+                ids: vec![first_keepalive_message_id.clone()],
+            },
+            Event::Acked {
+                ids: vec![first_keepalive_message_id],
+            },
+        ]);
+
+        super::super::keepalive::tick_with(
+            &server,
+            base + 120_001,
+            &|_| crate::server::knock::AgentState::Waiting,
+            &|_, _| true,
+            &|_, _| true,
+        );
+        let second_keepalive_message_id = {
+            let state = server.state.lock().unwrap();
+            state
+                .wake_bindings
+                .iter()
+                .filter_map(|(message_id, bound)| {
+                    let message = state.msgs.get(message_id)?;
+                    (bound == &direct_subscription_id && message.state == "pending")
+                        .then_some(message_id.clone())
+                })
+                .next()
+                .expect("second keepalive idle notice")
+        };
+        server.commit(&[
+            Event::Delivered {
+                ids: vec![second_keepalive_message_id.clone()],
+            },
+            Event::Acked {
+                ids: vec![second_keepalive_message_id],
+            },
+        ]);
+
+        tick_with_idle(&server, &|_| false);
+        let timer_message_id = server
+            .state
+            .lock()
+            .unwrap()
+            .wake_bindings
+            .iter()
+            .find_map(|(message_id, bound)| {
+                (bound == &timer_subscription_id).then_some(message_id.clone())
+            })
+            .expect("timer consumes the third shared notice");
+        {
+            let state = server.state.lock().unwrap();
+            assert_eq!(state.keepalives["master"].idle_episode_notices, 3);
+            assert_eq!(state.msgs.len(), 3);
+        }
+        server.commit(&[
+            Event::Delivered {
+                ids: vec![timer_message_id.clone()],
+            },
+            Event::NotificationConsumed {
+                subscription_id: timer_subscription_id.clone(),
+                message_id: timer_message_id,
+                consumed_ms: now_ms(),
+            },
+        ]);
+
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .wake_bindings
+                .values()
+                .filter(|bound| *bound == &timer_subscription_id)
+                .count(),
+            1,
+            "timer must stop after keepalive and timer notices consume all three slots"
+        );
+        assert_eq!(state.keepalives["master"].idle_episode_notices, 3);
+        assert_eq!(
+            state.notification_subscriptions[&timer_subscription_id].fired_count,
             1
         );
         drop(state);
