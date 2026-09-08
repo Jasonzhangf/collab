@@ -210,6 +210,18 @@ impl Server {
         if let Ok(data) = serde_json::to_string_pretty(msg) {
             let _ = std::fs::write(&path, data);
         }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("recipient-{}.jsonl", msg.to)))
+        {
+            use std::io::Write;
+            if let Ok(data) = serde_json::to_string(msg) {
+                let _ = file.write_all(data.as_bytes());
+                let _ = file.write_all(b"\n");
+                let _ = file.sync_data();
+            }
+        }
     }
 
     fn rewrite_journal_locked(&self, st: &State) {
@@ -359,6 +371,23 @@ fn notification_text(message: &Message) -> Option<String> {
         subject_raw,
         &visible_body(&message.body),
     ))
+}
+
+fn batch_notification_text(
+    batch: &[(i64, String, String, String, String)],
+    remaining: usize,
+) -> String {
+    let message_ids = batch.iter().map(|(_, id, _, _, _)| id.as_str()).collect::<Vec<_>>().join(",");
+    let actions = batch.iter().map(|(_, _, _, _, text)| {
+        text.split_once('[').and_then(|(_, rest)| rest.split_once(']')).map(|(subject, _)| subject).unwrap_or("notification")
+    }).collect::<Vec<_>>().join(",");
+    let task_ids = batch.iter().flat_map(|(_, _, _, _, text)| text.split_whitespace())
+        .filter(|token| token.starts_with("task-"))
+        .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+        .filter(|token| !token.is_empty())
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(",");
+    let older = (remaining > 0).then(|| format!(" older_messages={remaining}; run collab inbox")).unwrap_or_default();
+    format!("Batch wake: message_ids={message_ids} task_ids={} action_categories={actions}. Read full durable details from collab inbox; execute the actions, do not ACK-only.{older}", if task_ids.is_empty() { "none" } else { &task_ids })
 }
 
 /// Shared wake text for every channel. Keepalive and message delivery must not
@@ -562,7 +591,12 @@ fn attempt_notification_with(
             return false;
         }
         let pane = subscription.pane.clone();
-        let delay = server.config.notifications.delay_ms(&subscription.event);
+        let delay = state
+            .delivery_modes
+            .get(message_id)
+            .filter(|mode| mode.as_str() == "explicit-notification")
+            .map(|_| 0)
+            .unwrap_or_else(|| server.config.notifications.delay_ms(&subscription.event));
         let worker_pane = state.workers.get(&recipient).and_then(|w| w.pane.clone());
         (recipient, pane, delay, worker_pane)
     };
@@ -611,7 +645,13 @@ fn attempt_notification_with(
             let binding = state.wake_bindings.get(&message.id)?;
             let sub = state.notification_subscriptions.get(binding)?;
             (message.to == recipient
-                && server.config.notifications.delay_ms(&sub.event) == delay
+                && state
+                    .delivery_modes
+                    .get(&message.id)
+                    .filter(|mode| mode.as_str() == "explicit-notification")
+                    .map(|_| 0)
+                    .unwrap_or_else(|| server.config.notifications.delay_ms(&sub.event))
+                    == delay
                 && message.state == "pending"
                 && message.wake_attempt_count == 0
                 && sub.worker_id == recipient
@@ -681,14 +721,11 @@ fn attempt_notification_with(
         }],
     );
     drop(state);
-    let mut text_parts = batch.iter().map(|m| m.4.clone()).collect::<Vec<_>>();
-    if remaining > 0 {
-        text_parts.push(format!(
-            "[+{} older messages remain in inbox; run collab inbox]",
-            remaining
-        ));
-    }
-    let text = truncate_notification(text_parts.join(" | "));
+    let text = truncate_notification(compose_notification(
+        &first.1,
+        "notification-batch",
+        &batch_notification_text(&batch, remaining),
+    ));
     if !deliver(&pane, &text) {
         return false;
     }

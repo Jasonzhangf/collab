@@ -267,7 +267,7 @@ mod tests {
                     subject: Some("released:held".into()),
                     body: "RESOURCE_RELEASED task=held".into(),
                     in_reply_to: None,
-                    created_ms: now_ms() - 60_001,
+                    created_ms: now_ms() - 120_001,
                     state: "pending".into(),
                     wake_attempt_count: 0,
                     last_wake_attempt_ms: 0,
@@ -570,8 +570,8 @@ mod tests {
         }]);
         {
             let mut state = server.state.lock().unwrap();
-            state.msgs.get_mut(&second_id).unwrap().created_ms = now_ms() - 60_001;
-            state.msgs.get_mut(&first_id).unwrap().last_wake_attempt_ms = now_ms() - 60_001;
+            state.msgs.get_mut(&second_id).unwrap().created_ms = now_ms() - 120_001;
+            state.msgs.get_mut(&first_id).unwrap().last_wake_attempt_ms = now_ms() - 120_001;
         }
         assert!(super::super::attempt_notification_with_default(
             &server,
@@ -621,7 +621,9 @@ mod tests {
         ));
         assert_eq!(calls.borrow().len(), 1);
         assert!(calls.borrow()[0].contains(&first));
-        assert!(calls.borrow()[0].contains("second [new topic]"));
+        assert!(calls.borrow()[0].contains("message_ids=message-owner,second"));
+        assert!(calls.borrow()[0].contains("action_categories="));
+        assert!(calls.borrow()[0].contains("new topic"));
         assert_eq!(
             server.state.lock().unwrap().msgs["second"].state,
             "delivered"
@@ -637,7 +639,33 @@ mod tests {
     }
 
     #[test]
-    fn fresh_batch_waits_one_minute_and_absent_batch_is_not_replayed() {
+    fn explicit_delivery_mode_bypasses_batch_window() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let sub = subscribe(&server, "owner", "direct-message", None, None);
+        let id = bind_message(&server, "owner", &sub);
+        server.commit(&[Event::DeliveryMode {
+            msg_id: id.clone(),
+            mode: "explicit-notification".into(),
+        }]);
+        let calls = std::cell::Cell::new(0);
+        assert!(super::super::attempt_notification_with_default(
+            &server,
+            &id,
+            &sub,
+            &|_| true,
+            &|_, _| {
+                calls.set(calls.get() + 1);
+                true
+            }
+        ));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(server.state.lock().unwrap().msgs[&id].state, "delivered");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_batch_waits_two_minutes_and_absent_batch_is_not_replayed() {
         let (server, root) = test_server();
         register(&server, "owner");
         let sub = subscribe(&server, "owner", "direct-message", None, None);
@@ -664,7 +692,7 @@ mod tests {
             .msgs
             .get_mut(&id)
             .unwrap()
-            .created_ms -= 60_001;
+            .created_ms -= 120_001;
         assert!(!super::super::attempt_notification_with_default(
             &server,
             &id,
@@ -772,7 +800,7 @@ mod tests {
             .msgs
             .get_mut(&id)
             .unwrap()
-            .created_ms = now_ms() - 60_001;
+            .created_ms = now_ms() - 120_001;
 
         assert!(super::super::attempt_notification_with_default(
             &server,
@@ -923,13 +951,15 @@ mod tests {
         ));
 
         let text = delivered_text.lock().unwrap().clone();
-        assert_eq!(text.chars().count(), 1024);
+        assert!(text.chars().count() <= 1024);
         assert!(!text.contains("msg-batch-0"));
         assert!(!text.contains("msg-batch-1"));
         assert!(text.contains("msg-batch-2"));
         assert!(text.contains("msg-batch-3"));
         assert!(text.contains("msg-batch-4"));
-        assert!(text.ends_with("… [truncated; run collab inbox]"));
+        assert!(text.contains("message_ids="));
+        assert!(text.contains("action_categories="));
+        assert!(text.contains("collab inbox"));
 
         let state = server.state.lock().unwrap();
         let delivered_count = state

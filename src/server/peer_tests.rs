@@ -2178,6 +2178,13 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
         .join(".agent-collab/mailbox")
         .join(format!("{message_id}.json"))
         .exists());
+    let jsonl = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    assert!(std::fs::read_to_string(&jsonl).unwrap().lines().any(|line| {
+        serde_json::from_str::<Message>(line)
+            .map(|message| message.id == message_id)
+            .unwrap_or(false)
+    }));
+    assert_eq!(replay(&root).unwrap().msgs[&message_id].body, "RESOURCE_OCCUPIED feature=shared");
     assert_eq!(first.data["notification"], "mailbox-only-no-subscription");
     assert_eq!(
         server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
@@ -2225,9 +2232,46 @@ fn explicit_peer_notification_accepts_arbitrary_durable_body() {
         "The candidate is ready for your review."
     );
     assert_eq!(state.msgs[message_id].subject.as_deref(), Some("review"));
-    assert_eq!(state.msgs[message_id].wake_attempt_count, 0);
+    assert_eq!(state.msgs[message_id].wake_attempt_count, 1);
     assert_eq!(response.data["notification"], "subscribed-not-sent");
     drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn recipient_jsonl_records_latest_delivery_and_journal_replay() {
+    let (server, root) = test_server();
+    register(&server, "recipient", "%recipient");
+    let id = "jsonl-message";
+    server.commit(&[
+        Event::Sent {
+            msg: Message {
+                id: id.into(),
+                from: "sender".into(),
+                to: "recipient".into(),
+                mtype: "notify".into(),
+                subject: Some("progress".into()),
+                body: "task-jsonl progress".into(),
+                in_reply_to: None,
+                created_ms: now_ms(),
+                state: "pending".into(),
+                wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        },
+        Event::Delivered { ids: vec![id.into()] },
+        Event::Acked { ids: vec![id.into()] },
+    ]);
+    let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    let records = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Message>(line).unwrap())
+        .filter(|message| message.id == id)
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 3, "Sent/Delivered/Acked append snapshots");
+    assert_eq!(records.last().unwrap().state, "read");
+    assert_eq!(replay(&root).unwrap().msgs[id].state, "read");
     std::fs::remove_dir_all(root).ok();
 }
 
