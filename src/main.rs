@@ -246,6 +246,8 @@ enum TaskCmd {
         #[arg(long)]
         next: Option<String>,
     },
+    /// Accept an assigned task and atomically begin owner execution
+    Accept { id: String },
     /// Deprecated: peers self-register tasks; no central available queue
     Claim { id: String },
     /// Put an owned task into resource-waiting state until another task releases
@@ -949,6 +951,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     task_id: id,
                     status,
                     next_step: next,
+                },
+                TaskCmd::Accept { id } => Req::TaskAccept {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    task_id: id,
                 },
                 TaskCmd::Relocate {
                     id,

@@ -123,6 +123,22 @@ pub struct Message {
     pub last_wake_attempt_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerAdmissionRecord {
+    pub request_id: String,
+    pub decision: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub managed_subagent_id: Option<String>,
+    pub message_id: String,
+    pub task_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
 pub const REQUEST_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 
 pub fn is_goal_deadline(subscription: &NotificationSubscription) -> bool {
@@ -468,6 +484,15 @@ pub enum Event {
     TaskCreated {
         task: TaskRec,
     },
+    SchedulerAdmission {
+        admission: SchedulerAdmissionRecord,
+    },
+    SchedulerAdmissionStatus {
+        request_id: String,
+        status: String,
+        error: Option<String>,
+        updated_ms: i64,
+    },
     TaskUpdated {
         task: TaskRec,
     },
@@ -498,6 +523,7 @@ pub struct State {
     pub workers: HashMap<String, WorkerRec>,
     pub msgs: HashMap<String, Message>,
     pub tasks: HashMap<String, TaskRec>,
+    pub scheduler_admissions: HashMap<String, SchedulerAdmissionRecord>,
     pub task_lifecycle: HashMap<String, TaskLifecycleRecord>,
     pub cleanup_receipts: HashMap<String, CleanupReceipt>,
     pub delivery_modes: HashMap<String, String>,
@@ -723,6 +749,22 @@ impl State {
             Event::TaskCreated { task } | Event::TaskUpdated { task } => {
                 self.tasks.insert(task.id.clone(), task.clone());
             }
+            Event::SchedulerAdmission { admission } => {
+                self.scheduler_admissions
+                    .insert(admission.request_id.clone(), admission.clone());
+            }
+            Event::SchedulerAdmissionStatus {
+                request_id,
+                status,
+                error,
+                updated_ms,
+            } => {
+                if let Some(admission) = self.scheduler_admissions.get_mut(request_id) {
+                    admission.status = status.clone();
+                    admission.error = error.clone();
+                    admission.updated_ms = *updated_ms;
+                }
+            }
             Event::TaskLifecycleUpdated { task_id, record } => {
                 self.task_lifecycle.insert(task_id.clone(), record.clone());
             }
@@ -781,6 +823,14 @@ impl State {
         let mut tasks: Vec<_> = self.tasks.values().cloned().collect();
         tasks.sort_by(|a, b| a.id.cmp(&b.id));
         events.extend(tasks.into_iter().map(|task| Event::TaskCreated { task }));
+        let mut scheduler_admissions: Vec<_> =
+            self.scheduler_admissions.values().cloned().collect();
+        scheduler_admissions.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        events.extend(
+            scheduler_admissions
+                .into_iter()
+                .map(|admission| Event::SchedulerAdmission { admission }),
+        );
         let mut lifecycle: Vec<_> = self.task_lifecycle.iter().collect();
         lifecycle.sort_by(|a, b| a.0.cmp(b.0));
         events.extend(

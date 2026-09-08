@@ -4,7 +4,8 @@
 |---|---|---|---|---|
 | peer-identity | `identity::load_or_create` + Server registration | journaled `WorkerRec` | bind one tmux session identity to its current pane endpoint | inferred master from first register, copied token, claiming master from init/register |
 | project-master-authority | live registered master peer through Server | journaled `Event::MasterAssigned` plus live pane check | user-approved self-promote when no live master; live-master delegate to a live pane | implicit first-register promotion, promote while a live master exists, claim from a dead pane, treating Codex/Cursor root as Collab master |
-| task-lifecycle | task owner peer | journaled `TaskRec` | self-register, update, verify, integrate, close own task | central dispatch, another peer mutating lifecycle |
+| task-assignment | live master scheduler | journaled `SchedulerAdmissionRecord` plus `Sent`/`TaskRec` events | choose live idle registered peer before idle managed child; bind direct-message lease; persist one idempotent assignment by request ID | legacy `TaskDispatch`, automatic offer, duplicate reservation |
+| task-lifecycle | assigned task owner peer | journaled `TaskRec` | accept assigned scheduler task, update, verify, integrate, close own task | another peer mutating lifecycle, accepting managed assignment through ordinary task entry |
 | resource-claim | task owner peer through Server | active task feature/worktree claim | claim, hold, wait, release; conflict emits durable p2p notice | silent takeover, automatic release, global arbiter |
 | wait-edge | waiter peer + blocking resource owner | `TaskRec.wait` | bounded wait, synchronous conflict result, deadline transition, subscribed release event | cycle, missing responsible peer/deadline/resume path |
 | collaboration-journal | `server::Server` | `.agent-collab/server/journal.jsonl` | append/replay worker, task, message, migration events | manual JSON edits, silent replay skip |

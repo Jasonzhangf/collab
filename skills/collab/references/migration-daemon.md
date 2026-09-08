@@ -45,8 +45,11 @@ collab up
 ## Deprecated commands
 
 Never use implicit first-register master, master recovery, transfer-master,
-central dispatch, task claim queue, remove-worker, reset, or heartbeat
-recovery. Collab master is a separate explicit user-approved authority
+legacy central dispatch (`collab task dispatch`), task claim queue,
+remove-worker, reset, or heartbeat recovery. A live master may use the
+explicit scheduler assignment (`collab subagent dispatch`) to create one
+durable task/message reservation for an eligible peer. Collab master is a
+separate explicit user-approved authority
 decision, not Codex/Cursor root, migration, or daemon recovery. If a live
 master exists, only that master may delegate. If none exists, a peer may
 promote itself after recording user approval and verifying a live pane.

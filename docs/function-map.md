@@ -4,7 +4,8 @@
 |---|---|---|---|
 | identity.peer-register | `identity` + `server` | `load_or_create`, `provision`, `handle_register` | every registration is peer; no first-worker promotion; parent provisions a child pane identity before the agent starts |
 | identity.master-authority | `server` + `subagent` | `handle_master_promote`, `handle_master_delegate`, `handle_master_status`, `live_master_id`, `replay` | no live master: approved self-promote with a live pane; live master: only that master delegates to a live pane; init/register never assign master; dead recorded pane is not a live master; journal `RootAssigned` replays and rewrites as `MasterAssigned`; independent peers may decline a master invite; managed subagents must obey; live master may inspect and snapshot any managed subagent in the project |
-| task.self-lifecycle | task owner peer | `handle_task_register`, `handle_task_update`, `handle_task_deliver`, `handle_task_review`, `handle_task_integrated`, `handle_task_close` | owner records candidate delivery; owner or live master records review and exact `refs/heads/main` integration; current lifecycle records cannot bypass gates through direct status, while legacy persisted `accepted` records without lifecycle evidence retain only owner-local `accepted→merged` compatibility; lifecycle evidence is journaled and replayable |
+| task.scheduler-assignment | live master scheduler | `handle_scheduler_dispatch`, `scheduler_dispatch_deduplicated`, `scheduler_assignment_events` | stable request ID; ordinary live idle registered peer before idle managed child; `Sent` + `TaskCreated(assigned)` + managed binding + pending audit are one journal transaction; audit success/failure is durable and retries preserve the same outcome; legacy `TaskDispatch` remains fail-closed |
+| task.self-lifecycle | assigned task owner peer | `handle_task_accept`, `handle_task_register`, `handle_task_update`, `handle_task_deliver`, `handle_task_review`, `handle_task_integrated`, `handle_task_close` | owner authenticates and accepts an assigned task through `collab task accept`, atomically recording `assigned→working`; owner records candidate delivery; owner or live master records review and exact `refs/heads/main` integration; current lifecycle records cannot bypass gates through direct status, while legacy persisted `accepted` records without lifecycle evidence retain only owner-local `accepted→merged` compatibility; lifecycle evidence is journaled and replayable |
 | resource.p2p-conflict | `server` | `task_conflicts`, `handle_task_wait`, close release projection | task operations return synchronously; exact subscribed release exits waiting and clears edge |
 | wait.liveness | `server` | `handle_task_wait`, `wait_cycle`, `timers::tick` | bounded acyclic wait, responsible blocker owner, deadline state transition without unsolicited message |
 | notification.subscription | `server::state` + `server` | `default_direct_message_events`, `registered_peer_default_events`, `restore_registered_peer_default_leases`, `handle_notification_subscribe`, `matching_subscription`, `handle_notification_unsubscribe` | peer registration owns one deterministic finite default direct-message lease; short explicit leases cannot suppress it; daemon replay restores it only for a matching registered tmux session; resource/deadline/async-result remain one-shot |
@@ -14,8 +15,8 @@
 | migration.peer-v1 | `server` | migration inspect/plan/apply/verify handlers, `replay` | legacy role fields are discarded; snapshot/replay preserves lifecycle |
 | daemon.operator | CLI + `server::run` | `collab down`, `collab up`, `replay`, `daemon.lock` | explicit operator path, one socket writer, exclusive `daemon.lock` flock prevents duplicate daemon processes and unlinking of active daemon sockets, no role-derived authority |
 
-Central dispatch, transfer-master, master recovery, and
-automatic idle-worker offers have no owner in the target architecture and must
-remain fail-closed. Explicit user-approved master promotion and live-master
-delegation are owned by `identity.master-authority`. Codex/Cursor root is not
-Collab master.
+Legacy `TaskDispatch`, transfer-master, master recovery, and automatic
+idle-worker offers remain fail-closed. Live-master scheduler assignment is
+owned by `task.scheduler-assignment`; explicit user-approved master promotion
+and live-master delegation remain owned by `identity.master-authority`.
+Codex/Cursor root is not Collab master.

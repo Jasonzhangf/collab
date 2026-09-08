@@ -9,12 +9,13 @@ is a bounded preview; the durable mailbox remains authoritative.
 
 - Every registered identity is an equal peer. Declared `master`/`worker` roles
   are removed.
-- There is no central task dispatch, idle-worker assignment, progress report,
-  heartbeat, or ACK loop.
-- Each peer self-registers and owns its complete task lifecycle: latest-main
-  sync, private worktree, implementation, tests, exact commit, candidate
-  verification, short integration lease, main merge/verification/push, and
-  cleanup.
+- The live master scheduler is the sole task assignment admission owner. It
+  dispatches an authorized task to a live idle registered peer, then to an
+  idle managed child when no ordinary peer is eligible. The assigned peer
+  accepts the durable task before execution and owns the rest of its lifecycle.
+- Each peer owns its task lifecycle after acceptance: latest-main sync, private
+  worktree, implementation, tests, exact commit, candidate verification, short
+  integration lease, main merge/verification/push, and cleanup.
 - Peers communicate through an explicit `sendmessage` with a required short
   subject and durable body. Use
   it for resource occupancy/release or a direct peer notice; it never creates
@@ -61,9 +62,11 @@ prompt. That same stdio MCP works for Cursor, Codex, Claude Code, and
 other agents. The `collab` CLI is a complete fallback when MCP tools are
 not listed.
 
-`collab role`, `collab transfer-master`, `collab task claim`,
+`collab role`, `collab transfer-master`, `collab task claim`, the legacy
 `collab task dispatch`, `collab remove-worker`, and `collab reset` are
-deprecated and fail explicitly. Collab master is not Codex/Cursor root.
+deprecated and fail explicitly. Use `collab subagent dispatch` from the live
+master for a real assignment, then `collab task accept <task-id>` from the
+assigned peer. Collab master is not Codex/Cursor root.
 Protocol: `collab master status`, `collab master promote --approval` when no
 live master exists, and `collab master delegate` by the current live master.
 Init and register never create a master; a recorded identity without a live
@@ -86,6 +89,15 @@ read latest main
 → verify/push main
 → mark merged
 → close performs mandatory cleanup and persists a cleanup receipt
+```
+
+The master assignment prefix is durable and idempotent by request ID:
+
+```text
+collab subagent dispatch --request-id <id> --subject <topic> <body>
+→ peer reads task-<message-id>
+→ collab task accept task-<message-id>
+→ task update/deliver/review/integrated/close
 ```
 
 ```sh

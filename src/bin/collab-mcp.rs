@@ -69,6 +69,12 @@ fn tools() -> Value {
             &[]
         ),
         tool(
+            "collab_task_accept",
+            "Owner-authenticated acceptance of an assigned scheduler task; atomically records assigned to working.",
+            json!({"id":{"type":"string"}}),
+            &["id"]
+        ),
+        tool(
             "collab_task_register",
             "Register a task owned by the calling peer; /goal delegation is deferred.",
             json!({"id":{"type":"string"},"feature":{"type":"string"},"worktree":{"type":"string"},"branch":{"type":"string"},"base_commit":{"type":"string"},"priority":{"type":"string"},"next":{"type":"string"}}),
@@ -262,6 +268,9 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
             if let Some(id) = args.get("id").and_then(Value::as_str) {
                 argv.push(id.into());
             }
+        }
+        "collab_task_accept" => {
+            argv.extend(["task".into(), "accept".into(), required(args, "id")?]);
         }
         "collab_task_register" => {
             argv.extend(["task".into(), "register".into(), required(args, "id")?]);
@@ -561,6 +570,18 @@ mod tests {
         for field in ["request_id", "subject", "body", "feature_id", "priority"] {
             assert!(properties.contains_key(field), "missing MCP field {field}");
         }
+    }
+
+    #[test]
+    fn task_accept_schema_requires_owner_task_id() {
+        let definitions = tools();
+        let accept = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "collab_task_accept")
+            .unwrap();
+        assert_eq!(accept["inputSchema"]["required"], json!(["id"]));
     }
 
     #[test]

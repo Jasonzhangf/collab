@@ -2587,6 +2587,29 @@ fn scheduler_dispatch_deduplicated(
     let message_id = format!("scheduler-{request_id}");
     let task_id = format!("task-{message_id}");
     let state = server.state.lock().unwrap();
+    if let Some(admission) = state.scheduler_admissions.get(request_id) {
+        if admission.status != "succeeded" {
+            let decision = if admission.status == "failed" {
+                "audit-failed"
+            } else {
+                "audit-pending"
+            };
+            let error = admission.error.clone().unwrap_or_else(|| {
+                "scheduler admission audit is pending; retry with the same request_id".into()
+            });
+            return Some(Resp::err_data(
+                error,
+                json!({
+                    "request_id": request_id,
+                    "reservation": true,
+                    "decision": decision,
+                    "message_id": admission.message_id,
+                    "task_id": admission.task_id,
+                    "admission": admission,
+                }),
+            ));
+        }
+    }
     let (Some(message), Some(task)) = (
         state.msgs.get(&message_id).cloned(),
         state.tasks.get(&task_id).cloned(),
@@ -2612,6 +2635,22 @@ fn scheduler_dispatch_deduplicated(
             .unwrap_or(serde_json::Value::Null),
         "deduplicated": true,
     })))
+}
+
+fn scheduler_assignment_events(
+    message: Message,
+    task: TaskRec,
+    managed_child: Option<crate::subagent::Record>,
+) -> Vec<Event> {
+    let message_id = message.id.clone();
+    let mut events = vec![Event::Sent { msg: message }];
+    events.push(Event::TaskCreated { task });
+    if let Some(mut child) = managed_child {
+        child.status = "assigned".into();
+        child.last_message = Some(message_id);
+        events.push(Event::SubagentUpdated { subagent: child });
+    }
+    events
 }
 
 pub(crate) fn handle_scheduler_dispatch(
@@ -2762,17 +2801,19 @@ pub(crate) fn handle_scheduler_dispatch(
             created_ms: now,
             updated_ms: now,
         };
-        let mut events = vec![Event::Sent { msg: message }];
-        events.push(Event::TaskCreated { task: task.clone() });
-        if let Some(mut child) = managed_child {
-            child.status = "assigned".into();
-            child.last_message = Some(message_id.clone());
-            events.push(Event::SubagentUpdated { subagent: child });
-        }
-        server.commit_locked(&mut state, &events);
-        drop(state);
-
-        let admission = json!({
+        let admission_record = crate::server::state::SchedulerAdmissionRecord {
+            request_id: request_id.clone(),
+            decision: decision.into(),
+            worker_id: peer_id.clone(),
+            managed_subagent_id: managed_id.clone(),
+            message_id: message_id.clone(),
+            task_id: task_id.clone(),
+            status: "pending".into(),
+            error: None,
+            created_ms: now,
+            updated_ms: now,
+        };
+        let mut admission = json!({
             "request_id": request_id,
             "decision": decision,
             "worker_id": peer_id,
@@ -2780,12 +2821,49 @@ pub(crate) fn handle_scheduler_dispatch(
             "message_id": message_id,
             "task_id": task_id,
             "reason": reason,
+            "status": "pending",
+        });
+        let mut events = scheduler_assignment_events(message, task, managed_child);
+        let subscription = state
+            .matching_subscription(&peer_id, "direct-message", None, now)
+            .cloned();
+        events.push(Event::DeliveryMode {
+            msg_id: message_id.clone(),
+            mode: "explicit-notification".into(),
+        });
+        if let Some(subscription) = &subscription {
+            events.push(Event::WakeBound {
+                message_id: message_id.clone(),
+                subscription_id: subscription.id.clone(),
+            });
+        }
+        events.push(Event::SchedulerAdmission {
+            admission: admission_record,
+        });
+        server.commit_locked(&mut state, &events);
+        drop(state);
+        let notified = subscription.as_ref().is_some_and(|subscription| {
+            attempt_notification(server, &message_id, &subscription.id)
         });
         if let Err(error) = record_scheduler_admission(server, admission.clone()) {
+            let error = error
+                .error
+                .unwrap_or_else(|| "scheduler admission audit failed".into());
+            let mut state = server.state.lock().unwrap();
+            server.commit_locked(
+                &mut state,
+                &[Event::SchedulerAdmissionStatus {
+                    request_id: request_id.clone(),
+                    status: "failed".into(),
+                    error: Some(error.clone()),
+                    updated_ms: now_ms(),
+                }],
+            );
+            drop(state);
+            admission["status"] = json!("failed");
+            admission["error"] = json!(error.clone());
             return Resp::err_data(
-                error
-                    .error
-                    .unwrap_or_else(|| "scheduler admission audit failed".into()),
+                error,
                 json!({
                     "request_id": request_id,
                     "reservation": true,
@@ -2795,6 +2873,18 @@ pub(crate) fn handle_scheduler_dispatch(
                 }),
             );
         }
+        let mut state = server.state.lock().unwrap();
+        server.commit_locked(
+            &mut state,
+            &[Event::SchedulerAdmissionStatus {
+                request_id: request_id.clone(),
+                status: "succeeded".into(),
+                error: None,
+                updated_ms: now_ms(),
+            }],
+        );
+        drop(state);
+        admission["status"] = json!("succeeded");
         return Resp::data(json!({
             "request_id": request_id,
             "decision": decision,
@@ -2808,7 +2898,13 @@ pub(crate) fn handle_scheduler_dispatch(
                 .as_ref()
                 .map(|id| json!({"id": id, "worker_id": peer_id}))
                 .unwrap_or(serde_json::Value::Null),
-            "notification": "none; peer must accept the assigned task",
+            "notification": if subscription.is_none() {
+                "mailbox-only-no-subscription"
+            } else if notified {
+                "sent"
+            } else {
+                "subscribed-not-sent"
+            },
         }));
     }
     Resp::err(
@@ -3123,9 +3219,11 @@ pub(crate) fn handle_send_with_task(
         if child.status != "idle" {
             return Resp::err("subagent is not idle; query status instead of resending");
         }
-        if st.tasks.values().any(|task| {
-            task.owner == child.peer && task_resource_active(&task.status)
-        }) {
+        if st
+            .tasks
+            .values()
+            .any(|task| task.owner == child.peer && task_resource_active(&task.status))
+        {
             return Resp::err("managed subagent already has an active task");
         }
         Some(child)
@@ -3189,9 +3287,7 @@ pub(crate) fn handle_send_with_task(
                     && st
                         .tasks
                         .get(&format!("task-{}", existing.id))
-                        .is_some_and(|task| {
-                            task.owner == child.peer && task.created_by == from
-                        })
+                        .is_some_and(|task| task.owner == child.peer && task.created_by == from)
             });
         if !assign_task || managed_duplicate {
             return Resp::data(json!({"msg_id": existing.id, "deduplicated": true}));
@@ -3202,19 +3298,32 @@ pub(crate) fn handle_send_with_task(
     let subscription = st
         .matching_subscription(&to, "direct-message", None, now_ms())
         .cloned();
-    let mut events = vec![Event::Sent { msg }];
-    if let Some(task_id) = &task_id {
-        events.push(Event::TaskCreated { task: TaskRec {
-            id:task_id.clone(),owner:to.clone(),created_by:from.clone(),feature_id:None,
-            worktree_path:None,branch:None,base_commit:None,priority:"p2".into(),status:"assigned".into(),
-            next_step:Some(format!("Read collab msg {mid}; accept via subagent working; bind a worktree with task relocate before code edits.")),
-            wait:None,created_ms:now_ms(),updated_ms:now_ms(),
-        }});
-        let mut child = managed_child.expect("managed child validated above");
-        child.status = "assigned".into();
-        child.last_message = Some(mid.clone());
-        events.push(Event::SubagentUpdated { subagent: child });
-    }
+    let mut events = if let Some(task_id) = &task_id {
+        let task = TaskRec {
+            id: task_id.clone(),
+            owner: to.clone(),
+            created_by: from.clone(),
+            feature_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            priority: "p2".into(),
+            status: "assigned".into(),
+            next_step: Some(format!(
+                "Read collab msg {mid}; accept via subagent working; bind a worktree with task relocate before code edits."
+            )),
+            wait: None,
+            created_ms: now_ms(),
+            updated_ms: now_ms(),
+        };
+        scheduler_assignment_events(
+            msg,
+            task,
+            Some(managed_child.expect("managed child validated above")),
+        )
+    } else {
+        vec![Event::Sent { msg }]
+    };
     events.push(Event::DeliveryMode {
         msg_id: mid.clone(),
         mode: "explicit-notification".into(),
@@ -3569,6 +3678,63 @@ fn handle_task_claim(server: &Server, worker_id: String, token: String, task_id:
     ))
 }
 
+fn handle_task_accept(server: &Server, worker_id: String, token: String, task_id: String) -> Resp {
+    let mut st = server.state.lock().unwrap();
+    let Some(worker) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if worker.token != token {
+        return Resp::err("token mismatch: identity does not own this worker_id");
+    }
+    let Some(mut task) = st.tasks.get(&task_id).cloned() else {
+        return Resp::err(format!("task {} not found", task_id));
+    };
+    if task.owner != worker_id {
+        return Resp::err("only the task owner may accept its assignment");
+    }
+    let Some(admission) = st
+        .scheduler_admissions
+        .values()
+        .find(|admission| admission.task_id == task.id && admission.status == "succeeded")
+    else {
+        return Resp::err(
+            "task assignment provenance is missing; accept only scheduler assignments",
+        );
+    };
+    if admission.managed_subagent_id.is_some() {
+        return Resp::err("managed assignment must be accepted with collab subagent working");
+    }
+    if task.status == "working" {
+        return Resp::data(json!({
+            "task": task.id,
+            "status": task.status,
+            "owner": task.owner,
+            "accepted": true,
+            "idempotent": true,
+            "notification": "none",
+            "next_action": task.next_step,
+        }));
+    }
+    if task.status != "assigned" {
+        return Resp::err(format!(
+            "task {} is not assigned; current status is {}",
+            task.id, task.status
+        ));
+    }
+    task.status = "working".into();
+    task.wait = None;
+    task.updated_ms = now_ms();
+    server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
+    Resp::data(json!({
+        "task": task.id,
+        "status": task.status,
+        "owner": task.owner,
+        "accepted": true,
+        "notification": "none",
+        "next_action": task.next_step,
+    }))
+}
+
 fn handle_task_update(
     server: &Server,
     worker_id: String,
@@ -3604,6 +3770,9 @@ fn handle_task_update(
             return Resp::err(
                 "use collab task deliver to complete a claim; direct status mutation is rejected",
             );
+        }
+        if new_status == "working" && task.status == "assigned" {
+            return Resp::err("use collab task accept to accept an assigned task");
         }
         // Pre-review producers persisted accepted candidates without a lifecycle
         // record. Keep their owner-local merge transition replayable while new
@@ -4742,6 +4911,7 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::TaskRegister { .. }
         | Req::TaskRelocate { .. }
         | Req::TaskUpdate { .. }
+        | Req::TaskAccept { .. }
         | Req::TaskClaim { .. }
         | Req::TaskWait { .. }
         | Req::TaskDeliver { .. }
@@ -5076,6 +5246,11 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             status,
             next_step,
         } => handle_task_update(server, worker_id, token, task_id, status, next_step),
+        Req::TaskAccept {
+            worker_id,
+            token,
+            task_id,
+        } => handle_task_accept(server, worker_id, token, task_id),
         Req::TaskClaim {
             worker_id,
             token,
@@ -6193,7 +6368,67 @@ mod scheduler_admission_tests {
         assert_eq!(state.tasks.len(), 1);
         assert_eq!(state.msgs.len(), 1);
         assert_eq!(state.tasks["task-scheduler-req-ordinary-1"].owner, "peer");
+        let message_id = first.data["message_id"].as_str().unwrap();
+        let subscription_id = state.wake_bindings.get(message_id).unwrap();
+        assert_eq!(state.delivery_modes[message_id], "explicit-notification");
+        assert_eq!(
+            state.notification_subscriptions[subscription_id].worker_id,
+            "peer"
+        );
+        assert_eq!(
+            state.notification_subscriptions[subscription_id].event,
+            "direct-message"
+        );
         drop(state);
+        let rejected_update = dispatch(
+            &server,
+            Req::TaskUpdate {
+                worker_id: "peer".into(),
+                token: "token-peer".into(),
+                task_id: "task-scheduler-req-ordinary-1".into(),
+                status: Some("working".into()),
+                next_step: None,
+            },
+        );
+        assert!(!rejected_update.ok, "{rejected_update:?}");
+        assert!(rejected_update.error.unwrap().contains("task accept"));
+        let accepted = dispatch(
+            &server,
+            Req::TaskAccept {
+                worker_id: "peer".into(),
+                token: "token-peer".into(),
+                task_id: "task-scheduler-req-ordinary-1".into(),
+            },
+        );
+        assert!(accepted.ok, "{accepted:?}");
+        assert_eq!(accepted.data["status"], "working");
+        let retry = dispatch(
+            &server,
+            Req::TaskAccept {
+                worker_id: "peer".into(),
+                token: "token-peer".into(),
+                task_id: "task-scheduler-req-ordinary-1".into(),
+            },
+        );
+        assert!(retry.ok, "{retry:?}");
+        assert_eq!(retry.data["idempotent"], true);
+        let replayed = replay(&root).unwrap();
+        assert_eq!(
+            replayed.tasks["task-scheduler-req-ordinary-1"].status,
+            "working"
+        );
+        assert_eq!(
+            replayed.scheduler_admissions["req-ordinary-1"].status,
+            "succeeded"
+        );
+        let replayed_subscription_id = replayed
+            .wake_bindings
+            .get(first.data["message_id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            replayed.notification_subscriptions[replayed_subscription_id].worker_id,
+            "peer"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -6265,6 +6500,65 @@ mod scheduler_admission_tests {
     }
 
     #[test]
+    fn scheduler_dispatch_audit_failure_is_stable_on_request_retry() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let activity_path = root.join(".agent-collab/server/events.jsonl");
+        std::fs::create_dir_all(activity_path.parent().unwrap()).unwrap();
+        std::fs::create_dir(&activity_path).unwrap();
+        let server = Arc::new(server);
+        let request = |body: &str| {
+            dispatch(
+                &server,
+                Req::Subagent {
+                    worker_id: "master".into(),
+                    token: "token-master".into(),
+                    command: crate::subagent::Action::Dispatch {
+                        request_id: "req-audit-failure-1".into(),
+                        subject: "Audit failure task".into(),
+                        body: body.into(),
+                        feature_id: None,
+                        worktree_path: None,
+                        branch: None,
+                        base_commit: None,
+                        priority: "p2".into(),
+                        next_step: None,
+                    },
+                    launch_env: Default::default(),
+                },
+            )
+        };
+        let first = request("first body");
+        assert!(!first.ok, "{first:?}");
+        let first_error = first.error.clone().unwrap();
+        assert!(first_error.contains("scheduler admission audit failed"));
+        assert_eq!(first.data["reservation"], true);
+        *server.state.lock().unwrap() = replay(&root).unwrap();
+        let second = request("retry body is ignored");
+        assert!(!second.ok, "{second:?}");
+        assert_eq!(second.error.as_deref(), Some(first_error.as_str()));
+        assert_eq!(second.data["reservation"], true);
+        assert_eq!(second.data["message_id"], first.data["message_id"]);
+        assert_eq!(second.data["task_id"], first.data["task_id"]);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.msgs.len(), 1);
+        assert_eq!(
+            state.scheduler_admissions["req-audit-failure-1"].status,
+            "failed"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scheduler_dispatch_concurrent_same_request_reserves_once() {
         let (server, root) = test_server();
         register(&server, "master", "%master");
@@ -6305,13 +6599,27 @@ mod scheduler_admission_tests {
         let second = request(Arc::clone(&server), Arc::clone(&barrier));
         let first = first.join().unwrap();
         let second = second.join().unwrap();
-        assert!(first.ok, "{first:?}");
-        assert!(second.ok, "{second:?}");
+        assert!(
+            first.ok
+                || first
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("audit is pending")),
+            "{first:?}"
+        );
+        assert!(
+            second.ok
+                || second
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("audit is pending")),
+            "{second:?}"
+        );
         assert_eq!(first.data["task_id"], second.data["task_id"]);
         assert_eq!(first.data["message_id"], second.data["message_id"]);
-        assert!(["use-registered-peer", "deduplicated"]
+        assert!(["use-registered-peer", "deduplicated", "audit-pending"]
             .contains(&first.data["decision"].as_str().unwrap()));
-        assert!(["use-registered-peer", "deduplicated"]
+        assert!(["use-registered-peer", "deduplicated", "audit-pending"]
             .contains(&second.data["decision"].as_str().unwrap()));
         let state = server.state.lock().unwrap();
         assert_eq!(state.tasks.len(), 1);
