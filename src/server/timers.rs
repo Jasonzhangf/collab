@@ -159,7 +159,7 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
             server,
             &message_id,
             &subscription_id,
-            &|_| true,
+            &|pane| (server.pane_state_check)(pane) == super::knock::AgentState::Waiting,
             &|pane, text| super::knock_or_log(&server.log_path(), pane, text),
             &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
         );
@@ -783,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn working_agent_receives_notification_immediately() {
+    fn working_agent_defers_notification_without_attempt() {
         let (mut server, root) = test_server();
         Arc::get_mut(&mut server).unwrap().pane_state_check = |_| crate::server::knock::AgentState::Working;
         register(&server, "busy-worker");
@@ -798,17 +798,14 @@ mod tests {
             .unwrap()
             .created_ms = now_ms() - 120_001;
 
-        assert!(super::super::attempt_notification_with_default(
+        assert!(!super::super::attempt_notification_with_default(
             &server,
             &id,
             &sub,
             &|_| true,
             &|_, _| true
         ));
-        assert_eq!(
-            server.state.lock().unwrap().msgs[&id].wake_attempt_count,
-            1
-        );
+        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 0);
         assert_eq!(
             server.state.lock().unwrap().notification_subscriptions[&sub].status,
             "armed"

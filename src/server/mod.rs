@@ -113,23 +113,22 @@ pub struct Server {
     pub mailbox_notify: Notify,
 }
 
-fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) {
+fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) -> Result<(), String> {
     let path = root.join(".agent-collab/server/events.jsonl");
     let record = json!({
         "ts": now_ms(),
         "kind": kind,
         "detail": detail,
     });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-    {
-        use std::io::Write;
-        let mut line = serde_json::to_vec(&record).unwrap_or_default();
-        line.push(b'\n');
-        let _ = file.write_all(&line);
-    }
+        .map_err(|error| format!("open events: {error}"))?;
+    use std::io::Write;
+    let mut line = serde_json::to_vec(&record).map_err(|error| format!("serialize events: {error}"))?;
+    line.push(b'\n');
+    file.write_all(&line).map_err(|error| format!("append events: {error}"))
 }
 
 fn request_activity(req: &Req, resp: &Resp) -> serde_json::Value {
@@ -216,11 +215,16 @@ impl Server {
             &self.log_path(),
             &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"),
         );
-        record_activity(
+        if let Err(activity_error) = record_activity(
             &self.root,
             "mailbox_projection_error",
             json!({"exact_error": error, "recoverable": true}),
-        );
+        ) {
+            append_log(
+                &self.log_path(),
+                &format!("MAILBOX_PROJECTION_ERROR_RECORD_FAILED: {activity_error}"),
+            );
+        }
     }
 
     fn backup_message(&self, msg: &Message) -> Result<(), String> {
@@ -229,10 +233,29 @@ impl Server {
         let path = dir.join(format!("{}.json", msg.id));
         let data = serde_json::to_string_pretty(msg).map_err(|error| format!("message serialize: {error}"))?;
         std::fs::write(&path, data).map_err(|error| format!("message snapshot: {error}"))?;
+        let jsonl_path = dir.join(format!("recipient-{}.jsonl", msg.to));
+        if jsonl_path.exists() {
+            let projection = read_recipient_mailbox(&jsonl_path, &msg.to)?;
+            if projection.partial_tail {
+                let content = std::fs::read(&jsonl_path)
+                    .map_err(|error| format!("read partial mailbox: {error}"))?;
+                let valid_len = content
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&jsonl_path)
+                    .map_err(|error| format!("open partial mailbox: {error}"))?;
+                file.set_len(valid_len as u64)
+                    .map_err(|error| format!("truncate partial mailbox: {error}"))?;
+            }
+        }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join(format!("recipient-{}.jsonl", msg.to)))
+            .open(&jsonl_path)
             .map_err(|error| format!("open: {error}"))?;
         use std::io::Write;
         let subject = msg.subject.as_deref().unwrap_or("notice");
@@ -741,6 +764,13 @@ fn attempt_notification_with_at(
         crate::server::knock::append_log(
             &server.log_path(),
             &format!("knock deferred pane={pane} recipient={recipient} agent state is unknown"),
+        );
+        return false;
+    }
+    if state_probe == crate::server::knock::AgentState::Working {
+        crate::server::knock::append_log(
+            &server.log_path(),
+            &format!("knock deferred pane={pane} recipient={recipient} agent is working"),
         );
         return false;
     }
@@ -2105,7 +2135,13 @@ fn handle_cross_project_send(
         "cross_project": true,
         "source_master": from,
         "target_master": to,
-        "notification": if notified { "sent" } else { "mailbox-only-no-subscription" }
+        "notification": if subscription.is_none() {
+            "mailbox-only-no-subscription"
+        } else if notified {
+            "sent"
+        } else {
+            "subscribed-not-sent"
+        }
     }))
 }
 
@@ -3849,7 +3885,7 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
                             .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e)))
                     }
                 };
-                record_activity(
+                let _ = record_activity(
                     &server.root,
                     "request",
                     request_activity(&activity_req, &resp),
@@ -3858,7 +3894,7 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
             }
             Err(e) => {
                 let resp = Resp::err(format!("bad request: {}", e));
-                record_activity(&server.root, "protocol_error", json!({"error": resp.error}));
+                let _ = record_activity(&server.root, "protocol_error", json!({"error": resp.error}));
                 resp
             }
         };
@@ -3996,7 +4032,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         server_dir.join("server.pid"),
         std::process::id().to_string(),
     )?;
-    record_activity(
+    let _ = record_activity(
         &scope.root,
         "daemon_start",
         json!({"pid": std::process::id()}),

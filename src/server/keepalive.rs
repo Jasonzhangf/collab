@@ -561,7 +561,7 @@ pub(crate) fn tick_with(
             &subscription_id,
             &|_| true,
             &|pane, text| wake(pane, text),
-            &|_, _| true,
+            &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
             now,
         );
     }
