@@ -20,7 +20,8 @@ latest main
   -> sync latest main and verify exact integration candidate
   -> acquire short integration/resource lease
   -> integrate, verify main, push exact main HEAD
-  -> mark merged
+  -> task review --accept
+  -> task integrated --commit <main-sha> --evidence <main-gates>
   -> cleanup_pending
   -> cleanup_verified receipt
   -> closed
@@ -29,9 +30,10 @@ latest main
 States:
 
 ```text
-working -> verifying -> reviewed -> delivered -> merged -> closed
+working -> verifying -> reviewed -> delivered -> accepted -> merged -> closed
 blocked -> waiting -> blocked|working
-reviewed|delivered -> rework -> working
+delivered -> rework -> working
+accepted -> rework -> working
 * -> cancelled
 ```
 
@@ -48,7 +50,8 @@ collab task update <task-id> --status verifying --next "<next evidence gate>"
 collab task update <task-id> --status reviewed
 collab task deliver <task-id> --evidence "commit=<sha>; gates=pass" \
   --worktree ./playground/<short-slug>
-collab task update <task-id> --status merged --next "main verified and pushed"
+collab task review <task-id> --accept --evidence "review gates=pass"
+collab task integrated <task-id> --commit <main-sha> --evidence "main gates=pass"
 collab task close <task-id>
 ```
 
@@ -60,7 +63,8 @@ keepalive after the task is done is closed with `collab notify close`.
 - Declare task ID, owner, feature/resource ID, worktree, branch, base commit,
   priority, status, and next step before product edits.
 - Never share/reuse a worktree. Never depend on dirty main.
-- Only the owner may update, deliver, mark merged, cancel, or close.
+- Only the owner may update, deliver, cancel, or normally close. Review and
+  exact-main integration require the task owner or live master.
 - Force close exceptions are explicit and audited: a live master may close
   any task; with no live master the owner may self-close, or a registered
   peer may close a task whose owner tmux identity is lost.
@@ -72,6 +76,12 @@ keepalive after the task is done is closed with `collab notify close`.
   unique unmerged history, or cleanup failure.
 - Cancellation cannot bypass cleanup. Dirty/missing/unproven paths are never
   force-removed. Terminal state without a receipt is an audit failure.
+
+Delivery and integration are separate durable milestones. `task deliver`
+records candidate evidence; the task owner or live master uses
+`task review --accept|--rework` to record the review decision; `task integrated`
+accepts only the exact current `refs/heads/main` commit and records mainline
+evidence. Direct status updates cannot bypass review or integration.
 
 ## Task liveness and escalation
 

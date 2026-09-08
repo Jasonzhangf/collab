@@ -262,6 +262,24 @@ enum TaskCmd {
         #[arg(long)]
         worktree: String,
     },
+    /// Accept a delivered task or return it for rework
+    Review {
+        id: String,
+        #[arg(long, conflicts_with = "rework", required_unless_present = "rework")]
+        accept: bool,
+        #[arg(long, conflicts_with = "accept", required_unless_present = "accept")]
+        rework: bool,
+        #[arg(long)]
+        evidence: String,
+    },
+    /// Record exact integration of an accepted task on main
+    Integrated {
+        id: String,
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        evidence: String,
+    },
     /// Mark the caller's task blocked without notifying unrelated peers
     Block {
         id: String,
@@ -966,6 +984,30 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     task_id: id,
                     evidence: Some(evidence),
                     worktree: Some(worktree),
+                },
+                TaskCmd::Review {
+                    id,
+                    accept,
+                    rework,
+                    evidence,
+                } => Req::TaskReview {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    task_id: id,
+                    accept,
+                    rework,
+                    evidence,
+                },
+                TaskCmd::Integrated {
+                    id,
+                    commit,
+                    evidence,
+                } => Req::TaskIntegrated {
+                    worker_id: ident.worker_id,
+                    token: ident.token,
+                    task_id: id,
+                    commit,
+                    evidence,
                 },
                 TaskCmd::Block { id, next } => Req::TaskUpdate {
                     worker_id: ident.worker_id,

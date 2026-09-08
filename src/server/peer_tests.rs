@@ -228,6 +228,37 @@ fn create_task(server: &Server, owner: &str, id: &str, feature: &str) -> Resp {
     )
 }
 
+fn initialize_main(root: &Path) {
+    for args in [
+        ["init", "-q"].as_slice(),
+        ["config", "user.email", "test@example.com"].as_slice(),
+        ["config", "user.name", "Collab Test"].as_slice(),
+        ["commit", "--allow-empty", "-q", "-m", "main"].as_slice(),
+        ["branch", "-M", "main"].as_slice(),
+    ] {
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+fn current_head(root: &Path) -> String {
+    String::from_utf8(
+        Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned()
+}
+
 #[test]
 fn failed_journal_cannot_apply_a_keepalive_reservation() {
     let (server, root) = test_server();
@@ -1261,13 +1292,26 @@ fn owner_completes_local_lifecycle_without_peer_reports() {
     assert!(delivered.ok);
     assert_eq!(delivered.data["notification"], "none");
     assert!(
-        handle_task_update(
+        handle_task_review(
             &server,
             "peer".into(),
             "token-peer".into(),
             "task".into(),
-            Some("merged".into()),
-            Some("main verified".into()),
+            true,
+            false,
+            "reviewed candidate".into(),
+        )
+        .ok
+    );
+    initialize_main(&root);
+    assert!(
+        handle_task_integrated(
+            &server,
+            "peer".into(),
+            "token-peer".into(),
+            "task".into(),
+            current_head(&root),
+            "main verified".into(),
         )
         .ok
     );
@@ -1693,13 +1737,26 @@ fn holder_close_persists_release_only_for_waiter() {
         .ok
     );
     assert!(
-        handle_task_update(
+        handle_task_review(
             &server,
             "holder".into(),
             "token-holder".into(),
             "held".into(),
-            Some("merged".into()),
-            Some("main verified".into()),
+            true,
+            false,
+            "reviewed candidate".into(),
+        )
+        .ok
+    );
+    initialize_main(&root);
+    assert!(
+        handle_task_integrated(
+            &server,
+            "holder".into(),
+            "token-holder".into(),
+            "held".into(),
+            current_head(&root),
+            "main verified".into(),
         )
         .ok
     );
@@ -2710,11 +2767,216 @@ fn lifecycle_cannot_bypass_review_or_delivery() {
     );
     assert_eq!(
         skipped_delivery.error.as_deref(),
-        Some("invalid task transition reviewed -> merged")
+        Some("use collab task review/integrated for integration-owned lifecycle transitions")
     );
     assert_eq!(
         server.state.lock().unwrap().tasks["task"].status,
         "reviewed"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn delivery_review_and_exact_main_integration_are_durable() {
+    let (server, root) = test_server();
+    register(&server, "owner", "%owner");
+    register(&server, "outsider", "%outsider");
+    assert!(create_task(&server, "owner", "task", "feature").ok);
+    assert!(
+        handle_task_update(
+            &server,
+            "owner".into(),
+            "token-owner".into(),
+            "task".into(),
+            Some("verifying".into()),
+            None,
+        )
+        .ok
+    );
+    assert!(
+        handle_task_update(
+            &server,
+            "owner".into(),
+            "token-owner".into(),
+            "task".into(),
+            Some("reviewed".into()),
+            None,
+        )
+        .ok
+    );
+    assert!(
+        handle_task_deliver(
+            &server,
+            "owner".into(),
+            "token-owner".into(),
+            "task".into(),
+            Some("candidate commit and gates passed".into()),
+            Some("candidate".into()),
+        )
+        .ok
+    );
+    let denied = handle_task_review(
+        &server,
+        "outsider".into(),
+        "token-outsider".into(),
+        "task".into(),
+        true,
+        false,
+        "outsider review".into(),
+    );
+    assert!(!denied.ok);
+    assert!(
+        handle_task_review(
+            &server,
+            "owner".into(),
+            "token-owner".into(),
+            "task".into(),
+            true,
+            false,
+            "review gates passed".into(),
+        )
+        .ok
+    );
+
+    for args in [
+        ["init", "-q"].as_slice(),
+        ["config", "user.email", "test@example.com"].as_slice(),
+        ["config", "user.name", "Collab Test"].as_slice(),
+        ["commit", "--allow-empty", "-q", "-m", "main"].as_slice(),
+        ["branch", "-M", "main"].as_slice(),
+    ] {
+        assert!(Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let head = String::from_utf8(
+        Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert!(
+        handle_task_integrated(
+            &server,
+            "owner".into(),
+            "token-owner".into(),
+            "task".into(),
+            head,
+            "main integration verified".into(),
+        )
+        .ok
+    );
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.tasks["task"].status, "merged");
+    let lifecycle = &state.task_lifecycle["task"];
+    assert_eq!(
+        lifecycle.delivery_evidence.as_deref(),
+        Some("candidate commit and gates passed")
+    );
+    assert_eq!(lifecycle.reviewer.as_deref(), Some("owner"));
+    assert_eq!(
+        lifecycle.integration_evidence.as_deref(),
+        Some("main integration verified")
+    );
+    drop(state);
+    let replayed = replay(&root).unwrap();
+    assert_eq!(replayed.tasks["task"].status, "merged");
+    assert_eq!(
+        replayed.task_lifecycle["task"]
+            .integration_evidence
+            .as_deref(),
+        Some("main integration verified")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn accepted_task_can_return_to_rework_and_redeliver() {
+    let (server, root) = test_server();
+    register(&server, "owner", "%owner");
+    assert!(create_task(&server, "owner", "task", "feature").ok);
+    for status in ["verifying", "reviewed"] {
+        assert!(
+            handle_task_update(
+                &server,
+                "owner".into(),
+                "token-owner".into(),
+                "task".into(),
+                Some(status.into()),
+                None,
+            )
+            .ok
+        );
+    }
+    assert!(
+        handle_task_deliver(
+            &server,
+            "owner".into(),
+            "token-owner".into(),
+            "task".into(),
+            Some("first candidate".into()),
+            Some("candidate".into()),
+        )
+        .ok
+    );
+    assert!(
+        handle_task_review(
+            &server,
+            "owner".into(),
+            "token-owner".into(),
+            "task".into(),
+            true,
+            false,
+            "accepted".into(),
+        )
+        .ok
+    );
+    assert!(
+        handle_task_update(
+            &server,
+            "owner".into(),
+            "token-owner".into(),
+            "task".into(),
+            Some("rework".into()),
+            Some("address review findings".into()),
+        )
+        .ok
+    );
+    for status in ["working", "verifying", "reviewed"] {
+        assert!(
+            handle_task_update(
+                &server,
+                "owner".into(),
+                "token-owner".into(),
+                "task".into(),
+                Some(status.into()),
+                None,
+            )
+            .ok
+        );
+    }
+    let redelivery = handle_task_deliver(
+        &server,
+        "owner".into(),
+        "token-owner".into(),
+        "task".into(),
+        Some("corrected candidate".into()),
+        Some("candidate".into()),
+    );
+    assert!(redelivery.ok, "{}", redelivery.error.unwrap_or_default());
+    assert_eq!(
+        server.state.lock().unwrap().task_lifecycle["task"]
+            .delivery_evidence
+            .as_deref(),
+        Some("corrected candidate")
     );
     std::fs::remove_dir_all(root).ok();
 }
