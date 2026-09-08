@@ -1,5 +1,5 @@
 use super::*;
-use crate::server::state::default_priority;
+use crate::server::state::{default_priority, is_goal_deadline};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -131,6 +131,7 @@ fn cancelling_master_idle_subscription_supersedes_pending_wake() {
                 status: "armed".into(),
                 created_ms: now_ms() - 900_000,
                 updated_ms: now_ms(),
+                status_reason: None,
             },
         },
         Event::Sent {
@@ -210,6 +211,120 @@ fn deadline_subscription_requires_live_master_authority() {
         60,
     );
     assert!(accepted.ok, "master should be allowed: {accepted:?}");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn goal_deadline_rejects_periodic_rearm_options() {
+    let (server, root) = test_server();
+    register(&server, "master", "%master");
+    server.commit(&[Event::MasterAssigned {
+        worker_id: "master".into(),
+        assigned_by: "operator".into(),
+        approval: Some("user-approved".into()),
+        assigned_ms: now_ms(),
+    }]);
+
+    let response = handle_notification_subscribe(
+        &server,
+        "master".into(),
+        "token-master".into(),
+        "deadline".into(),
+        Some("goal:inactive".into()),
+        None,
+        Vec::new(),
+        Some(600_000),
+        100,
+        86_400,
+    );
+    assert!(!response.ok);
+    assert_eq!(
+        response.error.as_deref(),
+        Some("goal deadline subscriptions are one-shot and require one at-ms trigger")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn goal_deadline_registration_deduplicates_same_deadline() {
+    let (server, root) = test_server();
+    register(&server, "master", "%master");
+    server.commit(&[Event::MasterAssigned {
+        worker_id: "master".into(),
+        assigned_by: "operator".into(),
+        approval: Some("user-approved".into()),
+        assigned_ms: now_ms(),
+    }]);
+    let trigger_ms = now_ms() + 10_000;
+    let first = handle_notification_subscribe(
+        &server,
+        "master".into(),
+        "token-master".into(),
+        "deadline".into(),
+        Some("goal:revision-7".into()),
+        Some(trigger_ms),
+        Vec::new(),
+        None,
+        1,
+        86_400,
+    );
+    assert!(first.ok, "{}", first.error.unwrap_or_default());
+    let second = handle_notification_subscribe(
+        &server,
+        "master".into(),
+        "token-master".into(),
+        "deadline".into(),
+        Some("goal:revision-7".into()),
+        Some(trigger_ms),
+        Vec::new(),
+        None,
+        1,
+        86_400,
+    );
+    assert!(second.ok, "{}", second.error.unwrap_or_default());
+    assert_eq!(second.data["deduplicated"], true);
+    assert_eq!(second.data["subscription"]["id"], first.data["subscription"]["id"]);
+    assert_eq!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .notification_subscriptions
+            .values()
+            .filter(|subscription| is_goal_deadline(subscription))
+            .count(),
+            1
+    );
+
+    let next_revision = handle_notification_subscribe(
+        &server,
+        "master".into(),
+        "token-master".into(),
+        "deadline".into(),
+        Some("goal:revision-8".into()),
+        Some(trigger_ms),
+        Vec::new(),
+        None,
+        1,
+        86_400,
+    );
+    assert!(next_revision.ok, "{}", next_revision.error.unwrap_or_default());
+    assert!(next_revision.data.get("deduplicated").is_none());
+    assert_ne!(
+        next_revision.data["subscription"]["id"],
+        first.data["subscription"]["id"]
+    );
+    assert_eq!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .notification_subscriptions
+            .values()
+            .filter(|subscription| is_goal_deadline(subscription))
+            .count(),
+        2
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -921,6 +1036,7 @@ fn registration_adds_default_lease_when_only_short_direct_message_lease_exists()
             status: "armed".into(),
             created_ms: now,
             updated_ms: now,
+            status_reason: None,
         },
     });
 

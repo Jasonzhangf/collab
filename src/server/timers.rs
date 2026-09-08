@@ -1,6 +1,6 @@
-use crate::server::state::{now_ms, Event, Message, MAX_WAKE_ATTEMPTS};
+use crate::server::state::{goal_deadline_key, is_goal_deadline, now_ms, Event, Message, MAX_WAKE_ATTEMPTS};
 use crate::server::Server;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const WAKE_ATTEMPT_LEASE_MS: i64 = 10_000;
@@ -93,10 +93,37 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 }
             }
         }
-        let live_master = match super::live_master_id(server, &state) {
-            Ok(live_master) => live_master,
-            Err(_) => None,
-        };
+        let live_master_probe = super::live_master_id(server, &state);
+        let live_master = live_master_probe.clone().ok().flatten();
+        let mut subscriptions: Vec<_> = state.notification_subscriptions.values().collect();
+        subscriptions.sort_by_key(|subscription| (subscription.created_ms, subscription.id.clone()));
+        for subscription in subscriptions {
+            if subscription.status != "armed"
+                || !is_goal_deadline(subscription)
+                || subscription.expires_ms <= now
+                || lost_sub_ids.contains(&subscription.id)
+            {
+                continue;
+            }
+            let Ok(live_master) = &live_master_probe else {
+                continue;
+            };
+            if live_master.as_deref() != Some(subscription.worker_id.as_str()) {
+                lifecycle_events.push(Event::NotificationSuppressed {
+                    subscription_id: subscription.id.clone(),
+                    status: "suppressed".into(),
+                    reason: "goal-deadline-requires-live-master".into(),
+                    updated_ms: now,
+                });
+            } else if subscription.fired_count > 0 {
+                lifecycle_events.push(Event::NotificationSuppressed {
+                    subscription_id: subscription.id.clone(),
+                    status: "consumed".into(),
+                    reason: "goal-deadline-one-shot-already-fired".into(),
+                    updated_ms: now,
+                });
+            }
+        }
         for task in state.tasks.values() {
             let Some(wait) = task.wait.as_ref() else {
                 continue;
@@ -164,7 +191,28 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
     {
         let state = server.state.lock().unwrap();
         let mut idle_gate_records = HashMap::new();
-        for subscription in state.notification_subscriptions.values() {
+        let mut goal_deadline_keys = state
+            .wake_bindings
+            .iter()
+            .filter_map(|(message_id, subscription_id)| {
+                let message = state.msgs.get(message_id)?;
+                if message.state != "pending" {
+                    return None;
+                }
+                let subscription = state.notification_subscriptions.get(subscription_id)?;
+                let Some(key) = goal_deadline_key(subscription) else {
+                    return None;
+                };
+                (key.2 <= now).then_some(key)
+            })
+            .collect::<HashSet<_>>();
+        let live_master = match super::live_master_id(server, &state) {
+            Ok(live_master) => live_master,
+            Err(_) => None,
+        };
+        let mut subscriptions: Vec<_> = state.notification_subscriptions.values().collect();
+        subscriptions.sort_by_key(|subscription| (subscription.created_ms, subscription.id.clone()));
+        for subscription in subscriptions {
             let next_trigger = subscription
                 .interval_ms
                 .map(|interval| {
@@ -223,6 +271,8 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 || unknown_sub_ids.contains(&subscription.id)
                 || !server.config.timers.enabled
                 || !matches!(subscription.event.as_str(), "deadline" | "master-idle")
+                || (is_goal_deadline(subscription)
+                    && live_master.as_deref() != Some(subscription.worker_id.as_str()))
                 || !master_idle_ready
                 || !master_idle_gate_open
                 || next_trigger.is_none_or(|trigger| trigger > now)
@@ -235,6 +285,14 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 })
             {
                 continue;
+            }
+            if is_goal_deadline(subscription) {
+                let Some(key) = goal_deadline_key(subscription) else {
+                    continue;
+                };
+                if !goal_deadline_keys.insert(key) {
+                    continue;
+                }
             }
             let message_id = super::gen_msg_id();
             if subscription.event == "master-idle" {
@@ -406,6 +464,7 @@ mod tests {
                 status: "armed".into(),
                 created_ms: now - interval_ms,
                 updated_ms: now,
+                status_reason: None,
             },
         }]);
         id
@@ -436,6 +495,7 @@ mod tests {
                 status: "armed".into(),
                 created_ms: now_ms(),
                 updated_ms: now_ms(),
+                status_reason: None,
             },
         }]);
         id
@@ -931,6 +991,275 @@ mod tests {
                 .filter(|bound| *bound == &subscription_id)
                 .count(),
             1
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn goal_deadline_consumes_one_occurrence_even_when_legacy_record_is_recurring() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let now = now_ms();
+        let subscription_id = "sub-goal-legacy".to_string();
+        server.commit(&[Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: subscription_id.clone(),
+                worker_id: "master".into(),
+                event: "deadline".into(),
+                subject: Some("goal:inactive".into()),
+                pane: "%test-master".into(),
+                method: "tmux".into(),
+                trigger_ms: Some(now - 1),
+                trigger_times_ms: Vec::new(),
+                interval_ms: Some(600_000),
+                repeat_count: 100,
+                fired_count: 26,
+                expires_ms: now + 86_400_000,
+                status: "armed".into(),
+                created_ms: now - 26 * 600_000,
+                updated_ms: now,
+                status_reason: None,
+            },
+        }]);
+
+        tick_with_idle(&server, &|_| false);
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert!(state.msgs.is_empty(), "a fired inactive goal cannot rearm");
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].status,
+            "consumed",
+            "fired={} reason={:?}",
+            state.notification_subscriptions[&subscription_id].fired_count,
+            state.notification_subscriptions[&subscription_id].status_reason
+        );
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id]
+                .status_reason
+                .as_deref(),
+            Some("goal-deadline-one-shot-already-fired")
+        );
+        let snapshot = state.snapshot_events();
+        drop(state);
+
+        let (replayed, replay_root) = test_server();
+        for event in &snapshot {
+            replayed.commit(std::slice::from_ref(event));
+        }
+        tick_with_idle(&replayed, &|_| false);
+        let replayed_state = replayed.state.lock().unwrap();
+        assert!(replayed_state.msgs.is_empty());
+        assert_eq!(
+            replayed_state.notification_subscriptions[&subscription_id]
+                .status_reason
+                .as_deref(),
+            Some("goal-deadline-one-shot-already-fired")
+        );
+        drop(replayed_state);
+        std::fs::remove_dir_all(replay_root).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn goal_deadline_success_consumes_legacy_periodic_shape_once() {
+        let (mut server, root) = test_server();
+        Arc::get_mut(&mut server).unwrap().config.notifications.mode = "immediate".into();
+        Arc::get_mut(&mut server).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Working;
+        register_master(&server);
+        let now = now_ms();
+        let subscription_id = "sub-goal-active".to_string();
+        server.commit(&[Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: subscription_id.clone(),
+                worker_id: "master".into(),
+                event: "deadline".into(),
+                subject: Some("goal:active".into()),
+                pane: "%test-master".into(),
+                method: "tmux".into(),
+                trigger_ms: Some(now - 1),
+                trigger_times_ms: Vec::new(),
+                interval_ms: Some(600_000),
+                repeat_count: 100,
+                fired_count: 0,
+                expires_ms: now + 86_400_000,
+                status: "armed".into(),
+                created_ms: now - 600_000,
+                updated_ms: now,
+                status_reason: None,
+            },
+        }]);
+
+        tick_with_idle(&server, &|_| false);
+        Arc::get_mut(&mut server).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Waiting;
+        let message_id = server
+            .state
+            .lock()
+            .unwrap()
+            .wake_bindings
+            .keys()
+            .next()
+            .cloned()
+            .expect("goal deadline message");
+        assert!(super::super::attempt_notification_with_default(
+            &server,
+            &message_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| true,
+        ));
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs.len(), 1);
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].status,
+            "consumed",
+            "fired={} reason={:?}",
+            state.notification_subscriptions[&subscription_id].fired_count,
+            state.notification_subscriptions[&subscription_id].status_reason
+        );
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id]
+                .status_reason
+                .as_deref(),
+            Some("goal-deadline-one-shot-delivered")
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn duplicate_goal_deadline_records_emit_one_wake_for_the_same_deadline() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let now = now_ms();
+        for (subscription_id, created_ms) in [("sub-goal-duplicate-a", now - 2), ("sub-goal-duplicate-b", now - 1)] {
+            server.commit(&[Event::NotificationSubscribed {
+                subscription: NotificationSubscription {
+                    id: subscription_id.into(),
+                    worker_id: "master".into(),
+                    event: "deadline".into(),
+                    subject: Some("goal:revision-7".into()),
+                    pane: "%test-master".into(),
+                    method: "tmux".into(),
+                    trigger_ms: Some(now - 1),
+                    trigger_times_ms: Vec::new(),
+                    interval_ms: None,
+                    repeat_count: 1,
+                    fired_count: 0,
+                    expires_ms: now + 86_400_000,
+                    status: "armed".into(),
+                    created_ms,
+                    updated_ms: now,
+                    status_reason: None,
+                },
+            }]);
+        }
+
+        tick_with_idle(&server, &|_| false);
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .msgs
+                .values()
+                .filter(|message| message.subject.as_deref() == Some("deadline:goal:revision-7"))
+                .count(),
+            1
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn goal_deadline_never_wakes_a_non_master_subscription() {
+        let (server, root) = test_server();
+        register_master(&server);
+        register(&server, "worker");
+        let now = now_ms();
+        let subscription_id = "sub-goal-worker".to_string();
+        server.commit(&[Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: subscription_id.clone(),
+                worker_id: "worker".into(),
+                event: "deadline".into(),
+                subject: Some("goal:worker".into()),
+                pane: "%test-worker".into(),
+                method: "tmux".into(),
+                trigger_ms: Some(now - 1),
+                trigger_times_ms: Vec::new(),
+                interval_ms: None,
+                repeat_count: 1,
+                fired_count: 0,
+                expires_ms: now + 86_400_000,
+                status: "armed".into(),
+                created_ms: now,
+                updated_ms: now,
+                status_reason: None,
+            },
+        }]);
+
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert!(state.msgs.is_empty());
+        assert_eq!(state.notification_subscriptions[&subscription_id].status, "suppressed");
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id]
+                .status_reason
+                .as_deref(),
+            Some("goal-deadline-requires-live-master")
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cancelled_goal_deadline_never_rearms_after_duplicate_ticks() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let now = now_ms();
+        let subscription_id = "sub-goal-cancelled".to_string();
+        server.commit(&[Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: subscription_id.clone(),
+                worker_id: "master".into(),
+                event: "deadline".into(),
+                subject: Some("goal:cancelled".into()),
+                pane: "%test-master".into(),
+                method: "tmux".into(),
+                trigger_ms: Some(now - 1),
+                trigger_times_ms: Vec::new(),
+                interval_ms: None,
+                repeat_count: 1,
+                fired_count: 0,
+                expires_ms: now + 86_400_000,
+                status: "armed".into(),
+                created_ms: now,
+                updated_ms: now,
+                status_reason: None,
+            },
+        }]);
+
+        let cancelled = super::super::handle_notification_unsubscribe(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            subscription_id.clone(),
+        );
+        assert!(cancelled.ok, "{}", cancelled.error.unwrap_or_default());
+        tick_with_idle(&server, &|_| false);
+
+        let state = server.state.lock().unwrap();
+        assert!(state.msgs.is_empty());
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].status,
+            "cancelled"
+        );
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].fired_count,
+            0
         );
         drop(state);
         std::fs::remove_dir_all(root).ok();

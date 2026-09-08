@@ -10,9 +10,9 @@ use crate::server::knock::{
 };
 use serde_json::json;
 use state::{
-    now_ms, runtime_for_pane, task_resource_active, wait_cycle, CleanupReceipt, Event, Message,
-    MigrationRecord, NotificationSubscription, State, TaskRec, WaitSpec, WorkerRec,
-    MAX_WAKE_ATTEMPTS,
+    goal_deadline_key, now_ms, runtime_for_pane, task_resource_active, wait_cycle,
+    CleanupReceipt, Event, Message, MigrationRecord, NotificationSubscription, State, TaskRec,
+    WaitSpec, WorkerRec, MAX_WAKE_ATTEMPTS,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -718,6 +718,7 @@ fn default_direct_message_events(
             status: "armed".into(),
             created_ms: now,
             updated_ms: now,
+            status_reason: None,
         },
     });
     events
@@ -1110,6 +1111,7 @@ mod notification_batch_tests {
                     status: "armed".into(),
                     created_ms: now,
                     updated_ms: now,
+                    status_reason: None,
                 },
             },
         ]);
@@ -1442,6 +1444,20 @@ fn handle_notification_subscribe(
     if event == "deadline" && trigger_ms.is_some() && !trigger_times_ms.is_empty() {
         return Resp::err("use at-ms or trigger-ms, not both");
     }
+    let goal_deadline = subject
+        .as_deref()
+        .is_some_and(|value| value.starts_with("goal:"));
+    if event == "deadline"
+        && goal_deadline
+        && (interval_ms.is_some()
+            || repeat_count != 1
+            || trigger_times_ms.len() > 1
+            || (trigger_ms.is_none() && trigger_times_ms.is_empty()))
+    {
+        return Resp::err(
+            "goal deadline subscriptions are one-shot and require one at-ms trigger",
+        );
+    }
     let now = now_ms();
     let expires_ms = now.saturating_add((ttl_seconds as i64).saturating_mul(1000));
     let mut state = server.state.lock().unwrap();
@@ -1461,6 +1477,29 @@ fn handle_notification_subscribe(
             } else {
                 "no live master; deadline subscriptions require an approved live master"
             });
+        }
+    }
+    if goal_deadline {
+        let requested_key = trigger_ms
+            .or_else(|| trigger_times_ms.first().copied())
+            .and_then(|trigger| subject.clone().map(|subject| (worker_id.clone(), subject, trigger)));
+        if let Some(existing) = state
+            .notification_subscriptions
+            .values()
+            .filter(|subscription| {
+                goal_deadline_key(subscription).as_ref() == requested_key.as_ref()
+                    && matches!(subscription.status.as_str(), "armed" | "consumed")
+                    && subscription.expires_ms > now
+            })
+            .min_by_key(|subscription| (subscription.created_ms, subscription.id.clone()))
+            .cloned()
+        {
+            return Resp::data(json!({
+                "subscription": existing,
+                "one_shot": true,
+                "max_repeat_count": crate::server::state::MAX_NOTIFICATION_REPEATS,
+                "deduplicated": true,
+            }));
         }
     }
     let Some(pane) = state.worker_pane(&worker_id) else {
@@ -1546,6 +1585,7 @@ fn handle_notification_subscribe(
         status: "armed".into(),
         created_ms: now,
         updated_ms: now,
+        status_reason: None,
     };
     server.commit_locked(
         &mut state,
@@ -1554,7 +1594,7 @@ fn handle_notification_subscribe(
         }],
     );
     Resp::data(
-        json!({"subscription": subscription, "one_shot": false, "max_repeat_count": crate::server::state::MAX_NOTIFICATION_REPEATS}),
+        json!({"subscription": subscription, "one_shot": goal_deadline, "max_repeat_count": crate::server::state::MAX_NOTIFICATION_REPEATS}),
     )
 }
 

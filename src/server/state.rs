@@ -86,6 +86,8 @@ pub struct NotificationSubscription {
     pub status: String,
     pub created_ms: i64,
     pub updated_ms: i64,
+    #[serde(default)]
+    pub status_reason: Option<String>,
 }
 
 pub fn default_repeat_count() -> u32 { 1 }
@@ -122,6 +124,44 @@ pub struct Message {
 }
 
 pub const REQUEST_COOLDOWN_MS: i64 = 5 * 60 * 1000;
+
+pub fn is_goal_deadline(subscription: &NotificationSubscription) -> bool {
+    subscription.event == "deadline"
+        && subscription
+            .subject
+            .as_deref()
+            .is_some_and(|subject| subject.starts_with("goal:"))
+}
+
+/// Canonical identity for one goal deadline occurrence. Registrations and the
+/// scheduler share this key so a new goal revision cannot shadow an existing
+/// goal merely because its deadline happens to be the same.
+pub fn goal_deadline_key(
+    subscription: &NotificationSubscription,
+) -> Option<(String, String, i64)> {
+    if !is_goal_deadline(subscription) {
+        return None;
+    }
+    let trigger = subscription
+        .interval_ms
+        .map(|interval| {
+            subscription
+                .trigger_ms
+                .unwrap_or(subscription.created_ms.saturating_add(interval))
+        })
+        .or_else(|| {
+            subscription
+                .trigger_times_ms
+                .get(subscription.fired_count as usize)
+                .copied()
+        })
+        .or(subscription.trigger_ms)?;
+    Some((
+        subscription.worker_id.clone(),
+        subscription.subject.clone()?,
+        trigger,
+    ))
+}
 
 /// Durable, project-level scheduling signals.  The sets contain identifiers
 /// only; task, bug, and mailbox truth remains in their respective stores and
@@ -397,6 +437,12 @@ pub enum Event {
         status: String,
         updated_ms: i64,
     },
+    NotificationSuppressed {
+        subscription_id: String,
+        status: String,
+        reason: String,
+        updated_ms: i64,
+    },
     NotificationConsumed {
         subscription_id: String,
         message_id: String,
@@ -470,6 +516,14 @@ impl State {
             return;
         };
         subscription.fired_count = subscription.fired_count.saturating_add(1);
+        if is_goal_deadline(subscription) {
+            subscription.status = "consumed".into();
+            subscription.status_reason = Some("goal-deadline-one-shot-delivered".into());
+            if let Some(consumed_ms) = consumed_ms {
+                subscription.updated_ms = consumed_ms;
+            }
+            return;
+        }
         let total = if subscription.interval_ms.is_some() {
             subscription.repeat_count
         } else {
@@ -547,6 +601,20 @@ impl State {
                 if let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id)
                 {
                     subscription.status = status.clone();
+                    subscription.status_reason = None;
+                    subscription.updated_ms = *updated_ms;
+                }
+            }
+            Event::NotificationSuppressed {
+                subscription_id,
+                status,
+                reason,
+                updated_ms,
+            } => {
+                if let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id)
+                {
+                    subscription.status = status.clone();
+                    subscription.status_reason = Some(reason.clone());
                     subscription.updated_ms = *updated_ms;
                 }
             }
@@ -935,6 +1003,27 @@ mod tests {
         assert_eq!(state.master_wake.delivery_state, "pending");
     }
 
+    #[test]
+    fn goal_due_is_idempotent_per_revision_and_advances_for_new_revision() {
+        let mut state = State::default();
+        state.apply(&Event::MasterWakeSignal {
+            signal: MasterWakeSignal::GoalDue { revision: 7 },
+            at_ms: 10,
+        });
+        state.apply(&Event::MasterWakeSignal {
+            signal: MasterWakeSignal::GoalDue { revision: 7 },
+            at_ms: 20,
+        });
+        assert_eq!(state.master_wake.active_goal_revision, Some(7));
+        assert_eq!(state.master_wake.last_updated_ms, 10);
+        state.apply(&Event::MasterWakeSignal {
+            signal: MasterWakeSignal::GoalDue { revision: 8 },
+            at_ms: 30,
+        });
+        assert_eq!(state.master_wake.active_goal_revision, Some(8));
+        assert_eq!(state.master_wake.last_updated_ms, 30);
+    }
+
     fn msg(id: &str, to: &str, mtype: &str) -> Message {
         Message {
             id: id.into(),
@@ -1119,6 +1208,7 @@ mod tests {
                 status: "armed".into(),
                 created_ms: 1,
                 updated_ms: 1,
+                status_reason: None,
             },
         });
 
@@ -1169,7 +1259,7 @@ mod tests {
                 subject: Some("timer".into()), pane: "%7".into(), method: "tmux".into(),
                 trigger_ms: None, trigger_times_ms: Vec::new(), interval_ms: Some(1_000),
                 repeat_count: 3, fired_count: 0, expires_ms: 10_000,
-                status: "armed".into(), created_ms: 1, updated_ms: 1,
+                status: "armed".into(), created_ms: 1, updated_ms: 1, status_reason: None,
             },
         });
         for count in 1..=3 {
@@ -1198,6 +1288,7 @@ mod tests {
             status: "armed".into(),
             created_ms: 1_000,
             updated_ms: 1_000,
+            status_reason: None,
         };
 
         let mut none_state = State::default();
@@ -1270,6 +1361,7 @@ mod tests {
                 status: "armed".into(),
                 created_ms: 1_000,
                 updated_ms: 1_000,
+                status_reason: None,
             },
         });
         state.apply(&Event::Sent {
@@ -1344,6 +1436,7 @@ mod tests {
                 status: "armed".into(),
                 created_ms: 1_000,
                 updated_ms: 1_000,
+                status_reason: None,
             },
         });
         state.apply(&Event::Sent {
@@ -1417,6 +1510,7 @@ mod tests {
                 status: "armed".into(),
                 created_ms: 1_000,
                 updated_ms: 1_000,
+                status_reason: None,
             },
         });
         state.apply(&Event::Sent {
