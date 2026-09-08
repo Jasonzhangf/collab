@@ -290,8 +290,14 @@ pub(crate) fn tick_with(
                                 .get(&master_id)
                                 .and_then(|master| master.pane.as_deref())
                                 == Some(sub.pane.as_str())
-                                && (server.pane_alive_check)(&sub.pane)
-                                && (server.pane_owner_check)(&master_id, &sub.pane)
+                                && matches!(
+                                    (server.pane_alive_check)(&sub.pane),
+                                    super::knock::PanePresence::Present
+                                )
+                                && matches!(
+                                    (server.pane_owner_check)(&master_id, &sub.pane),
+                                    Ok(true)
+                                )
                         });
                     if master_id == worker.id {
                         if let Some(sub) = subscription {
@@ -413,7 +419,9 @@ mod tests {
             sends.set(sends.get() + 1);
             false
         };
-        tick_with(&server, base, &|_| AgentState::Waiting, &send, &|_, _| Ok(true));
+        tick_with(&server, base, &|_| AgentState::Waiting, &send, &|_, _| {
+            Ok(true)
+        });
         for n in 1..=3 {
             tick_with(
                 &server,
@@ -943,10 +951,16 @@ mod tests {
         for stale_kind in ["mismatched", "dead", "unowned"] {
             let (mut server, root, base) = episode_server();
             if stale_kind == "dead" {
-                server.pane_alive_check = |pane| pane != "%stale";
+                server.pane_alive_check = |pane| {
+                    if pane == "%stale" {
+                        super::super::knock::PanePresence::Missing
+                    } else {
+                        super::super::knock::PanePresence::Present
+                    }
+                };
             }
             if stale_kind == "unowned" {
-                server.pane_owner_check = |_, pane| pane != "%stale";
+                server.pane_owner_check = |_, pane| Ok(pane != "%stale");
             }
             if managed {
                 server.commit(&[Event::SubagentUpdated {

@@ -92,7 +92,10 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 }
             }
         }
-        let live_master = super::live_master_id(server, &state);
+        let live_master = match super::live_master_id(server, &state) {
+            Ok(live_master) => live_master,
+            Err(_) => None,
+        };
         for task in state.tasks.values() {
             let Some(wait) = task.wait.as_ref() else {
                 continue;
@@ -781,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_includes_newer_pending_messages_and_never_replays() {
+    fn batch_excludes_messages_after_first_window_and_never_replays() {
         let (server, root) = test_server();
         register(&server, "owner");
         let subscription = subscribe(&server, "owner", "direct-message", None, None);
@@ -810,12 +813,12 @@ mod tests {
         ));
         assert_eq!(calls.borrow().len(), 1);
         assert!(calls.borrow()[0].contains(&first));
-        assert!(calls.borrow()[0].contains("message_ids=message-owner,second"));
+        assert!(calls.borrow()[0].contains("message_ids=message-owner"));
+        assert!(!calls.borrow()[0].contains("second"));
         assert!(calls.borrow()[0].contains("action_categories="));
-        assert!(calls.borrow()[0].contains("new topic"));
         assert_eq!(
             server.state.lock().unwrap().msgs["second"].state,
-            "delivered"
+            "pending"
         );
         assert!(!super::super::attempt_notification_with_default(
             &server,
@@ -1206,14 +1209,14 @@ mod tests {
             working_at,
             &|_| crate::server::knock::AgentState::Working,
             &|_, _| true,
-            &|_, _| true,
+            &|_, _| Ok(true),
         );
         super::super::keepalive::tick_with(
             &server,
             working_at + 1,
             &|_| crate::server::knock::AgentState::Waiting,
             &|_, _| true,
-            &|_, _| true,
+            &|_, _| Ok(true),
         );
         tick_with_idle(&server, &|_| false);
 
@@ -1267,14 +1270,14 @@ mod tests {
             base,
             &|_| crate::server::knock::AgentState::Working,
             &|_, _| true,
-            &|_, _| true,
+            &|_, _| Ok(true),
         );
         super::super::keepalive::tick_with(
             &server,
             base + 1,
             &|_| crate::server::knock::AgentState::Waiting,
             &|_, _| true,
-            &|_, _| true,
+            &|_, _| Ok(true),
         );
         let first_keepalive_message_id = server
             .state
@@ -1300,7 +1303,7 @@ mod tests {
             base + 120_001,
             &|_| crate::server::knock::AgentState::Waiting,
             &|_, _| true,
-            &|_, _| true,
+            &|_, _| Ok(true),
         );
         let second_keepalive_message_id = {
             let state = server.state.lock().unwrap();

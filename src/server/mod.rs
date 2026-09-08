@@ -1011,8 +1011,8 @@ mod notification_batch_tests {
                 root: root.clone(),
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
-                pane_alive_check: |_| true,
-                pane_owner_check: |_, _| true,
+                pane_alive_check: |_| crate::server::knock::PanePresence::Present,
+                pane_owner_check: |_, _| Ok(true),
                 pane_state_check: |_| crate::server::knock::AgentState::Waiting,
                 mailbox_notify: tokio::sync::Notify::new(),
             }),
@@ -1111,7 +1111,7 @@ mod notification_batch_tests {
                 delivered.lock().unwrap().push(text.to_string());
                 true
             },
-            &|_, _| true,
+            &|_, _| Ok(true),
             now,
         ));
 
@@ -1162,7 +1162,7 @@ mod notification_batch_tests {
                 delivered.lock().unwrap().push(text.to_string());
                 true
             },
-            &|_, _| true,
+            &|_, _| Ok(true),
             window_start + 120_000,
         ));
         let text = delivered.lock().unwrap().join("\n");
@@ -1213,7 +1213,7 @@ mod notification_batch_tests {
                 delivered.lock().unwrap().push(text.to_string());
                 true
             },
-            &|_, _| true,
+            &|_, _| Ok(true),
             now,
         ));
         let text = delivered.lock().unwrap().join("\n");
@@ -1232,7 +1232,7 @@ mod notification_batch_tests {
                 delivered.lock().unwrap().push(text.to_string());
                 true
             },
-            &|_, _| true,
+            &|_, _| Ok(true),
             now,
         ));
         assert!(delivered.lock().unwrap().iter().any(|text| {
@@ -1298,7 +1298,7 @@ mod notification_batch_tests {
             &subscription_id,
             &|_| false,
             &|_, _| panic!("a failed reservation must not send"),
-            &|_, _| true,
+            &|_, _| Ok(true),
             now,
         ));
         assert_eq!(server.state.lock().unwrap().msgs["reserved-once"].state, "pending");
@@ -1312,7 +1312,7 @@ mod notification_batch_tests {
             &subscription_id,
             &|_| true,
             &|_, _| panic!("a reserved message must never be replayed"),
-            &|_, _| true,
+            &|_, _| Ok(true),
             now + 300_000,
         ));
         std::fs::remove_dir_all(root).unwrap();
