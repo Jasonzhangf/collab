@@ -532,9 +532,14 @@ impl State {
         if subscription.fired_count >= total {
             subscription.status = "consumed".into();
         } else if let Some(interval) = subscription.interval_ms {
-            let next_trigger = subscription
-                .trigger_ms
-                .map(|trigger| trigger.saturating_add(interval))
+            let next_trigger = consumed_ms
+                .filter(|_| subscription.event == "master-idle")
+                .map(|consumed| consumed.saturating_add(interval))
+                .or_else(|| {
+                    subscription
+                        .trigger_ms
+                        .map(|trigger| trigger.saturating_add(interval))
+                })
                 .unwrap_or_else(|| {
                     subscription.created_ms.saturating_add(
                         interval.saturating_mul(subscription.fired_count.saturating_add(1) as i64),
@@ -689,7 +694,16 @@ impl State {
                     // occurrences with the cursor so timer delivery, which
                     // already records NotificationConsumed, remains idempotent.
                     if read_count > fired_count {
-                        self.consume_notification(&subscription_id, None);
+                        let consumed_ms = if subscription.event == "master-idle" {
+                            self.msgs.get(id).and_then(|message| {
+                                [message.last_wake_attempt_ms, message.created_ms]
+                                    .into_iter()
+                                    .find(|timestamp| *timestamp > 0)
+                            })
+                        } else {
+                            None
+                        };
+                        self.consume_notification(&subscription_id, consumed_ms);
                     }
                 }
             }

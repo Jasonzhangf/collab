@@ -1379,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn recurring_master_idle_wake_advances_after_consumed_binding() {
+    fn overdue_master_idle_cursor_does_not_catch_up_after_consumption() {
         let (server, root) = test_server();
         register_master(&server);
         let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
@@ -1410,14 +1410,17 @@ mod tests {
                 (bound == &subscription_id).then_some(message_id.clone())
             })
             .expect("first master idle wake");
+        let attempted_at = now_ms();
         server.commit(&[
+            Event::WakeAttempted {
+                ids: vec![first_message_id.clone()],
+                attempted_ms: attempted_at,
+            },
             Event::Delivered {
                 ids: vec![first_message_id.clone()],
             },
-            Event::NotificationConsumed {
-                subscription_id: subscription_id.clone(),
-                message_id: first_message_id,
-                consumed_ms: now_ms(),
+            Event::Acked {
+                ids: vec![first_message_id],
             },
         ]);
 
@@ -1429,7 +1432,16 @@ mod tests {
                 .values()
                 .filter(|bound| *bound == &subscription_id)
                 .count(),
-            2
+            1,
+            "an overdue cursor must wait for the next interval after consumption"
+        );
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].fired_count,
+            1
+        );
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].trigger_ms,
+            Some(attempted_at + 15 * 60 * 1000)
         );
         drop(state);
         std::fs::remove_dir_all(root).ok();
