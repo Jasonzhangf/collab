@@ -1378,6 +1378,40 @@ fn non_master_force_close_is_rejected() {
 }
 
 #[test]
+fn orphan_force_close_defers_when_owner_pane_probe_is_unknown() {
+    let (server, root) = test_server();
+    register(&server, "owner", "%owner");
+    register(&server, "peer", "%peer");
+    assert!(create_task(&server, "owner", "working", "feature").ok);
+    let mut server = server;
+    server.pane_owner_check = |worker_id, pane| {
+        if worker_id == "owner" && pane == "%owner" {
+            Err(())
+        } else {
+            Ok(true)
+        }
+    };
+    let resp = handle_task_close(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "working".into(),
+        true,
+        Some("owner pane probe is unknown; defer orphan close".into()),
+    );
+    assert!(!resp.ok);
+    assert_eq!(
+        resp.error.as_deref(),
+        Some("manual force close is not authorized for this caller")
+    );
+    assert_eq!(
+        server.state.lock().unwrap().tasks["working"].status,
+        "working"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn owner_force_close_when_no_live_master_is_allowed() {
     let (server, root) = test_server();
     register(&server, "owner", "%owner");
@@ -1444,6 +1478,58 @@ fn registered_peer_force_closes_orphaned_owner_with_no_live_master() {
         Some("owner pane lost; no live master; peer closes orphan"),
     );
     drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn repeated_orphan_force_close_is_idempotent_after_journal_replay() {
+    let (server, root) = test_server();
+    register(&server, "owner", "%owner");
+    register(&server, "peer", "%peer");
+    assert!(create_task(&server, "owner", "orphan", "feature").ok);
+    let mut server = server;
+    server.pane_alive_check = |pane| {
+        if pane == "%owner" {
+            PanePresence::Missing
+        } else {
+            PanePresence::Present
+        }
+    };
+    let reason = "owner pane lost; replay closes the same orphan";
+    let first = handle_task_close(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "orphan".into(),
+        true,
+        Some(reason.into()),
+    );
+    assert!(first.ok, "{}", first.error.unwrap_or_default());
+    let receipt_id = first.data["receipt_id"].as_str().unwrap().to_owned();
+    let task_updated_ms = server.state.lock().unwrap().tasks["orphan"].updated_ms;
+    let journal_path = root.join(".agent-collab/server/journal.jsonl");
+    let journal_after_first = std::fs::read_to_string(&journal_path).unwrap();
+    *server.state.lock().unwrap() = replay(&root).unwrap();
+
+    let second = handle_task_close(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "orphan".into(),
+        true,
+        Some(reason.into()),
+    );
+    assert!(second.ok, "{}", second.error.unwrap_or_default());
+    assert_eq!(second.data["idempotent"], true);
+    assert_eq!(second.data["receipt_id"], receipt_id);
+    assert_eq!(
+        server.state.lock().unwrap().tasks["orphan"].updated_ms,
+        task_updated_ms
+    );
+    assert_eq!(
+        std::fs::read_to_string(&journal_path).unwrap(),
+        journal_after_first
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

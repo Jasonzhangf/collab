@@ -3243,6 +3243,26 @@ fn handle_task_close(
                 }),
             );
         }
+        if task.status == "closed" {
+            if let Some(receipt) = st.cleanup_receipts.get(&task.id).filter(|receipt| {
+                receipt.task_id == task.id
+                    && receipt.worktree_path == task.worktree_path
+                    && receipt.branch == task.branch
+            }) {
+                return Resp::data(json!({
+                    "task": task.id,
+                    "status": task.status,
+                    "owner": task.owner,
+                    "manual": true,
+                    "reason": receipt.manual_reason,
+                    "receipt_id": receipt.id,
+                    "superseded_pending_keepalives": [],
+                    "stale_workers": stale_worker_views(&st, &server.pane_alive_check),
+                    "idempotent": true,
+                    "next_action": "lifecycle complete; keepalives for this task owner stopped",
+                }));
+            }
+        }
         let mut closed = task;
         closed.status = "closed".into();
         closed.wait = None;
