@@ -505,7 +505,10 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
         },
     );
     assert!(!no_assigned.ok);
-    assert_eq!(no_assigned.error.as_deref(), Some("no assigned task to accept"));
+    assert_eq!(
+        no_assigned.error.as_deref(),
+        Some("no assigned task to accept")
+    );
     let unknown = crate::subagent::handle(
         &server,
         "parent",
@@ -712,22 +715,30 @@ fn managed_subagent_send_binds_the_selected_child_when_multiple_children_are_ass
         "token-parent",
         Action::Send {
             id: "managed-a".into(),
-            subject: "first-task".into(),
-            body: "first body".into(),
+            subject: "same-task".into(),
+            body: "same body".into(),
         },
     );
     assert!(first.ok, "{}", first.error.unwrap_or_default());
+    let first_message = server.state.lock().unwrap().subagents["managed-a"]
+        .last_message
+        .clone()
+        .unwrap();
     let second = crate::subagent::handle(
         &server,
         "parent",
         "token-parent",
         Action::Send {
             id: "managed-b".into(),
-            subject: "second-task".into(),
-            body: "second body".into(),
+            subject: "same-task".into(),
+            body: "same body".into(),
         },
     );
     assert!(second.ok, "{}", second.error.unwrap_or_default());
+    let second_message = server.state.lock().unwrap().subagents["managed-b"]
+        .last_message
+        .clone()
+        .unwrap();
 
     let journal: Vec<serde_json::Value> =
         std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
@@ -737,11 +748,11 @@ fn managed_subagent_send_binds_the_selected_child_when_multiple_children_are_ass
             .collect();
     let first_sent_index = journal
         .iter()
-        .position(|event| event["ev"] == "Sent" && event["msg"]["body"] == "first body")
+        .position(|event| event["ev"] == "Sent" && event["msg"]["id"] == first_message)
         .unwrap();
     let second_sent_index = journal
         .iter()
-        .position(|event| event["ev"] == "Sent" && event["msg"]["body"] == "second body")
+        .position(|event| event["ev"] == "Sent" && event["msg"]["id"] == second_message)
         .unwrap();
     assert!(!journal[first_sent_index..second_sent_index]
         .iter()

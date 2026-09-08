@@ -2677,7 +2677,19 @@ pub(crate) fn handle_send_with_task(
             && m.body == msg.body
             && m.state == "pending"
     }) {
-        return Resp::data(json!({"msg_id": existing.id, "deduplicated": true}));
+        let managed_duplicate = assign_task
+            && managed_child.as_ref().is_some_and(|child| {
+                child.last_message.as_deref() == Some(existing.id.as_str())
+                    && st
+                        .tasks
+                        .get(&format!("task-{}", existing.id))
+                        .is_some_and(|task| {
+                            task.owner == child.peer && task.created_by == from
+                        })
+            });
+        if !assign_task || managed_duplicate {
+            return Resp::data(json!({"msg_id": existing.id, "deduplicated": true}));
+        }
     }
     let mid = msg.id.clone();
     let task_id = assign_task.then(|| format!("task-{mid}"));
