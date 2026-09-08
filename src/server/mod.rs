@@ -2567,7 +2567,69 @@ pub(crate) fn scheduler_admit_subagent_start(
 }
 
 fn record_scheduler_admission(server: &Server, admission: serde_json::Value) -> Result<(), Resp> {
-    if let Err(error) = record_activity(&server.root, "scheduler_admission", admission) {
+    ensure_scheduler_admission_audit(server, &admission).map(|_| ())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchedulerAdmissionAuditState {
+    Recorded,
+    Failed(String),
+}
+
+fn scheduler_admission_audit_state(
+    server: &Server,
+    request_id: &str,
+) -> Result<Option<SchedulerAdmissionAuditState>, Resp> {
+    let path = server.root.join(".agent-collab/server/events.jsonl");
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Resp::err(format!(
+                "scheduler admission audit failed: lookup {error}"
+            )))
+        }
+    };
+    for line in content.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record.get("kind").and_then(serde_json::Value::as_str) != Some("scheduler_admission")
+            || record
+                .get("detail")
+                .and_then(|detail| detail.get("request_id"))
+                .and_then(serde_json::Value::as_str)
+                != Some(request_id)
+        {
+            continue;
+        }
+        let detail = record.get("detail").cloned().unwrap_or_else(|| json!({}));
+        if detail.get("status").and_then(serde_json::Value::as_str) == Some("failed") {
+            let error = detail
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("scheduler admission audit failed")
+                .to_string();
+            return Ok(Some(SchedulerAdmissionAuditState::Failed(error)));
+        }
+        return Ok(Some(SchedulerAdmissionAuditState::Recorded));
+    }
+    Ok(None)
+}
+
+fn ensure_scheduler_admission_audit(
+    server: &Server,
+    admission: &serde_json::Value,
+) -> Result<SchedulerAdmissionAuditState, Resp> {
+    if let Some(request_id) = admission
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        if let Some(state) = scheduler_admission_audit_state(server, request_id)? {
+            return Ok(state);
+        }
+    }
+    if let Err(error) = record_activity(&server.root, "scheduler_admission", admission.clone()) {
         append_log(
             &server.log_path(),
             &format!("SCHEDULER_ADMISSION_RECORD_FAILED: {error}"),
@@ -2576,7 +2638,21 @@ fn record_scheduler_admission(server: &Server, admission: serde_json::Value) -> 
             "scheduler admission audit failed: {error}"
         )));
     }
-    Ok(())
+    Ok(SchedulerAdmissionAuditState::Recorded)
+}
+
+fn scheduler_admission_audit_error(
+    result: Result<SchedulerAdmissionAuditState, Resp>,
+) -> Option<String> {
+    match result {
+        Ok(SchedulerAdmissionAuditState::Recorded) => None,
+        Ok(SchedulerAdmissionAuditState::Failed(error)) => Some(error),
+        Err(error) => Some(
+            error
+                .error
+                .unwrap_or_else(|| "scheduler admission audit failed".into()),
+        ),
+    }
 }
 
 fn scheduler_admission_failed_response(
@@ -2622,10 +2698,9 @@ fn scheduler_dispatch_recover_pending(server: &Server, request_id: &str) -> Opti
             "status": "pending",
             "recovery": true,
         });
-        if let Err(error) = record_scheduler_admission(server, audit) {
-            let error = error
-                .error
-                .unwrap_or_else(|| "scheduler admission audit failed".into());
+        if let Some(error) =
+            scheduler_admission_audit_error(ensure_scheduler_admission_audit(server, &audit))
+        {
             server.commit_locked(
                 &mut state,
                 &[Event::SchedulerAdmissionStatus {
@@ -2936,10 +3011,9 @@ pub(crate) fn handle_scheduler_dispatch(
             admission: admission_record,
         });
         server.commit_locked(&mut state, &events);
-        if let Err(error) = record_scheduler_admission(server, admission.clone()) {
-            let error = error
-                .error
-                .unwrap_or_else(|| "scheduler admission audit failed".into());
+        if let Some(error) =
+            scheduler_admission_audit_error(ensure_scheduler_admission_audit(server, &admission))
+        {
             server.commit_locked(
                 &mut state,
                 &[Event::SchedulerAdmissionStatus {
@@ -6084,6 +6158,8 @@ mod ownership_probe_tests {
 mod scheduler_admission_tests {
     use super::*;
     use crate::server::peer_tests::{register, test_server};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -6521,6 +6597,12 @@ mod scheduler_admission_tests {
             replayed.notification_subscriptions[replayed_subscription_id].worker_id,
             "peer"
         );
+        let audit_count = std::fs::read_to_string(root.join(".agent-collab/server/events.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("scheduler_admission") && line.contains("req-ordinary-1"))
+            .count();
+        assert_eq!(audit_count, 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -6738,6 +6820,11 @@ mod scheduler_admission_tests {
             }),
         )
         .unwrap();
+        let audit_path = root.join(".agent-collab/server/events.jsonl");
+        let original_mode = std::fs::metadata(&audit_path).unwrap().permissions().mode();
+        let mut read_only = std::fs::metadata(&audit_path).unwrap().permissions();
+        read_only.set_mode(original_mode & !0o222);
+        std::fs::set_permissions(&audit_path, read_only).unwrap();
         let server = Arc::new(server);
         let recovered = dispatch(
             &server,
@@ -6758,6 +6845,9 @@ mod scheduler_admission_tests {
                 launch_env: Default::default(),
             },
         );
+        let mut restored = std::fs::metadata(&audit_path).unwrap().permissions();
+        restored.set_mode(original_mode);
+        std::fs::set_permissions(&audit_path, restored).unwrap();
         assert!(recovered.ok, "{recovered:?}");
         assert_eq!(recovered.data["recovered"], true);
         assert_eq!(recovered.data["decision"], "use-registered-peer");
@@ -6769,6 +6859,14 @@ mod scheduler_admission_tests {
             "succeeded"
         );
         drop(state);
+        let audit_count = std::fs::read_to_string(root.join(".agent-collab/server/events.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains("scheduler_admission") && line.contains("req-pending-recovery-1")
+            })
+            .count();
+        assert_eq!(audit_count, 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
