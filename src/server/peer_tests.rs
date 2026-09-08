@@ -1,5 +1,5 @@
 use super::*;
-use crate::server::state::{default_priority, is_goal_deadline};
+use crate::server::state::{default_priority, is_goal_deadline, TaskRec};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2765,6 +2765,7 @@ fn recipient_jsonl_records_latest_delivery_and_journal_replay() {
     let projection = read_recipient_mailbox(&path, "recipient").unwrap();
     assert_eq!(projection.records.len(), 3);
     assert!(projection.partial_tail);
+    assert!(projection.unterminated_tail);
     std::fs::write(&path, "{\"bad\":true}\nnot-json\n").unwrap();
     assert!(read_recipient_mailbox(&path, "recipient").is_err());
     std::fs::remove_dir_all(root).ok();
@@ -2847,9 +2848,156 @@ fn recipient_jsonl_accepts_legacy_bare_message_before_new_append() {
 }
 
 #[test]
+fn recipient_jsonl_separates_complete_unterminated_legacy_record() {
+    let (server, root) = test_server();
+    register(&server, "recipient", "%recipient");
+    let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let legacy = Message {
+        id: "legacy-without-newline".into(),
+        from: "sender".into(),
+        to: "recipient".into(),
+        mtype: "notify".into(),
+        subject: Some("progress".into()),
+        body: "complete record without separator".into(),
+        in_reply_to: None,
+        created_ms: now_ms(),
+        state: "pending".into(),
+        wake_attempt_count: 0,
+        last_wake_attempt_ms: 0,
+    };
+    std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "after-legacy-without-newline".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("progress".into()),
+            body: "new record".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    let projection = read_recipient_mailbox(&path, "recipient").unwrap();
+    assert_eq!(projection.records.len(), 2);
+    assert!(!projection.partial_tail);
+    assert!(!projection.unterminated_tail);
+    assert_eq!(
+        projection.records[0]["message"]["id"],
+        "legacy-without-newline"
+    );
+    assert_eq!(
+        projection.records[1]["message"]["id"],
+        "after-legacy-without-newline"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn partial_recipient_tail_is_repaired_before_append_and_replay_preserves_assignment() {
+    let (server, root) = test_server();
+    register(&server, "recipient", "%recipient");
+    server.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "partial-assigned-task".into(),
+            owner: "recipient".into(),
+            created_by: "sender".into(),
+            feature_id: Some("partial-mailbox".into()),
+            worktree_path: None,
+            branch: None,
+            base_commit: Some("partial-base".into()),
+            priority: "p0".into(),
+            status: "working".into(),
+            next_step: Some("replay after restart".into()),
+            wait: None,
+            created_ms: now_ms(),
+            updated_ms: now_ms(),
+        },
+    }]);
+    let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "before-partial".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("progress".into()),
+            body: "before partial tail".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    let mut content = std::fs::read_to_string(&path).unwrap();
+    content.push_str("{\"partial\":");
+    std::fs::write(&path, content).unwrap();
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "after-partial".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("progress".into()),
+            body: "after partial tail".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    let projection = read_recipient_mailbox(&path, "recipient").unwrap();
+    assert_eq!(projection.records.len(), 2);
+    assert!(!projection.partial_tail);
+    assert!(!projection.unterminated_tail);
+    assert_eq!(projection.records[0]["message"]["id"], "before-partial");
+    assert_eq!(projection.records[1]["message"]["id"], "after-partial");
+    drop(server);
+    let replayed = replay(&root).unwrap();
+    assert_eq!(replayed.msgs["before-partial"].state, "pending");
+    assert_eq!(replayed.msgs["after-partial"].state, "pending");
+    assert_eq!(replayed.tasks["partial-assigned-task"].owner, "recipient");
+    assert_eq!(
+        replayed.tasks["partial-assigned-task"]
+            .feature_id
+            .as_deref(),
+        Some("partial-mailbox")
+    );
+    assert_eq!(
+        replayed.tasks["partial-assigned-task"].next_step.as_deref(),
+        Some("replay after restart")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn malformed_recipient_jsonl_does_not_block_future_append_or_journal_replay() {
     let (server, root) = test_server();
     register(&server, "recipient", "%recipient");
+    server.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "assigned-task".into(),
+            owner: "recipient".into(),
+            created_by: "sender".into(),
+            feature_id: Some("mailbox-envelope".into()),
+            worktree_path: None,
+            branch: None,
+            base_commit: Some("base-commit".into()),
+            priority: "p0".into(),
+            status: "working".into(),
+            next_step: Some("consume mailbox".into()),
+            wait: None,
+            created_ms: now_ms(),
+            updated_ms: now_ms(),
+        },
+    }]);
     let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "{\"bad\":true}\n").unwrap();
@@ -2870,12 +3018,24 @@ fn malformed_recipient_jsonl_does_not_block_future_append_or_journal_replay() {
     }]);
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(content.lines().any(|line| line.contains("after-malformed")));
+    assert!(!content.lines().any(|line| line == "{\"bad\":true}"));
+    let projection = read_recipient_mailbox(&path, "recipient").unwrap();
+    assert_eq!(projection.records.len(), 1);
+    assert_eq!(projection.records[0]["message"]["id"], "after-malformed");
     assert!(
         std::fs::read_to_string(root.join(".agent-collab/server/log.txt"))
             .unwrap()
             .contains("MAILBOX_JSONL_RECOVERABLE")
     );
-    assert_eq!(replay(&root).unwrap().msgs["after-malformed"].state, "pending");
+    drop(server);
+    let replayed = replay(&root).unwrap();
+    assert_eq!(replayed.msgs["after-malformed"].state, "pending");
+    let assignment = &replayed.tasks["assigned-task"];
+    assert_eq!(assignment.owner, "recipient");
+    assert_eq!(assignment.feature_id.as_deref(), Some("mailbox-envelope"));
+    assert_eq!(assignment.base_commit.as_deref(), Some("base-commit"));
+    assert_eq!(assignment.status, "working");
+    assert_eq!(assignment.next_step.as_deref(), Some("consume mailbox"));
     std::fs::remove_dir_all(root).ok();
 }
 

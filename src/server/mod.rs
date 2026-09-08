@@ -265,14 +265,28 @@ impl Server {
                     file.set_len(valid_len as u64)
                         .map_err(|error| format!("truncate partial mailbox: {error}"))?;
                 }
+                Ok(projection) if projection.unterminated_tail => {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&jsonl_path)
+                        .map_err(|error| format!("open unterminated mailbox: {error}"))?;
+                    use std::io::Write;
+                    file.write_all(b"\n")
+                        .map_err(|error| format!("terminate mailbox record: {error}"))?;
+                    file.sync_data()
+                        .map_err(|error| format!("sync mailbox separator: {error}"))?;
+                }
                 Ok(_) => {}
                 Err(error) => {
                     // Journal state is authoritative. A projection error is
                     // queryable and recoverable; it must not prevent a later
                     // durable message from being appended to the mailbox.
+                    let truncated = recover_malformed_mailbox_tail(&jsonl_path, &msg.to)?;
                     append_log(
                         &self.log_path(),
-                        &format!("MAILBOX_JSONL_RECOVERABLE: {error}"),
+                        &format!(
+                            "MAILBOX_JSONL_RECOVERABLE: {error}; malformed_tail_truncated={truncated}"
+                        ),
                     );
                 }
             }
@@ -524,6 +538,7 @@ fn batch_notification_text(
 struct RecipientMailboxRead {
     records: Vec<serde_json::Value>,
     partial_tail: bool,
+    unterminated_tail: bool,
 }
 
 fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailboxRead, String> {
@@ -548,7 +563,48 @@ fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailb
     Ok(RecipientMailboxRead {
         records,
         partial_tail,
+        unterminated_tail: has_unterminated_tail,
     })
+}
+
+fn recover_malformed_mailbox_tail(path: &Path, recipient: &str) -> Result<bool, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("read malformed mailbox: {error}"))?;
+    let mut valid_len = 0usize;
+    let mut offset = 0usize;
+    for segment in content.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let record_result = serde_json::from_str::<serde_json::Value>(line)
+            .map_err(|error| format!("malformed JSONL record: {error}"))
+            .and_then(|record| normalize_mailbox_record(record, recipient, 0));
+        match record_result {
+            Ok(_) => valid_len = offset + segment.len(),
+            Err(error) => {
+                if content[offset + segment.len()..].trim().is_empty() {
+                    let file = std::fs::OpenOptions::new().write(true).open(path).map_err(
+                        |open_error| format!("open malformed mailbox for truncation: {open_error}"),
+                    )?;
+                    file.set_len(valid_len as u64).map_err(|truncate_error| {
+                        format!("truncate malformed mailbox: {truncate_error}")
+                    })?;
+                    return Ok(true);
+                }
+                return Err(error);
+            }
+        }
+        offset += segment.len();
+    }
+    if offset < content.len() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("open malformed mailbox for truncation: {error}"))?;
+        file.set_len(valid_len as u64)
+            .map_err(|error| format!("truncate malformed mailbox: {error}"))?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn normalize_mailbox_record(
