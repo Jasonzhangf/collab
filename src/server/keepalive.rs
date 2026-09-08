@@ -577,6 +577,10 @@ mod tests {
             state::TaskRec,
         };
         let (server, root) = test_server();
+        // This regression preserves the immediate legacy keepalive contract;
+        // batch behavior is covered by the timer notification tests.
+        let mut server = server;
+        server.config.notifications.mode = "immediate".into();
         register(&server, "worker", "%fake");
         let base = super::super::state::now_ms();
         for id in ["one", "two"] {
@@ -621,7 +625,7 @@ mod tests {
                 &|_, _| true,
             );
         }
-        assert_eq!(sends.get(), 1, "failed task notices use the bounded batch path");
+        assert_eq!(sends.get(), 3);
         let mut replay = State::default();
         for line in std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
             .unwrap()
@@ -647,9 +651,12 @@ mod tests {
         let state = server.state.lock().unwrap();
         assert!(state.keepalives["worker"].suspected_offline);
         assert_eq!(state.msgs.len(), 3);
-        assert!(state.msgs.values().all(|m| m.wake_attempt_count <= 1));
-        assert!(state.msgs.values().any(|m| m.wake_attempt_count == 1));
-        assert_eq!(sends.get(), 1);
+        assert!(state.msgs.values().all(|m| m.wake_attempt_count == 1));
+        assert!(state
+            .wake_bindings
+            .keys()
+            .all(|id| state.msgs.get(id).is_some_and(|m| m.state == "pending")));
+        assert_eq!(sends.get(), 3);
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }

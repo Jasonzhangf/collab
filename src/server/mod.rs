@@ -237,22 +237,18 @@ impl Server {
         use std::io::Write;
         let subject = msg.subject.as_deref().unwrap_or("notice");
         let (priority, action) = notification_class(subject);
-        let task_ids = msg.body.split_whitespace()
-            .filter(|token| token.starts_with("task-"))
-            .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
-            .filter(|token| !token.is_empty())
-            .collect::<std::collections::BTreeSet<_>>();
         let record = json!({
             "schema_version": 1,
             "record_type": "message",
             "recipient": msg.to,
-            "category": subject,
+            "category": semantic_notification_category(subject, &msg.mtype),
             "priority": priority,
             "action": action,
-            "task_ids": task_ids,
+            "task_ids": [],
             "created_ms": msg.created_ms,
-            "window_start_ms": msg.created_ms,
-            "window_end_ms": msg.created_ms.saturating_add(120_000),
+            "window_start_ms": serde_json::Value::Null,
+            "window_end_ms": serde_json::Value::Null,
+            "window_source": "not-attached-to-message-event",
             "state": msg.state,
             "exact_error": serde_json::Value::Null,
             "message": msg,
@@ -393,6 +389,29 @@ fn notification_class(subject: &str) -> (&'static str, &'static str) {
         return ("P2", "note it and go straight back to your current task");
     }
     ("P1", "do the in-scope action the message asks for")
+}
+
+fn semantic_notification_category(subject: &str, mtype: &str) -> &'static str {
+    if subject.starts_with("master-idle") || subject.starts_with("worker-idle") {
+        return "idle";
+    }
+    if subject.starts_with("task-keepalive")
+        || subject.starts_with("subagent-status")
+        || subject.starts_with("progress")
+        || subject.starts_with("delivery")
+    {
+        return "progress";
+    }
+    if subject.starts_with("resource")
+        || subject.starts_with("deadline")
+        || subject.starts_with("worker-unresponsive")
+    {
+        return "system";
+    }
+    if mtype == "notify" {
+        return "direct";
+    }
+    "system"
 }
 
 /// A notification is an interrupt, not the turn's goal. Without an explicit

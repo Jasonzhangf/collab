@@ -2184,11 +2184,11 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
             .map(|record| record["schema_version"] == 1
                 && record["record_type"] == "message"
                 && record["recipient"] == "recipient"
-                && record["category"] == "occupied"
+                && record["category"] == "direct"
                 && record["task_ids"].is_array()
                 && record["created_ms"].is_i64()
-                && record["window_start_ms"].is_i64()
-                && record["window_end_ms"].is_i64()
+                && record["window_start_ms"].is_null()
+                && record["window_end_ms"].is_null()
                 && record["state"] == "pending"
                 && record["exact_error"].is_null()
                 && record["message"]["id"] == message_id)
@@ -2287,8 +2287,8 @@ fn recipient_jsonl_records_latest_delivery_and_journal_replay() {
         assert_eq!(record["category"], "progress");
         assert!(record["task_ids"].is_array());
         assert!(record["created_ms"].is_i64());
-        assert!(record["window_start_ms"].is_i64());
-        assert!(record["window_end_ms"].is_i64());
+        assert!(record["window_start_ms"].is_null());
+        assert!(record["window_end_ms"].is_null());
         assert!(record["exact_error"].is_null());
     }
     assert_eq!(records.last().unwrap()["message"]["state"], "read");
