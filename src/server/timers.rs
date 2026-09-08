@@ -93,9 +93,16 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
             let next_trigger = subscription
                 .interval_ms
                 .map(|interval| {
-                    subscription
+                    let trigger = subscription
                         .trigger_ms
-                        .unwrap_or(subscription.created_ms.saturating_add(interval))
+                        .unwrap_or(subscription.created_ms.saturating_add(interval));
+                    if subscription.event == "master-idle" {
+                        trigger
+                    } else {
+                        trigger.saturating_add(
+                            interval.saturating_mul(subscription.fired_count as i64),
+                        )
+                    }
                 })
                 .or_else(|| {
                     subscription
@@ -1154,16 +1161,16 @@ mod tests {
 
         let id4 = bind_message_with_id(&server, "ack-worker", &sub, "msg-ack-4");
 
-        assert!(super::super::attempt_notification_with_default(
+        assert!(!super::super::attempt_notification_with_default(
             &server,
             &id4,
             &sub,
             &|_| true,
-            &|_, _| true,
+            &|_, _| panic!("unacked notification limit must defer delivery"),
         ));
         assert_eq!(
             server.state.lock().unwrap().msgs[&id4].wake_attempt_count,
-            1
+            0
         );
 
         server.commit(&[Event::Acked { ids: msg_ids }]);
@@ -1176,6 +1183,18 @@ mod tests {
                 .values()
                 .filter(|m| m.to == "ack-worker" && m.state == "delivered")
                 .count(),
+            0
+        );
+
+        assert!(super::super::attempt_notification_with_default(
+            &server,
+            &id4,
+            &sub,
+            &|_| true,
+            &|_, _| true,
+        ));
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&id4].wake_attempt_count,
             1
         );
 
