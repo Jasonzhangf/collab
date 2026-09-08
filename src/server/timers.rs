@@ -97,10 +97,16 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                         .trigger_ms
                         .unwrap_or(subscription.created_ms.saturating_add(interval))
                 })
-                .or_else(|| subscription.trigger_times_ms.get(subscription.fired_count as usize).copied())
+                .or_else(|| {
+                    subscription
+                        .trigger_times_ms
+                        .get(subscription.fired_count as usize)
+                        .copied()
+                })
                 .or(subscription.trigger_ms);
             let master_idle_ready = if subscription.event == "master-idle" {
-                super::live_master_id(server, &state).as_deref() == Some(subscription.worker_id.as_str())
+                super::live_master_id(server, &state).as_deref()
+                    == Some(subscription.worker_id.as_str())
                     && state
                         .keepalives
                         .get(&subscription.worker_id)
@@ -839,33 +845,19 @@ mod tests {
     }
 
     #[test]
-    fn master_idle_subscription_accepts_60_minute_interval_without_worker_wake() {
+    fn master_idle_subscription_accepts_60_minute_interval_and_wakes_master() {
         let (server, root) = test_server();
         register_master(&server);
         let subscription_id = master_idle_subscription(&server, 60 * 60 * 1000);
-        register(&server, "worker");
-        server.commit(&[Event::NotificationSubscribed {
-            subscription: NotificationSubscription {
-                id: "sub-worker-idle".into(),
-                worker_id: "worker".into(),
-                event: "master-idle".into(),
-                subject: Some("master-idle".into()),
-                pane: "%test-worker".into(),
-                method: "tmux".into(),
-                trigger_ms: Some(now_ms() - 1),
-                trigger_times_ms: Vec::new(),
-                interval_ms: Some(60 * 60 * 1000),
-                repeat_count: 1,
-                fired_count: 0,
-                expires_ms: now_ms() + 86_400_000,
-                status: "armed".into(),
-                created_ms: now_ms() - 60 * 60 * 1000,
-                updated_ms: now_ms(),
-            },
-        }]);
 
         tick_with_idle(&server, &|_| false);
         let state = server.state.lock().unwrap();
+        let master_wakes = state
+            .wake_bindings
+            .values()
+            .filter(|bound| *bound == &subscription_id)
+            .count();
+        assert_eq!(master_wakes, 1, "60-minute master wake must be non-vacuous");
         assert!(state
             .wake_bindings
             .values()

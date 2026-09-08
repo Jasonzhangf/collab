@@ -941,7 +941,8 @@ fn handle_notification_subscribe(
             "direct-message subscription must not specify a subject"
         });
     }
-    if event != "deadline" && event != "master-idle"
+    if event != "deadline"
+        && event != "master-idle"
         && (trigger_ms.is_some()
             || !trigger_times_ms.is_empty()
             || interval_ms.is_some()
@@ -1092,10 +1093,10 @@ fn handle_notification_unsubscribe(
         return Resp::err("only the subscription owner may unsubscribe");
     }
     let mut events = vec![Event::NotificationStatus {
-            subscription_id: subscription_id.clone(),
-            status: "cancelled".into(),
-            updated_ms: now_ms(),
-        }];
+        subscription_id: subscription_id.clone(),
+        status: "cancelled".into(),
+        updated_ms: now_ms(),
+    }];
     let pending = state
         .wake_bindings
         .iter()
