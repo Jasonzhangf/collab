@@ -2272,6 +2272,40 @@ fn recipient_jsonl_records_latest_delivery_and_journal_replay() {
     assert_eq!(records.len(), 3, "Sent/Delivered/Acked append snapshots");
     assert_eq!(records.last().unwrap()["message"]["state"], "read");
     assert_eq!(replay(&root).unwrap().msgs[id].state, "read");
+    let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    std::fs::write(&path, format!("{}{{\"partial\":", std::fs::read_to_string(&path).unwrap())).unwrap();
+    assert_eq!(read_recipient_mailbox(&path).unwrap().len(), 3);
+    std::fs::write(&path, "{\"bad\":true}\nnot-json\n").unwrap();
+    assert!(read_recipient_mailbox(&path).is_err());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn recipient_jsonl_failure_is_logged_without_panicking() {
+    let (server, root) = test_server();
+    register(&server, "recipient", "%recipient");
+    std::fs::create_dir_all(root.join(".agent-collab/mailbox/recipient-recipient.jsonl")).unwrap();
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "jsonl-failure".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("failure".into()),
+            body: "preserve journal truth".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    assert!(std::fs::read_to_string(root.join(".agent-collab/server/log.txt"))
+        .unwrap()
+        .contains("MAILBOX_JSONL_WRITE_FAILED"));
+    assert_eq!(replay(&root).unwrap().msgs["jsonl-failure"].state, "pending");
     std::fs::remove_dir_all(root).ok();
 }
 

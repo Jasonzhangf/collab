@@ -181,19 +181,25 @@ impl Server {
         for ev in evs {
             st.apply(ev);
             if let Event::Sent { msg } = ev {
-                self.backup_message(msg);
+                    if let Err(error) = self.backup_message(msg) {
+                        append_log(&self.log_path(), &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"));
+                    }
             }
             if let Event::Delivered { ids } = ev {
                 for id in ids {
                     if let Some(msg) = st.msgs.get(id) {
-                        self.backup_message(msg);
+                        if let Err(error) = self.backup_message(msg) {
+                            append_log(&self.log_path(), &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"));
+                        }
                     }
                 }
             }
             if let Event::Acked { ids } = ev {
                 for id in ids {
                     if let Some(msg) = st.msgs.get(id) {
-                        self.backup_message(msg);
+                        if let Err(error) = self.backup_message(msg) {
+                            append_log(&self.log_path(), &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"));
+                        }
                     }
                 }
             }
@@ -203,9 +209,9 @@ impl Server {
         }
     }
 
-    fn backup_message(&self, msg: &Message) {
+    fn backup_message(&self, msg: &Message) -> Result<(), String> {
         let dir = self.root.join(".agent-collab").join("mailbox");
-        let _ = std::fs::create_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|error| format!("create directory: {error}"))?;
         let path = dir.join(format!("{}.json", msg.id));
         if let Ok(data) = serde_json::to_string_pretty(msg) {
             let _ = std::fs::write(&path, data);
@@ -214,7 +220,7 @@ impl Server {
             .create(true)
             .append(true)
             .open(dir.join(format!("recipient-{}.jsonl", msg.to)))
-            .expect("recipient mailbox JSONL open failed");
+            .map_err(|error| format!("open: {error}"))?;
         use std::io::Write;
         let record = json!({
             "schema_version": 1,
@@ -222,10 +228,11 @@ impl Server {
             "recipient": msg.to,
             "message": msg,
         });
-        let data = serde_json::to_string(&record).expect("recipient mailbox JSONL serialize failed");
-        file.write_all(data.as_bytes()).expect("recipient mailbox JSONL append failed");
-        file.write_all(b"\n").expect("recipient mailbox JSONL newline failed");
-        file.sync_data().expect("recipient mailbox JSONL sync failed");
+        let data = serde_json::to_string(&record).map_err(|error| format!("serialize: {error}"))?;
+        file.write_all(data.as_bytes()).map_err(|error| format!("append: {error}"))?;
+        file.write_all(b"\n").map_err(|error| format!("newline: {error}"))?;
+        file.sync_data().map_err(|error| format!("sync: {error}"))?;
+        Ok(())
     }
 
     fn rewrite_journal_locked(&self, st: &State) {
@@ -392,6 +399,22 @@ fn batch_notification_text(
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(",");
     let older = (remaining > 0).then(|| format!(" older_messages={remaining}; run collab inbox")).unwrap_or_default();
     format!("Batch wake: message_ids={message_ids} task_ids={} action_categories={actions}. Read full durable details from collab inbox; execute the actions, do not ACK-only.{older}", if task_ids.is_empty() { "none" } else { &task_ids })
+}
+
+#[cfg(test)]
+fn read_recipient_mailbox(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+    let content = std::fs::read_to_string(path).map_err(|error| format!("read: {error}"))?;
+    let lines = content.lines().collect::<Vec<_>>();
+    let partial_tail = !content.ends_with('\n');
+    let mut records = Vec::new();
+    for (index, line) in lines.into_iter().enumerate() {
+        match serde_json::from_str(line) {
+            Ok(record) => records.push(record),
+            Err(_error) if partial_tail && index + 1 == content.lines().count() => break,
+            Err(error) => return Err(format!("malformed JSONL record {}: {error}", index + 1)),
+        }
+    }
+    Ok(records)
 }
 
 /// Shared wake text for every channel. Keepalive and message delivery must not
@@ -2763,10 +2786,6 @@ fn handle_task_close(
                 Event::WakeBound {
                     message_id: message_id.clone(),
                     subscription_id: subscription.id.clone(),
-                },
-                Event::DeliveryMode {
-                    msg_id: message_id.clone(),
-                    mode: "explicit-notification".into(),
                 },
             ]);
             subscribed_notifications.push((message_id, subscription.id));
