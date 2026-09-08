@@ -784,7 +784,12 @@ fn attempt_notification_with_at(
         (recipient, pane, delay, worker_pane, explicit)
     };
 
-    let presence = (server.pane_alive_check)(&pane);
+    let worker_pane_mismatch = worker_pane.as_deref() != Some(&pane);
+    let presence = if worker_pane_mismatch {
+        PanePresence::Missing
+    } else {
+        (server.pane_alive_check)(&pane)
+    };
     if presence == PanePresence::Unknown {
         return false;
     }
@@ -804,9 +809,7 @@ fn attempt_notification_with_at(
     };
 
     let mut state = server.state.lock().unwrap();
-    let worker_pane_mismatch = worker_pane.as_deref() != Some(&pane);
-    if worker_pane.is_none()
-        || worker_pane_mismatch
+    if worker_pane_mismatch
         || !alive
         || !owned
         || state_probe == crate::server::knock::AgentState::Absent
@@ -1386,18 +1389,20 @@ fn handle_notification_subscribe(
     if let Err(error) = verify(&state, &worker_id, &token) {
         return error;
     }
-    let live_master = live_master_id(server, &state);
-    if event == "deadline" && live_master.as_deref() != Some(worker_id.as_str()) {
-        return Resp::err(if live_master.is_some() {
-            "master authority required for deadline subscriptions"
-        } else {
-            "no live master; deadline subscriptions require an approved live master"
-        });
-    }
-    if event == "master-idle"
-        && live_master_id(server, &state).as_deref() != Some(worker_id.as_str())
-    {
-        return Resp::err("master-idle subscription requires the live registered master");
+    if matches!(event.as_str(), "deadline" | "master-idle") {
+        let live_master = match live_master_id(server, &state) {
+            Ok(master) => master,
+            Err(error) => return Resp::err(error),
+        };
+        if live_master.as_deref() != Some(worker_id.as_str()) {
+            return Resp::err(if event == "master-idle" {
+                "master-idle subscription requires the live registered master"
+            } else if live_master.is_some() {
+                "master authority required for deadline subscriptions"
+            } else {
+                "no live master; deadline subscriptions require an approved live master"
+            });
+        }
     }
     let Some(pane) = state.worker_pane(&worker_id) else {
         return Resp::err("notification subscription requires a registered tmux pane");
@@ -2114,13 +2119,38 @@ fn role_brief(state: &State, worker_id: &str) -> serde_json::Value {
     })
 }
 
-pub(crate) fn live_master_id(server: &Server, state: &State) -> Option<String> {
-    let worker_id = state.master_worker_id.as_deref()?;
-    let worker = state.workers.get(worker_id)?;
-    let pane = worker.pane.as_deref()?;
-    ((server.pane_alive_check)(pane) == PanePresence::Present
-        && (server.pane_owner_check)(worker_id, pane) == Ok(true))
-    .then(|| worker_id.to_string())
+fn worker_identity_presence(server: &Server, worker: &WorkerRec) -> PanePresence {
+    let Some(pane) = worker.pane.as_deref() else {
+        return PanePresence::Missing;
+    };
+    match (server.pane_alive_check)(pane) {
+        PanePresence::Present => match (server.pane_owner_check)(&worker.id, pane) {
+            Ok(true) => PanePresence::Present,
+            Ok(false) => PanePresence::Missing,
+            Err(()) => PanePresence::Unknown,
+        },
+        presence => presence,
+    }
+}
+
+pub(crate) fn live_master_id(
+    server: &Server,
+    state: &State,
+) -> Result<Option<String>, &'static str> {
+    let Some(worker) = state
+        .master_worker_id
+        .as_ref()
+        .and_then(|id| state.workers.get(id))
+    else {
+        return Ok(None);
+    };
+    match worker_identity_presence(server, worker) {
+        PanePresence::Present => Ok(Some(worker.id.clone())),
+        PanePresence::Missing => Ok(None),
+        PanePresence::Unknown => {
+            Err("master identity is unknown; defer authority changes until pane probes succeed")
+        }
+    }
 }
 
 fn is_managed_subagent(state: &State, worker_id: &str) -> bool {
@@ -2145,13 +2175,14 @@ fn verify_master_actor(
         ));
     }
     match live_master_id(server, state) {
-        Some(master) if master == worker_id => Ok(()),
-        Some(_) => Err(Resp::err(
+        Ok(Some(master)) if master == worker_id => Ok(()),
+        Ok(Some(_)) => Err(Resp::err(
             "master authority required; ask the registered master to delegate",
         )),
-        None => Err(Resp::err(
+        Ok(None) => Err(Resp::err(
             "no live master; a peer may promote itself only with explicit user approval",
         )),
+        Err(error) => Err(Resp::err(error)),
     }
 }
 
@@ -2171,15 +2202,19 @@ fn handle_master_promote(
     if approval.trim().is_empty() {
         return Resp::err("master promotion requires explicit user approval");
     }
-    if live_master_id(server, &state).is_some() {
-        return Resp::err("master already exists; only the registered master may delegate");
+    match live_master_id(server, &state) {
+        Ok(Some(_)) => {
+            return Resp::err("master already exists; only the registered master may delegate")
+        }
+        Err(error) => return Resp::err(error),
+        Ok(None) => {}
     }
-    if worker
-        .pane
-        .as_deref()
-        .is_none_or(|pane| (server.pane_alive_check)(pane) != PanePresence::Present)
-    {
-        return Resp::err("master promotion requires a live tmux pane");
+    match worker_identity_presence(server, &worker) {
+        PanePresence::Present => {}
+        PanePresence::Missing => return Resp::err("master promotion requires a live tmux pane"),
+        PanePresence::Unknown => return Resp::err(
+            "promotion candidate identity is unknown; defer promotion until pane probes succeed",
+        ),
     }
     server.commit_locked(
         &mut state,
@@ -2210,12 +2245,16 @@ fn handle_master_delegate(
     let Some(target) = state.workers.get(&target_id) else {
         return Resp::err(format!("target worker {} not registered", target_id));
     };
-    if target
-        .pane
-        .as_deref()
-        .is_none_or(|pane| (server.pane_alive_check)(pane) != PanePresence::Present)
-    {
-        return Resp::err("master delegation requires a live target tmux pane");
+    match worker_identity_presence(server, target) {
+        PanePresence::Present => {}
+        PanePresence::Missing => {
+            return Resp::err("master delegation requires a live target tmux pane")
+        }
+        PanePresence::Unknown => {
+            return Resp::err(
+                "delegation target identity is unknown; defer delegation until pane probes succeed",
+            )
+        }
     }
     server.commit_locked(
         &mut state,
@@ -2340,7 +2379,15 @@ fn master_assignment_view(
 
 fn handle_master_status(server: &Server) -> Resp {
     let state = server.state.lock().unwrap();
-    let live = live_master_id(server, &state);
+    let live = match live_master_id(server, &state) {
+        Ok(master) => master,
+        Err(error) => {
+            return Resp::err_data(
+                error,
+                json!({"status": "unknown", "recorded_worker_id": state.master_worker_id}),
+            )
+        }
+    };
     let master = live
         .as_ref()
         .map(|id| master_assignment_view(&state, id, true));
@@ -2548,7 +2595,11 @@ fn handle_cross_project_send(
         );
     }
     let mut st = server.state.lock().unwrap();
-    if live_master_id(server, &st).as_deref() != Some(to.as_str()) {
+    let live_master = match live_master_id(server, &st) {
+        Ok(master) => master,
+        Err(error) => return Resp::err(error),
+    };
+    if live_master.as_deref() != Some(to.as_str()) {
         return Resp::err("cross-project communication requires the target to be a live master");
     }
     let Some(recipient) = st.workers.get(&to) else {
@@ -3166,7 +3217,10 @@ fn handle_task_close(
         let Some(reason) = reason else {
             return Resp::err("force close requires a non-empty --reason");
         };
-        let live_master = live_master_id(server, &st);
+        let live_master = match live_master_id(server, &st) {
+            Ok(master) => master,
+            Err(error) => return Resp::err(error),
+        };
         let owner_identity_live = st
             .workers
             .get(&task.owner)
@@ -3478,7 +3532,10 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         "tasks": tasks,
         "inbox": {"unread": unread.len()},
         "next_actions": next_actions,
-        "master": live_master_id(server, &st).map(|id| json!({"worker_id": id})),
+        "master": match live_master_id(server, &st) {
+            Ok(master) => master.map(|id| json!({"worker_id": id})),
+            Err(error) => Some(json!({"status": "unknown", "error": error})),
+        },
         "authority": {
             "managed_subagent": managed,
             "must_obey_master": managed,
@@ -3653,7 +3710,11 @@ fn worker_status_summary_with_maps(
         .map(server.pane_alive_check)
         .unwrap_or(PanePresence::Missing);
     let endpoint_live = presence == PanePresence::Present;
-    let ownership = pane.map(|p| (server.pane_owner_check)(&w.id, p));
+    let ownership = if endpoint_live {
+        pane.map(|p| (server.pane_owner_check)(&w.id, p))
+    } else {
+        None
+    };
     let identity_valid = endpoint_live && ownership == Some(Ok(true));
     let agent_state = if endpoint_live && identity_valid {
         pane.map(|p| match (server.pane_state_check)(p) {
@@ -3680,7 +3741,9 @@ fn worker_status_summary_with_maps(
     let keepalive = keepalives.get(&w.id);
     let suspected_offline = keepalive.map(|k| k.suspected_offline).unwrap_or(false);
     let unacked_keepalives = keepalive.map(|k| k.unacked).unwrap_or(0);
-    let status = if !endpoint_live {
+    let status = if agent_state == "unknown" {
+        "unknown"
+    } else if !endpoint_live {
         "lost"
     } else if !identity_valid {
         "identity-mismatch"
@@ -3689,7 +3752,9 @@ fn worker_status_summary_with_maps(
     } else {
         agent_state
     };
-    let diagnostic = if status == "lost" {
+    let diagnostic = if status == "unknown" {
+        None
+    } else if status == "lost" {
         Some("pane dead or not found; clean up task or restart pane")
     } else if status == "identity-mismatch" {
         Some("pane re-bound or owned by different process; verify pane ownership")
@@ -3702,8 +3767,13 @@ fn worker_status_summary_with_maps(
         "id": w.id,
         "pane": w.pane,
         "status": status,
-        "endpoint_live": endpoint_live,
-        "identity_valid": identity_valid,
+        "presence": match presence {
+            PanePresence::Present => "present",
+            PanePresence::Missing => "missing",
+            PanePresence::Unknown => "unknown",
+        },
+        "endpoint_live": (presence != PanePresence::Unknown).then_some(endpoint_live),
+        "identity_valid": (presence != PanePresence::Unknown && ownership != Some(Err(()))).then_some(identity_valid),
         "agent_state": agent_state,
         "unacked_notifications": unacked_notifications,
         "pending_notifications": pending_notifications,
@@ -4581,6 +4651,160 @@ pub(crate) mod peer_tests;
 #[cfg(test)]
 mod ownership_probe_tests {
     use super::*;
+
+    #[test]
+    fn unknown_worker_status_does_not_claim_lost_or_advise_cleanup() {
+        for failure in ["presence", "ownership", "agent"] {
+            let (mut server, root) = peer_tests::test_server();
+            peer_tests::register(&server, "worker", "%worker");
+            match failure {
+                "presence" => server.pane_alive_check = |_| PanePresence::Unknown,
+                "ownership" => server.pane_owner_check = |_, _| Err(()),
+                _ => server.pane_state_check = |_| knock::AgentState::Unknown,
+            }
+            let mut state = server.state.lock().unwrap();
+            state.keepalives.insert(
+                "worker".into(),
+                keepalive::Record {
+                    suspected_offline: true,
+                    ..Default::default()
+                },
+            );
+            let view = worker_status_summary_with_maps(
+                &server,
+                &state.tasks,
+                &state.msgs,
+                &state.keepalives,
+                &state.workers["worker"],
+            );
+            assert_eq!(view["status"], "unknown", "{failure}: {view}");
+            assert!(view["diagnostic"].is_null(), "{failure}: {view}");
+            if failure == "presence" {
+                assert_eq!(view["presence"], "unknown");
+                assert!(view["endpoint_live"].is_null());
+            }
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn unknown_master_blocks_promotion_and_delegation_without_reassignment() {
+        for failure in ["presence", "ownership"] {
+            let (mut server, root) = peer_tests::test_server();
+            peer_tests::register(&server, "master", "%master");
+            peer_tests::register(&server, "peer", "%peer");
+            assert!(
+                handle_master_promote(
+                    &server,
+                    "master".into(),
+                    "token-master".into(),
+                    "approved".into()
+                )
+                .ok
+            );
+            match failure {
+                "presence" => {
+                    server.pane_alive_check = |pane| {
+                        if pane == "%master" {
+                            PanePresence::Unknown
+                        } else {
+                            PanePresence::Present
+                        }
+                    }
+                }
+                _ => {
+                    server.pane_owner_check = |worker, _| {
+                        if worker == "master" {
+                            Err(())
+                        } else {
+                            Ok(true)
+                        }
+                    }
+                }
+            }
+            let promoted = handle_master_promote(
+                &server,
+                "peer".into(),
+                "token-peer".into(),
+                "approved".into(),
+            );
+            assert!(!promoted.ok, "{failure}: {promoted:?}");
+            assert!(promoted.error.unwrap().contains("unknown"));
+            let delegated = handle_master_delegate(
+                &server,
+                "master".into(),
+                "token-master".into(),
+                "peer".into(),
+            );
+            assert!(!delegated.ok);
+            assert!(delegated.error.unwrap().contains("unknown"));
+            let status = handle_master_status(&server);
+            assert!(!status.ok);
+            assert_eq!(status.data["status"], "unknown");
+            assert!(status.data.get("recorded_unusable").is_none());
+            assert_eq!(
+                server.state.lock().unwrap().master_worker_id.as_deref(),
+                Some("master")
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn unknown_candidate_identity_blocks_promotion_and_delegation_explicitly() {
+        for failure in ["presence", "ownership"] {
+            let (mut server, root) = peer_tests::test_server();
+            peer_tests::register(&server, "master", "%master");
+            peer_tests::register(&server, "peer", "%peer");
+            match failure {
+                "presence" => {
+                    server.pane_alive_check = |pane| {
+                        if pane == "%peer" {
+                            PanePresence::Unknown
+                        } else {
+                            PanePresence::Present
+                        }
+                    }
+                }
+                _ => {
+                    server.pane_owner_check =
+                        |worker, _| if worker == "peer" { Err(()) } else { Ok(true) }
+                }
+            }
+            let promoted = handle_master_promote(
+                &server,
+                "peer".into(),
+                "token-peer".into(),
+                "approved".into(),
+            );
+            assert!(!promoted.ok, "{failure}: {promoted:?}");
+            assert!(promoted.error.unwrap().contains("unknown"));
+            assert!(server.state.lock().unwrap().master_worker_id.is_none());
+            assert!(
+                handle_master_promote(
+                    &server,
+                    "master".into(),
+                    "token-master".into(),
+                    "approved".into()
+                )
+                .ok
+            );
+            let delegated = handle_master_delegate(
+                &server,
+                "master".into(),
+                "token-master".into(),
+                "peer".into(),
+            );
+            assert!(!delegated.ok, "{failure}: {delegated:?}");
+            assert!(delegated.error.unwrap().contains("unknown"));
+            assert_eq!(
+                server.state.lock().unwrap().master_worker_id.as_deref(),
+                Some("master")
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn ownership_command_errors_are_unknown_and_success_is_parsed_strictly() {

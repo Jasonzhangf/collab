@@ -49,7 +49,9 @@ fn observed_label(agent: AgentState) -> &'static str {
 }
 
 fn managed_subagent_target(state: &State, server: &Server) -> Option<String> {
-    let target = super::live_master_id(server, state)?;
+    let Ok(Some(target)) = super::live_master_id(server, state) else {
+        return None;
+    };
     let worker = state.workers.get(&target)?;
     let pane = worker.pane.as_deref()?;
     ((server.pane_alive_check)(pane) == super::knock::PanePresence::Present
@@ -313,7 +315,7 @@ pub(crate) fn tick_with(
                     worker_id: worker.id.clone(),
                     record,
                 }];
-                if let Some(master_id) = super::live_master_id(server, &state) {
+                if let Ok(Some(master_id)) = super::live_master_id(server, &state) {
                     if master_id != worker.id {
                         let alert_id = super::gen_msg_id();
                         events.push(Event::Sent {
@@ -396,8 +398,11 @@ pub(crate) fn tick_with(
             if new_idle_reason {
                 record.idle_episode_reason = idle_reason.into();
             }
-            let is_live_master = super::live_master_id(server, &state)
-                .is_some_and(|master_id| master_id == worker.id);
+            let master = match super::live_master_id(server, &state) {
+                Ok(master) => master,
+                Err(_) => continue,
+            };
+            let is_live_master = master.as_deref() == Some(worker.id.as_str());
             let idle_notification_due = if is_live_master {
                 is_idle
                     && record.idle_episode_notices < 3
@@ -408,7 +413,7 @@ pub(crate) fn tick_with(
                 is_idle && was_working && record.idle_episode_notices == 0
             };
             if idle_notification_due {
-                if let Some(master_id) = super::live_master_id(server, &state) {
+                if let Some(master_id) = master {
                     if master_id == worker.id {
                         if let Some(sub) =
                             state.matching_subscription(&worker.id, "direct-message", None, now)
@@ -518,7 +523,7 @@ pub(crate) fn tick_with(
             server.config.keepalive.max_unacked,
         );
         if !old.suspected_offline && record.suspected_offline {
-            if let Some(master_id) = super::live_master_id(server, &state) {
+            if let Ok(Some(master_id)) = super::live_master_id(server, &state) {
                 if master_id != worker.id {
                     let alert_id = super::gen_msg_id();
                     let mut alert_events = vec![Event::Sent {

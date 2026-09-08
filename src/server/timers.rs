@@ -36,6 +36,10 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
     let mut lost_sub_ids = Vec::new();
     let mut unknown_sub_ids = Vec::new();
     for (id, worker_id, pane, current_worker_pane) in checks {
+        if current_worker_pane.as_deref() != Some(&pane) {
+            lost_sub_ids.push(id);
+            continue;
+        }
         let presence = (server.pane_alive_check)(&pane);
         if presence == super::knock::PanePresence::Unknown {
             unknown_sub_ids.push(id);
@@ -57,8 +61,7 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
         } else {
             super::knock::AgentState::Absent
         };
-        if current_worker_pane.as_deref() != Some(&pane)
-            || presence == super::knock::PanePresence::Missing
+        if presence == super::knock::PanePresence::Missing
             || !owned
             || agent == crate::server::knock::AgentState::Absent
         {
@@ -136,8 +139,7 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 })
                 .or(subscription.trigger_ms);
             let master_idle_ready = if subscription.event == "master-idle" {
-                super::live_master_id(server, &state).as_deref()
-                    == Some(subscription.worker_id.as_str())
+                matches!(super::live_master_id(server, &state), Ok(Some(id)) if id == subscription.worker_id)
                     && state
                         .keepalives
                         .get(&subscription.worker_id)
@@ -1052,6 +1054,41 @@ mod tests {
         assert_eq!(state.msgs[&id].wake_attempt_count, 0);
         drop(state);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_pane_mismatch_cancels_even_when_liveness_is_unknown() {
+        use super::super::knock::PanePresence;
+        for notification_entry in [false, true] {
+            let (mut server, root) = test_server();
+            register(&server, "worker");
+            let sub = subscribe(&server, "worker", "direct-message", None, None);
+            let message = bind_message(&server, "worker", &sub);
+            let mut worker = server.state.lock().unwrap().workers["worker"].clone();
+            worker.pane = Some("%replacement".into());
+            server.commit(&[Event::Registered { worker }]);
+            Arc::get_mut(&mut server).unwrap().pane_alive_check = |_| PanePresence::Unknown;
+            if notification_entry {
+                assert!(!super::super::attempt_notification_with(
+                    &server,
+                    &message,
+                    &sub,
+                    &|_| panic!("mismatched pane cannot receive"),
+                    &|_, _| panic!("mismatched pane cannot be sent to"),
+                    &server.pane_owner_check
+                ));
+            } else {
+                tick_with_idle(&server, &|_| true);
+            }
+            let state = server.state.lock().unwrap();
+            assert_eq!(
+                state.notification_subscriptions[&sub].status, "pane-lost",
+                "notification_entry={notification_entry}"
+            );
+            assert_eq!(state.msgs[&message].wake_attempt_count, 0);
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

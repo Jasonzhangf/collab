@@ -718,7 +718,10 @@ fn run(
             bail!("only the bound subagent may report readiness or work");
         }
     } else if record.parent != actor
-        && crate::server::live_master_id(server, &state).as_deref() != Some(actor)
+        && crate::server::live_master_id(server, &state)
+            .map_err(anyhow::Error::msg)?
+            .as_deref()
+            != Some(actor)
     {
         bail!("only the creating parent or live master may manage this subagent");
     }
