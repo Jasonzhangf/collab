@@ -807,11 +807,14 @@ fn run(
             // report and leave the durable managed status at working even
             // though the child owns no actionable task. Reconcile that stale
             // state before asking the task sender to bind the next dispatch.
-            let stale_working_without_task = record.status == "working"
-                && !state.tasks.values().any(|task| {
-                    task.owner == record.peer
-                        && crate::server::state::task_resource_active(&task.status)
-                });
+            let has_active_owned_task = state.tasks.values().any(|task| {
+                task.owner == record.peer
+                    && crate::server::state::task_resource_active(&task.status)
+            });
+            let stale_working_without_task = record.status == "working" && !has_active_owned_task;
+            if record.status == "idle" && has_active_owned_task {
+                bail!("managed subagent already has an active task");
+            }
             if record.status != "idle" && !stale_working_without_task {
                 bail!("subagent is not idle; query status instead of resending");
             }

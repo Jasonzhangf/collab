@@ -555,6 +555,21 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
         )
         .ok
     );
+    let still_working = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Send {
+            id: "managed".into(),
+            subject: "must-wait".into(),
+            body: "active task still owns the child".into(),
+        },
+    );
+    assert!(!still_working.ok);
+    assert_eq!(
+        still_working.error.as_deref(),
+        Some("subagent is not idle; query status instead of resending")
+    );
     assert!(
         crate::subagent::handle(
             &server,
@@ -864,20 +879,61 @@ fn managed_subagent_send_reclaims_working_child_without_an_owned_task() {
         )
         .ok
     );
-    let still_working = crate::subagent::handle(
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "child",
+            "token-child",
+            Action::Ready {
+                id: "managed".into(),
+            },
+        )
+        .ok
+    );
+    let before = {
+        let state = server.state.lock().unwrap();
+        (
+            state.tasks.len(),
+            state.subagents["managed"].last_message.clone(),
+            state.subagents["managed"].status.clone(),
+        )
+    };
+    let idle_with_active_task = crate::subagent::handle(
         &server,
         "parent",
         "token-parent",
         Action::Send {
             id: "managed".into(),
-            subject: "must-wait".into(),
-            body: "active task still owns the child".into(),
+            subject: "must-wait-idle".into(),
+            body: "idle status still has an active task".into(),
         },
     );
-    assert!(!still_working.ok);
+    assert!(!idle_with_active_task.ok);
     assert_eq!(
-        still_working.error.as_deref(),
-        Some("subagent is not idle; query status instead of resending")
+        idle_with_active_task.error.as_deref(),
+        Some("managed subagent already has an active task")
+    );
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.tasks.len(), before.0);
+    assert_eq!(state.subagents["managed"].last_message, before.1);
+    assert_eq!(state.subagents["managed"].status, before.2);
+    drop(state);
+    let direct_idle_with_active_task = handle_send_with_task(
+        &server,
+        "parent".into(),
+        "child".into(),
+        "notify".into(),
+        Some("direct-must-wait".into()),
+        "direct active task still owns the child".into(),
+        None,
+        "immediate".into(),
+        true,
+        Some("managed"),
+    );
+    assert!(!direct_idle_with_active_task.ok);
+    assert_eq!(
+        direct_idle_with_active_task.error.as_deref(),
+        Some("managed subagent already has an active task")
     );
     std::fs::remove_dir_all(root).unwrap();
 }

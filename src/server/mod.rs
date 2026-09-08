@@ -2655,6 +2655,11 @@ pub(crate) fn handle_send_with_task(
         if child.status != "idle" {
             return Resp::err("subagent is not idle; query status instead of resending");
         }
+        if st.tasks.values().any(|task| {
+            task.owner == child.peer && task_resource_active(&task.status)
+        }) {
+            return Resp::err("managed subagent already has an active task");
+        }
         Some(child)
     } else {
         if managed_subagent_id.is_some() {
