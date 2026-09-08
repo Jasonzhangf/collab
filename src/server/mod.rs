@@ -853,10 +853,10 @@ fn attempt_notification_with_at(
         })
         .collect::<Vec<_>>();
     batch.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-    let Some(first) = batch.first() else {
+    let Some(window_start_ms) = batch.first().map(|candidate| candidate.0) else {
         return false;
     };
-    let window_end = first.0.saturating_add(delay);
+    let window_end = window_start_ms.saturating_add(delay);
     batch.retain(|candidate| candidate.0 <= window_end);
     const MAX_BATCH_DELIVERY: usize = 3;
     let total_pending = batch.len();
@@ -883,7 +883,9 @@ fn attempt_notification_with_at(
         })
         .max()
         .unwrap_or(0);
-    if now.saturating_sub(first.0) < delay || now.saturating_sub(last_attempt) < delay {
+    if now.saturating_sub(window_start_ms) < delay
+        || now.saturating_sub(last_attempt) < delay
+    {
         return false;
     }
     let ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
@@ -1092,6 +1094,48 @@ mod notification_batch_tests {
             !text.contains("DETAIL-old-notice") && !text.contains("DETAIL-late-notice"),
             "batch wake must carry task summary while full details stay in JSONL"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn four_notice_batch_uses_the_original_window_start_after_capping() {
+        let (server, root) = test_server();
+        let subscription_id = register_and_subscribe(&server, "recipient");
+        let window_start = 10_000_000;
+        for (index, offset) in [(0, 0), (1, 60_000), (2, 70_000), (3, 80_000)] {
+            queue_message(
+                &server,
+                "recipient",
+                &subscription_id,
+                &format!("backlog-{index}"),
+                window_start + offset,
+            );
+        }
+
+        let delivered = Mutex::new(Vec::new());
+        assert!(attempt_notification_with_at(
+            &server,
+            "backlog-0",
+            &subscription_id,
+            &|_| true,
+            &|_, text| {
+                delivered.lock().unwrap().push(text.to_string());
+                true
+            },
+            &|_, _| true,
+            window_start + 120_000,
+        ));
+        let text = delivered.lock().unwrap().join("\n");
+        assert!(!text.contains("backlog-0"));
+        assert!(text.contains("backlog-1"));
+        assert!(text.contains("backlog-2"));
+        assert!(text.contains("backlog-3"));
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs["backlog-0"].state, "pending");
+        assert_eq!(state.msgs["backlog-1"].state, "delivered");
+        assert_eq!(state.msgs["backlog-2"].state, "delivered");
+        assert_eq!(state.msgs["backlog-3"].state, "delivered");
+        drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
 
