@@ -208,7 +208,8 @@ pub(crate) fn tick_with(
             .iter()
             .map(|id| (id.clone(), state.tasks[id].status.clone()))
             .collect();
-        if record.idle_episode_tasks != task_revision {
+        let task_revision_changed = record.idle_episode_tasks != task_revision;
+        if task_revision_changed {
             record.idle_episode_notices = 0;
             record.idle_episode_reason.clear();
             record.idle_episode_stopped = false;
@@ -230,6 +231,7 @@ pub(crate) fn tick_with(
         if old.observed == "working"
             || agent == AgentState::Working
             || (old.observed.is_empty()
+                && !tasks.is_empty()
                 && managed
                     .as_ref()
                     .is_some_and(|child| child.status == "working"))
@@ -313,6 +315,7 @@ pub(crate) fn tick_with(
                 is_idle
                     && record.working_seen
                     && record.idle_episode_notices == 0
+                    && (managed.is_none() || !tasks.is_empty() || task_revision_changed)
                     && (managed.is_none()
                         || now.saturating_sub(record.pending_since_ms) >= SUBAGENT_STATE_SETTLE_MS)
             };
@@ -700,7 +703,7 @@ mod tests {
         }
         assert_eq!(status_count(&server), 0, "flaps must not notify");
 
-        // Once a state holds past the settle window it is reported exactly once.
+        // A settled managed state without actionable work remains quiet.
         tick_with(
             &server,
             now + 200_000,
@@ -708,7 +711,11 @@ mod tests {
             &wake,
             &|_, _| Ok(true),
         );
-        assert_eq!(status_count(&server), 1);
+        assert_eq!(
+            status_count(&server),
+            0,
+            "a managed idle state without actionable work must not wake the master"
+        );
         tick_with(
             &server,
             now + 400_000,
@@ -716,7 +723,11 @@ mod tests {
             &wake,
             &|_, _| Ok(true),
         );
-        assert_eq!(status_count(&server), 1, "settled state reports once");
+        assert_eq!(
+            status_count(&server),
+            0,
+            "a settled managed idle state without actionable work stays quiet"
+        );
 
         // Even a long monitoring round is not a new task episode.
         tick_with(
@@ -749,8 +760,8 @@ mod tests {
         );
         assert_eq!(
             status_count(&server),
-            1,
-            "monitoring cannot open another managed idle episode"
+            0,
+            "monitoring cannot open a no-task managed idle episode"
         );
 
         std::fs::remove_dir_all(root).unwrap();
@@ -1002,23 +1013,42 @@ mod tests {
                 server.pane_owner_check = |_, pane| Ok(pane != "%stale");
             }
             if managed {
-                server.commit(&[Event::SubagentUpdated {
-                    subagent: crate::subagent::Record {
-                        id: "managed".into(),
-                        parent: "master".into(),
-                        peer: "worker".into(),
-                        status: "working".into(),
-                        session: Some("session".into()),
-                        pane: Some("%worker".into()),
-                        profile: None,
-                        created_ms: base,
-                        ready_deadline_ms: base + 90_000,
-                        last_message: None,
-                        error: None,
-                        probe_failures: Vec::new(),
-                        runtime: Some("cursor".into()),
+                server.commit(&[
+                    Event::SubagentUpdated {
+                        subagent: crate::subagent::Record {
+                            id: "managed".into(),
+                            parent: "master".into(),
+                            peer: "worker".into(),
+                            status: "working".into(),
+                            session: Some("session".into()),
+                            pane: Some("%worker".into()),
+                            profile: None,
+                            created_ms: base,
+                            ready_deadline_ms: base + 90_000,
+                            last_message: None,
+                            error: None,
+                            probe_failures: Vec::new(),
+                            runtime: Some("cursor".into()),
+                        },
                     },
-                }]);
+                    Event::TaskCreated {
+                        task: crate::server::state::TaskRec {
+                            id: "managed-task".into(),
+                            owner: "worker".into(),
+                            created_by: "master".into(),
+                            feature_id: None,
+                            worktree_path: None,
+                            branch: None,
+                            base_commit: None,
+                            priority: "p2".into(),
+                            status: "working".into(),
+                            next_step: None,
+                            wait: None,
+                            created_ms: base,
+                            updated_ms: base,
+                        },
+                    },
+                ]);
             }
             let valid = server
                 .state
@@ -1121,23 +1151,42 @@ mod tests {
     #[test]
     fn managed_idle_waits_for_master_subscription() {
         let (server, root, base) = episode_server();
-        server.commit(&[Event::SubagentUpdated {
-            subagent: crate::subagent::Record {
-                id: "managed".into(),
-                parent: "master".into(),
-                peer: "worker".into(),
-                status: "working".into(),
-                session: Some("session".into()),
-                pane: Some("%worker".into()),
-                profile: None,
-                created_ms: base,
-                ready_deadline_ms: base + 90_000,
-                last_message: None,
-                error: None,
-                probe_failures: Vec::new(),
-                runtime: Some("cursor".into()),
+        server.commit(&[
+            Event::SubagentUpdated {
+                subagent: crate::subagent::Record {
+                    id: "managed".into(),
+                    parent: "master".into(),
+                    peer: "worker".into(),
+                    status: "working".into(),
+                    session: Some("session".into()),
+                    pane: Some("%worker".into()),
+                    profile: None,
+                    created_ms: base,
+                    ready_deadline_ms: base + 90_000,
+                    last_message: None,
+                    error: None,
+                    probe_failures: Vec::new(),
+                    runtime: Some("cursor".into()),
+                },
             },
-        }]);
+            Event::TaskCreated {
+                task: crate::server::state::TaskRec {
+                    id: "managed-task".into(),
+                    owner: "worker".into(),
+                    created_by: "master".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p2".into(),
+                    status: "working".into(),
+                    next_step: None,
+                    wait: None,
+                    created_ms: base,
+                    updated_ms: base,
+                },
+            },
+        ]);
         let subscriptions =
             std::mem::take(&mut server.state.lock().unwrap().notification_subscriptions);
         observe(&server, base + 1_000, "worker", AgentState::Waiting);
