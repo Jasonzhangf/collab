@@ -800,11 +800,29 @@ fn run(
             }
         }
         Action::Send { subject, body, .. } => {
-            if record.status != "idle" {
-                bail!("subagent is not idle; query status instead of resending");
-            }
             if subject.trim().is_empty() || body.trim().is_empty() {
                 bail!("subject and task body are required");
+            }
+            // A keepalive pane observation can race with the child's ready
+            // report and leave the durable managed status at working even
+            // though the child owns no actionable task. Reconcile that stale
+            // state before asking the task sender to bind the next dispatch.
+            let stale_working_without_task = record.status == "working"
+                && !state.tasks.values().any(|task| {
+                    task.owner == record.peer
+                        && crate::server::state::task_resource_active(&task.status)
+                });
+            if record.status != "idle" && !stale_working_without_task {
+                bail!("subagent is not idle; query status instead of resending");
+            }
+            if stale_working_without_task {
+                record.status = "idle".into();
+                server.commit_locked(
+                    &mut state,
+                    &[Event::SubagentUpdated {
+                        subagent: record.clone(),
+                    }],
+                );
             }
             drop(state);
             let result = match notify(

@@ -811,6 +811,78 @@ fn managed_subagent_send_binds_the_selected_child_when_multiple_children_are_ass
 }
 
 #[test]
+fn managed_subagent_send_reclaims_working_child_without_an_owned_task() {
+    use crate::subagent::{Action, Record};
+    let (server, root) = test_server();
+    register(&server, "parent", "%parent");
+    register(&server, "child", "%child");
+    let now = now_ms();
+    server.commit(&[Event::SubagentUpdated {
+        subagent: Record {
+            id: "managed".into(),
+            parent: "parent".into(),
+            peer: "child".into(),
+            // A keepalive pane observation can leave this stale after the
+            // child has reported ready and consumed an empty recv cycle.
+            status: "working".into(),
+            session: Some("$child".into()),
+            pane: Some("%child".into()),
+            profile: None,
+            created_ms: now,
+            ready_deadline_ms: now + 90_000,
+            last_message: None,
+            error: None,
+            probe_failures: Vec::new(),
+            runtime: None,
+        },
+    }]);
+
+    let assigned = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Send {
+            id: "managed".into(),
+            subject: "next-task".into(),
+            body: "dispatch after ready and recv".into(),
+        },
+    );
+    assert!(assigned.ok, "{}", assigned.error.unwrap_or_default());
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.subagents["managed"].status, "assigned");
+    assert_eq!(state.tasks.len(), 1);
+    assert_eq!(state.tasks.values().next().unwrap().owner, "child");
+    drop(state);
+    assert!(
+        crate::subagent::handle(
+            &server,
+            "child",
+            "token-child",
+            Action::Working {
+                id: "managed".into(),
+            },
+        )
+        .ok
+    );
+    let still_working = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Send {
+            id: "managed".into(),
+            subject: "must-wait".into(),
+            body: "active task still owns the child".into(),
+        },
+    );
+    assert!(!still_working.ok);
+    assert_eq!(
+        still_working.error.as_deref(),
+        Some("subagent is not idle; query status instead of resending")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
     let (server, root) = test_server();
     register(&server, "peer-a", "%a");
