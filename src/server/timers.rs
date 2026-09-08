@@ -1016,7 +1016,39 @@ mod tests {
     }
 
     #[test]
-    fn delivered_but_unacked_messages_never_pause_new_notifications() {
+    fn explicit_notification_remains_immediate_while_agent_is_working() {
+        let (mut server, root) = test_server();
+        Arc::get_mut(&mut server).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Working;
+        register(&server, "busy-worker");
+        let sub = subscribe(&server, "busy-worker", "direct-message", None, None);
+        let id = bind_message(&server, "busy-worker", &sub);
+        server.commit(&[Event::DeliveryMode {
+            msg_id: id.clone(),
+            mode: "explicit-notification".into(),
+        }]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .msgs
+            .get_mut(&id)
+            .unwrap()
+            .created_ms = now_ms() - 60_001;
+
+        assert!(super::super::attempt_notification_with_default(
+            &server,
+            &id,
+            &sub,
+            &|_| true,
+            &|_, _| true
+        ));
+        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn unacked_notifications_limit_pauses_wakes_and_resumes_after_ack() {
         let (mut server, root) = test_server();
         Arc::get_mut(&mut server).unwrap().config.notifications.mode = "immediate".into();
         register(&server, "ack-worker");

@@ -706,7 +706,7 @@ fn attempt_notification_with_at(
     if !server.config.notifications.enabled {
         return false;
     }
-    let (recipient, pane, delay, worker_pane) = {
+    let (recipient, pane, delay, worker_pane, explicit) = {
         let state = server.state.lock().unwrap();
         let Some(seed) = state.msgs.get(message_id) else {
             return false;
@@ -726,7 +726,11 @@ fn attempt_notification_with_at(
             .map(|_| 0)
             .unwrap_or_else(|| server.config.notifications.delay_ms(&subscription.event));
         let worker_pane = state.workers.get(&recipient).and_then(|w| w.pane.clone());
-        (recipient, pane, delay, worker_pane)
+        let explicit = state
+            .delivery_modes
+            .get(message_id)
+            .is_some_and(|mode| mode == "explicit-notification");
+        (recipient, pane, delay, worker_pane, explicit)
     };
 
     let alive = (server.pane_alive_check)(&pane);
@@ -759,17 +763,26 @@ fn attempt_notification_with_at(
         );
         return false;
     }
-    if state_probe == crate::server::knock::AgentState::Unknown {
+    if state_probe == crate::server::knock::AgentState::Unknown
+        || (state_probe == crate::server::knock::AgentState::Working && !explicit)
+    {
         crate::server::knock::append_log(
             &server.log_path(),
             &format!("knock deferred pane={pane} recipient={recipient} agent state is unknown"),
         );
         return false;
     }
-    if state_probe == crate::server::knock::AgentState::Working {
+    if !explicit
+        && state
+            .msgs
+            .values()
+            .filter(|message| message.to == recipient && message.state == "delivered")
+            .count() as u32
+            >= server.config.notifications.max_unacked
+    {
         crate::server::knock::append_log(
             &server.log_path(),
-            &format!("knock deferred pane={pane} recipient={recipient} agent is working"),
+            &format!("knock deferred pane={pane} recipient={recipient} unacked notification limit reached"),
         );
         return false;
     }
