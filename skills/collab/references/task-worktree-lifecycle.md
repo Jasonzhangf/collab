@@ -81,7 +81,10 @@ Delivery and integration are separate durable milestones. `task deliver`
 records candidate evidence; the task owner or live master uses
 `task review --accept|--rework` to record the review decision; `task integrated`
 accepts only the exact current `refs/heads/main` commit and records mainline
-evidence. Direct status updates cannot bypass review or integration.
+evidence. Direct status updates cannot bypass review or integration for current
+lifecycle records. A persisted pre-review `accepted` task with no lifecycle
+evidence retains an owner-local `accepted→merged` compatibility path; it
+records task state only and does not create review or integration evidence.
 
 ## Task liveness and escalation
 

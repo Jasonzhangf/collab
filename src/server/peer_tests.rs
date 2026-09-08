@@ -2970,6 +2970,40 @@ fn lifecycle_cannot_bypass_review_or_delivery() {
 }
 
 #[test]
+fn legacy_accepted_candidate_can_record_merge() {
+    let (server, root) = test_server();
+    register(&server, "peer", "%peer");
+    assert!(create_task(&server, "peer", "accepted-task", "feature").ok);
+    {
+        let mut state = server.state.lock().unwrap();
+        let mut task = state.tasks.remove("accepted-task").unwrap();
+        task.status = "accepted".into();
+        state.tasks.insert(task.id.clone(), task);
+    }
+    let merged = handle_task_update(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "accepted-task".into(),
+        Some("merged".into()),
+        Some("integration recorded".into()),
+    );
+    assert!(
+        merged.ok,
+        "legacy accepted task must be mergeable: {merged:?}"
+    );
+    assert_eq!(
+        server.state.lock().unwrap().tasks["accepted-task"].status,
+        "merged"
+    );
+    assert_eq!(
+        replay(&root).unwrap().tasks["accepted-task"].status,
+        "merged"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn delivery_review_and_exact_main_integration_are_durable() {
     let (server, root) = test_server();
     register(&server, "owner", "%owner");
@@ -3131,6 +3165,30 @@ fn accepted_task_can_return_to_rework_and_redeliver() {
             "accepted".into(),
         )
         .ok
+    );
+    let direct_verifying = handle_task_update(
+        &server,
+        "owner".into(),
+        "token-owner".into(),
+        "task".into(),
+        Some("verifying".into()),
+        None,
+    );
+    assert_eq!(
+        direct_verifying.error.as_deref(),
+        Some("invalid task transition accepted -> verifying")
+    );
+    let direct_merge = handle_task_update(
+        &server,
+        "owner".into(),
+        "token-owner".into(),
+        "task".into(),
+        Some("merged".into()),
+        None,
+    );
+    assert_eq!(
+        direct_merge.error.as_deref(),
+        Some("use collab task review/integrated for integration-owned lifecycle transitions")
     );
     assert!(
         handle_task_update(

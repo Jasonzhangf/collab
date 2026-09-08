@@ -112,7 +112,10 @@ Normal states are `working`, `blocked`, `waiting`, `verifying`, `reviewed`,
 `task deliver`; `accepted` through `task review --accept`; `merged` through
 `task integrated`; and `closed` through `task close`. Review and integration
 require the task owner or live master, and both persist their evidence. Direct
-status mutation cannot bypass these gates.
+status mutation cannot bypass these gates for current lifecycle records. For
+compatibility, an owner may move a persisted pre-review `accepted` task with
+no lifecycle evidence directly to `merged`; this path records task state only
+and cannot manufacture review or integration evidence.
 
 Delivery is a local durable milestone. It sends no peer message. Every task
 with a declared worktree carries a cleanup obligation. Close fails before

@@ -3021,7 +3021,13 @@ fn handle_task_update(
                 "use collab task deliver to complete a claim; direct status mutation is rejected",
             );
         }
-        if matches!(new_status.as_str(), "accepted" | "merged") {
+        // Pre-review producers persisted accepted candidates without a lifecycle
+        // record. Keep their owner-local merge transition replayable while new
+        // review records continue through the evidence-bearing integrated path.
+        let legacy_accepted_merge = new_status == "merged"
+            && task.status == "accepted"
+            && !st.task_lifecycle.contains_key(&task.id);
+        if new_status == "accepted" || (new_status == "merged" && !legacy_accepted_merge) {
             return Resp::err(
                 "use collab task review/integrated for integration-owned lifecycle transitions",
             );
