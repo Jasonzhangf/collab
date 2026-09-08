@@ -353,7 +353,33 @@ pub(crate) fn tick_with(
             let mut events = Vec::new();
             if was_working && is_idle {
                 if let Some(master_id) = super::live_master_id(server, &state) {
-                    if master_id != worker.id {
+                    if master_id == worker.id {
+                        if let Some(sub) = state.matching_subscription(&worker.id, "direct-message", None, now) {
+                            let alert_id = super::gen_msg_id();
+                            events.push(Event::Sent {
+                                msg: Message {
+                                    id: alert_id.clone(),
+                                    from: "collab-server".into(),
+                                    to: worker.id.clone(),
+                                    mtype: "notify".into(),
+                                    subject: Some(format!("master-idle: {}", worker.id)),
+                                    body: format!(
+                                        "Master {} is now idle with no actionable task. Scheduling continues: inspect the task graph, worker/subagent load, liveness, saturation, and blockers; dispatch authorized work or resolve and reassign blockers. Cancel only iff no actionable task, dependency, resolvable blocker, or authorized open bug remains, using collab notify unsubscribe {} and record the receipt. If the goal is complete, report the evidence to the user.",
+                                        worker.id, sub.id
+                                    ),
+                                    in_reply_to: None,
+                                    created_ms: now,
+                                    state: "pending".into(),
+                                    wake_attempt_count: 0,
+                                    last_wake_attempt_ms: 0,
+                                },
+                            });
+                            events.push(Event::WakeBound {
+                                message_id: alert_id,
+                                subscription_id: sub.id.clone(),
+                            });
+                        }
+                    } else {
                         let alert_id = super::gen_msg_id();
                         events.push(Event::Sent {
                             msg: Message {

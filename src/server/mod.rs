@@ -318,6 +318,9 @@ fn notification_class(subject: &str) -> (&'static str, &'static str) {
     if subject.starts_with("worker-idle") {
         return ("P1", "dispatch work to this idle capacity");
     }
+    if subject.starts_with("master-idle") {
+        return ("P1", "run the scheduling pass: inspect graph/load/liveness, dispatch authorized work, and resolve blockers");
+    }
     if subject.starts_with("subagent-status") {
         return ("P1", "re-dispatch, close, or leave the child idle");
     }
