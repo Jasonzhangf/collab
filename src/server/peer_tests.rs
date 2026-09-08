@@ -3243,6 +3243,159 @@ fn malformed_recipient_jsonl_does_not_block_future_append_or_journal_replay() {
 }
 
 #[test]
+fn interior_malformed_recipient_jsonl_preserves_bad_line_and_appends_later_message() {
+    let (server, root) = test_server();
+    register(&server, "recipient", "%recipient");
+    let path = root.join(".agent-collab/mailbox/recipient-recipient.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    server.commit(&[Event::TaskCreated {
+        task: TaskRec {
+            id: "interior-assigned-task".into(),
+            owner: "recipient".into(),
+            created_by: "sender".into(),
+            feature_id: Some("interior-mailbox-recovery".into()),
+            worktree_path: Some("./playground/interior-mailbox-recovery".into()),
+            branch: Some("codex/interior-mailbox-recovery".into()),
+            base_commit: Some("interior-base".into()),
+            priority: "p1".into(),
+            status: "working".into(),
+            next_step: Some("consume preserved mailbox".into()),
+            wait: None,
+            created_ms: now_ms(),
+            updated_ms: now_ms(),
+        },
+    }]);
+
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "before-interior-malformed".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("progress".into()),
+            body: "before malformed interior record".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+    let malformed_line = "not-json-interior-record-preserve-this-line";
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "later-valid-record".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("progress".into()),
+            body: "later valid record".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    let (first, remaining) = content.split_once('\n').unwrap();
+    std::fs::write(&path, format!("{first}\n{malformed_line}\n{remaining}")).unwrap();
+
+    server.commit(&[Event::Sent {
+        msg: Message {
+            id: "after-interior-malformed".into(),
+            from: "sender".into(),
+            to: "recipient".into(),
+            mtype: "notify".into(),
+            subject: Some("progress".into()),
+            body: "new append after malformed interior record".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        },
+    }]);
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.lines().any(|line| line == malformed_line));
+    let projection = read_recipient_mailbox(&path, "recipient").unwrap();
+    assert_eq!(
+        projection
+            .records
+            .iter()
+            .filter_map(|record| record["message"]["id"].as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "before-interior-malformed",
+            "later-valid-record",
+            "after-interior-malformed"
+        ]
+    );
+    assert_eq!(projection.recoverable_errors.len(), 1);
+    assert!(projection.recoverable_errors[0].contains("record 2"));
+
+    let server = Arc::new(server);
+    let response = dispatch(
+        &server,
+        Req::MailboxRead {
+            all: false,
+            sort: Some("time-asc".into()),
+            worker_id: Some("recipient".into()),
+        },
+    );
+    assert!(response.ok);
+    assert_eq!(
+        response.data["recipient_jsonl"]["status"],
+        "recoverable-error"
+    );
+    assert!(response.data["recipient_jsonl"]["exact_error"]
+        .as_str()
+        .unwrap()
+        .contains("record 2"));
+    assert_eq!(
+        response.data["recipient_jsonl"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    drop(server);
+    let replayed = replay(&root).unwrap();
+    assert_eq!(
+        replayed.msgs["later-valid-record"].body,
+        "later valid record"
+    );
+    assert_eq!(
+        replayed.msgs["after-interior-malformed"].body,
+        "new append after malformed interior record"
+    );
+    let assignment = &replayed.tasks["interior-assigned-task"];
+    assert_eq!(assignment.owner, "recipient");
+    assert_eq!(
+        assignment.feature_id.as_deref(),
+        Some("interior-mailbox-recovery")
+    );
+    assert_eq!(
+        assignment.worktree_path.as_deref(),
+        Some("./playground/interior-mailbox-recovery")
+    );
+    assert_eq!(
+        assignment.branch.as_deref(),
+        Some("codex/interior-mailbox-recovery")
+    );
+    assert_eq!(assignment.base_commit.as_deref(), Some("interior-base"));
+    assert_eq!(assignment.status, "working");
+    assert_eq!(
+        assignment.next_step.as_deref(),
+        Some("consume preserved mailbox")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn removed_role_and_dispatch_commands_fail_fast() {
     let (server, root) = test_server();
     register(&server, "peer", "%peer");

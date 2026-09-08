@@ -250,33 +250,43 @@ impl Server {
         let jsonl_path = dir.join(format!("recipient-{}.jsonl", msg.to));
         if jsonl_path.exists() {
             match read_recipient_mailbox(&jsonl_path, &msg.to) {
-                Ok(projection) if projection.partial_tail => {
-                    let content = std::fs::read(&jsonl_path)
-                        .map_err(|error| format!("read partial mailbox: {error}"))?;
-                    let valid_len = content
-                        .iter()
-                        .rposition(|byte| *byte == b'\n')
-                        .map(|index| index + 1)
-                        .unwrap_or(0);
-                    let file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&jsonl_path)
-                        .map_err(|error| format!("open partial mailbox: {error}"))?;
-                    file.set_len(valid_len as u64)
-                        .map_err(|error| format!("truncate partial mailbox: {error}"))?;
+                Ok(projection) => {
+                    if !projection.recoverable_errors.is_empty() {
+                        append_log(
+                            &self.log_path(),
+                            &format!(
+                                "MAILBOX_JSONL_RECOVERABLE: {}",
+                                projection.recoverable_errors.join(" | ")
+                            ),
+                        );
+                    }
+                    if projection.partial_tail {
+                        let content = std::fs::read(&jsonl_path)
+                            .map_err(|error| format!("read partial mailbox: {error}"))?;
+                        let valid_len = content
+                            .iter()
+                            .rposition(|byte| *byte == b'\n')
+                            .map(|index| index + 1)
+                            .unwrap_or(0);
+                        let file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&jsonl_path)
+                            .map_err(|error| format!("open partial mailbox: {error}"))?;
+                        file.set_len(valid_len as u64)
+                            .map_err(|error| format!("truncate partial mailbox: {error}"))?;
+                    } else if projection.unterminated_tail {
+                        let mut file =
+                            std::fs::OpenOptions::new()
+                                .append(true)
+                                .open(&jsonl_path)
+                                .map_err(|error| format!("open unterminated mailbox: {error}"))?;
+                        use std::io::Write;
+                        file.write_all(b"\n")
+                            .map_err(|error| format!("terminate mailbox record: {error}"))?;
+                        file.sync_data()
+                            .map_err(|error| format!("sync mailbox separator: {error}"))?;
+                    }
                 }
-                Ok(projection) if projection.unterminated_tail => {
-                    let mut file = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&jsonl_path)
-                        .map_err(|error| format!("open unterminated mailbox: {error}"))?;
-                    use std::io::Write;
-                    file.write_all(b"\n")
-                        .map_err(|error| format!("terminate mailbox record: {error}"))?;
-                    file.sync_data()
-                        .map_err(|error| format!("sync mailbox separator: {error}"))?;
-                }
-                Ok(_) => {}
                 Err(error) => {
                     // Journal state is authoritative. A projection error is
                     // queryable and recoverable; it must not prevent a later
@@ -539,6 +549,7 @@ struct RecipientMailboxRead {
     records: Vec<serde_json::Value>,
     partial_tail: bool,
     unterminated_tail: bool,
+    recoverable_errors: Vec<String>,
 }
 
 fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailboxRead, String> {
@@ -547,30 +558,58 @@ fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailb
     let has_unterminated_tail = !content.is_empty() && !content.ends_with('\n');
     let mut partial_tail = false;
     let mut records = Vec::new();
-    for (index, line) in lines.into_iter().enumerate() {
+    let mut recoverable_errors = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(record) => match normalize_mailbox_record(record, recipient, index + 1) {
                 Ok(record) => records.push(record),
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if has_unterminated_tail && index + 1 == lines.len() {
+                        return Err(error);
+                    }
+                    if lines
+                        .iter()
+                        .skip(index + 1)
+                        .any(|later| !later.trim().is_empty())
+                    {
+                        recoverable_errors.push(error);
+                    } else {
+                        return Err(error);
+                    }
+                }
             },
-            Err(_error) if has_unterminated_tail && index + 1 == content.lines().count() => {
-                partial_tail = true;
-                break;
+            Err(error) => {
+                let error = format!("malformed JSONL record {}: {error}", index + 1);
+                if has_unterminated_tail && index + 1 == lines.len() {
+                    partial_tail = true;
+                    break;
+                }
+                if lines
+                    .iter()
+                    .skip(index + 1)
+                    .any(|later| !later.trim().is_empty())
+                {
+                    recoverable_errors.push(error);
+                } else {
+                    return Err(error);
+                }
             }
-            Err(error) => return Err(format!("malformed JSONL record {}: {error}", index + 1)),
         }
     }
     Ok(RecipientMailboxRead {
         records,
         partial_tail,
         unterminated_tail: has_unterminated_tail,
+        recoverable_errors,
     })
 }
 
 fn recover_malformed_mailbox_tail(path: &Path, recipient: &str) -> Result<bool, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|error| format!("read malformed mailbox: {error}"))?;
-    let mut valid_len = 0usize;
+    // Only remove a malformed run at EOF. Interior malformed records remain
+    // part of the append-only projection so later valid records are retained.
+    let mut statuses = Vec::new();
     let mut offset = 0usize;
     for segment in content.split_inclusive('\n') {
         let line = segment.strip_suffix('\n').unwrap_or(segment);
@@ -578,24 +617,18 @@ fn recover_malformed_mailbox_tail(path: &Path, recipient: &str) -> Result<bool, 
         let record_result = serde_json::from_str::<serde_json::Value>(line)
             .map_err(|error| format!("malformed JSONL record: {error}"))
             .and_then(|record| normalize_mailbox_record(record, recipient, 0));
-        match record_result {
-            Ok(_) => valid_len = offset + segment.len(),
-            Err(error) => {
-                if content[offset + segment.len()..].trim().is_empty() {
-                    let file = std::fs::OpenOptions::new().write(true).open(path).map_err(
-                        |open_error| format!("open malformed mailbox for truncation: {open_error}"),
-                    )?;
-                    file.set_len(valid_len as u64).map_err(|truncate_error| {
-                        format!("truncate malformed mailbox: {truncate_error}")
-                    })?;
-                    return Ok(true);
-                }
-                return Err(error);
-            }
-        }
+        statuses.push((offset, record_result.is_ok()));
         offset += segment.len();
     }
-    if offset < content.len() {
+
+    let mut trailing_malformed_start = None;
+    for (start, valid) in statuses.into_iter().rev() {
+        if valid {
+            break;
+        }
+        trailing_malformed_start = Some(start);
+    }
+    if let Some(valid_len) = trailing_malformed_start {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(path)
@@ -4849,20 +4882,26 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                         let missing = missing_recipient_projection_messages(&st, recipient, &read);
                         let status = if read.partial_tail {
                             "partial-tail"
+                        } else if !read.recoverable_errors.is_empty() {
+                            "recoverable-error"
                         } else if missing.is_empty() {
                             "ok"
                         } else {
                             "incomplete"
                         };
-                        let exact_error = (!missing.is_empty()).then(|| {
-                            format!(
+                        let mut exact_errors = read.recoverable_errors.clone();
+                        if !missing.is_empty() {
+                            exact_errors.push(format!(
                                 "recipient JSONL is missing message records: {}",
                                 missing.join(",")
-                            )
-                        });
+                            ));
+                        }
+                        let exact_error =
+                            (!exact_errors.is_empty()).then(|| exact_errors.join(" | "));
                         Some(json!({
                             "status": status,
                             "partial_tail": read.partial_tail,
+                            "recoverable_errors": read.recoverable_errors,
                             "missing_message_ids": missing,
                             "exact_error": exact_error,
                             "records": read.records,
