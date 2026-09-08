@@ -756,9 +756,6 @@ fn run(
             ) {
                 bail!("subagent is not running");
             }
-            if !ready && record.status != "assigned" {
-                bail!("no assigned task to accept");
-            }
             if ready && record.status == "idle" {
                 return Ok(json!({"subagent": record, "reused": true}));
             }
@@ -766,12 +763,21 @@ fn run(
                 bail!("accept the assigned task before reporting completion");
             }
             let assigned_task = if !ready {
+                // A keepalive pane probe may persist `working` before the
+                // child gets a chance to claim its still-assigned task. Keep
+                // the task binding as the source of truth and accept both
+                // sides of that short race. A working task is accepted only
+                // when the managed record is already working, which makes a
+                // repeated claim idempotent without reopening other states.
+                if !matches!(record.status.as_str(), "assigned" | "working") {
+                    bail!("no assigned task to accept");
+                }
                 let task_id = record
                     .last_message
                     .as_ref()
                     .map(|id| format!("task-{id}"))
                     .ok_or_else(|| anyhow::anyhow!("assigned task message binding is missing"))?;
-                let task = state
+                let mut task = state
                     .tasks
                     .get(&task_id)
                     .cloned()
@@ -779,28 +785,41 @@ fn run(
                 if task.owner != actor {
                     bail!("task owner mismatch");
                 }
-                if task.status != "assigned" {
+                if task.status != "assigned"
+                    && !(record.status == "working" && task.status == "working")
+                {
                     bail!(
                         "assigned task {task_id} is not in assigned state (status={})",
                         task.status
                     );
                 }
-                Some(task)
+                let task_was_assigned = task.status == "assigned";
+                if task_was_assigned {
+                    task.status = "working".into();
+                    task.updated_ms = now_ms();
+                }
+                Some((task, task_was_assigned))
             } else {
                 None
             };
-            record.status = if ready { "idle" } else { "working" }.into();
-            if let Some(mut task) = assigned_task {
-                task.status = "working".into();
-                task.updated_ms = now_ms();
-                server.commit_locked(&mut state, &[Event::TaskUpdated { task }]);
+            let next_status = if ready { "idle" } else { "working" };
+            let mut events = Vec::new();
+            if let Some((task, task_was_assigned)) = assigned_task {
+                if task_was_assigned {
+                    events.push(Event::TaskUpdated { task });
+                }
             }
-            server.commit_locked(
-                &mut state,
-                &[Event::SubagentUpdated {
+            if record.status != next_status {
+                record.status = next_status.into();
+                events.push(Event::SubagentUpdated {
                     subagent: record.clone(),
-                }],
-            );
+                });
+            }
+            if !events.is_empty() {
+                // Persist the task and managed-record transition together so
+                // replay cannot observe a half-claimed assignment.
+                server.commit_locked(&mut state, &events);
+            }
             drop(state);
             if ready {
                 notify(

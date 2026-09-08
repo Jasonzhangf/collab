@@ -1106,6 +1106,110 @@ fn managed_subagent_working_requires_existing_owned_assigned_task() {
 }
 
 #[test]
+fn managed_subagent_working_accepts_assignment_after_probe_race_and_is_idempotent() {
+    use crate::subagent::{Action, Record};
+
+    let (server, root) = test_server();
+    register(&server, "parent", "%parent");
+    register(&server, "child", "%child");
+    let now = now_ms();
+    server.commit(&[Event::SubagentUpdated {
+        subagent: Record {
+            id: "managed".into(),
+            parent: "parent".into(),
+            peer: "child".into(),
+            status: "idle".into(),
+            session: Some("$child".into()),
+            pane: Some("%child".into()),
+            profile: None,
+            created_ms: now,
+            ready_deadline_ms: now + 90_000,
+            last_message: None,
+            error: None,
+            probe_failures: Vec::new(),
+            runtime: None,
+        },
+    }]);
+
+    let sent = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Send {
+            id: "managed".into(),
+            subject: "race-task".into(),
+            body: "claim the task after the probe observes working".into(),
+        },
+    );
+    assert!(sent.ok, "{}", sent.error.unwrap_or_default());
+    let message_id = server.state.lock().unwrap().subagents["managed"]
+        .last_message
+        .clone()
+        .unwrap();
+    let task_id = format!("task-{message_id}");
+    {
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.subagents["managed"].status, "assigned");
+        assert_eq!(state.tasks[&task_id].status, "assigned");
+        assert_eq!(state.tasks.len(), 1);
+    }
+
+    // Model the keepalive pane probe winning the race: it observes the child
+    // as working and persists that managed status while the task is assigned.
+    let mut probed = server.state.lock().unwrap().subagents["managed"].clone();
+    probed.status = "working".into();
+    server.commit(&[Event::SubagentUpdated { subagent: probed }]);
+
+    let first = crate::subagent::handle(
+        &server,
+        "child",
+        "token-child",
+        Action::Working {
+            id: "managed".into(),
+        },
+    );
+    assert!(first.ok, "{}", first.error.unwrap_or_default());
+    {
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.subagents["managed"].status, "working");
+        assert_eq!(state.tasks[&task_id].status, "working");
+        assert_eq!(state.tasks[&task_id].owner, "child");
+        assert_eq!(state.tasks.len(), 1);
+    }
+
+    // Once both durable records are working, a repeated claim is a harmless
+    // replay of the same transition and must not append or create anything.
+    let journal_after_first =
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+    let second = crate::subagent::handle(
+        &server,
+        "child",
+        "token-child",
+        Action::Working {
+            id: "managed".into(),
+        },
+    );
+    assert!(second.ok, "{}", second.error.unwrap_or_default());
+    let journal_after_second =
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+    assert_eq!(journal_after_second, journal_after_first);
+    assert_eq!(server.state.lock().unwrap().tasks.len(), 1);
+
+    let replayed = replay(&root).unwrap();
+    assert_eq!(replayed.subagents["managed"].status, "working");
+    assert_eq!(replayed.tasks[&task_id].status, "working");
+    assert_eq!(replayed.tasks[&task_id].owner, "child");
+    assert_eq!(replayed.tasks.len(), 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
     let (server, root) = test_server();
     register(&server, "peer-a", "%a");
