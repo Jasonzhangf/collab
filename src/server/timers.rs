@@ -34,13 +34,37 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
             .collect()
     };
     let mut lost_sub_ids = Vec::new();
+    let mut unknown_sub_ids = Vec::new();
     for (id, worker_id, pane, current_worker_pane) in checks {
+        let presence = (server.pane_alive_check)(&pane);
+        if presence == super::knock::PanePresence::Unknown {
+            unknown_sub_ids.push(id);
+            continue;
+        }
+        let owned = if presence == super::knock::PanePresence::Present {
+            match (server.pane_owner_check)(&worker_id, &pane) {
+                Ok(owned) => owned,
+                Err(()) => {
+                    unknown_sub_ids.push(id);
+                    continue;
+                }
+            }
+        } else {
+            false
+        };
+        let agent = if presence == super::knock::PanePresence::Present {
+            (server.pane_state_check)(&pane)
+        } else {
+            super::knock::AgentState::Absent
+        };
         if current_worker_pane.as_deref() != Some(&pane)
-            || !(server.pane_alive_check)(&pane)
-            || !(server.pane_owner_check)(&worker_id, &pane)
-            || (server.pane_state_check)(&pane) == crate::server::knock::AgentState::Absent
+            || presence == super::knock::PanePresence::Missing
+            || !owned
+            || agent == crate::server::knock::AgentState::Absent
         {
             lost_sub_ids.push(id);
+        } else if agent == super::knock::AgentState::Unknown {
+            unknown_sub_ids.push(id);
         }
     }
 
@@ -128,6 +152,7 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 true
             };
             if subscription.status != "armed"
+                || unknown_sub_ids.contains(&subscription.id)
                 || !server.config.timers.enabled
                 || !matches!(subscription.event.as_str(), "deadline" | "master-idle")
                 || !master_idle_ready
@@ -189,6 +214,7 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 let message = state.msgs.get(message_id)?;
                 let subscription = state.notification_subscriptions.get(subscription_id)?;
                 (message.state == "pending"
+                    && !unknown_sub_ids.contains(subscription_id)
                     && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
                     && now - message.last_wake_attempt_ms >= WAKE_ATTEMPT_LEASE_MS
                     && subscription.status == "armed"
@@ -238,8 +264,8 @@ mod tests {
                 root: root.clone(),
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
-                pane_alive_check: |_| true,
-                pane_owner_check: |_, _| true,
+                pane_alive_check: |_| super::super::knock::PanePresence::Present,
+                pane_owner_check: |_, _| Ok(true),
                 pane_state_check: |_| crate::server::knock::AgentState::Waiting,
                 mailbox_notify: tokio::sync::Notify::new(),
             }),
@@ -555,8 +581,8 @@ mod tests {
             root: root.clone(),
             state: Mutex::new(replayed),
             journal: Mutex::new(journal),
-            pane_alive_check: |_| true,
-            pane_owner_check: |_, _| true,
+            pane_alive_check: |_| super::super::knock::PanePresence::Present,
+            pane_owner_check: |_, _| Ok(true),
             pane_state_check: |_| crate::server::knock::AgentState::Waiting,
             mailbox_notify: tokio::sync::Notify::new(),
         };
@@ -1007,7 +1033,8 @@ mod tests {
     #[test]
     fn pane_lost_transitions_subscription_to_pane_lost_and_stops_storm() {
         let (mut server, root) = test_server();
-        Arc::get_mut(&mut server).unwrap().pane_alive_check = |_| false;
+        Arc::get_mut(&mut server).unwrap().pane_alive_check =
+            |_| super::super::knock::PanePresence::Missing;
         register(&server, "lost-worker");
         let sub = subscribe(&server, "lost-worker", "direct-message", None, None);
         let id = bind_message(&server, "lost-worker", &sub);
@@ -1025,6 +1052,68 @@ mod tests {
         assert_eq!(state.msgs[&id].wake_attempt_count, 0);
         drop(state);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn unknown_prechecks_defer_timer_and_notification_without_cancelling_or_sending() {
+        use super::super::knock::{AgentState, PanePresence};
+        for failure in ["presence", "ownership", "view"] {
+            let (mut server, root) = test_server();
+            register(&server, "worker");
+            let direct = subscribe(&server, "worker", "direct-message", None, None);
+            let deadline = subscribe(
+                &server,
+                "worker",
+                "deadline",
+                Some("due"),
+                Some(now_ms() - 1),
+            );
+            let message = bind_message(&server, "worker", &direct);
+            let inner = Arc::get_mut(&mut server).unwrap();
+            match failure {
+                "presence" => {
+                    inner.pane_alive_check = |_| PanePresence::Unknown;
+                    inner.pane_owner_check =
+                        |_, _| panic!("unknown presence must short-circuit ownership");
+                    inner.pane_state_check =
+                        |_| panic!("unknown presence must short-circuit state probe");
+                }
+                "ownership" => {
+                    inner.pane_owner_check = |_, _| Err(());
+                    inner.pane_state_check =
+                        |_| panic!("unknown ownership must short-circuit state probe");
+                }
+                _ => inner.pane_state_check = |_| AgentState::Unknown,
+            }
+            assert!(!super::super::attempt_notification_with(
+                &server,
+                &message,
+                &direct,
+                &|_| panic!("unknown must not reach delivery readiness"),
+                &|_, _| panic!("unknown must not send"),
+                &server.pane_owner_check
+            ));
+            tick_with_idle(&server, &|_| true);
+            let state = server.state.lock().unwrap();
+            assert_eq!(
+                state.notification_subscriptions[&direct].status, "armed",
+                "{failure}"
+            );
+            assert_eq!(
+                state.notification_subscriptions[&deadline].status, "armed",
+                "{failure}"
+            );
+            assert_eq!(state.notification_subscriptions[&deadline].fired_count, 0);
+            assert_eq!(
+                state.msgs.len(),
+                1,
+                "unknown deadline must not enqueue a notification"
+            );
+            assert_eq!(state.msgs[&message].state, "pending");
+            assert_eq!(state.msgs[&message].wake_attempt_count, 0);
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -1320,7 +1409,8 @@ mod tests {
                 registered_ms: now_ms(),
             },
         }]);
-        Arc::get_mut(&mut server).unwrap().pane_state_check = |_| crate::server::knock::AgentState::Absent;
+        Arc::get_mut(&mut server).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Absent;
         tick_with_idle(&server, &|_| true);
         assert_eq!(
             server.state.lock().unwrap().notification_subscriptions[&sub2].status,

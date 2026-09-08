@@ -5,7 +5,9 @@ pub mod timers;
 
 use crate::proto::{Req, Resp, MSG_TYPES};
 use crate::scope::Scope;
-use crate::server::knock::{append_log, knock_or_log, pane_alive, pane_idle};
+use crate::server::knock::{
+    append_log, knock_or_log, pane_alive, pane_idle, pane_presence, PanePresence,
+};
 use serde_json::json;
 use state::{
     now_ms, runtime_for_pane, task_resource_active, wait_cycle, CleanupReceipt, Event, Message,
@@ -107,8 +109,8 @@ pub struct Server {
     pub root: PathBuf,
     pub state: Mutex<State>,
     pub journal: Mutex<std::fs::File>,
-    pub pane_alive_check: fn(&str) -> bool,
-    pub pane_owner_check: fn(&str, &str) -> bool,
+    pub pane_alive_check: fn(&str) -> PanePresence,
+    pub pane_owner_check: fn(&str, &str) -> Result<bool, ()>,
     pub pane_state_check: fn(&str) -> crate::server::knock::AgentState,
     pub mailbox_notify: Notify,
 }
@@ -126,9 +128,11 @@ fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) -> Result
         .open(path)
         .map_err(|error| format!("open events: {error}"))?;
     use std::io::Write;
-    let mut line = serde_json::to_vec(&record).map_err(|error| format!("serialize events: {error}"))?;
+    let mut line =
+        serde_json::to_vec(&record).map_err(|error| format!("serialize events: {error}"))?;
     line.push(b'\n');
-    file.write_all(&line).map_err(|error| format!("append events: {error}"))
+    file.write_all(&line)
+        .map_err(|error| format!("append events: {error}"))
 }
 
 fn request_activity(req: &Req, resp: &Resp) -> serde_json::Value {
@@ -231,7 +235,8 @@ impl Server {
         let dir = self.root.join(".agent-collab").join("mailbox");
         std::fs::create_dir_all(&dir).map_err(|error| format!("create directory: {error}"))?;
         let path = dir.join(format!("{}.json", msg.id));
-        let data = serde_json::to_string_pretty(msg).map_err(|error| format!("message serialize: {error}"))?;
+        let data = serde_json::to_string_pretty(msg)
+            .map_err(|error| format!("message serialize: {error}"))?;
         std::fs::write(&path, data).map_err(|error| format!("message snapshot: {error}"))?;
         let jsonl_path = dir.join(format!("recipient-{}.jsonl", msg.to));
         if jsonl_path.exists() {
@@ -277,8 +282,10 @@ impl Server {
             "message": msg,
         });
         let data = serde_json::to_string(&record).map_err(|error| format!("serialize: {error}"))?;
-        file.write_all(data.as_bytes()).map_err(|error| format!("append: {error}"))?;
-        file.write_all(b"\n").map_err(|error| format!("newline: {error}"))?;
+        file.write_all(data.as_bytes())
+            .map_err(|error| format!("append: {error}"))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("newline: {error}"))?;
         file.sync_data().map_err(|error| format!("sync: {error}"))?;
         Ok(())
     }
@@ -405,7 +412,10 @@ fn notification_class(subject: &str) -> (&'static str, &'static str) {
         return ("P0", "resolve the blocker; you own it");
     }
     if subject.starts_with("release") || subject.contains("released") {
-        return ("P1", "the resource is free; resume the task that waited on it");
+        return (
+            "P1",
+            "the resource is free; resume the task that waited on it",
+        );
     }
     if subject.contains("recorded") || subject.contains("receipt") || subject.contains("delivered")
     {
@@ -467,14 +477,27 @@ fn batch_notification_text(
     batch: &[(i64, String, String, String, String)],
     remaining: usize,
 ) -> String {
-    let message_ids = batch.iter().map(|(_, id, _, _, _)| id.as_str()).collect::<Vec<_>>().join(",");
-    let actions = batch.iter().map(|(_, _, _, _, text)| {
-        text.split_once('[').and_then(|(_, rest)| rest.split_once(']')).map(|(subject, _)| subject).unwrap_or("notification")
-    }).collect::<Vec<_>>().join(",");
+    let message_ids = batch
+        .iter()
+        .map(|(_, id, _, _, _)| id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let actions = batch
+        .iter()
+        .map(|(_, _, _, _, text)| {
+            text.split_once('[')
+                .and_then(|(_, rest)| rest.split_once(']'))
+                .map(|(subject, _)| subject)
+                .unwrap_or("notification")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     // Message does not carry a typed task association. Do not infer one from
     // preview text; the durable inbox remains the source for task details.
     let task_ids = "none";
-    let older = (remaining > 0).then(|| format!(" older_messages={remaining}; run collab inbox")).unwrap_or_default();
+    let older = (remaining > 0)
+        .then(|| format!(" older_messages={remaining}; run collab inbox"))
+        .unwrap_or_default();
     format!("Batch wake: message_ids={message_ids} task_ids={task_ids} action_categories={actions}. Read full durable details from collab inbox; execute the actions, do not ACK-only.{older}")
 }
 
@@ -503,7 +526,10 @@ fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailb
             Err(error) => return Err(format!("malformed JSONL record {}: {error}", index + 1)),
         }
     }
-    Ok(RecipientMailboxRead { records, partial_tail })
+    Ok(RecipientMailboxRead {
+        records,
+        partial_tail,
+    })
 }
 
 fn missing_recipient_projection_messages(
@@ -709,7 +735,7 @@ fn attempt_notification_with(
     subscription_id: &str,
     can_receive: &dyn Fn(&str) -> bool,
     deliver: &dyn Fn(&str, &str) -> bool,
-    owns_pane: &dyn Fn(&str, &str) -> bool,
+    owns_pane: &dyn Fn(&str, &str) -> Result<bool, ()>,
 ) -> bool {
     attempt_notification_with_at(
         server,
@@ -728,7 +754,7 @@ fn attempt_notification_with_at(
     subscription_id: &str,
     can_receive: &dyn Fn(&str) -> bool,
     deliver: &dyn Fn(&str, &str) -> bool,
-    owns_pane: &dyn Fn(&str, &str) -> bool,
+    owns_pane: &dyn Fn(&str, &str) -> Result<bool, ()>,
     now: i64,
 ) -> bool {
     if !server.config.notifications.enabled {
@@ -758,8 +784,19 @@ fn attempt_notification_with_at(
         (recipient, pane, delay, worker_pane, explicit)
     };
 
-    let alive = (server.pane_alive_check)(&pane);
-    let owned = alive && owns_pane(&recipient, &pane);
+    let presence = (server.pane_alive_check)(&pane);
+    if presence == PanePresence::Unknown {
+        return false;
+    }
+    let alive = presence == PanePresence::Present;
+    let owned = if alive {
+        match owns_pane(&recipient, &pane) {
+            Ok(owned) => owned,
+            Err(()) => return false,
+        }
+    } else {
+        false
+    };
     let state_probe = if alive && owned {
         (server.pane_state_check)(&pane)
     } else {
@@ -1295,7 +1332,7 @@ pub(crate) fn attempt_notification_with_default(
         subscription_id,
         can_receive,
         deliver,
-        &|_, _| true,
+        &|_, _| Ok(true),
     )
 }
 
@@ -1530,11 +1567,16 @@ fn migration_issues(server: &Server, state: &State) -> Vec<String> {
     let mut issues = Vec::new();
     for worker in state.workers.values() {
         match worker.pane.as_deref() {
-            Some(pane) if pane.starts_with('%') => {
-                if !(server.pane_alive_check)(pane) {
-                    issues.push(format!("worker {} tmux pane is offline", worker.id));
+            Some(pane) if pane.starts_with('%') => match (server.pane_alive_check)(pane) {
+                PanePresence::Present => {}
+                PanePresence::Missing => {
+                    issues.push(format!("worker {} tmux pane is offline", worker.id))
                 }
-            }
+                PanePresence::Unknown => issues.push(format!(
+                    "worker {} tmux pane liveness is unknown",
+                    worker.id
+                )),
+            },
             _ => issues.push(format!("worker {} is not bound to tmux", worker.id)),
         }
     }
@@ -1995,15 +2037,13 @@ pub(crate) fn handle_register(
             ));
         }
         server.commit_locked(&mut st, &events);
-        return Resp::data(
-            json!({
-                "worker_id": worker_id,
-                "identity_kind": "peer",
-                "runtime": runtime,
-                "reused": true,
-                "role_brief": role_brief(&st, &worker_id)
-            }),
-        );
+        return Resp::data(json!({
+            "worker_id": worker_id,
+            "identity_kind": "peer",
+            "runtime": runtime,
+            "reused": true,
+            "role_brief": role_brief(&st, &worker_id)
+        }));
     }
     let rec = WorkerRec {
         id: worker_id.clone(),
@@ -2078,8 +2118,9 @@ pub(crate) fn live_master_id(server: &Server, state: &State) -> Option<String> {
     let worker_id = state.master_worker_id.as_deref()?;
     let worker = state.workers.get(worker_id)?;
     let pane = worker.pane.as_deref()?;
-    ((server.pane_alive_check)(pane) && (server.pane_owner_check)(worker_id, pane))
-        .then(|| worker_id.to_string())
+    ((server.pane_alive_check)(pane) == PanePresence::Present
+        && (server.pane_owner_check)(worker_id, pane) == Ok(true))
+    .then(|| worker_id.to_string())
 }
 
 fn is_managed_subagent(state: &State, worker_id: &str) -> bool {
@@ -2136,7 +2177,7 @@ fn handle_master_promote(
     if worker
         .pane
         .as_deref()
-        .is_none_or(|pane| !(server.pane_alive_check)(pane))
+        .is_none_or(|pane| (server.pane_alive_check)(pane) != PanePresence::Present)
     {
         return Resp::err("master promotion requires a live tmux pane");
     }
@@ -2172,7 +2213,7 @@ fn handle_master_delegate(
     if target
         .pane
         .as_deref()
-        .is_none_or(|pane| !(server.pane_alive_check)(pane))
+        .is_none_or(|pane| (server.pane_alive_check)(pane) != PanePresence::Present)
     {
         return Resp::err("master delegation requires a live target tmux pane");
     }
@@ -2233,7 +2274,7 @@ fn handle_worker_close(
     let mut killed_session = false;
     if kill_session {
         if let Some(pane) = target.pane.as_deref() {
-            if (server.pane_alive_check)(pane) {
+            if (server.pane_alive_check)(pane) == PanePresence::Present {
                 let output = std::process::Command::new("tmux")
                     .args(["display-message", "-p", "-t", pane, "#{session_id}"])
                     .output();
@@ -2514,7 +2555,8 @@ fn handle_cross_project_send(
         return Resp::err(format!("recipient {} not registered", to));
     };
     if recipient.pane.as_deref().is_none_or(|pane| {
-        !(server.pane_alive_check)(pane) || !(server.pane_owner_check)(&to, pane)
+        (server.pane_alive_check)(pane) != PanePresence::Present
+            || (server.pane_owner_check)(&to, pane) != Ok(true)
     }) {
         return Resp::err("cross-project communication requires a live target tmux identity");
     }
@@ -2861,10 +2903,18 @@ fn handle_task_update(
     }))
 }
 
-fn stale_worker_views(st: &State, is_reachable: &dyn Fn(&str) -> bool) -> Vec<serde_json::Value> {
+fn stale_worker_views(
+    st: &State,
+    presence: &dyn Fn(&str) -> PanePresence,
+) -> Vec<serde_json::Value> {
     st.workers
         .values()
-        .filter(|worker| worker.pane.is_some() && !worker.pane.as_deref().is_some_and(is_reachable))
+        .filter(|worker| {
+            worker
+                .pane
+                .as_deref()
+                .is_some_and(|pane| presence(pane) == PanePresence::Missing)
+        })
         .map(|worker| {
             let active_tasks: Vec<String> = st
                 .tasks
@@ -2883,15 +2933,22 @@ fn stale_worker_views(st: &State, is_reachable: &dyn Fn(&str) -> bool) -> Vec<se
 }
 
 fn tmux_session_for_pane(pane: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", "-t", pane, "#S"])
-        .output()
-        .ok()?;
+    tmux_session_for_pane_with(pane, &knock::tmux_output).ok()
+}
+
+fn tmux_session_for_pane_with(
+    pane: &str,
+    run: &dyn Fn(&[&str]) -> std::io::Result<std::process::Output>,
+) -> Result<String, ()> {
+    let output = run(&["display-message", "-p", "-t", pane, "#S"]).map_err(|_| ())?;
     if !output.status.success() {
-        return None;
+        return Err(());
     }
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!name.is_empty()).then_some(name)
+    let name = std::str::from_utf8(&output.stdout).map_err(|_| ())?.trim();
+    if name.is_empty() || name.contains(['\r', '\n']) {
+        return Err(());
+    }
+    Ok(name.to_string())
 }
 
 fn tmux_pane_for_session(session: &str) -> Option<String> {
@@ -2915,11 +2972,11 @@ fn tmux_pane_for_session(session: &str) -> Option<String> {
 /// worker id. Non-tmux operators always pass. Stale or split bindings wake
 /// the wrong agent, so keepalive and notification paths consult this guard
 /// before touching a pane.
-pub(crate) fn pane_owner_authoritative(worker_id: &str, pane: &str) -> bool {
+pub(crate) fn pane_owner_authoritative(worker_id: &str, pane: &str) -> Result<bool, ()> {
     if pane.starts_with('%') {
-        tmux_session_for_pane(pane).as_deref() == Some(worker_id)
+        tmux_session_for_pane_with(pane, &knock::tmux_output).map(|session| session == worker_id)
     } else {
-        true
+        Ok(true)
     }
 }
 
@@ -3115,7 +3172,8 @@ fn handle_task_close(
             .get(&task.owner)
             .and_then(|owner| owner.pane.as_deref())
             .is_some_and(|pane| {
-                (server.pane_alive_check)(pane) && (server.pane_owner_check)(&task.owner, pane)
+                (server.pane_alive_check)(pane) != PanePresence::Missing
+                    && (server.pane_owner_check)(&task.owner, pane) != Ok(false)
             });
         let authorized = live_master.as_deref() == Some(worker_id.as_str())
             || (live_master.is_none() && (task.owner == worker_id || !owner_identity_live));
@@ -3591,8 +3649,12 @@ fn worker_status_summary_with_maps(
         .values()
         .find(|task| task.owner == w.id && !matches!(task.status.as_str(), "closed" | "cancelled"));
     let pane = w.pane.as_deref();
-    let endpoint_live = pane.is_some_and(server.pane_alive_check);
-    let identity_valid = endpoint_live && pane.is_some_and(|p| (server.pane_owner_check)(&w.id, p));
+    let presence = pane
+        .map(server.pane_alive_check)
+        .unwrap_or(PanePresence::Missing);
+    let endpoint_live = presence == PanePresence::Present;
+    let ownership = pane.map(|p| (server.pane_owner_check)(&w.id, p));
+    let identity_valid = endpoint_live && ownership == Some(Ok(true));
     let agent_state = if endpoint_live && identity_valid {
         pane.map(|p| match (server.pane_state_check)(p) {
             crate::server::knock::AgentState::Waiting => "waiting",
@@ -3601,6 +3663,8 @@ fn worker_status_summary_with_maps(
             crate::server::knock::AgentState::Unknown => "unknown",
         })
         .unwrap_or("absent")
+    } else if presence == PanePresence::Unknown || (endpoint_live && ownership == Some(Err(()))) {
+        "unknown"
     } else {
         "absent"
     };
@@ -4245,7 +4309,9 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             }
             let count = msgs.len();
             let projection = worker_id.as_deref().and_then(|recipient| {
-                let path = server.root.join(".agent-collab/mailbox")
+                let path = server
+                    .root
+                    .join(".agent-collab/mailbox")
                     .join(format!("recipient-{recipient}.jsonl"));
                 match read_recipient_mailbox(&path, recipient) {
                     Ok(read) => {
@@ -4339,7 +4405,8 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
             }
             Err(e) => {
                 let resp = Resp::err(format!("bad request: {}", e));
-                let _ = record_activity(&server.root, "protocol_error", json!({"error": resp.error}));
+                let _ =
+                    record_activity(&server.root, "protocol_error", json!({"error": resp.error}));
                 resp
             }
         };
@@ -4463,7 +4530,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         root: scope.root.clone(),
         state: Mutex::new(state),
         journal: Mutex::new(journal_file),
-        pane_alive_check: pane_alive,
+        pane_alive_check: pane_presence,
         pane_owner_check: pane_owner_authoritative,
         pane_state_check: knock::probe_agent_state,
         mailbox_notify: Notify::new(),
@@ -4510,3 +4577,41 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
 
 #[cfg(test)]
 pub(crate) mod peer_tests;
+
+#[cfg(test)]
+mod ownership_probe_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_command_errors_are_unknown_and_success_is_parsed_strictly() {
+        assert_eq!(
+            tmux_session_for_pane_with("%42", &|_| Command::new("/dev/null/collab-missing-tmux")
+                .output()),
+            Err(())
+        );
+        assert_eq!(
+            tmux_session_for_pane_with("%42", &|_| Command::new("/bin/sh")
+                .args(["-c", "exit 7"])
+                .output()),
+            Err(())
+        );
+        assert_eq!(
+            tmux_session_for_pane_with("%42", &|_| Command::new("/bin/sh")
+                .args(["-c", "printf ''"])
+                .output()),
+            Err(())
+        );
+        assert_eq!(
+            tmux_session_for_pane_with("%42", &|_| Command::new("/bin/sh")
+                .args(["-c", "printf 'one\\ntwo\\n'"])
+                .output()),
+            Err(())
+        );
+        assert_eq!(
+            tmux_session_for_pane_with("%42", &|_| Command::new("/bin/sh")
+                .args(["-c", "printf 'worker\\n'"])
+                .output()),
+            Ok("worker".into())
+        );
+    }
+}

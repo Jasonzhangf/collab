@@ -12,6 +12,13 @@ pub enum AgentState {
     Waiting,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanePresence {
+    Present,
+    Missing,
+    Unknown,
+}
+
 struct PaneAliveCache {
     at: Option<std::time::Instant>,
     panes: Option<std::collections::HashSet<String>>,
@@ -23,60 +30,103 @@ static PANE_ALIVE_CACHE: std::sync::Mutex<PaneAliveCache> = std::sync::Mutex::ne
 const PANE_ALIVE_TTL: std::time::Duration = std::time::Duration::from_millis(250);
 
 pub fn pane_alive(pane: &str) -> bool {
+    pane_presence(pane) == PanePresence::Present
+}
+
+pub fn pane_presence(pane: &str) -> PanePresence {
+    pane_presence_with(pane, &PANE_ALIVE_CACHE, &tmux_output)
+}
+
+pub(super) fn tmux_output(args: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new("tmux").args(args).output()
+}
+
+fn pane_presence_with(
+    pane: &str,
+    cache: &std::sync::Mutex<PaneAliveCache>,
+    run: &dyn Fn(&[&str]) -> std::io::Result<std::process::Output>,
+) -> PanePresence {
     if !pane.starts_with('%') {
-        return false;
+        return PanePresence::Missing;
     }
     let now = std::time::Instant::now();
     {
-        let cache = PANE_ALIVE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        let cache = cache.lock().unwrap_or_else(|p| p.into_inner());
         if let (Some(at), Some(panes)) = (cache.at, cache.panes.as_ref()) {
             if now.saturating_duration_since(at) < PANE_ALIVE_TTL {
-                return panes.contains(pane);
+                return if panes.contains(pane) {
+                    PanePresence::Present
+                } else {
+                    PanePresence::Missing
+                };
             }
         }
     }
     // `tmux display-message -t <pane>` exits 0 even when the pane does not
     // exist, so enumerate all panes and compare pane ids exactly.
-    let output = Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id}"])
-        .output();
+    let output = run(&["list-panes", "-a", "-F", "#{pane_id}"]);
     let mut set = std::collections::HashSet::new();
-    if let Ok(o) = output {
-        if o.status.success() {
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                let id = line.trim();
-                if !id.is_empty() {
-                    set.insert(id.to_string());
-                }
-            }
+    let Ok(o) = output else {
+        return PanePresence::Unknown;
+    };
+    if !o.status.success() {
+        return PanePresence::Unknown;
+    }
+    let Ok(stdout) = std::str::from_utf8(&o.stdout) else {
+        return PanePresence::Unknown;
+    };
+    for line in stdout.lines() {
+        let id = line.trim();
+        if !id
+            .strip_prefix('%')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return PanePresence::Unknown;
         }
+        set.insert(id.to_string());
     }
     let alive = set.contains(pane);
-    let mut cache = PANE_ALIVE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
     cache.at = Some(now);
     cache.panes = Some(set);
-    alive
+    if alive {
+        PanePresence::Present
+    } else {
+        PanePresence::Missing
+    }
 }
 
 pub fn probe_agent_state(pane: &str) -> AgentState {
+    probe_agent_state_with(pane, &pane_view)
+}
+
+fn probe_agent_state_with(
+    pane: &str,
+    view: &dyn Fn(&str) -> Result<(String, String, String), PaneViewError>,
+) -> AgentState {
     if !pane.starts_with('%') {
         return AgentState::Absent;
     }
-    let Some((command, title, screen)) = pane_view(pane) else {
-        return AgentState::Absent;
+    let (command, title, screen) = match view(pane) {
+        Ok(view) => view,
+        Err(PaneViewError::Absent) => return AgentState::Absent,
+        Err(PaneViewError::Unknown) => return AgentState::Unknown,
     };
     let first = agent_state_from_with(&command, &title, &screen, official_status);
     if first != AgentState::Waiting {
         return first;
     }
     std::thread::sleep(std::time::Duration::from_millis(150));
-    let Some((command2, title2, screen2)) = pane_view(pane) else {
-        return AgentState::Absent;
+    let (command2, title2, screen2) = match view(pane) {
+        Ok(view) => view,
+        Err(PaneViewError::Absent) => return AgentState::Absent,
+        Err(PaneViewError::Unknown) => return AgentState::Unknown,
     };
-    if agent_state_from_with(&command2, &title2, &screen2, official_status) == AgentState::Working
-        || title2 != title
-        || screen2 != screen
-    {
+    let second = agent_state_from_with(&command2, &title2, &screen2, official_status);
+    if second != AgentState::Waiting {
+        return second;
+    }
+    if title2 != title || screen2 != screen {
         AgentState::Working
     } else {
         AgentState::Waiting
@@ -87,31 +137,62 @@ pub fn pane_idle(pane: &str) -> bool {
     probe_agent_state(pane) == AgentState::Waiting
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneViewError {
+    Absent,
+    Unknown,
+}
 
-fn pane_view(pane: &str) -> Option<(String, String, String)> {
-    let identity = Command::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            pane,
-            "#{pane_current_command}\t#{pane_title}",
-        ])
-        .output()
-        .ok()?;
-    if !identity.status.success() {
-        return None;
+fn pane_view_error(presence: PanePresence) -> PaneViewError {
+    match presence {
+        PanePresence::Missing => PaneViewError::Absent,
+        PanePresence::Present | PanePresence::Unknown => PaneViewError::Unknown,
     }
-    let output = String::from_utf8_lossy(&identity.stdout);
-    let (command, title) = output.trim().split_once('\t')?;
-    let screen = Command::new("tmux")
-        .args(["capture-pane", "-p", "-t", pane, "-S", "-40"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    Some((command.to_string(), title.to_string(), screen))
+}
+
+fn pane_view(pane: &str) -> Result<(String, String, String), PaneViewError> {
+    pane_view_with(pane, &tmux_output, &pane_presence)
+}
+
+fn pane_view_with(
+    pane: &str,
+    run: &dyn Fn(&[&str]) -> std::io::Result<std::process::Output>,
+    presence: &dyn Fn(&str) -> PanePresence,
+) -> Result<(String, String, String), PaneViewError> {
+    match presence(pane) {
+        PanePresence::Missing => return Err(PaneViewError::Absent),
+        PanePresence::Unknown => return Err(PaneViewError::Unknown),
+        PanePresence::Present => {}
+    }
+    let identity = run(&[
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{pane_current_command}\t#{pane_title}",
+    ])
+    .map_err(|_| PaneViewError::Unknown)?;
+    if !identity.status.success() {
+        return Err(pane_view_error(presence(pane)));
+    }
+    let output = std::str::from_utf8(&identity.stdout).map_err(|_| PaneViewError::Unknown)?;
+    let (command, title) = output
+        .trim_end_matches(['\r', '\n'])
+        .split_once('\t')
+        .ok_or(PaneViewError::Unknown)?;
+    if command.trim().is_empty() {
+        return Err(PaneViewError::Unknown);
+    }
+    let screen = run(&["capture-pane", "-p", "-t", pane, "-S", "-40"])
+        .map_err(|_| PaneViewError::Unknown)?;
+    if !screen.status.success() {
+        return Err(pane_view_error(presence(pane)));
+    }
+    Ok((
+        command.to_string(),
+        title.to_string(),
+        String::from_utf8(screen.stdout).map_err(|_| PaneViewError::Unknown)?,
+    ))
 }
 
 fn has_spinner(text: &str) -> bool {
@@ -435,9 +516,9 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if !matches!(state, AgentState::Waiting | AgentState::Working) {
         anyhow::bail!("pane {} is not a known agent (state: {:?})", pane, state);
     }
-    let kind = pane_view(pane)
-        .map(|(command, _, screen)| submit_kind(&command, &screen))
-        .unwrap_or(SubmitKind::BracketedPaste);
+    let (command, _, screen) =
+        pane_view(pane).map_err(|error| anyhow::anyhow!("pane {pane} view failed: {error:?}"))?;
+    let kind = submit_kind(&command, &screen);
     knock_kind(pane, text, kind, state == AgentState::Working)
 }
 
@@ -447,6 +528,148 @@ mod tests {
         agent_state_from, agent_state_from_with, literal_args, paste_args, paste_submit_args,
         steer_followup, submit_kind, AgentState, RuntimeKind, SubmitKind,
     };
+
+    fn output(text: &[u8]) -> std::io::Result<std::process::Output> {
+        use std::os::unix::process::ExitStatusExt;
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: text.to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn pane_presence_command_failures_are_unknown_and_not_cached() {
+        use super::{pane_presence_with, PaneAliveCache, PanePresence};
+        use std::process::Command;
+        let cache = std::sync::Mutex::new(PaneAliveCache {
+            at: None,
+            panes: None,
+        });
+        let missing_binary = |_: &[&str]| Command::new("/dev/null/collab-missing-tmux").output();
+        let nonzero = |_: &[&str]| Command::new("/bin/sh").args(["-c", "exit 7"]).output();
+        assert_eq!(
+            pane_presence_with("%42", &cache, &missing_binary),
+            PanePresence::Unknown
+        );
+        assert_eq!(
+            pane_presence_with("%42", &cache, &nonzero),
+            PanePresence::Unknown
+        );
+        assert_eq!(
+            pane_presence_with("%42", &cache, &|_| output(b"not a pane\n")),
+            PanePresence::Unknown
+        );
+        assert_eq!(
+            pane_presence_with("%42", &cache, &|_| output(b"\xff")),
+            PanePresence::Unknown
+        );
+        assert!(
+            cache.lock().unwrap().at.is_none(),
+            "failed enumeration must not cache absence"
+        );
+        assert_eq!(
+            pane_presence_with("%42", &cache, &|_| output(b"%42\n")),
+            PanePresence::Present
+        );
+        assert_eq!(
+            pane_presence_with("%43", &cache, &|_| panic!(
+                "successful enumeration is cached"
+            )),
+            PanePresence::Missing
+        );
+    }
+
+    #[test]
+    fn pane_view_command_failures_remain_unknown_until_absence_confirmed() {
+        use super::{pane_view_with, PanePresence, PaneViewError};
+        use std::process::Command;
+        for failed_stage in ["display-message", "capture-pane"] {
+            for startup_failure in [true, false] {
+                let run = |args: &[&str]| {
+                    if args[0] == failed_stage {
+                        if startup_failure {
+                            Command::new("/dev/null/collab-missing-tmux").output()
+                        } else {
+                            Command::new("/bin/sh").args(["-c", "exit 7"]).output()
+                        }
+                    } else {
+                        output(b"codex\ttitle\n")
+                    }
+                };
+                assert_eq!(
+                    pane_view_with("%42", &run, &|_| PanePresence::Present),
+                    Err(PaneViewError::Unknown)
+                );
+            }
+        }
+        assert_eq!(
+            pane_view_with("%42", &|_| output(b"malformed"), &|_| PanePresence::Present),
+            Err(PaneViewError::Unknown)
+        );
+        assert_eq!(
+            pane_view_with("%42", &|_| output(b"\xff"), &|_| PanePresence::Present),
+            Err(PaneViewError::Unknown)
+        );
+        assert_eq!(
+            pane_view_with(
+                "%42",
+                &|_| panic!("confirmed absent pane is not inspected"),
+                &|_| PanePresence::Missing
+            ),
+            Err(PaneViewError::Absent)
+        );
+        assert_eq!(
+            pane_view_with("%42", &|_| panic!("unknown pane is not inspected"), &|_| {
+                PanePresence::Unknown
+            }),
+            Err(PaneViewError::Unknown)
+        );
+        let checks = std::cell::Cell::new(0);
+        assert_eq!(
+            pane_view_with(
+                "%42",
+                &|_| Command::new("/bin/sh").args(["-c", "exit 7"]).output(),
+                &|_| {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == 1 {
+                        PanePresence::Present
+                    } else {
+                        PanePresence::Missing
+                    }
+                }
+            ),
+            Err(PaneViewError::Absent)
+        );
+    }
+
+    #[test]
+    fn probe_preserves_unknown_on_first_and_second_observation() {
+        use super::{probe_agent_state_with, PaneViewError};
+        assert_eq!(
+            probe_agent_state_with("%42", &|_| Err(PaneViewError::Unknown)),
+            AgentState::Unknown
+        );
+        assert_eq!(
+            probe_agent_state_with("%42", &|_| Err(PaneViewError::Absent)),
+            AgentState::Absent
+        );
+        let calls = std::cell::Cell::new(0);
+        let result = probe_agent_state_with("%42", &|_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Ok((
+                    "codex".into(),
+                    "".into(),
+                    "OpenAI Codex\n› \n  ? for shortcuts".into(),
+                ))
+            } else {
+                Err(PaneViewError::Unknown)
+            }
+        });
+        assert_eq!(calls.get(), 2);
+        assert_eq!(result, AgentState::Unknown);
+    }
 
     #[test]
     #[ignore = "requires tmux and node; uses a disposable session"]

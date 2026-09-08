@@ -52,7 +52,9 @@ fn managed_subagent_target(state: &State, server: &Server) -> Option<String> {
     let target = super::live_master_id(server, state)?;
     let worker = state.workers.get(&target)?;
     let pane = worker.pane.as_deref()?;
-    ((server.pane_alive_check)(pane) && (server.pane_owner_check)(&target, pane)).then_some(target)
+    ((server.pane_alive_check)(pane) == super::knock::PanePresence::Present
+        && (server.pane_owner_check)(&target, pane) == Ok(true))
+    .then_some(target)
 }
 
 fn handle_managed_subagent(
@@ -75,7 +77,11 @@ fn handle_managed_subagent(
         return (false, None);
     }
     let observed = observed_label(agent);
-    let old = state.keepalives.get(&worker.id).cloned().unwrap_or_default();
+    let old = state
+        .keepalives
+        .get(&worker.id)
+        .cloned()
+        .unwrap_or_default();
     let changed = old.observed != observed || subagent.status != observed;
     let mut record = old;
     record.observed = observed.into();
@@ -123,7 +129,12 @@ fn handle_managed_subagent(
     if notify_due {
         if let Some(target) = &target {
             let id = super::gen_msg_id();
-            let body = format!("subagent={} state={} tasks={}", subagent.id, observed, tasks.join(","));
+            let body = format!(
+                "subagent={} state={} tasks={}",
+                subagent.id,
+                observed,
+                tasks.join(",")
+            );
             events.push(Event::Sent {
                 msg: Message {
                     id: id.clone(),
@@ -234,7 +245,7 @@ pub(crate) fn tick_with(
     now: i64,
     probe: &dyn Fn(&str) -> AgentState,
     wake: &dyn Fn(&str, &str) -> bool,
-    owns_pane: &dyn Fn(&str, &str) -> bool,
+    owns_pane: &dyn Fn(&str, &str) -> Result<bool, ()>,
 ) {
     if !server.config.keepalive.enabled || !server.config.timers.enabled {
         return;
@@ -250,13 +261,29 @@ pub(crate) fn tick_with(
         let Some(pane) = worker.pane.clone() else {
             continue;
         };
-        let is_alive = (server.pane_alive_check)(&pane);
-        let is_owned = is_alive && owns_pane(&worker.id, &pane);
+        let presence = (server.pane_alive_check)(&pane);
+        if presence == super::knock::PanePresence::Unknown {
+            continue;
+        }
+        let is_alive = presence == super::knock::PanePresence::Present;
+        let is_owned = if is_alive {
+            match owns_pane(&worker.id, &pane) {
+                Ok(owned) => owned,
+                Err(()) => continue,
+            }
+        } else {
+            false
+        };
         let agent = if is_alive && is_owned {
             probe(&pane)
         } else {
             AgentState::Absent
         };
+        // Failed observation must not erase the working -> idle edge or an
+        // existing idle episode, including managed-subagent observations.
+        if agent == AgentState::Unknown {
+            continue;
+        }
 
         let mut state = server.state.lock().unwrap();
         if state.admission_frozen() {
@@ -307,7 +334,9 @@ pub(crate) fn tick_with(
                                 last_wake_attempt_ms: 0,
                             },
                         });
-                        if let Some(sub) = state.matching_subscription(&master_id, "direct-message", None, now) {
+                        if let Some(sub) =
+                            state.matching_subscription(&master_id, "direct-message", None, now)
+                        {
                             events.push(Event::WakeBound {
                                 message_id: alert_id,
                                 subscription_id: sub.id.clone(),
@@ -381,7 +410,9 @@ pub(crate) fn tick_with(
             if idle_notification_due {
                 if let Some(master_id) = super::live_master_id(server, &state) {
                     if master_id == worker.id {
-                        if let Some(sub) = state.matching_subscription(&worker.id, "direct-message", None, now) {
+                        if let Some(sub) =
+                            state.matching_subscription(&worker.id, "direct-message", None, now)
+                        {
                             let alert_id = super::gen_msg_id();
                             events.push(Event::Sent {
                                 msg: Message {
@@ -406,7 +437,8 @@ pub(crate) fn tick_with(
                                 subscription_id: sub.id.clone(),
                             });
                             record.last_notice_ms = now;
-                            record.idle_episode_notices = record.idle_episode_notices.saturating_add(1);
+                            record.idle_episode_notices =
+                                record.idle_episode_notices.saturating_add(1);
                         }
                     } else {
                         let alert_id = super::gen_msg_id();
@@ -429,7 +461,9 @@ pub(crate) fn tick_with(
                             },
                         });
                         record.idle_episode_notices = record.idle_episode_notices.saturating_add(1);
-                        if let Some(sub) = state.matching_subscription(&master_id, "direct-message", None, now) {
+                        if let Some(sub) =
+                            state.matching_subscription(&master_id, "direct-message", None, now)
+                        {
                             events.push(Event::WakeBound {
                                 message_id: alert_id,
                                 subscription_id: sub.id.clone(),
@@ -439,10 +473,13 @@ pub(crate) fn tick_with(
                 }
             }
             if record != old {
-                events.insert(0, Event::KeepaliveUpdated {
-                    worker_id: worker.id.clone(),
-                    record,
-                });
+                events.insert(
+                    0,
+                    Event::KeepaliveUpdated {
+                        worker_id: worker.id.clone(),
+                        record,
+                    },
+                );
             }
             if !events.is_empty() {
                 server.commit_locked(&mut state, &events);
@@ -502,7 +539,9 @@ pub(crate) fn tick_with(
                             last_wake_attempt_ms: 0,
                         },
                     }];
-                    if let Some(sub) = state.matching_subscription(&master_id, "direct-message", None, now) {
+                    if let Some(sub) =
+                        state.matching_subscription(&master_id, "direct-message", None, now)
+                    {
                         alert_events.push(Event::WakeBound {
                             message_id: alert_id,
                             subscription_id: sub.id.clone(),
@@ -538,26 +577,26 @@ pub(crate) fn tick_with(
         record.last_notice_id = Some(id.clone());
         let subscription_id = subscription.as_ref().expect("checked above").id.clone();
         let mut events = vec![
-                Event::KeepaliveUpdated {
-                    worker_id: worker.id.clone(),
-                    record,
+            Event::KeepaliveUpdated {
+                worker_id: worker.id.clone(),
+                record,
+            },
+            Event::Sent {
+                msg: Message {
+                    id: id.clone(),
+                    from: "collab-server".into(),
+                    to: worker.id.clone(),
+                    mtype: "keepalive".into(),
+                    subject: Some(subject.clone()),
+                    body: body.clone(),
+                    in_reply_to: None,
+                    created_ms: now,
+                    state: "pending".into(),
+                    wake_attempt_count: 0,
+                    last_wake_attempt_ms: 0,
                 },
-                Event::Sent {
-                    msg: Message {
-                        id: id.clone(),
-                        from: "collab-server".into(),
-                        to: worker.id.clone(),
-                        mtype: "keepalive".into(),
-                        subject: Some(subject.clone()),
-                        body: body.clone(),
-                        in_reply_to: None,
-                        created_ms: now,
-                        state: "pending".into(),
-                        wake_attempt_count: 0,
-                        last_wake_attempt_ms: 0,
-                    },
-                },
-            ];
+            },
+        ];
         events.push(Event::WakeBound {
             message_id: id.clone(),
             subscription_id: subscription_id.clone(),
@@ -581,6 +620,126 @@ pub(crate) fn tick_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_prechecks_preserve_working_edge_and_idle_episode_without_worker_wake() {
+        use super::super::knock::PanePresence;
+        use super::super::peer_tests::{register, test_server};
+        for failure in ["presence", "ownership", "view"] {
+            let (mut server, root) = test_server();
+            register(&server, "master", "%master");
+            register(&server, "worker", "%worker");
+            assert!(
+                super::super::handle_master_promote(
+                    &server,
+                    "master".into(),
+                    "token-master".into(),
+                    "approved".into()
+                )
+                .ok
+            );
+            let base = super::super::state::now_ms();
+            let initial = Record {
+                observed: "working".into(),
+                idle_since_ms: base,
+                ..Record::default()
+            };
+            server.commit(&[Event::KeepaliveUpdated {
+                worker_id: "worker".into(),
+                record: initial.clone(),
+            }]);
+            for episode in 0..2 {
+                let before = server.state.lock().unwrap().keepalives["worker"].clone();
+                let message_count = server.state.lock().unwrap().msgs.len();
+                match failure {
+                    "presence" => {
+                        server.pane_alive_check = |pane| {
+                            if pane == "%worker" {
+                                PanePresence::Unknown
+                            } else {
+                                PanePresence::Present
+                            }
+                        }
+                    }
+                    "ownership" => {
+                        server.pane_owner_check = |worker, _| {
+                            if worker == "worker" {
+                                Err(())
+                            } else {
+                                Ok(true)
+                            }
+                        }
+                    }
+                    _ => {
+                        server.pane_state_check = |pane| {
+                            if pane == "%worker" {
+                                AgentState::Unknown
+                            } else {
+                                AgentState::Waiting
+                            }
+                        }
+                    }
+                }
+                tick_with(
+                    &server,
+                    base + episode * 10_000 + 1,
+                    &server.pane_state_check,
+                    &|_, _| panic!("unknown never wakes a worker"),
+                    &server.pane_owner_check,
+                );
+                {
+                    let state = server.state.lock().unwrap();
+                    assert_eq!(
+                        state.keepalives["worker"], before,
+                        "{failure} must preserve the episode"
+                    );
+                    assert_eq!(state.msgs.len(), message_count, "unknown must not notify");
+                }
+                server.pane_alive_check = |_| PanePresence::Present;
+                server.pane_owner_check = |_, _| Ok(true);
+                server.pane_state_check = |_| AgentState::Waiting;
+                tick_with(
+                    &server,
+                    base + episode * 10_000 + 2,
+                    &server.pane_state_check,
+                    &|_, _| panic!("idle observation never wakes the worker"),
+                    &server.pane_owner_check,
+                );
+                let state = server.state.lock().unwrap();
+                assert_eq!(
+                    state
+                        .msgs
+                        .values()
+                        .filter(|m| m.subject.as_deref() == Some("worker-idle: worker"))
+                        .count(),
+                    1
+                );
+                assert!(!state.msgs.values().any(|m| m.to == "worker"));
+                assert!(!state.keepalives["worker"].suspected_offline);
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn confirmed_missing_precheck_still_records_absence() {
+        use super::super::peer_tests::{register, test_server};
+        let (mut server, root) = test_server();
+        register(&server, "worker", "%worker");
+        server.pane_alive_check = |_| super::super::knock::PanePresence::Missing;
+        tick_with(
+            &server,
+            super::super::state::now_ms(),
+            &|_| panic!("missing pane is not probed"),
+            &|_, _| panic!("missing pane is not woken"),
+            &|_, _| panic!("missing pane ownership is not queried"),
+        );
+        let state = server.state.lock().unwrap();
+        assert!(state.keepalives["worker"].suspected_offline);
+        assert_eq!(state.keepalives["worker"].observed, "absent");
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn scheduler_groups_tasks_and_persists_failed_attempts() {
         use super::super::{
@@ -619,21 +778,23 @@ mod tests {
             sends.set(sends.get() + 1);
             false
         };
-        tick_with(&server, base, &|_| AgentState::Waiting, &send, &|_, _| true);
+        tick_with(&server, base, &|_| AgentState::Waiting, &send, &|_, _| {
+            Ok(true)
+        });
         for n in 1..=3 {
             tick_with(
                 &server,
                 base + n * 900_000,
                 &|_| AgentState::Waiting,
                 &send,
-                &|_, _| true,
+                &|_, _| Ok(true),
             );
             tick_with(
                 &server,
                 base + n * 900_000,
                 &|_| AgentState::Waiting,
                 &send,
-                &|_, _| true,
+                &|_, _| Ok(true),
             );
         }
         assert_eq!(sends.get(), 3);
@@ -650,14 +811,14 @@ mod tests {
             base + 3_600_000,
             &|_| AgentState::Waiting,
             &send,
-            &|_, _| true,
+            &|_, _| Ok(true),
         );
         tick_with(
             &server,
             base + 9_000_000,
             &|_| AgentState::Waiting,
             &send,
-            &|_, _| true,
+            &|_, _| Ok(true),
         );
         let state = server.state.lock().unwrap();
         assert!(state.keepalives["worker"].suspected_offline);
@@ -748,12 +909,15 @@ mod tests {
         let (server, root) = test_server();
         register(&server, "master", "%master");
         register(&server, "child", "%child");
-        assert!(super::super::handle_master_promote(
-            &server,
-            "master".into(),
-            "token-master".into(),
-            "user approved master".into(),
-        ).ok);
+        assert!(
+            super::super::handle_master_promote(
+                &server,
+                "master".into(),
+                "token-master".into(),
+                "user approved master".into(),
+            )
+            .ok
+        );
         let now = super::super::state::now_ms();
         server.commit(&[
             Event::SubagentUpdated {
@@ -796,7 +960,13 @@ mod tests {
             wakes.set(wakes.get() + 1);
             true
         };
-        tick_with(&server, now + 900_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        tick_with(
+            &server,
+            now + 900_000,
+            &|_| AgentState::Waiting,
+            &wake,
+            &|_, _| Ok(true),
+        );
         let state = server.state.lock().unwrap();
         assert_eq!(wakes.get(), 0);
         assert_eq!(state.subagents["managed"].status, "idle");
@@ -813,7 +983,13 @@ mod tests {
         );
         drop(state);
 
-        tick_with(&server, now + 1_800_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        tick_with(
+            &server,
+            now + 1_800_000,
+            &|_| AgentState::Waiting,
+            &wake,
+            &|_, _| Ok(true),
+        );
         let state = server.state.lock().unwrap();
         assert_eq!(wakes.get(), 0);
         let status_messages: Vec<_> = state
@@ -826,10 +1002,23 @@ mod tests {
         drop(state);
 
         // A settled state is reported once, not on every later tick.
-        tick_with(&server, now + 2_700_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        tick_with(
+            &server,
+            now + 2_700_000,
+            &|_| AgentState::Waiting,
+            &wake,
+            &|_, _| Ok(true),
+        );
         let state = server.state.lock().unwrap();
         assert_eq!(wakes.get(), 0);
-        assert_eq!(state.msgs.values().filter(|m| m.mtype == "subagent-status").count(), 1);
+        assert_eq!(
+            state
+                .msgs
+                .values()
+                .filter(|m| m.mtype == "subagent-status")
+                .count(),
+            1
+        );
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -843,13 +1032,15 @@ mod tests {
         let (server, root) = test_server();
         register(&server, "master", "%master");
         register(&server, "child", "%child");
-        assert!(super::super::handle_master_promote(
-            &server,
-            "master".into(),
-            "token-master".into(),
-            "user approved master".into(),
-        )
-        .ok);
+        assert!(
+            super::super::handle_master_promote(
+                &server,
+                "master".into(),
+                "token-master".into(),
+                "user approved master".into(),
+            )
+            .ok
+        );
         let now = super::super::state::now_ms();
         server.commit(&[Event::SubagentUpdated {
             subagent: SubagentRecord {
@@ -896,14 +1087,26 @@ mod tests {
         ];
         for (i, agent) in flaps.iter().enumerate() {
             let at = now + 1_000 + (i as i64 * 5_000);
-            tick_with(&server, at, &|_| *agent, &wake, &|_, _| true);
+            tick_with(&server, at, &|_| *agent, &wake, &|_, _| Ok(true));
         }
         assert_eq!(status_count(&server), 0, "flaps must not notify");
 
         // Once a state holds past the settle window it is reported exactly once.
-        tick_with(&server, now + 200_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        tick_with(
+            &server,
+            now + 200_000,
+            &|_| AgentState::Waiting,
+            &wake,
+            &|_, _| Ok(true),
+        );
         assert_eq!(status_count(&server), 1);
-        tick_with(&server, now + 400_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
+        tick_with(
+            &server,
+            now + 400_000,
+            &|_| AgentState::Waiting,
+            &wake,
+            &|_, _| Ok(true),
+        );
         assert_eq!(status_count(&server), 1, "settled state reports once");
 
         std::fs::remove_dir_all(root).unwrap();
@@ -931,14 +1134,14 @@ mod tests {
             base,
             &|_| AgentState::Waiting,
             &|_, _| panic!("initial idle must not wake the master"),
-            &|_, _| true,
+            &|_, _| Ok(true),
         );
         tick_with(
             &server,
             base + 120_000,
             &|_| AgentState::Waiting,
             &|_, _| panic!("initial idle must not send a reminder"),
-            &|_, _| true,
+            &|_, _| Ok(true),
         );
 
         let state = server.state.lock().unwrap();
@@ -968,13 +1171,15 @@ mod tests {
         register(&server, "worker", "%worker");
         register(&server, "initial-idle", "%initial-idle");
         let server = Arc::new(server);
-        assert!(super::super::handle_master_promote(
-            &server,
-            "master".into(),
-            "token-master".into(),
-            "user approved master".into(),
-        )
-        .ok);
+        assert!(
+            super::super::handle_master_promote(
+                &server,
+                "master".into(),
+                "token-master".into(),
+                "user approved master".into(),
+            )
+            .ok
+        );
 
         let base = super::super::state::now_ms();
         let mut initial = Record::default();
@@ -991,7 +1196,7 @@ mod tests {
             true
         };
         let tick = |server: &Server, at: i64, agent: AgentState| {
-            tick_with(server, at, &|_| agent, &wake, &|_, _| true);
+            tick_with(server, at, &|_| agent, &wake, &|_, _| Ok(true));
         };
 
         tick(&server, base, AgentState::Waiting);
@@ -1009,11 +1214,14 @@ mod tests {
             .msgs
             .values()
             .filter(|message| {
-                message.to == "master"
-                    && message.subject == Some("worker-idle: worker".into())
+                message.to == "master" && message.subject == Some("worker-idle: worker".into())
             })
             .collect();
-        assert_eq!(idle_alerts.len(), 1, "monitor probe flaps do not re-arm idle");
+        assert_eq!(
+            idle_alerts.len(),
+            1,
+            "monitor probe flaps do not re-arm idle"
+        );
         assert_eq!(
             state
                 .msgs
@@ -1098,8 +1306,7 @@ mod tests {
                 .msgs
                 .values()
                 .filter(|message| {
-                    message.to == "master"
-                        && message.subject == Some("worker-idle: worker".into())
+                    message.to == "master" && message.subject == Some("worker-idle: worker".into())
                 })
                 .count(),
             1,
@@ -1137,8 +1344,7 @@ mod tests {
                 .msgs
                 .values()
                 .filter(|message| {
-                    message.to == "master"
-                        && message.subject == Some("worker-idle: worker".into())
+                    message.to == "master" && message.subject == Some("worker-idle: worker".into())
                 })
                 .count(),
             2,
