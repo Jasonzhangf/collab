@@ -765,20 +765,35 @@ fn run(
             if ready && record.status == "assigned" {
                 bail!("accept the assigned task before reporting completion");
             }
-            record.status = if ready { "idle" } else { "working" }.into();
-            if !ready {
-                if let Some(task_id) = record.last_message.as_ref().map(|id| format!("task-{id}")) {
-                    if let Some(mut task) = state.tasks.get(&task_id).cloned() {
-                        if task.owner != actor {
-                            bail!("task owner mismatch");
-                        }
-                        if task.status == "assigned" {
-                            task.status = "working".into();
-                            task.updated_ms = now_ms();
-                            server.commit_locked(&mut state, &[Event::TaskUpdated { task }]);
-                        }
-                    }
+            let assigned_task = if !ready {
+                let task_id = record
+                    .last_message
+                    .as_ref()
+                    .map(|id| format!("task-{id}"))
+                    .ok_or_else(|| anyhow::anyhow!("assigned task message binding is missing"))?;
+                let task = state
+                    .tasks
+                    .get(&task_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("assigned task {task_id} not found"))?;
+                if task.owner != actor {
+                    bail!("task owner mismatch");
                 }
+                if task.status != "assigned" {
+                    bail!(
+                        "assigned task {task_id} is not in assigned state (status={})",
+                        task.status
+                    );
+                }
+                Some(task)
+            } else {
+                None
+            };
+            record.status = if ready { "idle" } else { "working" }.into();
+            if let Some(mut task) = assigned_task {
+                task.status = "working".into();
+                task.updated_ms = now_ms();
+                server.commit_locked(&mut state, &[Event::TaskUpdated { task }]);
             }
             server.commit_locked(
                 &mut state,

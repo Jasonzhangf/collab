@@ -939,6 +939,173 @@ fn managed_subagent_send_reclaims_working_child_without_an_owned_task() {
 }
 
 #[test]
+fn managed_subagent_working_requires_existing_owned_assigned_task() {
+    use crate::subagent::{Action, Record};
+
+    {
+        let (server, root) = test_server();
+        register(&server, "parent", "%parent");
+        register(&server, "child", "%child");
+        let now = now_ms();
+        server.commit(&[Event::SubagentUpdated {
+            subagent: Record {
+                id: "missing-task".into(),
+                parent: "parent".into(),
+                peer: "child".into(),
+                status: "assigned".into(),
+                session: Some("$child".into()),
+                pane: Some("%child".into()),
+                profile: None,
+                created_ms: now,
+                ready_deadline_ms: now + 90_000,
+                last_message: Some("missing".into()),
+                error: None,
+                probe_failures: Vec::new(),
+                runtime: None,
+            },
+        }]);
+        let result = crate::subagent::handle(
+            &server,
+            "child",
+            "token-child",
+            Action::Working {
+                id: "missing-task".into(),
+            },
+        );
+        assert!(!result.ok);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("assigned task task-missing not found")
+        );
+        assert_eq!(
+            server.state.lock().unwrap().subagents["missing-task"].status,
+            "assigned"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    {
+        let (server, root) = test_server();
+        register(&server, "parent", "%parent");
+        register(&server, "child", "%child");
+        let now = now_ms();
+        server.commit(&[
+            Event::SubagentUpdated {
+                subagent: Record {
+                    id: "terminal-task".into(),
+                    parent: "parent".into(),
+                    peer: "child".into(),
+                    status: "assigned".into(),
+                    session: Some("$child".into()),
+                    pane: Some("%child".into()),
+                    profile: None,
+                    created_ms: now,
+                    ready_deadline_ms: now + 90_000,
+                    last_message: Some("terminal".into()),
+                    error: None,
+                    probe_failures: Vec::new(),
+                    runtime: None,
+                },
+            },
+            Event::TaskCreated {
+                task: TaskRec {
+                    id: "task-terminal".into(),
+                    owner: "child".into(),
+                    created_by: "parent".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p2".into(),
+                    status: "closed".into(),
+                    next_step: None,
+                    wait: None,
+                    created_ms: now,
+                    updated_ms: now,
+                },
+            },
+        ]);
+        let result = crate::subagent::handle(
+            &server,
+            "child",
+            "token-child",
+            Action::Working {
+                id: "terminal-task".into(),
+            },
+        );
+        assert!(!result.ok);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("assigned task task-terminal is not in assigned state (status=closed)")
+        );
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.subagents["terminal-task"].status, "assigned");
+        assert_eq!(state.tasks["task-terminal"].status, "closed");
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    {
+        let (server, root) = test_server();
+        register(&server, "parent", "%parent");
+        register(&server, "child", "%child");
+        let now = now_ms();
+        server.commit(&[
+            Event::SubagentUpdated {
+                subagent: Record {
+                    id: "owner-task".into(),
+                    parent: "parent".into(),
+                    peer: "child".into(),
+                    status: "assigned".into(),
+                    session: Some("$child".into()),
+                    pane: Some("%child".into()),
+                    profile: None,
+                    created_ms: now,
+                    ready_deadline_ms: now + 90_000,
+                    last_message: Some("owner".into()),
+                    error: None,
+                    probe_failures: Vec::new(),
+                    runtime: None,
+                },
+            },
+            Event::TaskCreated {
+                task: TaskRec {
+                    id: "task-owner".into(),
+                    owner: "other".into(),
+                    created_by: "parent".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p2".into(),
+                    status: "assigned".into(),
+                    next_step: None,
+                    wait: None,
+                    created_ms: now,
+                    updated_ms: now,
+                },
+            },
+        ]);
+        let result = crate::subagent::handle(
+            &server,
+            "child",
+            "token-child",
+            Action::Working {
+                id: "owner-task".into(),
+            },
+        );
+        assert!(!result.ok);
+        assert_eq!(result.error.as_deref(), Some("task owner mismatch"));
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.subagents["owner-task"].status, "assigned");
+        assert_eq!(state.tasks["task-owner"].owner, "other");
+        assert_eq!(state.tasks["task-owner"].status, "assigned");
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
     let (server, root) = test_server();
     register(&server, "peer-a", "%a");
