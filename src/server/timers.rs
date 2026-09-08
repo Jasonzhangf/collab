@@ -326,7 +326,12 @@ mod tests {
     }
 
     fn bind_message(server: &Server, worker_id: &str, subscription_id: &str) -> String {
-        bind_message_with_id(server, worker_id, subscription_id, &format!("message-{worker_id}"))
+        bind_message_with_id(
+            server,
+            worker_id,
+            subscription_id,
+            &format!("message-{worker_id}"),
+        )
     }
 
     fn bind_message_with_id(
@@ -964,7 +969,8 @@ mod tests {
     #[test]
     fn working_agent_defers_notification_without_attempt() {
         let (mut server, root) = test_server();
-        Arc::get_mut(&mut server).unwrap().pane_state_check = |_| crate::server::knock::AgentState::Working;
+        Arc::get_mut(&mut server).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Working;
         register(&server, "busy-worker");
         let sub = subscribe(&server, "busy-worker", "direct-message", None, None);
         let id = bind_message(&server, "busy-worker", &sub);
@@ -982,13 +988,24 @@ mod tests {
             &id,
             &sub,
             &|_| true,
-            &|_, _| true
+            &|_, _| panic!("should not deliver while busy")
         ));
         assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 0);
         assert_eq!(
             server.state.lock().unwrap().notification_subscriptions[&sub].status,
             "armed"
         );
+        // When agent transitions to idle (state becomes Waiting), wake succeeds.
+        Arc::get_mut(&mut server).unwrap().pane_state_check =
+            |_| crate::server::knock::AgentState::Waiting;
+        assert!(super::super::attempt_notification_with_default(
+            &server,
+            &id,
+            &sub,
+            &|_| true,
+            &|_, _| true
+        ));
+        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 1);
         std::fs::remove_dir_all(root).ok();
     }
 
