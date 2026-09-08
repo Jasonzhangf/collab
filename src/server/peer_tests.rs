@@ -2056,6 +2056,7 @@ fn tmux_notification_classifies_priority_and_names_one_action() {
     };
 
     assert!(notify("worker-idle: w1").contains("P1 ACTION: dispatch work to this idle capacity"));
+    assert!(notify("master-idle: master").contains("P1 ACTION: run the scheduling pass"));
     assert!(notify("worker-unresponsive: w1").contains("P1 ACTION: snapshot the pane"));
     assert!(notify("task-keepalive 1/3").contains("P1 ACTION: continue your own task"));
     assert!(notify("goal:plan.md").contains("P0 ACTION: run the long-horizon briefing"));
@@ -2799,6 +2800,148 @@ fn worker_freed_transitions_notify_live_master() {
     let alert = idle_alert.unwrap();
     assert!(alert.body.contains("now idle with no active task"));
     drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
+    let (server, root) = test_server();
+    register(&server, "master-worker", "%master");
+    let server_arc = std::sync::Arc::new(server);
+    let promote_resp = dispatch(
+        &server_arc,
+        Req::MasterPromote {
+            worker_id: "master-worker".into(),
+            token: "token-master-worker".into(),
+            approval: "approved".into(),
+        },
+    );
+    assert!(promote_resp.ok);
+
+    let mut initial_rec = crate::server::keepalive::Record::default();
+    initial_rec.observed = "working".into();
+    initial_rec.idle_since_ms = 1000;
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "master-worker".into(),
+        record: initial_rec,
+    }]);
+
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        2000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+
+    let state = server_arc.state.lock().unwrap();
+    let idle_alerts: Vec<_> = state
+        .msgs
+        .values()
+        .filter(|m| m.to == "master-worker" && m.subject == Some("master-idle: master-worker".into()))
+        .collect();
+    assert_eq!(idle_alerts.len(), 1, "one scheduling wake per transition");
+    let alert = idle_alerts[0];
+    assert!(alert.body.contains("task graph"));
+    assert!(alert.body.contains("saturation"));
+    assert!(alert.body.contains("Scheduling continues"));
+    assert!(alert.body.contains("no actionable task, dependency, resolvable blocker, or authorized open bug remains"));
+    assert!(alert.body.contains("collab notify unsubscribe sub-default-direct-message-master-worker"));
+    assert!(alert.body.contains("record the receipt"));
+    let subscription_id = state.wake_bindings.get(&alert.id).expect("master wake must bind once");
+    let subscription = state.notification_subscriptions.get(subscription_id).unwrap();
+    assert_eq!(subscription.worker_id, "master-worker");
+    assert_eq!(subscription.event, "direct-message");
+    assert_eq!(subscription.status, "armed");
+    drop(state);
+
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        3000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    let state = server_arc.state.lock().unwrap();
+    assert_eq!(
+        state.msgs.values().filter(|m| {
+            m.to == "master-worker" && m.subject == Some("master-idle: master-worker".into())
+        }).count(),
+        1,
+        "duplicate idle observation must not wake again"
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_idle_requires_live_master_armed_subscription_and_empty_backlog() {
+    let (server, root) = test_server();
+    register(&server, "unpromoted", "%unpromoted");
+    let server_arc = std::sync::Arc::new(server);
+    let mut initial_rec = crate::server::keepalive::Record::default();
+    initial_rec.observed = "working".into();
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "unpromoted".into(),
+        record: initial_rec.clone(),
+    }]);
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        2000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    assert!(!server_arc.state.lock().unwrap().msgs.values().any(|m| m.subject == Some("master-idle: unpromoted".into())));
+
+    let promote_resp = dispatch(
+        &server_arc,
+        Req::MasterPromote {
+            worker_id: "unpromoted".into(),
+            token: "token-unpromoted".into(),
+            approval: "approved".into(),
+        },
+    );
+    assert!(promote_resp.ok);
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "unpromoted".into(),
+        record: initial_rec.clone(),
+    }, Event::NotificationStatus {
+        subscription_id: "sub-default-direct-message-unpromoted".into(),
+        status: "consumed".into(),
+        updated_ms: 2001,
+    }]);
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        3000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    assert!(!server_arc.state.lock().unwrap().msgs.values().any(|m| m.subject == Some("master-idle: unpromoted".into())));
+    std::fs::remove_dir_all(root).unwrap();
+
+    let (server, root) = test_server();
+    register(&server, "busy-master", "%master");
+    let server_arc = std::sync::Arc::new(server);
+    assert!(dispatch(&server_arc, Req::MasterPromote {
+        worker_id: "busy-master".into(),
+        token: "token-busy-master".into(),
+        approval: "approved".into(),
+    }).ok);
+    create_task(&server_arc, "busy-master", "task-actionable", "feature");
+    server_arc.commit(&[Event::KeepaliveUpdated {
+        worker_id: "busy-master".into(),
+        record: initial_rec,
+    }]);
+    crate::server::keepalive::tick_with(
+        &server_arc,
+        4000,
+        &|_pane| crate::server::knock::AgentState::Waiting,
+        &|_pane, _text| true,
+        &|_worker_id, _pane| true,
+    );
+    assert!(!server_arc.state.lock().unwrap().msgs.values().any(|m| m.subject == Some("master-idle: busy-master".into())));
     std::fs::remove_dir_all(root).unwrap();
 }
 
