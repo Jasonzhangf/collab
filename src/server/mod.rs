@@ -2321,6 +2321,45 @@ fn worker_identity_presence(server: &Server, worker: &WorkerRec) -> PanePresence
     }
 }
 
+/// Decide whether a new managed child would starve an already registered peer.
+/// The caller must use the returned peer for the scope before creating a child.
+pub(crate) fn registered_idle_peer_for_admission(
+    server: &Server,
+    requester: &str,
+) -> Option<(String, String)> {
+    let state = server.state.lock().unwrap();
+    let mut workers: Vec<_> = state
+        .workers
+        .values()
+        .filter(|worker| worker.id != requester)
+        .collect();
+    workers.sort_by(|a, b| a.id.cmp(&b.id));
+    for worker in workers {
+        if is_managed_subagent(&state, &worker.id)
+            || !matches!(
+                worker_identity_presence(server, worker),
+                PanePresence::Present
+            )
+            || worker
+                .pane
+                .as_deref()
+                .map(|pane| (server.pane_state_check)(pane) == knock::AgentState::Waiting)
+                != Some(true)
+            || state
+                .tasks
+                .values()
+                .any(|task| task.owner == worker.id && task_claim_held(&task.status))
+        {
+            continue;
+        }
+        return Some((
+            worker.id.clone(),
+            "live registered peer is idle, owned, and has no actionable task".into(),
+        ));
+    }
+    None
+}
+
 pub(crate) fn live_master_id(
     server: &Server,
     state: &State,
@@ -4334,7 +4373,40 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             token,
             command,
             launch_env,
-        } => crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env),
+        } => {
+            if matches!(command, crate::subagent::Action::Start { .. }) {
+                let authorized = {
+                    let state = server.state.lock().unwrap();
+                    verify(&state, &worker_id, &token).is_ok()
+                        && live_master_id(server, &state).ok().flatten().as_deref()
+                            == Some(worker_id.as_str())
+                };
+                if authorized {
+                    if let Some((peer_id, reason)) =
+                        registered_idle_peer_for_admission(server, &worker_id)
+                    {
+                        let admission = json!({
+                            "decision": "use-registered-peer",
+                            "worker_id": peer_id,
+                            "reason": reason,
+                        });
+                        if let Err(error) =
+                            record_activity(&server.root, "scheduler_admission", admission.clone())
+                        {
+                            append_log(
+                                &server.log_path(),
+                                &format!("SCHEDULER_ADMISSION_RECORD_FAILED: {error}"),
+                            );
+                        }
+                        return Resp::data(json!({
+                            "admission": admission,
+                            "managed_subagent": serde_json::Value::Null,
+                        }));
+                    }
+                }
+            }
+            crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env)
+        }
         Req::Register {
             worker_id,
             token,
@@ -5342,5 +5414,113 @@ mod ownership_probe_tests {
                 .output()),
             Ok("worker".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod scheduler_admission_tests {
+    use super::*;
+    use crate::server::peer_tests::{register, test_server};
+    use std::sync::Arc;
+
+    #[test]
+    fn start_admits_registered_idle_peer_before_managed_child_without_duplicates() {
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "idle-peer", "%idle-peer");
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let server = Arc::new(server);
+
+        let start = |id: &str, token: &str| {
+            dispatch(
+                &server,
+                Req::Subagent {
+                    worker_id: "master".into(),
+                    token: token.into(),
+                    command: crate::subagent::Action::Start {
+                        id: Some(id.into()),
+                        runtime: Some("cursor".into()),
+                    },
+                    launch_env: Default::default(),
+                },
+            )
+        };
+        let first = start("unneeded-child", "token-master");
+        assert!(first.ok, "{first:?}");
+        assert_eq!(first.data["admission"]["decision"], "use-registered-peer");
+        assert_eq!(first.data["admission"]["worker_id"], "idle-peer");
+        let second = start("unneeded-child-2", "token-master");
+        assert!(second.ok, "{second:?}");
+        assert_eq!(second.data["admission"], first.data["admission"]);
+        assert!(server.state.lock().unwrap().subagents.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".agent-collab/server/events.jsonl"))
+                .unwrap()
+                .matches("scheduler_admission")
+                .count(),
+            2
+        );
+
+        let denied = start("denied-child", "wrong-token");
+        assert!(!denied.ok);
+        assert!(denied.error.unwrap().contains("authentication failed"));
+        assert!(server.state.lock().unwrap().subagents.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn admission_excludes_active_unknown_and_managed_capacity() {
+        let (mut server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.commit(&[Event::TaskCreated {
+            task: TaskRec {
+                id: "active-peer-task".into(),
+                owner: "peer".into(),
+                created_by: "master".into(),
+                feature_id: None,
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: "p1".into(),
+                status: "working".into(),
+                next_step: None,
+                wait: None,
+                created_ms: now_ms(),
+                updated_ms: now_ms(),
+            },
+        }]);
+        assert!(registered_idle_peer_for_admission(&server, "master").is_none());
+        server.pane_alive_check = |_| PanePresence::Unknown;
+        assert!(registered_idle_peer_for_admission(&server, "master").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "managed-peer", "%managed-peer");
+        server.commit(&[Event::SubagentUpdated {
+            subagent: crate::subagent::Record {
+                id: "existing-child".into(),
+                parent: "master".into(),
+                peer: "managed-peer".into(),
+                status: "idle".into(),
+                session: None,
+                pane: Some("%managed-peer".into()),
+                profile: None,
+                created_ms: now_ms(),
+                ready_deadline_ms: 0,
+                last_message: None,
+                error: None,
+                probe_failures: Vec::new(),
+                runtime: Some("cursor".into()),
+            },
+        }]);
+        assert!(registered_idle_peer_for_admission(&server, "master").is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
