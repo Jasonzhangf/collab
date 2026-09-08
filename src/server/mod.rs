@@ -2579,6 +2579,110 @@ fn record_scheduler_admission(server: &Server, admission: serde_json::Value) -> 
     Ok(())
 }
 
+fn scheduler_admission_failed_response(
+    admission: &crate::server::state::SchedulerAdmissionRecord,
+) -> Resp {
+    let error = admission.error.clone().unwrap_or_else(|| {
+        "scheduler admission audit failed; retry with the same request_id".into()
+    });
+    Resp::err_data(
+        error,
+        json!({
+            "request_id": admission.request_id,
+            "reservation": true,
+            "decision": "audit-failed",
+            "message_id": admission.message_id,
+            "task_id": admission.task_id,
+            "admission": admission,
+        }),
+    )
+}
+
+fn scheduler_dispatch_recover_pending(server: &Server, request_id: &str) -> Option<Resp> {
+    let (admission, task, subscription) = {
+        let mut state = server.state.lock().unwrap();
+        let Some(pending) = state
+            .scheduler_admissions
+            .get(request_id)
+            .filter(|admission| admission.status == "pending")
+            .cloned()
+        else {
+            return None;
+        };
+        let Some(task) = state.tasks.get(&pending.task_id).cloned() else {
+            return None;
+        };
+        let audit = json!({
+            "request_id": pending.request_id,
+            "decision": pending.decision,
+            "worker_id": pending.worker_id,
+            "managed_subagent_id": pending.managed_subagent_id,
+            "message_id": pending.message_id,
+            "task_id": pending.task_id,
+            "status": "pending",
+            "recovery": true,
+        });
+        if let Err(error) = record_scheduler_admission(server, audit) {
+            let error = error
+                .error
+                .unwrap_or_else(|| "scheduler admission audit failed".into());
+            server.commit_locked(
+                &mut state,
+                &[Event::SchedulerAdmissionStatus {
+                    request_id: request_id.into(),
+                    status: "failed".into(),
+                    error: Some(error.clone()),
+                    updated_ms: now_ms(),
+                }],
+            );
+            let mut failed = pending;
+            failed.status = "failed".into();
+            failed.error = Some(error);
+            return Some(scheduler_admission_failed_response(&failed));
+        }
+        server.commit_locked(
+            &mut state,
+            &[Event::SchedulerAdmissionStatus {
+                request_id: request_id.into(),
+                status: "succeeded".into(),
+                error: None,
+                updated_ms: now_ms(),
+            }],
+        );
+        let admission = state.scheduler_admissions.get(request_id).cloned()?;
+        let subscription = state
+            .matching_subscription(&admission.worker_id, "direct-message", None, now_ms())
+            .cloned();
+        (admission, task, subscription)
+    };
+    let notified = subscription.as_ref().is_some_and(|subscription| {
+        attempt_notification(server, &admission.message_id, &subscription.id)
+    });
+    Some(Resp::data(json!({
+        "request_id": admission.request_id,
+        "decision": admission.decision,
+        "admission": admission,
+        "message_id": admission.message_id,
+        "task_id": admission.task_id,
+        "target": task.owner,
+        "status": task.status,
+        "managed_subagent_id": admission.managed_subagent_id,
+        "managed_subagent": admission
+            .managed_subagent_id
+            .as_ref()
+            .map(|id| json!({"id": id, "worker_id": task.owner}))
+            .unwrap_or(serde_json::Value::Null),
+        "notification": if subscription.is_none() {
+            "mailbox-only-no-subscription"
+        } else if notified {
+            "sent"
+        } else {
+            "subscribed-not-sent"
+        },
+        "recovered": true,
+    })))
+}
+
 fn scheduler_dispatch_deduplicated(
     server: &Server,
     worker_id: &str,
@@ -2588,26 +2692,11 @@ fn scheduler_dispatch_deduplicated(
     let task_id = format!("task-{message_id}");
     let state = server.state.lock().unwrap();
     if let Some(admission) = state.scheduler_admissions.get(request_id) {
-        if admission.status != "succeeded" {
-            let decision = if admission.status == "failed" {
-                "audit-failed"
-            } else {
-                "audit-pending"
-            };
-            let error = admission.error.clone().unwrap_or_else(|| {
-                "scheduler admission audit is pending; retry with the same request_id".into()
-            });
-            return Some(Resp::err_data(
-                error,
-                json!({
-                    "request_id": request_id,
-                    "reservation": true,
-                    "decision": decision,
-                    "message_id": admission.message_id,
-                    "task_id": admission.task_id,
-                    "admission": admission,
-                }),
-            ));
+        if admission.status == "failed" {
+            return Some(scheduler_admission_failed_response(admission));
+        }
+        if admission.status == "pending" {
+            return None;
         }
     }
     let (Some(message), Some(task)) = (
@@ -2710,6 +2799,9 @@ pub(crate) fn handle_scheduler_dispatch(
     let message_id = format!("scheduler-{request_id}");
     let task_id = format!("task-{message_id}");
     for _ in 0..3 {
+        if let Some(response) = scheduler_dispatch_recover_pending(server, &request_id) {
+            return response;
+        }
         if let Some(response) = scheduler_dispatch_deduplicated(server, &worker_id, &request_id) {
             return response;
         }
@@ -2728,6 +2820,9 @@ pub(crate) fn handle_scheduler_dispatch(
                 )
             });
         let Some((peer_id, managed_id, reason, decision)) = candidate else {
+            if let Some(response) = scheduler_dispatch_recover_pending(server, &request_id) {
+                return response;
+            }
             if let Some(response) = scheduler_dispatch_deduplicated(server, &worker_id, &request_id)
             {
                 return response;
@@ -2841,15 +2936,10 @@ pub(crate) fn handle_scheduler_dispatch(
             admission: admission_record,
         });
         server.commit_locked(&mut state, &events);
-        drop(state);
-        let notified = subscription.as_ref().is_some_and(|subscription| {
-            attempt_notification(server, &message_id, &subscription.id)
-        });
         if let Err(error) = record_scheduler_admission(server, admission.clone()) {
             let error = error
                 .error
                 .unwrap_or_else(|| "scheduler admission audit failed".into());
-            let mut state = server.state.lock().unwrap();
             server.commit_locked(
                 &mut state,
                 &[Event::SchedulerAdmissionStatus {
@@ -2873,7 +2963,6 @@ pub(crate) fn handle_scheduler_dispatch(
                 }),
             );
         }
-        let mut state = server.state.lock().unwrap();
         server.commit_locked(
             &mut state,
             &[Event::SchedulerAdmissionStatus {
@@ -2884,6 +2973,9 @@ pub(crate) fn handle_scheduler_dispatch(
             }],
         );
         drop(state);
+        let notified = subscription.as_ref().is_some_and(|subscription| {
+            attempt_notification(server, &message_id, &subscription.id)
+        });
         admission["status"] = json!("succeeded");
         return Resp::data(json!({
             "request_id": request_id,
@@ -6540,6 +6632,13 @@ mod scheduler_admission_tests {
         let first_error = first.error.clone().unwrap();
         assert!(first_error.contains("scheduler admission audit failed"));
         assert_eq!(first.data["reservation"], true);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs["scheduler-req-audit-failure-1"].state, "pending");
+        assert_eq!(
+            state.msgs["scheduler-req-audit-failure-1"].wake_attempt_count,
+            0
+        );
+        drop(state);
         *server.state.lock().unwrap() = replay(&root).unwrap();
         let second = request("retry body is ignored");
         assert!(!second.ok, "{second:?}");
@@ -6553,6 +6652,121 @@ mod scheduler_admission_tests {
         assert_eq!(
             state.scheduler_admissions["req-audit-failure-1"].status,
             "failed"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_dispatch_recovers_pending_reservation_without_duplicates() {
+        // Simulate a process interruption after the reservation and audit write,
+        // but before the durable succeeded status commit.
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.commit(&[
+            Event::MasterAssigned {
+                worker_id: "master".into(),
+                assigned_by: "operator".into(),
+                approval: Some("scheduler test".into()),
+                assigned_ms: now_ms(),
+            },
+            Event::Sent {
+                msg: Message {
+                    id: "scheduler-req-pending-recovery-1".into(),
+                    from: "master".into(),
+                    to: "peer".into(),
+                    mtype: "notify".into(),
+                    subject: Some("Pending recovery".into()),
+                    body: "Reuse reservation".into(),
+                    in_reply_to: None,
+                    created_ms: now_ms(),
+                    state: "pending".into(),
+                    wake_attempt_count: 0,
+                    last_wake_attempt_ms: 0,
+                },
+            },
+            Event::TaskCreated {
+                task: TaskRec {
+                    id: "task-scheduler-req-pending-recovery-1".into(),
+                    owner: "peer".into(),
+                    created_by: "master".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p2".into(),
+                    status: "assigned".into(),
+                    next_step: Some("accept".into()),
+                    wait: None,
+                    created_ms: now_ms(),
+                    updated_ms: now_ms(),
+                },
+            },
+            Event::DeliveryMode {
+                msg_id: "scheduler-req-pending-recovery-1".into(),
+                mode: "explicit-notification".into(),
+            },
+            Event::WakeBound {
+                message_id: "scheduler-req-pending-recovery-1".into(),
+                subscription_id: "sub-default-direct-message-peer".into(),
+            },
+            Event::SchedulerAdmission {
+                admission: crate::server::state::SchedulerAdmissionRecord {
+                    request_id: "req-pending-recovery-1".into(),
+                    decision: "use-registered-peer".into(),
+                    worker_id: "peer".into(),
+                    managed_subagent_id: None,
+                    message_id: "scheduler-req-pending-recovery-1".into(),
+                    task_id: "task-scheduler-req-pending-recovery-1".into(),
+                    status: "pending".into(),
+                    error: None,
+                    created_ms: now_ms(),
+                    updated_ms: now_ms(),
+                },
+            },
+        ]);
+        record_scheduler_admission(
+            &server,
+            json!({
+                "request_id": "req-pending-recovery-1",
+                "decision": "use-registered-peer",
+                "worker_id": "peer",
+                "message_id": "scheduler-req-pending-recovery-1",
+                "task_id": "task-scheduler-req-pending-recovery-1",
+                "status": "pending",
+            }),
+        )
+        .unwrap();
+        let server = Arc::new(server);
+        let recovered = dispatch(
+            &server,
+            Req::Subagent {
+                worker_id: "master".into(),
+                token: "token-master".into(),
+                command: crate::subagent::Action::Dispatch {
+                    request_id: "req-pending-recovery-1".into(),
+                    subject: "Changed subject is ignored".into(),
+                    body: "Changed body is ignored".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p2".into(),
+                    next_step: None,
+                },
+                launch_env: Default::default(),
+            },
+        );
+        assert!(recovered.ok, "{recovered:?}");
+        assert_eq!(recovered.data["recovered"], true);
+        assert_eq!(recovered.data["decision"], "use-registered-peer");
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs.len(), 1);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(
+            state.scheduler_admissions["req-pending-recovery-1"].status,
+            "succeeded"
         );
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
@@ -6599,27 +6813,13 @@ mod scheduler_admission_tests {
         let second = request(Arc::clone(&server), Arc::clone(&barrier));
         let first = first.join().unwrap();
         let second = second.join().unwrap();
-        assert!(
-            first.ok
-                || first
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("audit is pending")),
-            "{first:?}"
-        );
-        assert!(
-            second.ok
-                || second
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("audit is pending")),
-            "{second:?}"
-        );
+        assert!(first.ok, "{first:?}");
+        assert!(second.ok, "{second:?}");
         assert_eq!(first.data["task_id"], second.data["task_id"]);
         assert_eq!(first.data["message_id"], second.data["message_id"]);
-        assert!(["use-registered-peer", "deduplicated", "audit-pending"]
+        assert!(["use-registered-peer", "deduplicated"]
             .contains(&first.data["decision"].as_str().unwrap()));
-        assert!(["use-registered-peer", "deduplicated", "audit-pending"]
+        assert!(["use-registered-peer", "deduplicated"]
             .contains(&second.data["decision"].as_str().unwrap()));
         let state = server.state.lock().unwrap();
         assert_eq!(state.tasks.len(), 1);
@@ -6627,6 +6827,10 @@ mod scheduler_admission_tests {
         assert_eq!(
             state.tasks["task-scheduler-req-concurrent-1"].status,
             "assigned"
+        );
+        assert_eq!(
+            state.scheduler_admissions["req-concurrent-1"].status,
+            "succeeded"
         );
         drop(state);
         std::fs::remove_dir_all(root).unwrap();

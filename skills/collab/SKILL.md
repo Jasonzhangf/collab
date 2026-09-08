@@ -181,6 +181,25 @@ after it already succeeded. Child results go to the parent with
 `collab sendmessage`, not the parent-only `subagent send` action.
 No ACK loops, automatic respawn or redispatch.
 
+The live master is the sole scheduler assignment owner. Dispatch through the
+durable scheduler path with a stable request ID:
+
+```sh
+collab subagent dispatch --request-id <id> --subject <topic> "<assignment>"
+```
+
+The scheduler reserves one message/task pair for an eligible peer, binds the
+peer's active direct-message lease, records the admission audit, persists its
+succeeded or failed status, and only then attempts one bounded notification on
+success. An ordinary assigned peer must authenticate
+with its own worker token and run `collab task accept <task-id>`; that command
+atomically records `assigned -> working` and is the only receive entry for this
+assignment. `collab task update --status working` is rejected for an assigned
+task. A managed child accepts through `collab subagent working <id>`. Reusing a
+request ID after an audit interruption recovers the existing reservation and
+must never create a second task or message. The legacy `collab task dispatch`
+and `collab task claim` commands remain deprecated and fail explicitly.
+
 Consume notifications promptly with `collab recv`. A successful receive delivers
 and acknowledges the batch atomically. After 3 delivered-but-unconsumed
 notifications, push knocks pause automatically to prevent notification storms
