@@ -230,6 +230,39 @@ task at `assigned`, `working`, `blocked`, `waiting`, `delivered`, or
 or merge, perform the real cleanup and close the task; a reminder does not
 create a second task or a duplicate dispatch.
 
+## Main integration requires a reviewed clean main
+
+Before integrating any delivered task, the integration owner must inspect the
+actual main worktree and separate source truth from local residue:
+
+```sh
+git status --short --branch
+git diff --stat
+git ls-files --others --exclude-standard
+```
+
+Review every tracked and untracked path. For each path, take exactly one
+auditable decision:
+
+- **commit** it only when it is an authorized project change, with its own
+  commit/evidence and scope;
+- **preserve and stop** when ownership or authorization is unclear; or
+- **drop** it only when the human or owning task explicitly authorizes that
+  exact path, after recording the path and reason.
+
+Never use `reset`, `restore`, `stash`, broad `git clean`, wildcard deletion, or
+an overwrite to make main appear clean. Never absorb another worker's files
+into a feature commit. A clean status is a gate, not a cosmetic target.
+
+Only after this review is main clean may the owner merge the exact delivered
+commit, rerun main verification, push and verify the remote receipt, install
+the resulting release through the canonical installer, restart only the
+affected daemon with its service-scoped command, and run the deployed public
+entrypoint replay. Candidate tests, a local merge, an installed binary, or a
+daemon restart alone do not prove delivery. Cleanup/close is last and must
+retain its receipt; a blocked dirty-main review remains an explicit blocker
+with owner, unblock condition, and next check.
+
 Escalation routing is explicit:
 
 - A managed subagent and an ordinary worker both report blockers to the live
