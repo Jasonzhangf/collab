@@ -39,6 +39,82 @@ pub(super) fn register(server: &Server, id: &str, pane: &str) -> Resp {
     )
 }
 
+#[test]
+fn master_idle_subscription_is_restricted_to_the_live_master_and_supported_intervals() {
+    let (server, root) = test_server();
+    register(&server, "master", "%master");
+    register(&server, "worker", "%worker");
+    server.commit(&[Event::MasterAssigned {
+        worker_id: "master".into(),
+        assigned_by: "operator".into(),
+        approval: Some("user-approved".into()),
+        assigned_ms: now_ms(),
+    }]);
+
+    let worker = handle_notification_subscribe(
+        &server, "worker".into(), "token-worker".into(), "master-idle".into(),
+        Some("master-idle".into()), None, Vec::new(), Some(900_000), 3, 86_400,
+    );
+    assert!(!worker.ok);
+    assert_eq!(worker.error.as_deref(), Some("master-idle subscription requires the live registered master"));
+
+    let accepted = handle_notification_subscribe(
+        &server, "master".into(), "token-master".into(), "master-idle".into(),
+        Some("master-idle".into()), None, Vec::new(), Some(3_600_000), 3, 86_400,
+    );
+    assert!(accepted.ok, "{}", accepted.error.unwrap_or_default());
+
+    let invalid = handle_notification_subscribe(
+        &server, "master".into(), "token-master".into(), "master-idle".into(),
+        Some("master-idle".into()), None, Vec::new(), Some(60_000), 3, 86_400,
+    );
+    assert!(!invalid.ok);
+    assert_eq!(invalid.error.as_deref(), Some("master-idle interval must be exactly 900000 or 3600000 ms"));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cancelling_master_idle_subscription_supersedes_pending_wake() {
+    let (server, root) = test_server();
+    register(&server, "master", "%master");
+    server.commit(&[
+        Event::MasterAssigned {
+            worker_id: "master".into(), assigned_by: "operator".into(),
+            approval: Some("user-approved".into()), assigned_ms: now_ms(),
+        },
+        Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: "sub-master-idle".into(), worker_id: "master".into(),
+                event: "master-idle".into(), subject: Some("master-idle".into()),
+                pane: "%master".into(), method: "tmux".into(),
+                trigger_ms: Some(now_ms() - 1), trigger_times_ms: Vec::new(),
+                interval_ms: Some(900_000), repeat_count: 3, fired_count: 0,
+                expires_ms: now_ms() + 86_400_000, status: "armed".into(),
+                created_ms: now_ms() - 900_000, updated_ms: now_ms(),
+            },
+        },
+        Event::Sent {
+            msg: Message {
+                id: "pending-idle".into(), from: "collab-server".into(), to: "master".into(),
+                mtype: "notification".into(), subject: Some("master-idle:master-idle".into()),
+                body: "MASTER_IDLE_WAKE scheduling continues".into(), in_reply_to: None,
+                created_ms: now_ms(), state: "pending".into(), wake_attempt_count: 0,
+                last_wake_attempt_ms: 0,
+            },
+        },
+        Event::WakeBound { message_id: "pending-idle".into(), subscription_id: "sub-master-idle".into() },
+    ]);
+    let cancelled = handle_notification_unsubscribe(
+        &server, "master".into(), "token-master".into(), "sub-master-idle".into(),
+    );
+    assert!(cancelled.ok, "{}", cancelled.error.unwrap_or_default());
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.notification_subscriptions["sub-master-idle"].status, "cancelled");
+    assert_eq!(state.msgs["pending-idle"].state, "superseded");
+    drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn create_task(server: &Server, owner: &str, id: &str, feature: &str) -> Resp {
     handle_task_register(
         server,

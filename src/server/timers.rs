@@ -92,12 +92,32 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
         for subscription in state.notification_subscriptions.values() {
             let next_trigger = subscription
                 .interval_ms
-                .map(|interval| subscription.trigger_ms.unwrap_or(subscription.created_ms.saturating_add(interval)).saturating_add(interval.saturating_mul(subscription.fired_count as i64)))
+                .map(|interval| {
+                    subscription
+                        .trigger_ms
+                        .unwrap_or(subscription.created_ms.saturating_add(interval))
+                })
                 .or_else(|| subscription.trigger_times_ms.get(subscription.fired_count as usize).copied())
                 .or(subscription.trigger_ms);
+            let master_idle_ready = if subscription.event == "master-idle" {
+                super::live_master_id(server, &state).as_deref() == Some(subscription.worker_id.as_str())
+                    && state
+                        .keepalives
+                        .get(&subscription.worker_id)
+                        .is_some_and(|record| record.observed == "idle" && record.idle_since_ms > 0)
+                    && (server.pane_state_check)(&subscription.pane)
+                        == crate::server::knock::AgentState::Waiting
+                    && !state.tasks.values().any(|task| {
+                        task.owner == subscription.worker_id
+                            && super::keepalive::actionable(&task.status)
+                    })
+            } else {
+                true
+            };
             if subscription.status != "armed"
                 || !server.config.timers.enabled
-                || subscription.event != "deadline"
+                || !matches!(subscription.event.as_str(), "deadline" | "master-idle")
+                || !master_idle_ready
                 || next_trigger.is_none_or(|trigger| trigger > now)
                 || state
                     .wake_bindings
@@ -114,11 +134,18 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                         from: "collab-server".into(),
                         to: subscription.worker_id.clone(),
                         mtype: "notification".into(),
-                        subject: subscription
-                            .subject
-                            .as_ref()
-                            .map(|subject| format!("deadline:{subject}")),
-                        body: format!("DEADLINE_REACHED subject={}{}", subscription.subject.as_deref().unwrap_or_default(), if subscription.fired_count + 1 >= if subscription.interval_ms.is_some() { subscription.repeat_count } else { subscription.trigger_times_ms.len().max(1) as u32 } { "; LAST_REMINDER=true; renew explicitly: collab notify subscribe --event deadline --subject <subject> --at-ms <future-epoch-ms> --ttl-seconds <bounded>" } else { "" }),
+                        subject: subscription.subject.as_ref().map(|subject| {
+                            if subscription.event == "master-idle" {
+                                format!("master-idle:{subject}")
+                            } else {
+                                format!("deadline:{subject}")
+                            }
+                        }),
+                        body: if subscription.event == "master-idle" {
+                            format!("MASTER_IDLE_WAKE subject={} scheduling continues; inspect actionable tasks and authorized open bugs. Cancel this subscription only iff no actionable task, dependency, resolvable blocker, or authorized open bug remains: collab notify unsubscribe {}", subscription.subject.as_deref().unwrap_or_default(), subscription.id)
+                        } else {
+                            format!("DEADLINE_REACHED subject={}{}", subscription.subject.as_deref().unwrap_or_default(), if subscription.fired_count + 1 >= if subscription.interval_ms.is_some() { subscription.repeat_count } else { subscription.trigger_times_ms.len().max(1) as u32 } { "; LAST_REMINDER=true; renew explicitly: collab notify subscribe --event deadline --subject <subject> --at-ms <future-epoch-ms> --ttl-seconds <bounded>" } else { "" })
+                        },
                         in_reply_to: None,
                         created_ms: now,
                         state: "pending".into(),
@@ -169,7 +196,10 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::state::{NotificationSubscription, State, TaskRec, WaitSpec, WorkerRec};
+    use crate::server::keepalive::Record;
+    use crate::server::state::{
+        Event, NotificationSubscription, State, TaskRec, WaitSpec, WorkerRec,
+    };
     use std::sync::Mutex;
 
     fn test_server() -> (Arc<Server>, std::path::PathBuf) {
@@ -211,6 +241,52 @@ mod tests {
                 registered_ms: now_ms(),
             },
         }]);
+    }
+
+    fn register_master(server: &Server) {
+        register(server, "master");
+        let now = now_ms();
+        server.commit(&[
+            Event::MasterAssigned {
+                worker_id: "master".into(),
+                assigned_by: "operator".into(),
+                approval: Some("user-approved".into()),
+                assigned_ms: now,
+            },
+            Event::KeepaliveUpdated {
+                worker_id: "master".into(),
+                record: Record {
+                    observed: "idle".into(),
+                    idle_since_ms: now - 900_001,
+                    ..Record::default()
+                },
+            },
+        ]);
+    }
+
+    fn master_idle_subscription(server: &Server, interval_ms: i64) -> String {
+        let now = now_ms();
+        let id = format!("sub-master-idle-{interval_ms}");
+        server.commit(&[Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: id.clone(),
+                worker_id: "master".into(),
+                event: "master-idle".into(),
+                subject: Some("master-idle".into()),
+                pane: "%test-master".into(),
+                method: "tmux".into(),
+                trigger_ms: Some(now - 1),
+                trigger_times_ms: Vec::new(),
+                interval_ms: Some(interval_ms),
+                repeat_count: 3,
+                fired_count: 0,
+                expires_ms: now + 86_400_000,
+                status: "armed".into(),
+                created_ms: now - interval_ms,
+                updated_ms: now,
+            },
+        }]);
+        id
     }
 
     fn subscribe(
@@ -729,6 +805,117 @@ mod tests {
                 .count(),
             1
         );
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_idle_subscription_emits_at_15_minutes_only_for_live_idle_master() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+
+        tick_with_idle(&server, &|_| false);
+        tick_with_idle(&server, &|_| false);
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state
+                .wake_bindings
+                .values()
+                .filter(|bound| *bound == &subscription_id)
+                .count(),
+            1
+        );
+        let message_id = state
+            .wake_bindings
+            .iter()
+            .find_map(|(message_id, bound)| (bound == &subscription_id).then_some(message_id))
+            .unwrap();
+        assert_eq!(state.msgs[message_id].to, "master");
+        assert!(state.msgs[message_id].body.contains("scheduling"));
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_idle_subscription_accepts_60_minute_interval_without_worker_wake() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let subscription_id = master_idle_subscription(&server, 60 * 60 * 1000);
+        register(&server, "worker");
+        server.commit(&[Event::NotificationSubscribed {
+            subscription: NotificationSubscription {
+                id: "sub-worker-idle".into(),
+                worker_id: "worker".into(),
+                event: "master-idle".into(),
+                subject: Some("master-idle".into()),
+                pane: "%test-worker".into(),
+                method: "tmux".into(),
+                trigger_ms: Some(now_ms() - 1),
+                trigger_times_ms: Vec::new(),
+                interval_ms: Some(60 * 60 * 1000),
+                repeat_count: 1,
+                fired_count: 0,
+                expires_ms: now_ms() + 86_400_000,
+                status: "armed".into(),
+                created_ms: now_ms() - 60 * 60 * 1000,
+                updated_ms: now_ms(),
+            },
+        }]);
+
+        tick_with_idle(&server, &|_| false);
+        let state = server.state.lock().unwrap();
+        assert!(state
+            .wake_bindings
+            .values()
+            .all(|bound| bound == &subscription_id));
+        assert!(state.msgs.values().all(|message| message.to == "master"));
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_idle_wake_waits_for_actionable_tasks_to_clear() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+        working_task(&server, "master");
+
+        tick_with_idle(&server, &|_| false);
+
+        let state = server.state.lock().unwrap();
+        assert!(state
+            .wake_bindings
+            .values()
+            .all(|bound| bound != &subscription_id));
+        assert!(state.msgs.is_empty());
+        drop(state);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn master_idle_wake_requires_observed_idle_state() {
+        let (server, root) = test_server();
+        register_master(&server);
+        let subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
+
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "master".into(),
+            record: Record {
+                observed: "working".into(),
+                idle_since_ms: 0,
+                ..Record::default()
+            },
+        }]);
+        tick_with_idle(&server, &|_| false);
+
+        let state = server.state.lock().unwrap();
+        assert!(state
+            .wake_bindings
+            .values()
+            .all(|bound| bound != &subscription_id));
+        assert!(state.msgs.is_empty());
         drop(state);
         std::fs::remove_dir_all(root).ok();
     }

@@ -544,11 +544,12 @@ fn iso(ms: i64) -> String {
 
 const MAX_NOTIFICATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER: usize = 3;
-const NOTIFICATION_EVENTS: [&str; 4] = [
+const NOTIFICATION_EVENTS: [&str; 5] = [
     "direct-message",
     "resource-released",
     "deadline",
     "async-result",
+    "master-idle",
 ];
 const DEFAULT_DIRECT_MESSAGE_TTL_SECONDS: u64 = MAX_NOTIFICATION_TTL_SECONDS;
 
@@ -940,7 +941,7 @@ fn handle_notification_subscribe(
             "direct-message subscription must not specify a subject"
         });
     }
-    if event != "deadline"
+    if event != "deadline" && event != "master-idle"
         && (trigger_ms.is_some()
             || !trigger_times_ms.is_empty()
             || interval_ms.is_some()
@@ -957,6 +958,11 @@ fn handle_notification_subscribe(
     if let Err(error) = verify(&state, &worker_id, &token) {
         return error;
     }
+    if event == "master-idle"
+        && live_master_id(server, &state).as_deref() != Some(worker_id.as_str())
+    {
+        return Resp::err("master-idle subscription requires the live registered master");
+    }
     let Some(pane) = state.worker_pane(&worker_id) else {
         return Resp::err("notification subscription requires a registered tmux pane");
     };
@@ -970,6 +976,17 @@ fn handle_notification_subscribe(
         .count();
     if active >= MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER {
         return Resp::err("maximum 3 active subscriptions per agent");
+    }
+    if event == "master-idle" {
+        if trigger_ms.is_some() || !trigger_times_ms.is_empty() {
+            return Resp::err("master-idle requires a recurring interval, not an absolute trigger");
+        }
+        if !matches!(interval_ms, Some(900_000 | 3_600_000)) {
+            return Resp::err("master-idle interval must be exactly 900000 or 3600000 ms");
+        }
+        if repeat_count == 0 || repeat_count > crate::server::state::MAX_NOTIFICATION_REPEATS {
+            return Resp::err("repeat_count must be between 1 and 100");
+        }
     }
     if event == "deadline" {
         if interval_ms.is_some() && (!trigger_times_ms.is_empty() || trigger_ms.is_some()) {
@@ -1074,14 +1091,27 @@ fn handle_notification_unsubscribe(
     if subscription.worker_id != worker_id {
         return Resp::err("only the subscription owner may unsubscribe");
     }
-    server.commit_locked(
-        &mut state,
-        &[Event::NotificationStatus {
+    let mut events = vec![Event::NotificationStatus {
             subscription_id: subscription_id.clone(),
             status: "cancelled".into(),
             updated_ms: now_ms(),
-        }],
-    );
+        }];
+    let pending = state
+        .wake_bindings
+        .iter()
+        .filter_map(|(message_id, bound_subscription)| {
+            (bound_subscription == &subscription_id
+                && state
+                    .msgs
+                    .get(message_id)
+                    .is_some_and(|message| message.state == "pending"))
+            .then_some(message_id.clone())
+        })
+        .collect::<Vec<_>>();
+    if !pending.is_empty() {
+        events.push(Event::Superseded { ids: pending });
+    }
+    server.commit_locked(&mut state, &events);
     Resp::data(json!({"subscription_id": subscription_id, "status": "cancelled"}))
 }
 
