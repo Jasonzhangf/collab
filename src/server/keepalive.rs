@@ -371,8 +371,9 @@ pub(crate) fn tick_with(
                 .is_some_and(|master_id| master_id == worker.id);
             let idle_notification_due = if is_live_master {
                 is_idle
-                    && (record.idle_episode_notices == 0
-                        || (record.idle_episode_notices < 3
+                    && record.idle_episode_notices < 3
+                    && ((was_working && record.idle_episode_notices == 0)
+                        || (record.idle_episode_notices > 0
                             && now.saturating_sub(record.last_notice_ms) >= 120_000))
             } else {
                 is_idle && was_working && record.idle_episode_notices == 0
@@ -905,6 +906,49 @@ mod tests {
         tick_with(&server, now + 400_000, &|_| AgentState::Waiting, &wake, &|_, _| true);
         assert_eq!(status_count(&server), 1, "settled state reports once");
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_master_idle_only_records_observation() {
+        use super::super::peer_tests::{register, test_server};
+
+        let (server, root) = test_server();
+        register(&server, "master", "%master");
+        assert!(super::super::handle_master_promote(
+            &server,
+            "master".into(),
+            "token-master".into(),
+            "user approved master".into(),
+        )
+        .ok);
+
+        let base = super::super::state::now_ms();
+        tick_with(
+            &server,
+            base,
+            &|_| AgentState::Waiting,
+            &|_, _| panic!("initial idle must not wake the master"),
+            &|_, _| true,
+        );
+        tick_with(
+            &server,
+            base + 120_000,
+            &|_| AgentState::Waiting,
+            &|_, _| panic!("initial idle must not send a reminder"),
+            &|_, _| true,
+        );
+
+        let state = server.state.lock().unwrap();
+        let record = state.keepalives.get("master").expect("idle observation persists");
+        assert_eq!(record.observed, "idle");
+        assert_eq!(record.idle_episode_notices, 0);
+        assert_eq!(record.idle_episode_reason, "no-actionable-tasks");
+        assert!(!state
+            .msgs
+            .values()
+            .any(|message| message.subject == Some("master-idle: master".into())));
+        drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
 
