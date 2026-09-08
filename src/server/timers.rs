@@ -125,16 +125,13 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 || !matches!(subscription.event.as_str(), "deadline" | "master-idle")
                 || !master_idle_ready
                 || next_trigger.is_none_or(|trigger| trigger > now)
-                || state
-                    .wake_bindings
-                    .iter()
-                    .any(|(message_id, bound)| {
-                        bound == &subscription.id
-                            && state
-                                .msgs
-                                .get(message_id)
-                                .is_some_and(|message| message.state == "pending")
-                    })
+                || state.wake_bindings.iter().any(|(message_id, bound)| {
+                    bound == &subscription.id
+                        && state
+                            .msgs
+                            .get(message_id)
+                            .is_some_and(|message| message.state == "pending")
+                })
             {
                 continue;
             }
@@ -945,7 +942,9 @@ mod tests {
             .unwrap()
             .wake_bindings
             .iter()
-            .find_map(|(message_id, bound)| (bound == &subscription_id).then_some(message_id.clone()))
+            .find_map(|(message_id, bound)| {
+                (bound == &subscription_id).then_some(message_id.clone())
+            })
             .expect("first master idle wake");
         server.commit(&[
             Event::Delivered {
