@@ -248,7 +248,11 @@ fn launch_args(
         }
         return Ok(("agent".into(), args));
     }
-    let mut args = vec!["--profile".into(), profile.codex_profile.clone()];
+    let mut args = vec![
+        "--profile".into(),
+        profile.codex_profile.clone(),
+        "--approve-for-me".into(),
+    ];
     if let Some(model) = &profile.model {
         args.extend(["--model".into(), model.clone()]);
     }
@@ -1241,7 +1245,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exe, "codex");
-        assert_eq!(args[..2], ["--profile", "oauth"]);
+        assert_eq!(args[..3], ["--profile", "oauth", "--approve-for-me"]);
+        assert!(args.contains(&"--approve-for-me".to_string()));
+        assert!(!args.contains(&"dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(!args
             .iter()
             .any(|a| a == "danger-full-access" || a == "--ask-for-approval"));
