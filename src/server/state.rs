@@ -135,6 +135,7 @@ pub struct Message {
     #[serde(default)]
     pub subject: Option<String>,
     pub body: String,
+    #[serde(default)]
     pub in_reply_to: Option<String>,
     pub created_ms: i64,
     /// pending -> delivered -> read; replies may also become superseded.

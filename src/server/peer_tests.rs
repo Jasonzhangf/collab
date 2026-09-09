@@ -3172,6 +3172,37 @@ async fn recv_consumes_messages_without_a_follow_up_ack() {
 }
 
 #[test]
+fn legacy_sent_event_replay_classifies_message_without_reply_reference() {
+    let (_server, root) = test_server();
+    let journal_path = root.join(".agent-collab/server/journal.jsonl");
+    std::fs::write(
+        &journal_path,
+        r#"{"ev":"Sent","msg":{"id":"legacy-message","from":"peer-a","to":"peer-b","type":"request","subject":"legacy","body":"legacy body","created_ms":1,"state":"pending"}}
+"#,
+    )
+    .unwrap();
+
+    let state = replay(&root).expect("legacy Sent event must replay");
+    let message = state
+        .msgs
+        .get("legacy-message")
+        .expect("replay must retain the legacy message");
+    assert_eq!(message.in_reply_to, None);
+    assert_eq!(message.mtype, "request");
+    assert_eq!(
+        state
+            .inbox_of("peer-b")
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["legacy-message"]
+    );
+    assert!(!state.answered("legacy-message"));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn malformed_journal_replay_fails_fast() {
     let (_server, root) = test_server();
     std::fs::write(
