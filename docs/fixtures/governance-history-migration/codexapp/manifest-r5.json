@@ -4,7 +4,7 @@
   "canonical_project_cwd": "/Users/fanzhang/Documents/github/codexapp",
   "source_schema_version": "codexapp-transport-journal-v1",
   "target_schema_version": "collab-v1",
-  "source_snapshot_digest": "sha256:c3d995d870cd45a3887c1f3eddba4e2a214db6b60158f3b037ed4fc826f485a4",
+  "source_snapshot_digest": "sha256:77b2a730b6dc34dca560bef4e9139e5553bdca91ba5456530f2c8219f3d189aa",
   "source_epoch": null,
   "target_epoch": "unassigned-fresh-inspect-20260909",
   "project_admission": "needs_operator",

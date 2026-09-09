@@ -17,11 +17,13 @@ The main collection window was `2026-09-09T23:30:19Z` through
 `/private/tmp/unmerged-branch-inventory-r2-fresh-inspect-20260909-raw.log`.
 It has 184 lines, 8,637 bytes, and SHA-256
 `f89b816552ed32c765fc235196d40e3cd0328396145a1c3183940f09dbca8f91`.
-The candidate identity is in raw lines 1-5, Git observations are in lines
-6-37, source JSONL counts and digests are in lines 38-55, mailbox and claims
-inventory is in lines 56-68, PID/socket observations are in lines 69-76,
-goal projections are in lines 77-134, and the codexapp protocol projection is
-in lines 135-183.
+The candidate identity is in raw lines 1-6, Git observations are in lines
+7-51, source JSONL counts and digests are in lines 52-67, mailbox and claims
+inventory is in lines 68-81, PID/socket observations are in lines 82-89,
+goal projections are in lines 90-156, and the codexapp protocol projection is
+in lines 157-183. The corrected 16-process census is retained below from the
+same inspection turn's follow-up read-only command output; it was not rerun
+for this fix.
 
 The raw transcript is a record of commands and their output, not a frozen
 source snapshot. The source files were mutable while the broader inspection
@@ -93,7 +95,7 @@ inventory evidence, not immutable archive receipts:
 | Project | Mailbox rows | Mailbox digest-list SHA-256 | Claims rows | Claims digest-list SHA-256 |
 | --- | ---: | --- | ---: | --- |
 | Collab | 7 | `6fe9bba474b61d0571dec0747f795c2395dbbf832f70f63c4e4638f2f6b1dcb7` | 2 | `856e9e5fa38f767a2d0a38201899c0d815ba2d4bd57e01236d2eb6595003472c` |
-| AppSDK | 559 | `e6135c72113e850435e75d6d6811f52726bab1d18bf44c1c6f1a8c5eef24e093` | 3 | `e43815a502c9f85e99f1d0f8f71db3b3473e05b998fa674fa9200b03d7721` |
+| AppSDK | 559 | `e6135c72113e850435e75d6d6811f52726bab1d18bf44c1c6f1a8c5eef24e093` | 3 | `e43815a502c9f85e99f1d0f8f71db3b3473913e05b998fa674fa9200b03d7721` |
 | RouteCodex | 3,665 | `49d79aaab2d32b2da2e20a1b1aa8cc1e263593fcae2c8dc9047478925dcd6b5c` | 37 | `803eb6e0234f0270c9914316e0fa6fa2daa0a6959b939c9a73d575808b0583ca` |
 
 The AppSDK mailbox count was 559 in the final digest capture; an earlier
@@ -170,6 +172,46 @@ The exact process-path census found 16 matching `collab serve` processes. It
 does not prove 16 writers: process identity and writer ownership are separate
 facts. It does prove that one host-wide writer is not established by the
 current state.
+
+### Corrected process census evidence
+
+This is the verbatim output retained from the follow-up read-only census in
+the prior inspection turn. The raw transcript did not emit a wall-clock
+second for that follow-up command; the bounded observation interval is
+`2026-09-09T23:30:21Z` through `2026-09-09T23:41:44Z`, after the primary
+capture ended and before the candidate documentation was committed. This
+limitation is explicit rather than a fabricated point timestamp. The exact
+filter was:
+
+```text
+ps -axo pid=,command= | rg '^[[:space:]]*[0-9]+[[:space:]]+/Users/fanzhang/\.cargo/bin/collab serve([[:space:]]|$)'
+```
+
+Verbatim matching rows:
+
+```text
+26448 /Users/fanzhang/.cargo/bin/collab serve
+26504 /Users/fanzhang/.cargo/bin/collab serve
+26521 /Users/fanzhang/.cargo/bin/collab serve
+30336 /Users/fanzhang/.cargo/bin/collab serve
+34612 /Users/fanzhang/.cargo/bin/collab serve
+38198 /Users/fanzhang/.cargo/bin/collab serve
+39819 /Users/fanzhang/.cargo/bin/collab serve
+39973 /Users/fanzhang/.cargo/bin/collab serve
+41012 /Users/fanzhang/.cargo/bin/collab serve
+41455 /Users/fanzhang/.cargo/bin/collab serve
+45205 /Users/fanzhang/.cargo/bin/collab serve
+55335 /Users/fanzhang/.cargo/bin/collab serve
+56952 /Users/fanzhang/.cargo/bin/collab serve
+57862 /Users/fanzhang/.cargo/bin/collab serve
+74687 /Users/fanzhang/.cargo/bin/collab serve
+99199 /Users/fanzhang/.cargo/bin/collab serve
+```
+
+The three canonical PID files pointed to 34612 (Collab), 56952 (AppSDK) and
+57862 (RouteCodex). The presence of multiple matching processes and separate
+project sockets leaves one global writer unproven. No process was stopped or
+modified.
 
 Canonical sockets were present with these observations:
 
@@ -263,11 +305,28 @@ capability receipt was verified, so codexapp remains `needs_operator`.
 
 The four accompanying `manifest-r5.json` files are S1 planned drafts. They
 use the schema in `docs/migration-v1-history-manifest.schema.json`, keep every
-target sequence/entity/archive field null, and never claim `mapped`,
-`verified`, archived, replayed, or imported. The schema has no
-`source_disposition` field; the archive-only disposition is therefore
-expressed by the planned status plus the exact blocker and first failed
-boundary, rather than by adding an invalid property.
+target sequence/entity/archive field null, set the required
+`source_disposition` explicitly, and never claim `mapped`, `verified`,
+archived, replayed, or imported. Records with `source_disposition=archive_only`
+retain their exact blocker and first failed boundary.
+
+For each manifest, `source_snapshot_digest` is the SHA-256 of the UTF-8 byte
+sequence formed from every record sorted by `source_record_id`, appending
+`source_record_id`, one NUL byte, `source_record_digest`, one NUL byte for
+each record. The resulting values are:
+
+| Manifest | Computed source snapshot digest |
+| --- | --- |
+| Collab | `sha256:ed35cbf7ad939af952b2cf7716fece6128c8b80916ed70a298c0f060af5a274d` |
+| AppSDK | `sha256:aa05ec79c3791705e67d8976ad39c73fbd905baf5cda7918b8cc83719e3c31df` |
+| RouteCodex | `sha256:f7d88a6111b44c6a5ec5fccc1592cea49bd33f0170ffc5581c970cd89f0747f2` |
+| codexapp | `sha256:77b2a730b6dc34dca560bef4e9139e5553bdca91ba5456530f2c8219f3d189aa` |
+
+The offline check is reproducible with:
+
+```text
+jq -j '.records | sort_by(.source_record_id)[] | .source_record_id, "\u0000", .source_record_digest, "\u0000"' manifest-r5.json | shasum -a 256
+```
 
 For the eventual operation:
 
@@ -349,10 +408,10 @@ remain dirty.
 | RouteCodex | 74 | 75 | +1 | 378 | 378 | 0 |
 | codexapp | no Git | no Git | unchanged | n/a | n/a | n/a |
 
-The r4 process recheck described 21 matching processes; this r5 refresh uses
-the corrected exact path filter and found 16. The earlier count was a shell
-search artifact and is not reused. The r5 source digests are new observations;
-none is an immutable archive receipt.
+The r4 process recheck described 21 matching processes; this r5 refresh found
+16 in a separate follow-up observation. The counts differ by observation
+time/context and do not establish writer ownership. The r5 source digests are
+new observations; none is an immutable archive receipt.
 
 ## Blocking prerequisites
 
