@@ -62,6 +62,26 @@ pub struct WorkerRec {
     pub registered_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeBinding {
+    pub worktree_root: String,
+    pub owning_project_scope: String,
+    pub task_id: String,
+    pub owner_agent_id: String,
+    pub binding_id: String,
+    pub base_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandReceipt {
+    pub operation_id: String,
+    pub outcome: serde_json::Value,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub revision: u64,
+}
+
 pub const MAX_WAKE_ATTEMPTS: u32 = 1;
 pub const MAX_NOTIFICATION_REPEATS: u32 = 100;
 
@@ -90,7 +110,9 @@ pub struct NotificationSubscription {
     pub status_reason: Option<String>,
 }
 
-pub fn default_repeat_count() -> u32 { 1 }
+pub fn default_repeat_count() -> u32 {
+    1
+}
 
 impl NotificationSubscription {
     pub fn matches(&self, worker_id: &str, event: &str, subject: Option<&str>, now: i64) -> bool {
@@ -152,9 +174,7 @@ pub fn is_goal_deadline(subscription: &NotificationSubscription) -> bool {
 /// Canonical identity for one goal deadline occurrence. Registrations and the
 /// scheduler share this key so a new goal revision cannot shadow an existing
 /// goal merely because its deadline happens to be the same.
-pub fn goal_deadline_key(
-    subscription: &NotificationSubscription,
-) -> Option<(String, String, i64)> {
+pub fn goal_deadline_key(subscription: &NotificationSubscription) -> Option<(String, String, i64)> {
     if !is_goal_deadline(subscription) {
         return None;
     }
@@ -263,8 +283,10 @@ impl MasterWakeAccumulator {
                 if let Some(index) = idle_removed {
                     self.idle_workers.remove(index);
                 }
-                let unresponsive_removed =
-                    self.unresponsive_workers.iter().position(|id| id == worker_id);
+                let unresponsive_removed = self
+                    .unresponsive_workers
+                    .iter()
+                    .position(|id| id == worker_id);
                 if let Some(index) = unresponsive_removed {
                     self.unresponsive_workers.remove(index);
                 }
@@ -511,6 +533,14 @@ pub enum Event {
     MigrationUpdated {
         migration: MigrationRecord,
     },
+    ReducerCheckpoint {
+        sequence: u64,
+        revision: u64,
+    },
+    CommandRecorded {
+        command_id: String,
+        receipt: CommandReceipt,
+    },
     #[serde(alias = "RootAssigned")]
     MasterAssigned {
         worker_id: String,
@@ -518,10 +548,17 @@ pub enum Event {
         approval: Option<String>,
         assigned_ms: i64,
     },
+    WorktreeBound {
+        binding: WorktreeBinding,
+    },
 }
 
 #[derive(Default)]
 pub struct State {
+    /// Monotonic in-memory reducer revision and journal sequence.  These are
+    /// not business payload and are advanced only by the resident writer.
+    pub revision: u64,
+    pub sequence: u64,
     pub master_wake: MasterWakeAccumulator,
     pub keepalives: HashMap<String, super::keepalive::Record>,
     pub subagents: HashMap<String, crate::subagent::Record>,
@@ -535,10 +572,12 @@ pub struct State {
     pub notification_subscriptions: HashMap<String, NotificationSubscription>,
     pub wake_bindings: HashMap<String, String>,
     pub migration: Option<MigrationRecord>,
+    pub command_receipts: HashMap<String, CommandReceipt>,
     pub master_worker_id: Option<String>,
     pub master_assigned_by: Option<String>,
     pub master_approval: Option<String>,
     pub master_assigned_ms: Option<i64>,
+    pub worktree_bindings: HashMap<String, WorktreeBinding>,
 }
 
 impl State {
@@ -689,14 +728,10 @@ impl State {
                 }
                 if ids.iter().any(|id| {
                     self.wake_bindings.contains_key(id)
-                        && self
-                            .msgs
-                            .get(id)
-                            .is_some_and(|message| {
-                                message.from == "collab-server"
-                                    && self.master_worker_id.as_deref()
-                                        == Some(message.to.as_str())
-                            })
+                        && self.msgs.get(id).is_some_and(|message| {
+                            message.from == "collab-server"
+                                && self.master_worker_id.as_deref() == Some(message.to.as_str())
+                        })
                 }) {
                     self.master_wake.delivery_state = "notified_unconsumed".into();
                 }
@@ -791,6 +826,14 @@ impl State {
             Event::MigrationUpdated { migration } => {
                 self.migration = Some(migration.clone());
             }
+            Event::ReducerCheckpoint { .. } => {}
+            Event::CommandRecorded {
+                command_id,
+                receipt,
+            } => {
+                self.command_receipts
+                    .insert(command_id.clone(), receipt.clone());
+            }
             Event::MasterAssigned {
                 worker_id,
                 assigned_by,
@@ -801,6 +844,10 @@ impl State {
                 self.master_assigned_by = Some(assigned_by.clone());
                 self.master_approval = approval.clone();
                 self.master_assigned_ms = Some(*assigned_ms);
+            }
+            Event::WorktreeBound { binding } => {
+                self.worktree_bindings
+                    .insert(binding.binding_id.clone(), binding.clone());
             }
         }
     }
@@ -820,15 +867,21 @@ impl State {
         }
         let mut workers: Vec<_> = self.workers.values().cloned().collect();
         workers.sort_by(|a, b| a.id.cmp(&b.id));
-        events.extend(workers.into_iter().map(|worker| Event::Registered { worker }));
+        events.extend(
+            workers
+                .into_iter()
+                .map(|worker| Event::Registered { worker }),
+        );
         let mut keepalives: Vec<_> = self.keepalives.iter().collect();
         keepalives.sort_by(|a, b| a.0.cmp(b.0));
-        events.extend(keepalives.into_iter().map(|(worker_id, record)| {
-            Event::KeepaliveUpdated {
-                worker_id: worker_id.clone(),
-                record: record.clone(),
-            }
-        }));
+        events.extend(
+            keepalives
+                .into_iter()
+                .map(|(worker_id, record)| Event::KeepaliveUpdated {
+                    worker_id: worker_id.clone(),
+                    record: record.clone(),
+                }),
+        );
         let mut subagents: Vec<_> = self.subagents.values().cloned().collect();
         subagents.sort_by(|a, b| a.id.cmp(&b.id));
         events.extend(
@@ -892,6 +945,14 @@ impl State {
         if let Some(migration) = self.migration.clone() {
             events.push(Event::MigrationUpdated { migration });
         }
+        let mut command_receipts: Vec<_> = self.command_receipts.iter().collect();
+        command_receipts.sort_by(|a, b| a.0.cmp(b.0));
+        events.extend(command_receipts.into_iter().map(|(command_id, receipt)| {
+            Event::CommandRecorded {
+                command_id: command_id.clone(),
+                receipt: receipt.clone(),
+            }
+        }));
         if let Some(worker_id) = self.master_worker_id.clone() {
             events.push(Event::MasterAssigned {
                 worker_id,
@@ -900,6 +961,17 @@ impl State {
                 assigned_ms: self.master_assigned_ms.unwrap_or(0),
             });
         }
+        let mut bindings: Vec<_> = self.worktree_bindings.values().cloned().collect();
+        bindings.sort_by(|a, b| a.binding_id.cmp(&b.binding_id));
+        events.extend(
+            bindings
+                .into_iter()
+                .map(|binding| Event::WorktreeBound { binding }),
+        );
+        events.push(Event::ReducerCheckpoint {
+            sequence: self.sequence,
+            revision: self.revision,
+        });
         events
     }
 
@@ -926,9 +998,10 @@ impl State {
     }
 
     pub fn scheduler_message_deliverable(&self, message_id: &str) -> bool {
-        !self.scheduler_admissions.values().any(|admission| {
-            admission.message_id == message_id && admission.status != "succeeded"
-        })
+        !self
+            .scheduler_admissions
+            .values()
+            .any(|admission| admission.message_id == message_id && admission.status != "succeeded")
     }
 
     /// True when some other message is a reply to `msg`.
@@ -1173,6 +1246,46 @@ mod tests {
     }
 
     #[test]
+    fn command_receipt_and_worktree_binding_replay_preserve_durable_state() {
+        let mut state = State::default();
+        let receipt = CommandReceipt {
+            operation_id: "operation-1".into(),
+            outcome: serde_json::json!({"accepted": true}),
+            sequence: 4,
+            revision: 4,
+        };
+        let binding = WorktreeBinding {
+            worktree_root: "/project/playground/task".into(),
+            owning_project_scope: "/project".into(),
+            task_id: "task-1".into(),
+            owner_agent_id: "worker-1".into(),
+            binding_id: "binding-task-1".into(),
+            base_commit: "abc123".into(),
+        };
+        let events = [
+            Event::CommandRecorded {
+                command_id: "command-1".into(),
+                receipt: receipt.clone(),
+            },
+            Event::WorktreeBound {
+                binding: binding.clone(),
+            },
+        ];
+        for event in &events {
+            state.apply(event);
+        }
+
+        let replayed = events.iter().fold(State::default(), |mut state, event| {
+            state.apply(event);
+            state
+        });
+        assert_eq!(replayed.command_receipts["command-1"], receipt);
+        assert_eq!(replayed.worktree_bindings["binding-task-1"], binding);
+        assert_eq!(state.command_receipts, replayed.command_receipts);
+        assert_eq!(state.worktree_bindings, replayed.worktree_bindings);
+    }
+
+    #[test]
     fn legacy_role_field_is_ignored_on_replay() {
         let mut st = State::default();
         let event: Event = serde_json::from_str(
@@ -1346,19 +1459,45 @@ mod tests {
         let mut state = State::default();
         state.apply(&Event::NotificationSubscribed {
             subscription: NotificationSubscription {
-                id: "sub-periodic".into(), worker_id: "waiter".into(), event: "deadline".into(),
-                subject: Some("timer".into()), pane: "%7".into(), method: "tmux".into(),
-                trigger_ms: None, trigger_times_ms: Vec::new(), interval_ms: Some(1_000),
-                repeat_count: 3, fired_count: 0, expires_ms: 10_000,
-                status: "armed".into(), created_ms: 1, updated_ms: 1, status_reason: None,
+                id: "sub-periodic".into(),
+                worker_id: "waiter".into(),
+                event: "deadline".into(),
+                subject: Some("timer".into()),
+                pane: "%7".into(),
+                method: "tmux".into(),
+                trigger_ms: None,
+                trigger_times_ms: Vec::new(),
+                interval_ms: Some(1_000),
+                repeat_count: 3,
+                fired_count: 0,
+                expires_ms: 10_000,
+                status: "armed".into(),
+                created_ms: 1,
+                updated_ms: 1,
+                status_reason: None,
             },
         });
         for count in 1..=3 {
-            state.apply(&Event::NotificationConsumed { subscription_id: "sub-periodic".into(), message_id: format!("m{count}"), consumed_ms: count * 1_000 });
-            if count < 3 { assert_eq!(state.notification_subscriptions["sub-periodic"].status, "armed"); }
+            state.apply(&Event::NotificationConsumed {
+                subscription_id: "sub-periodic".into(),
+                message_id: format!("m{count}"),
+                consumed_ms: count * 1_000,
+            });
+            if count < 3 {
+                assert_eq!(
+                    state.notification_subscriptions["sub-periodic"].status,
+                    "armed"
+                );
+            }
         }
-        assert_eq!(state.notification_subscriptions["sub-periodic"].status, "consumed");
-        assert_eq!(state.notification_subscriptions["sub-periodic"].fired_count, 3);
+        assert_eq!(
+            state.notification_subscriptions["sub-periodic"].status,
+            "consumed"
+        );
+        assert_eq!(
+            state.notification_subscriptions["sub-periodic"].fired_count,
+            3
+        );
     }
 
     #[test]
