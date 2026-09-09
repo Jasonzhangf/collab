@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://collab.local/schema/v1-governance-history-migration-manifest.json",
+  "title": "Collab v1 governance history migration manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "migration_id",
+    "source_project_id",
+    "canonical_project_cwd",
+    "source_schema_version",
+    "target_schema_version",
+    "source_snapshot_digest",
+    "target_epoch",
+    "mapping_status",
+    "records"
+  ],
+  "properties": {
+    "migration_id": {"type": "string", "minLength": 1},
+    "source_project_id": {"type": "string", "minLength": 1},
+    "canonical_project_cwd": {"type": "string", "minLength": 1},
+    "source_repo": {"type": ["string", "null"]},
+    "source_branch": {"type": ["string", "null"]},
+    "source_head": {"type": ["string", "null"]},
+    "source_tree": {"type": ["string", "null"]},
+    "source_schema_version": {"type": "string", "minLength": 1},
+    "target_schema_version": {"type": "string", "minLength": 1},
+    "source_snapshot_digest": {"type": "string", "minLength": 1},
+    "target_epoch": {"type": "string", "minLength": 1},
+    "mapping_status": {
+      "enum": ["planned", "running", "verified", "needs_operator", "reset_required", "aborted"]
+    },
+    "archive_ref": {"type": ["string", "null"]},
+    "archive_digest": {"type": ["string", "null"]},
+    "created_at": {"type": "string", "minLength": 1},
+    "updated_at": {"type": "string", "minLength": 1},
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_record_id",
+          "source_record_type",
+          "source_record_digest",
+          "mapping_class",
+          "mapping_status",
+          "target_epoch"
+        ],
+        "properties": {
+          "source_record_id": {"type": "string", "minLength": 1},
+          "source_record_type": {"type": "string", "minLength": 1},
+          "source_record_digest": {"type": "string", "minLength": 1},
+          "target_epoch": {"type": "string", "minLength": 1},
+          "target_sequence": {"type": ["integer", "null"], "minimum": 0},
+          "target_entity_id": {"type": ["string", "null"]},
+          "agent_id": {"type": ["string", "null"]},
+          "runtime_id": {"type": ["string", "null"]},
+          "binding_id": {"type": ["string", "null"]},
+          "endpoint_generation": {"type": ["integer", "null"], "minimum": 0},
+          "appsdk_record_ref": {"type": ["string", "null"]},
+          "appsdk_record_digest": {"type": ["string", "null"]},
+          "mapping_class": {"enum": ["direct", "adapt", "reset", "unknown"]},
+          "mapping_status": {
+            "enum": ["mapped", "needs_reconciliation", "blocked", "rejected", "unknown"]
+          },
+          "raw_archive_ref": {"type": ["string", "null"]},
+          "exact_error": {"type": ["string", "null"]},
+          "first_failed_boundary": {"type": ["string", "null"]},
+          "created_at": {"type": "string", "minLength": 1},
+          "updated_at": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}
