@@ -1618,6 +1618,51 @@ fn registration_creates_one_finite_default_direct_message_subscription() {
 }
 
 #[test]
+fn cancelled_default_lease_stays_suppressed_until_explicit_subscribe() {
+    let (server, root) = test_server();
+    assert!(register(&server, "peer", "%peer").ok);
+
+    let cancelled = handle_notification_unsubscribe(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "sub-default-direct-message-peer".into(),
+    );
+    assert!(cancelled.ok, "{}", cancelled.error.unwrap_or_default());
+    assert!(register(&server, "peer", "%peer").ok);
+
+    let state = server.state.lock().unwrap();
+    assert_eq!(
+        state.notification_subscriptions["sub-default-direct-message-peer"].status,
+        "cancelled"
+    );
+    assert!(default_direct_message_events(&state, "peer", "%peer", now_ms()).is_empty());
+    drop(state);
+
+    let explicit = handle_notification_subscribe(
+        &server,
+        "peer".into(),
+        "token-peer".into(),
+        "direct-message".into(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        1,
+        3_600,
+    );
+    assert!(explicit.ok, "{}", explicit.error.unwrap_or_default());
+    let explicit_id = explicit.data["subscription"]["id"].as_str().unwrap();
+    assert_ne!(explicit_id, "sub-default-direct-message-peer");
+    assert_eq!(
+        explicit.data["subscription"]["status"],
+        serde_json::Value::String("armed".into())
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn registration_adds_default_lease_when_only_short_direct_message_lease_exists() {
     let mut state = State::default();
     let now = 10_000;

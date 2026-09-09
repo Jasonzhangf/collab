@@ -800,6 +800,13 @@ fn default_direct_message_events(
 ) -> Vec<Event> {
     let mut events = Vec::new();
     let default_id = default_direct_message_id(worker_id);
+    if state
+        .notification_subscriptions
+        .get(&default_id)
+        .is_some_and(|subscription| subscription.status == "cancelled")
+    {
+        return events;
+    }
     let refresh_after_ms = DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000 / 2;
     let mut current_is_fresh = false;
     for subscription in state.notification_subscriptions.values().filter(|sub| {
