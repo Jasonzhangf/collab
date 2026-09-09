@@ -1101,7 +1101,7 @@ mod tests {
             std::env::temp_dir().join(format!("collab-probe-test-{:016x}", rand::random::<u64>()));
         std::fs::create_dir(&directory).unwrap();
         let executable = directory.join("codex-fixture");
-        std::fs::write(&executable, "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n case \"$1\" in\n --profile) shift; profile=$1;;\n --output-last-message) shift; output=$1;;\n esac\n shift\ndone\ncase \"$profile\" in\n good) printf OK > \"$output\";;\n wrong) printf NOT_OK > \"$output\";;\n fail) exit 3;;\n slow) exec sleep 20;;\nesac\n").unwrap();
+        std::fs::write(&executable, "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n case \"$1\" in\n --profile) shift; profile=$1;;\n --output-last-message) shift; output=$1;;\n esac\n shift\ndone\ncase \"$profile\" in\n good) printf OK > \"$output\";;\n wrong) printf NOT_OK > \"$output\";;\n fail) exit 3;;\n slow) exec sleep 2;;\nesac\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let settings = config::Health {
             timeout_seconds: 1,
@@ -1114,20 +1114,20 @@ mod tests {
             ("slow", false),
         ] {
             let start = Instant::now();
-            assert_eq!(
-                probe_with(
-                    &executable,
-                    "codex",
-                    &config::Profile {
-                        codex_profile: name.into(),
-                        model: None
-                    },
-                    &settings,
-                    &std::env::vars().collect()
-                )
-                .is_ok(),
-                expected
+            let result = probe_with(
+                &executable,
+                "codex",
+                &config::Profile {
+                    codex_profile: name.into(),
+                    model: None,
+                },
+                &settings,
+                &std::env::vars().collect(),
             );
+            assert_eq!(result.is_ok(), expected);
+            if name == "slow" {
+                assert_eq!(result.unwrap_err().to_string(), "probe timed out");
+            }
             assert!(start.elapsed() < Duration::from_secs(3));
         }
         std::fs::remove_dir_all(directory).unwrap();
@@ -1176,7 +1176,7 @@ mod tests {
         )
         .is_err());
         let slow = directory.join("agent-slow");
-        std::fs::write(&slow, "#!/bin/sh\nexec sleep 20\n").unwrap();
+        std::fs::write(&slow, "#!/bin/sh\nexec sleep 2\n").unwrap();
         std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o700)).unwrap();
         let start = Instant::now();
         let err = probe_with(
