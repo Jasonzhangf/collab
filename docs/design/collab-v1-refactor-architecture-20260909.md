@@ -52,7 +52,7 @@ The following choices are binding:
   back into this integration branch. No worker edits `main`.
 
 Existing v1 contracts remain normative where they do not conflict with this
-document: [`docs/collab.md`](../collab.md),
+document: [`skills/collab/references/task-worktree-lifecycle.md`](../../skills/collab/references/task-worktree-lifecycle.md),
 [`docs/migration-v1-to-low-intervention.md`](../migration-v1-to-low-intervention.md),
 and [`docs/goals/collab-runtime-queue-handoff-plan.md`](../goals/collab-runtime-queue-handoff-plan.md).
 This document supersedes their project-level daemon and identity assumptions
@@ -497,20 +497,31 @@ validation evidence with no task-state behavior change.
 
 ### R2 — global daemon and single reducer
 
-Owner: one GCM worker after R1. Allowed paths: `src/server/mod.rs`,
+Owner: one GCM worker after R1. Core paths are `src/server/mod.rs`,
 `src/server/state.rs`, `src/config.rs`, a new
 `src/server/notification_contract.rs`, daemon tests and protocol fixtures.
+For the one-time notification extraction only, R2 may also edit the existing
+notification implementation paths `src/server/timers.rs`,
+`src/server/keepalive.rs`, `src/server/knock.rs` and the new
+`src/server/mailbox.rs`; those paths are transferred to R4 after R2 delivery.
 R2 is the sole owner of durable `WorktreeBinding`, master-grant enforcement,
 replay/sequence/idempotency, one resident writer and explicit journal errors.
 It consumes the R1 types and must not add a second storage format.
 
-Before delivery, R2 must extract the producer-side seam that later rounds use
-without editing R2 files: `NotificationStateView` (read-only reducer state),
-`NotificationSink` (typed event submission), the reducer event interface, and
-the module export/daemon wiring needed for those types to compile on the real
-serve path. The seam must prove one journal event can be read by a consumer
-without a second writer or JSONL implementation. R2's done-iff includes this
-compiled seam and its focused tests; a document-only interface is insufficient.
+Before delivery, R2 must physically move the legacy notification implementation
+out of `src/server/mod.rs` and `src/server/state.rs`: JSONL append/read and
+repair, batching and delivery selection, and the persisted
+`MasterWakeAccumulator` behavior must live exactly once in the transferred
+notification paths. R2 deletes the old definitions, wires the real serve path
+to the moved implementation, and proves existing notification tests still use
+that path. It also exposes the producer-side seam that later rounds consume:
+`NotificationStateView` (read-only reducer state), `NotificationSink` (typed
+event submission), the reducer event interface, and the module export/daemon
+wiring. The seam must prove one journal event can be read by a consumer without
+a second writer or JSONL implementation. R2's done-iff includes the physical
+move, no duplicate old owner, compiled seam and focused tests; a document-only
+interface is insufficient. Once R2 is delivered, the listed notification paths
+belong exclusively to R4 and R2 may no longer edit them.
 
 ### R3 — AppServer adapters and real bidirectional Loop
 
@@ -528,8 +539,8 @@ cursor evidence and negative stale/unknown/timeout/wrong-turn cases.
 
 ### R4 — notification accumulator, batching and JSONL projection
 
-Owner: one GCM worker after R2. Allowed paths: `src/server/timers.rs`,
-`src/server/keepalive.rs`, `src/server/knock.rs`, new
+Owner: one GCM worker after R2's physical extraction. Allowed paths:
+`src/server/timers.rs`, `src/server/keepalive.rs`, `src/server/knock.rs`,
 `src/server/mailbox.rs`, notification tests and
 `skills/collab/references/notifications.md`. R4 consumes the R2
 `NotificationStateView`/`NotificationSink` seam and is the sole writer of the
