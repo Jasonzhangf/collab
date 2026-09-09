@@ -1,0 +1,91 @@
+{
+  "fixture_version": 1,
+  "project_id": "collab",
+  "manifest": "manifest.json",
+  "mode": "no_write",
+  "source_observation": {
+    "captured_at": "2026-09-09T19:54:14Z",
+    "raw_log": "/private/tmp/governance-history-live-refresh-20260909-repair-raw.log",
+    "capture": "capture-03",
+    "inputs": [
+      {
+        "source_record_id": ".agent-collab/mailbox",
+        "source_path": "/Volumes/extension/code/collab/.agent-collab/mailbox",
+        "file_count": 7,
+        "line_count": 58,
+        "digest": "sha256:67ab5e8977150060574bfce98360eea8be9cc628e6fc8a006e536b59e8c01b7e"
+      },
+      {
+        "source_record_id": ".agent-collab/server/events.jsonl",
+        "source_path": "/Volumes/extension/code/collab/.agent-collab/server/events.jsonl",
+        "line_count": 457,
+        "byte_count": 73125,
+        "digest": "sha256:d580c6168ef1caf84c42ca30169b987d2695e04c1b9fd8795dcd31e05c424268"
+      },
+      {
+        "source_record_id": ".agent-collab/server/journal.jsonl",
+        "source_path": "/Volumes/extension/code/collab/.agent-collab/server/journal.jsonl",
+        "line_count": 72,
+        "byte_count": 20871,
+        "digest": "sha256:c47e0f95b388809274ae2c43b8a23289e3d92e6afa6a61ea21033a7491fffc83"
+      }
+    ]
+  },
+  "expected": {
+    "manifest_mapping_status": "planned",
+    "archive_ref": null,
+    "archive_digest": null,
+    "target_mappings_created": false,
+    "source_mutations": false
+  },
+  "cases": [
+    {
+      "case_id": "dirty-candidate",
+      "trigger": "source checkout has 671 status entries and 667 untracked files",
+      "expected_mapping_class": "reset",
+      "expected_boundary": "candidate"
+    },
+    {
+      "case_id": "multiple-writers",
+      "trigger": "host has 20 processes matching the exact collab serve command",
+      "expected_mapping_class": "reset",
+      "expected_boundary": "writer-admission"
+    },
+    {
+      "case_id": "source-digest-drift",
+      "trigger": "the source events projection changes between inspect reads",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "snapshot"
+    },
+    {
+      "case_id": "malformed-middle",
+      "trigger": "a copied JSONL stream contains malformed JSON before its tail",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "schema"
+    },
+    {
+      "case_id": "duplicate-record-id",
+      "trigger": "two copied records claim one source record ID",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "schema"
+    },
+    {
+      "case_id": "missing-owner",
+      "trigger": "an active task has no durable owner relation",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "owner"
+    },
+    {
+      "case_id": "changed-cwd",
+      "trigger": "a task or identity points outside the canonical project cwd",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "scope"
+    },
+    {
+      "case_id": "unknown-outcome",
+      "trigger": "a command result cannot distinguish failure from an ambiguous side effect",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "operation"
+    }
+  ]
+}
