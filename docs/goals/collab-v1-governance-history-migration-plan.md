@@ -46,6 +46,12 @@ If a receipt is missing, conflicting or not reproducible, this goal remains
 blocked at `runtime_prerequisite`; it must not reimplement that round inside a
 migration adapter.
 
+The latest read-only site evidence is
+[`docs/evidence/governance-history-live-refresh-r3-20260909.md`](../evidence/governance-history-live-refresh-r3-20260909.md).
+Its classifications supersede older inventory snapshots. At that refresh,
+Collab, AppSDK and RouteCodex were `reset_required`, while codexapp was
+`needs_operator`; no project was admitted for live active replay.
+
 ## Migration stages and worker contracts
 
 All implementation work starts from the current clean v1 integration branch in
@@ -119,10 +125,14 @@ replay and cleanup remain separate evidence facts.
 ### Collab
 
 Start from the v1 integration lineage, not the dirty v2 branch. Inspect the
-72-line journal and 442-line event projection observed on 2026-09-09, then
-replay the complete source prefix. The existing `v1-low-intervention` verified
+72-line journal and the latest mutable event projection observed in the r3
+refresh, then classify the source before deciding whether any prefix is safe
+to replay. The r3 refresh found 472 event lines, 146 worktrees and 130
+unmerged branches, plus multiple host `collab serve` processes and no live
+master, so the current disposition is `reset_required`; no direct replay is
+admitted from that snapshot. The existing `v1-low-intervention` verified
 record is evidence of a prior local migration only; it does not prove global
-daemon ownership. Preserve approximately 98 playground directories until each
+daemon ownership. Preserve every playground directory until each
 worktree/branch/claim is classified. Empty PID/lock files yield `unknown`, not
 "daemon stopped".
 

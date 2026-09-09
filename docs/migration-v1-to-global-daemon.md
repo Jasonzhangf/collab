@@ -2,8 +2,11 @@
 
 Status: migration-specific contract. Runtime ownership and implementation
 milestones remain in the canonical v1 refactor design. The inventory below is a
-read-only snapshot captured at `2026-09-09T16:12:32Z`; the command transcript and
-digests are in
+historical read-only snapshot captured at `2026-09-09T16:12:32Z`; it is retained
+for provenance only. The current read-only refresh is
+[`docs/evidence/governance-history-live-refresh-r3-20260909.md`](./evidence/governance-history-live-refresh-r3-20260909.md)
+and supersedes the snapshot's migration classifications. The older command
+transcript and digests are in
 [`docs/evidence/governance-history-inventory-20260909.md`](./evidence/governance-history-inventory-20260909.md).
 Counts, PIDs, branches and live bindings are observations with an expiry time;
 they are not durable claims that the migration has already run.
@@ -41,6 +44,15 @@ second daemon or converts an unknown result into success.
 The inventory intentionally records `unknown` where an empty PID or missing
 directory cannot prove absence. A later `inspect` must refresh these values
 before taking a migration lease.
+
+## Current refresh supersession
+
+The r3 refresh observed mutable journal/event drift, multiple `collab serve`
+processes, lost or unknown workers, dirty roots and missing runtime bindings.
+Its current disposition is `reset_required` for Collab, AppSDK and RouteCodex,
+and `needs_operator` for codexapp. No source is currently admitted for direct
+active replay. The historical table above must not be used to skip the fresh
+inspect, writer freeze, immutable archive, or new-epoch reset gates.
 
 ## Manifest and idempotency
 
