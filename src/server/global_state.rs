@@ -612,10 +612,22 @@ impl GlobalState {
             .and_then(|project| project.lookup_registration(app_scope_id))
     }
 
+    /// Look up an unscoped binding only when its ID is host-wide unique.
+    /// Route-aware callers must use [`Self::lookup_binding_for`], because the
+    /// same binding ID is allowed in two independent project scopes.
     pub fn lookup_binding(&self, binding_id: &BindingId) -> Option<&RuntimeBinding> {
-        self.projects
-            .values()
-            .find_map(|project| project.lookup_binding(binding_id))
+        let mut found = None;
+        for project in self.projects.values() {
+            if let Some(binding) = project.lookup_binding(binding_id) {
+                if found.is_some() {
+                    // An ambiguous unscoped lookup must fail closed rather
+                    // than selecting whichever project sorts first.
+                    return None;
+                }
+                found = Some(binding);
+            }
+        }
+        found
     }
 
     pub fn lookup_binding_for(
@@ -683,9 +695,9 @@ impl GlobalState {
     }
 
     /// Register or reconnect a runtime binding.  An older generation is
-    /// rejected before state mutation.  A newer generation may replace an
-    /// ungranted binding with the same principal; an active master grant must
-    /// be explicitly recreated on a new binding generation.
+    /// rejected before state mutation.  A newer generation may replace a
+    /// binding with the same principal; reconnecting revokes any grant tied
+    /// to the old generation and requires an explicit new grant.
     pub fn bind_runtime(&mut self, binding: RuntimeBinding) -> Result<StateVersion, StateError> {
         binding.validate()?;
         let scope_key = binding.project_scope.as_str().to_owned();
@@ -726,12 +738,6 @@ impl GlobalState {
                     binding.binding_id, binding.endpoint_generation
                 )));
             }
-            if project.lookup_master_grant(&binding.binding_id).is_some() {
-                return Err(StateError::BindingConflict(format!(
-                    "binding {} has an active master grant; rebind requires a new binding id",
-                    binding.binding_id
-                )));
-            }
         }
 
         let duplicate_runtime = project.runtime_bindings.values().find(|current| {
@@ -758,7 +764,13 @@ impl GlobalState {
                     binding.app_scope_id
                 )));
             }
-            project.runtime_bindings.insert(binding_key, binding);
+            project
+                .runtime_bindings
+                .insert(binding_key.clone(), binding);
+            // A capability is fenced to the endpoint generation.  Rebinding
+            // the same binding ID therefore revokes the old capability in
+            // the same candidate transaction.
+            project.master_grants.remove(&binding_key);
             Ok(())
         })
     }
@@ -767,7 +779,8 @@ impl GlobalState {
     /// pure lookup and never repairs or advances a stale binding.
     pub fn validate_binding(&self, incoming: &RuntimeBinding) -> Result<(), StateError> {
         incoming.validate()?;
-        let Some(current) = self.lookup_binding(&incoming.binding_id) else {
+        let route_scope = incoming.route_scope();
+        let Some(current) = self.lookup_binding_for(&route_scope, &incoming.binding_id) else {
             return Err(StateError::BindingNotFound(
                 incoming.binding_id.as_str().to_owned(),
             ));
@@ -839,6 +852,34 @@ impl GlobalState {
                 .get_mut(&scope_key)
                 .ok_or_else(|| StateError::ProjectNotRegistered(scope_key.clone()))?;
             project.master_grants.insert(binding_key, grant);
+            Ok(())
+        })
+    }
+
+    /// Revoke the current master capability for one scoped binding.  The
+    /// operation is idempotent, while a later reconnect also removes the
+    /// grant automatically through `bind_runtime`.
+    pub fn revoke_master(
+        &mut self,
+        project_scope: &ProjectScopeId,
+        binding_id: &BindingId,
+    ) -> Result<StateVersion, StateError> {
+        validate_project_scope(project_scope)?;
+        validate_binding_id(binding_id)?;
+        let scope_key = project_scope.as_str().to_owned();
+        let project = self
+            .lookup_project(project_scope)
+            .ok_or_else(|| StateError::ProjectNotRegistered(scope_key.clone()))?;
+        if project.lookup_master_grant(binding_id).is_none() {
+            return Ok(self.version());
+        }
+
+        self.mutate(|next| {
+            let project = next
+                .projects
+                .get_mut(&scope_key)
+                .ok_or_else(|| StateError::ProjectNotRegistered(scope_key.clone()))?;
+            project.master_grants.remove(binding_id.as_str());
             Ok(())
         })
     }
@@ -1194,6 +1235,53 @@ mod tests {
     }
 
     #[test]
+    fn same_binding_id_in_different_projects_is_route_scoped() {
+        let first_scope = project_scope();
+        let second_scope = ProjectScopeId::new(format!("{}/second", first_scope.as_str()))
+            .expect("second project scope");
+        let mut state = GlobalState::default();
+        state
+            .register_project(registration(&first_scope, "app-one"))
+            .unwrap();
+        state
+            .register_project(registration(&second_scope, "app-one"))
+            .unwrap();
+
+        let first = binding(
+            &first_scope,
+            "app-one",
+            "agent-one",
+            "runtime-one",
+            "shared-binding",
+            1,
+        );
+        let second = binding(
+            &second_scope,
+            "app-one",
+            "agent-two",
+            "runtime-two",
+            "shared-binding",
+            1,
+        );
+        state.bind_runtime(first.clone()).unwrap();
+        state.bind_runtime(second.clone()).unwrap();
+
+        let shared_id = BindingId::new("shared-binding").unwrap();
+        assert!(state.lookup_binding(&shared_id).is_none());
+        assert_eq!(
+            state.lookup_binding_for(&first.route_scope(), &shared_id),
+            Some(&first)
+        );
+        assert_eq!(
+            state.lookup_binding_for(&second.route_scope(), &shared_id),
+            Some(&second)
+        );
+        state.validate_binding(&first).unwrap();
+        state.validate_binding(&second).unwrap();
+        state.validate().unwrap();
+    }
+
+    #[test]
     fn sequence_and_revision_advance_together_and_cas_is_fenced() {
         let scope = project_scope();
         let mut state = GlobalState::default();
@@ -1323,6 +1411,83 @@ mod tests {
             state.role_for_binding(&scope, &runtime.binding_id),
             PeerRole::Master
         );
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn reconnect_revokes_old_master_grant_and_explicit_revoke_is_idempotent() {
+        let scope = project_scope();
+        let mut state = GlobalState::default();
+        state
+            .register_project(registration(&scope, "app-one"))
+            .unwrap();
+        let current = binding(
+            &scope,
+            "app-one",
+            "agent-one",
+            "runtime-one",
+            "binding-one",
+            4,
+        );
+        state.bind_runtime(current.clone()).unwrap();
+        state
+            .grant_master(grant(&scope, "app-one", "agent-one", "binding-one", 4))
+            .unwrap();
+        assert_eq!(
+            state.role_for_binding(&scope, &current.binding_id),
+            PeerRole::Master
+        );
+
+        let reconnected = binding(
+            &scope,
+            "app-one",
+            "agent-one",
+            "runtime-one",
+            "binding-one",
+            5,
+        );
+        state.bind_runtime(reconnected.clone()).unwrap();
+        assert!(state
+            .lookup_master_grant(&scope, &reconnected.binding_id)
+            .is_none());
+        assert_eq!(
+            state.role_for_binding(&scope, &reconnected.binding_id),
+            PeerRole::Peer
+        );
+        assert!(matches!(
+            state.grant_master(grant(&scope, "app-one", "agent-one", "binding-one", 4)),
+            Err(StateError::StaleBinding {
+                expected_generation: 5,
+                observed_generation: 4,
+                ..
+            })
+        ));
+        state
+            .grant_master(grant(&scope, "app-one", "agent-one", "binding-one", 5))
+            .unwrap();
+        assert_eq!(
+            state.role_for_binding(&scope, &reconnected.binding_id),
+            PeerRole::Master
+        );
+
+        let before_revoke = state.version();
+        state
+            .revoke_master(&scope, &reconnected.binding_id)
+            .unwrap();
+        assert_eq!(
+            state.role_for_binding(&scope, &reconnected.binding_id),
+            PeerRole::Peer
+        );
+        assert!(state
+            .lookup_master_grant(&scope, &reconnected.binding_id)
+            .is_none());
+        let after_revoke = state.version();
+        assert!(after_revoke.revision > before_revoke.revision);
+        state
+            .revoke_master(&scope, &reconnected.binding_id)
+            .unwrap();
+        assert_eq!(state.version(), after_revoke);
+        state.validate_binding(&reconnected).unwrap();
         state.validate().unwrap();
     }
 
