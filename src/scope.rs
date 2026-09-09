@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::identity::AppServerId;
+use crate::identity::{validate_id_for_protocol, AppServerId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9,8 +9,34 @@ use serde::{Deserialize, Serialize};
 pub struct ProjectScopeId(String);
 
 impl ProjectScopeId {
+    pub fn new(value: impl Into<String>) -> anyhow::Result<Self> {
+        let value = value.into();
+        if value.is_empty() {
+            anyhow::bail!("project scope id must not be empty");
+        }
+        if value.chars().any(char::is_control) {
+            anyhow::bail!("project scope id must not contain control characters");
+        }
+        if !Path::new(&value).is_absolute() {
+            anyhow::bail!("project scope id must be an absolute path");
+        }
+        Ok(Self(value))
+    }
+
+    fn from_registered_cwd(cwd: &Path) -> anyhow::Result<Self> {
+        let root = normalize_registered_cwd(cwd)?;
+        let value = root.to_str().ok_or_else(|| {
+            anyhow::anyhow!("registered project cwd must be valid UTF-8 for the wire scope")
+        })?;
+        Self::new(value.to_owned())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        Self::new(self.0.clone()).map(|_| ())
     }
 }
 
@@ -25,22 +51,26 @@ impl RouteScope {
         app_scope_id: AppServerId,
         registered_cwd: &Path,
     ) -> anyhow::Result<Self> {
-        let root = normalize_registered_cwd(registered_cwd)?;
         Ok(Self {
             app_scope_id,
-            project_scope_id: ProjectScopeId(root.to_string_lossy().into_owned()),
+            project_scope_id: ProjectScopeId::from_registered_cwd(registered_cwd)?,
         })
     }
 
     pub fn validate_registered_cwd(&self, registered_cwd: &Path) -> anyhow::Result<()> {
-        let normalized = normalize_registered_cwd(registered_cwd)?;
-        if self.project_scope_id.as_str() != normalized.to_string_lossy() {
+        let normalized = ProjectScopeId::from_registered_cwd(registered_cwd)?;
+        if self.project_scope_id != normalized {
             anyhow::bail!(
                 "project cwd is outside the registered project scope: {}",
-                normalized.display()
+                registered_cwd.display()
             );
         }
         Ok(())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_id_for_protocol(self.app_scope_id.as_str())?;
+        self.project_scope_id.validate()
     }
 
     pub fn validate_same_route(&self, other: &Self) -> anyhow::Result<()> {
@@ -586,6 +616,50 @@ mod tests {
         );
         assert_eq!(route, before);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_registered_cwd_fails_closed_without_scope_collision() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let parent = test_root("non-utf8-route-scope");
+        std::fs::create_dir_all(&parent).unwrap();
+        let first = parent.join(OsString::from_vec(b"project-\xff".to_vec()));
+        let second = parent.join(OsString::from_vec(b"project-\xfe".to_vec()));
+        if std::fs::create_dir(&first).is_err() || std::fs::create_dir(&second).is_err() {
+            std::fs::remove_dir_all(parent).ok();
+            return;
+        }
+
+        assert!(RouteScope::for_registered_project(
+            AppServerId::new("appserver-1").unwrap(),
+            &first
+        )
+        .is_err());
+        assert!(RouteScope::for_registered_project(
+            AppServerId::new("appserver-1").unwrap(),
+            &second
+        )
+        .is_err());
+        std::fs::remove_dir_all(parent).ok();
+    }
+
+    #[test]
+    fn long_registered_cwd_has_a_valid_unbounded_project_scope() {
+        let base = test_root("long-route-scope");
+        let mut root = base.clone();
+        for index in 0..24 {
+            root = root.join(format!("segment-{index:02}-abcdef"));
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let route =
+            RouteScope::for_registered_project(AppServerId::new("appserver-1").unwrap(), &root)
+                .unwrap();
+        assert!(route.project_scope_id.as_str().len() > 256);
+        route.validate_registered_cwd(&root).unwrap();
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

@@ -52,8 +52,7 @@ impl CommandEnvelope {
         crate::identity::validate_id_for_protocol(self.command_id.as_str())?;
         crate::identity::validate_id_for_protocol(self.operation_id.as_str())?;
         crate::identity::validate_id_for_protocol(self.actor_binding_id.as_str())?;
-        crate::identity::validate_id_for_protocol(self.scope.app_scope_id.as_str())?;
-        crate::identity::validate_id_for_protocol(self.scope.project_scope_id.as_str())?;
+        self.scope.validate()?;
         for id in [
             self.turn_id.as_ref().map(TurnId::as_str),
             self.message_id.as_ref().map(MessageId::as_str),
@@ -72,7 +71,9 @@ impl CommandEnvelope {
         registered: &RuntimeIdentity,
         registered_scope: &RouteScope,
     ) -> anyhow::Result<()> {
+        registered.validate()?;
         self.validate()?;
+        registered_scope.validate()?;
         let incoming = RuntimeIdentity {
             agent_id: registered.agent_id.clone(),
             runtime_id: registered.runtime_id.clone(),
@@ -81,18 +82,10 @@ impl CommandEnvelope {
             binding_id: self.actor_binding_id.clone(),
             native_thread_id: registered.native_thread_id.clone(),
         };
-        validate_binding(registered, &incoming)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        validate_binding(registered, &incoming)?;
         self.scope.validate_same_route(registered_scope)?;
         if self.scope.app_scope_id != registered.appserver_id {
             anyhow::bail!("command app scope does not match actor AppServer identity");
-        }
-        if self.endpoint_generation != registered.endpoint_generation {
-            anyhow::bail!(
-                "stale endpoint generation: expected {}, observed {}",
-                registered.endpoint_generation,
-                self.endpoint_generation
-            );
         }
         Ok(())
     }
@@ -406,7 +399,8 @@ pub const MSG_TYPES: [&str; 3] = ["notify", "request", "reply"];
 mod tests {
     use super::*;
     use crate::identity::{
-        AgentId, AppServerId, BindingId, CommandId, NativeThreadId, OperationId, RuntimeId,
+        AgentId, AppServerId, BindingId, BindingValidationError, CommandId, NativeThreadId,
+        OperationId, RuntimeId,
     };
     use crate::scope::RouteScope;
     use std::path::Path;
@@ -565,5 +559,47 @@ mod tests {
         assert_eq!(command, before_command);
         assert_eq!(identity, before_identity);
         assert_eq!(scope, before_scope);
+    }
+
+    #[test]
+    fn command_envelope_preserves_typed_binding_error_chain() {
+        let identity = registered_identity();
+        let scope = registered_scope();
+        let mut command = envelope(scope.clone());
+        command.endpoint_generation = 6;
+
+        let error = command.validate_for(&identity, &scope).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<BindingValidationError>(),
+            Some(BindingValidationError::StaleGeneration {
+                expected: 7,
+                observed: 6
+            })
+        ));
+    }
+
+    #[test]
+    fn command_envelope_accepts_long_registered_cwd() {
+        let mut root = std::env::temp_dir().join(format!(
+            "collab-long-envelope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for index in 0..24 {
+            root = root.join(format!("segment-{index:02}-abcdef"));
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let scope =
+            RouteScope::for_registered_project(AppServerId::new("appserver-1").unwrap(), &root)
+                .unwrap();
+        assert!(scope.project_scope_id.as_str().len() > 256);
+        let command = envelope(scope.clone());
+        command
+            .validate_for(&registered_identity(), &scope)
+            .unwrap();
+        std::fs::remove_dir_all(root).ok();
     }
 }
