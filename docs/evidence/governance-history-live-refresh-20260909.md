@@ -36,7 +36,7 @@ commit.
 | repair candidate worktree | `/Volumes/extension/code/collab/playground/v1-migration-audit-repair-20260909` |
 | repair checkout before edit | detached HEAD at the base commit above |
 | prior evidence revision | `ea2e76d44661051e56ba399c6fd94ec1b894db7f` (content source only) |
-| repair candidate state | clean before the copied document; this document is the only intended write |
+| repair candidate state | clean before the copied documentation and fixture set; candidate writes are limited to the 10 docs paths in this candidate |
 | live roots changed | two authorized audit-delivery mailbox appends from the prior evidence delivery; no source truth was edited by this repair |
 
 The repair raw-log index is:
@@ -48,7 +48,7 @@ The repair raw-log index is:
 | 03 | `/private/tmp/governance-history-live-refresh-20260909-repair-raw.log:37-53` | journal/events line counts and digests |
 | 04 | `/private/tmp/governance-history-live-refresh-20260909-repair-raw.log:54-80` | token-redacted identity/pane keys and target-field presence |
 | 05-07 | `/private/tmp/governance-history-live-refresh-20260909-repair-raw.log:81-764` | three complete, separately captured `collab who` JSON responses (Collab, AppSDK, RouteCodex) |
-| 08, 11 | `/private/tmp/governance-history-live-refresh-20260909-repair-raw.log:765-846` | daemon artifacts, PID/cwd/socket descriptors, and mailbox projections |
+| 08, 11 | `/private/tmp/governance-history-live-refresh-20260909-repair-raw.log:765-846` | daemon artifacts, PID/cwd/socket descriptors, and mailbox projections; `capture-11` was collected at `2026-09-09T19:56:01Z` |
 | 09-10 | `/private/tmp/governance-history-live-refresh-20260909-repair-raw.log:783-803` | codexapp connection result and global `collab serve` count |
 | 12 | `/private/tmp/governance-history-live-refresh-20260909-repair-raw.log:847-855` | OneStop stale-PID recheck |
 
@@ -97,12 +97,15 @@ their project owners; this audit does not repair, reset, or merge them.
 
 ## Mutable source projections
 
-The repair recheck rows below were collected at `2026-09-09T19:54:14Z` with
-`wc -l -c` and full-file `shasum -a 256`; the raw output is indexed at
+The repair recheck journal and event rows below were collected at
+`2026-09-09T19:54:14Z` with `wc -l -c` and full-file `shasum -a 256`; the raw
+output is indexed at
 `/private/tmp/governance-history-live-refresh-20260909-repair-raw.log#capture-03`
-(lines 37-53). The mailbox hash is over regular files in C-locale sorted
-absolute-path order, concatenated byte-for-byte. A mailbox count or digest does
-not say that every message is current or consumable.
+(lines 37-53). The mailbox rows were collected by repair `capture-11` at
+`2026-09-09T19:56:01Z` and are indexed at lines 835-846. The mailbox hash is
+over regular files in C-locale sorted absolute-path order, concatenated
+byte-for-byte. A mailbox count or digest does not say that every message is
+current or consumable.
 
 | Project | Journal | Events | Mailbox | Source interpretation |
 |---|---|---|---|---|
@@ -134,9 +137,9 @@ lines with aggregate SHA-256
 `ab65e143db0c364b46c8c0c705ea79c409d15eed5b8921d359394edcb389bcb3`. Neither
 delivery acknowledged, closed, reassigned, or repaired an existing record.
 
-The repair capture at `2026-09-09T19:56:01Z` observed `552` AppSDK mailbox
-files and `7,216` lines with the digest in the table above. The raw mailbox
-projection is indexed at `capture-11`, lines 835-846. It is a mutable source
+The repair `capture-11` at `2026-09-09T19:56:01Z` observed `552` AppSDK
+mailbox files and `7,216` lines with the digest in the table above. The raw
+mailbox projection is indexed at lines 835-846. It is a mutable source
 projection and is not a frozen archive.
 
 The source drift is itself an admission blocker. The same live roots changed
@@ -169,7 +172,7 @@ not identify a holder or prove an exclusive lock.
 | Collab | `server.pid` value `34612`; `/Users/fanzhang/.cargo/bin/collab serve`; started Tue Sep 8 18:33:18 | PID 34612 cwd `/Volumes/extension/code/collab`; fd 11 holds `/Volumes/extension/code/collab/.agent-collab/server/server.sock` | regular file, 0 bytes, `-rw-r--r--`, mtime `2026-09-07T08:00:11-0700`; holder unknown | Unix socket, `srw-------`, mtime `2026-09-08T18:33:18-0700` |
 | AppSDK | `server.pid` value `56952`; `/Users/fanzhang/.cargo/bin/collab serve`; started Wed Sep 9 08:31:36 | PID 56952 cwd `/Users/fanzhang/Documents/github/appsdk`; fd 11 holds `/Users/fanzhang/Documents/github/appsdk/.agent-collab/server/server.sock` | regular file, 0 bytes, `-rw-r--r--`, mtime `2026-09-07T01:57:55-0700`; holder unknown | Unix socket, `srw-------`, mtime `2026-09-09T08:31:37-0700` |
 | RouteCodex | `server.pid` value `57862`; `/Users/fanzhang/.cargo/bin/collab serve`; started Wed Sep 9 06:50:08 | PID 57862 cwd `/Users/fanzhang/Documents/github/routecodex`; fd 11 holds `/Users/fanzhang/Documents/github/routecodex/.agent-collab/server/server.sock` | regular file, 0 bytes, `-rw-r--r--`, mtime `2026-09-07T05:12:43-0700`; holder unknown | Unix socket, `srw-------`, mtime not reread in final artifact check |
-| OneStop (control sample) | `server.pid` artifact value `15303`; no live `collab serve` process in repair recheck | PID/cwd/socket owner unknown; `capture-12` records `ps_rows=0`, `cwd_rows=0`, `unix_rows=0` | regular file, 0 bytes, `-rw-r--r--`, mtime `2026-09-07T01:21:40-0700`; holder unknown | Unix socket, `srw-------`, mtime `2026-09-09T12:21:36-0700`; owner unknown |
+| OneStop (control sample) | `server.pid` artifact value `15303`; no live `collab serve` process in repair recheck | PID/cwd/socket owner unknown; `capture-12` records `ps_rows=0`, `cwd_rows=0`, `unix_rows=0` | regular file, 0 bytes, `-rw-r--r--`, mtime `2026-09-07T01:21:40-0700`; holder unknown | Unix socket, `srw-------`, mtime `2026-09-09T12:56:54-0700`; owner unknown |
 
 These observations establish local PID/cwd/socket alignment for three
 project-local daemons during the repair recheck. OneStop's stale artifacts

@@ -15,6 +15,9 @@ Each project directory has two files:
   manifest to the source projection observations and lists the negative cases
   that a later copied-input harness must exercise.
 
+Together with this README and the evidence document, the two files in each of
+the four project directories make up the candidate's 10 docs-only paths.
+
 The manifests intentionally use `mapping_status=planned`. Every record keeps
 `mapping_status=planned`, leaves target sequence/entity and archive fields
 null, and carries its observed `mapping_class`. The shared
@@ -31,10 +34,12 @@ records sorted by `source_record_id`, with each field followed by a NUL byte:
 source_record_id NUL source_record_digest NUL ... final NUL
 ```
 
-The per-record digests are the exact SHA-256 values recorded by the repair
-capture at
+The journal and event per-record digests are the exact SHA-256 values recorded
+by the repair capture at
 `/private/tmp/governance-history-live-refresh-20260909-repair-raw.log`,
-`capture-03`, lines 37-53. The source Git identity fields come from
+`capture-03`, lines 37-53. The mailbox per-record digests come from repair
+`capture-11` at `2026-09-09T19:56:01Z`, lines 835-846. The source Git identity
+fields come from
 `capture-02`, lines 8-36. The codexapp endpoint error is preserved from
 `capture-09`, lines 783-800. Those source projections were mutable at capture
 time; the fixture descriptors therefore record the observation path and

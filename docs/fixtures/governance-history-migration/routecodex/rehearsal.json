@@ -6,7 +6,7 @@
   "source_observation": {
     "captured_at": "2026-09-09T19:54:14Z",
     "raw_log": "/private/tmp/governance-history-live-refresh-20260909-repair-raw.log",
-    "capture": "capture-03",
+    "capture": "capture-03 (journal/events) and capture-11 (mailbox, 2026-09-09T19:56:01Z)",
     "inputs": [
       {
         "source_record_id": ".agent-collab/mailbox",
