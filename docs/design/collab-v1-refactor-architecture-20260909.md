@@ -153,7 +153,9 @@ worker may therefore report to its dispatching master even when its process
 treated as an independently registered project. A path with no binding, a
 binding for another project, or a client-supplied ancestor guess is rejected.
 Ordinary peer-to-peer scope checks still use the registered project root and
-continue to reject cross-project communication.
+continue to reject cross-project communication. A `WorktreeBinding` authorizes
+the execution location for an already-authorized task; it never changes the
+sender's registered `project_scope_id` or creates a cross-project exception.
 
 ### Stable identity versus an execution instance
 
@@ -285,14 +287,20 @@ Default identity is `peer`. `master` is a user-authorized capability, not an
 automatic rank. A master coordinates only its project boundary and retains no
 ownership of another peer's worktree.
 
-| Sender → target | Same app + same project | Same app + different project | Different app scope | Cross project |
-| --- | --- | --- | --- | --- |
-| master → master | explicit coordination or bug reference | master-only coordination | master-only coordination | master-only command with target verification |
-| master → own worker/subagent | allowed through durable dispatch/message | allowed only through an active `WorktreeBinding` and parent grant | allowed only through an active `WorktreeBinding` and parent grant | rejected |
-| worker → own master/parent | allowed through the active task/binding | allowed only through the active task/binding | allowed only through the active task/binding | rejected |
-| peer → peer | allowed only when same project and both are independent peers; no inherited-subagent shortcut | rejected | rejected | rejected |
-| subagent → sibling/non-parent subagent | rejected | rejected | rejected | rejected |
-| Desktop → daemon | allowed after registered binding and user master grant where required | scope checked | scope checked | scope checked |
+| Relationship | Required authorization and scope | Result |
+| --- | --- | --- |
+| master → master | Both are live user-authorized masters; explicit coordination or bug reference. This is the only ordinary cross-scope channel. | Allowed across app and project scopes after target-master verification. |
+| master → own worker/subagent | Active parent grant plus `WorktreeBinding`; the binding's `owning_project_scope` must equal the dispatching master's registered project scope. The worker may use a different app scope, and its worktree `cwd` is only an execution location. | Allowed only for that task and parent chain. |
+| worker → own master/parent | Active task and binding with the same owning project scope as the parent; app scope may differ. | Allowed only to the bound parent/master. |
+| independent peer → peer | Both are independent peers and both `app_scope_id` and registered `project_scope_id` are equal. No `WorktreeBinding` shortcut. | Allowed only within that app/project scope. |
+| subagent → sibling or non-parent subagent | No direct grant, even when the processes share an AppServer or project. | Rejected. |
+| Desktop → daemon | Registered endpoint generation; a user master grant is required when the Desktop identity is promoted to master. | Scope and role checked before any write. |
+
+Same app with different registered projects is therefore rejected for
+master↔worker, worker↔parent and peer↔peer. A task worktree belongs to the
+parent's project through `owning_project_scope`; it cannot be used to smuggle a
+message across registered projects. Different app scopes with the same
+registered project are valid for an explicitly bound master↔worker relation.
 
 Different masters have no parent/child relation. Their work is coordinated by
 explicit messages and AppSDK bug records, not by assigning one master under the
@@ -490,31 +498,48 @@ validation evidence with no task-state behavior change.
 ### R2 — global daemon and single reducer
 
 Owner: one GCM worker after R1. Allowed paths: `src/server/mod.rs`,
-`src/server/state.rs`, `src/config.rs`, daemon tests and protocol fixtures.
+`src/server/state.rs`, `src/config.rs`, a new
+`src/server/notification_contract.rs`, daemon tests and protocol fixtures.
 R2 is the sole owner of durable `WorktreeBinding`, master-grant enforcement,
 replay/sequence/idempotency, one resident writer and explicit journal errors.
 It consumes the R1 types and must not add a second storage format.
+
+Before delivery, R2 must extract the producer-side seam that later rounds use
+without editing R2 files: `NotificationStateView` (read-only reducer state),
+`NotificationSink` (typed event submission), the reducer event interface, and
+the module export/daemon wiring needed for those types to compile on the real
+serve path. The seam must prove one journal event can be read by a consumer
+without a second writer or JSONL implementation. R2's done-iff includes this
+compiled seam and its focused tests; a document-only interface is insufficient.
 
 ### R3 — AppServer adapters and real bidirectional Loop
 
 Owner: one GCM worker after R2. Allowed paths: new `src/adapters/` modules,
 `src/client.rs`, `src/bin/collab-mcp.rs`, adapter tests and replay fixtures.
-R3 owns adapter detection/submission and the native P0 interrupt mapping; it
-does not edit reducer state or notification scheduling. Map TUI and Desktop
-AppServer operations into the same typed surface; tmux is optional. Prove both
-directions with separate request/turn/cursor evidence and negative
-stale/unknown/timeout/wrong-turn cases.
+R3 consumes the R2 command/reducer seam; it owns the adapter module declaration
+inside `src/client.rs`, adapter detection/submission, and the native P0
+interrupt mapping. It does not edit `src/server/mod.rs`, `src/server/state.rs`,
+or notification scheduling. If the final daemon bootstrap needs a one-line
+wire-only change outside these paths, the integration owner performs it after
+R3 review and reruns the affected gate; R3 may not leave an unreferenced
+adapter module. Map TUI and Desktop AppServer operations into the same typed
+surface; tmux is optional. Prove both directions with separate request/turn/
+cursor evidence and negative stale/unknown/timeout/wrong-turn cases.
 
 ### R4 — notification accumulator, batching and JSONL projection
 
 Owner: one GCM worker after R2. Allowed paths: `src/server/timers.rs`,
 `src/server/keepalive.rs`, `src/server/knock.rs`, new
 `src/server/mailbox.rs`, notification tests and
-`skills/collab/references/notifications.md`. R4 owns only the accumulator,
-JSONL projection and wake policy; it consumes the R2 reducer interface and
-does not modify identity/role enforcement. Implement two-minute batching,
-latest-state presentation, raw JSONL retention, master-only wake, worker idle
-episode idempotency and three-reminder stop.
+`skills/collab/references/notifications.md`. R4 consumes the R2
+`NotificationStateView`/`NotificationSink` seam and is the sole writer of the
+accumulator, JSONL projection and wake policy in these paths. It must not edit
+`src/server/mod.rs`, `src/server/state.rs` or R2 identity/role/reducer code. If
+production module wiring is required, the integration owner makes the single
+wire-only change after R4 review and reruns the notification gate; R4 may not
+introduce a second mailbox or leave its projector disconnected. Implement
+two-minute batching, latest-state presentation, raw JSONL retention,
+master-only wake, worker idle episode idempotency and three-reminder stop.
 
 ### R5 — bug/worktree/Loop integration and skill contract
 
@@ -542,7 +567,11 @@ Each round must provide:
 - no duplicate truth, hidden fallback, silent error conversion or scope leak;
 - clean worktree and task delivery receipt.
 
-The final branch is ready to replace `main` only when all of these are true:
+The following gates are separate; passing one does not imply the next.
+
+### Refactor-branch integration-ready
+
+The refactor branch reaches this state when:
 
 1. Rust reducer replay is deterministic and all journal/write/unknown errors
    remain visible.
@@ -554,13 +583,30 @@ The final branch is ready to replace `main` only when all of these are true:
    before the remediation dispatch continues.
 4. Master-only wake, worker-idle episode deduplication, two-minute batching,
    latest-state presentation, JSONL retention and three-reminder stop pass.
-5. Bug priority, independent worktree, review, merge, push, install, daemon
-   restart, live replay and cleanup evidence are all separately recorded.
-6. The final candidate is based on the latest `origin/main`, the exact merged
-   tree has been reviewed, the remote ref is verified, and every unmerged
-   refactor worktree/branch is either clean and explicitly retained for
-   post-main cleanup or proven to contain no required work. Final task close
-   still requires the separate mainline cleanup receipt.
+5. Bug priority, independent worktree, review and merge evidence are recorded
+   for every required round, and the merged branch has passed its tests/build.
+6. Every worker worktree is clean or has an explicitly owned open cleanup
+   obligation. Cleanup receipts, installation and daemon restart are not
+   prerequisites for this intermediate state.
+
+### Allowed to replace `main`
+
+The release owner may replace `main` only after the exact candidate is synced
+with the latest `origin/main`, its final tests/build and independent review pass,
+the candidate/main ancestry and diff are verified, the remote ref is checked,
+and every unmerged refactor worktree/branch is either explicitly retained with
+no required work lost or proven to contain no required work. This gate records
+the authorization to change the main ref; it does not require post-main
+installation or cleanup receipts.
+
+### Mainline delivery complete
+
+After the tested main ref is replaced and pushed, delivery is complete only when
+the canonical global binary is rebuilt and installed, the one daemon is
+controlled-restarted, runtime bindings are revalidated, the real public
+entrypoint replay passes, and each retained task/worktree has an actual cleanup
+receipt and close record. Push, install, restart, replay and cleanup evidence
+remain separate facts even when one command performs more than one action.
 
 No source implementation is considered complete from this design document
 alone. The next action is Astra's independent design review of this contract;
