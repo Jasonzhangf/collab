@@ -239,8 +239,9 @@
               "properties": {"mapping_status": {"enum": ["blocked", "rejected", "unknown"]}}
             },
             "then": {
-              "required": ["exact_error", "first_failed_boundary"],
+              "required": ["blocker_code", "exact_error", "first_failed_boundary"],
               "properties": {
+                "blocker_code": {"type": "string", "minLength": 1},
                 "exact_error": {"type": "string", "minLength": 1},
                 "first_failed_boundary": {"type": "string", "minLength": 1}
               }

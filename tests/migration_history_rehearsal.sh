@@ -79,6 +79,40 @@ jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .source_di
     "$collab_fixture" >"$schema_case"
 schema_reject 'archive-only-record-requires-exact-error' "$schema_case"
 
+schema_case="$schema_cases_root/archive-missing-blocker.json"
+jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .source_disposition = "archive_only" | .blocker_code = null | .first_failed_boundary = "candidate" | .exact_error = "PROJECT_ADMISSION_BLOCKED:candidate" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'archive-only-record-requires-blocker' "$schema_case"
+
+schema_case="$schema_cases_root/archive-missing-boundary.json"
+jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .source_disposition = "archive_only" | .blocker_code = "PROJECT_ADMISSION_BLOCKED" | .first_failed_boundary = null | .exact_error = "PROJECT_ADMISSION_BLOCKED:candidate" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'archive-only-record-requires-boundary' "$schema_case"
+
+schema_case="$schema_cases_root/rebuild-missing-blocker.json"
+jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .source_disposition = "rebuild_required" | .blocker_code = null | .first_failed_boundary = "candidate" | .exact_error = "REBUILD_REQUIRED:candidate" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'rebuild-required-record-requires-blocker' "$schema_case"
+
+schema_case="$schema_cases_root/rebuild-missing-error.json"
+jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .source_disposition = "rebuild_required" | .blocker_code = "REBUILD_REQUIRED" | .first_failed_boundary = "candidate" | .exact_error = null else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'rebuild-required-record-requires-exact-error' "$schema_case"
+
+schema_case="$schema_cases_root/rebuild-missing-boundary.json"
+jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .source_disposition = "rebuild_required" | .blocker_code = "REBUILD_REQUIRED" | .first_failed_boundary = null | .exact_error = "REBUILD_REQUIRED:candidate" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'rebuild-required-record-requires-boundary' "$schema_case"
+
+schema_case="$schema_cases_root/direct-replay-blocked-missing-blocker.json"
+jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .mapping_class = "direct" | .source_disposition = "direct_replay" | .mapping_status = "blocked" | .blocker_code = null | .raw_archive_ref = "archive/record" | .first_failed_boundary = "owner" | .exact_error = "OWNER_UNAVAILABLE:peer" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'direct-replay-failure-requires-blocker' "$schema_case"
+
+schema_case="$schema_cases_root/adapt-blocked-missing-blocker.json"
+jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .mapping_status = "blocked" | .blocker_code = null | .raw_archive_ref = "archive/record" | .first_failed_boundary = "owner" | .exact_error = "OWNER_UNAVAILABLE:peer" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'adapt-failure-requires-blocker' "$schema_case"
 expected_records='{
   "collab": [
     {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","blocker_code":null,"target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
