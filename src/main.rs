@@ -6,6 +6,7 @@ mod scope;
 mod server;
 mod subagent;
 mod install_skills;
+pub(crate) mod migration;
 
 use clap::{Parser, Subcommand};
 use identity::Identity;
