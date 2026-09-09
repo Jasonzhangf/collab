@@ -104,7 +104,13 @@ inspection manifest is still `planned` and its source bytes remain untouched.
 controller's action boundary: `direct_replay`, `adapt_reconcile`,
 `archive_only` or `rebuild_required`. In particular, `unknown` records are
 `archive_only` until an operator supplies evidence; a `reset` classification is
-`rebuild_required`, not permission to delete the old source.
+`rebuild_required`, not permission to delete the old source. These dimensions
+are intentionally not a one-to-one enum: a structurally direct record may
+still need `adapt_reconcile` when its runtime, scope or identity binding must
+be re-established, and a record may be retained as `archive_only` when a
+project admission gate prevents active replay. Conversely, `unknown` always
+forces `archive_only`, while `reset` always forces `rebuild_required`; neither
+may become an active mapped record without a new verified observation.
 
 `source_epoch` is nullable because legacy projects may have no trustworthy
 epoch. A null source epoch forces a fresh target epoch for active state. The

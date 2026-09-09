@@ -162,6 +162,30 @@
           },
           {
             "if": {
+              "required": ["mapping_class"],
+              "properties": {"mapping_class": {"const": "unknown"}}
+            },
+            "then": {
+              "properties": {
+                "source_disposition": {"const": "archive_only"},
+                "blocker_code": {"type": "string", "minLength": 1}
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["mapping_class"],
+              "properties": {"mapping_class": {"const": "reset"}}
+            },
+            "then": {
+              "properties": {
+                "source_disposition": {"const": "rebuild_required"},
+                "blocker_code": {"type": "string", "minLength": 1}
+              }
+            }
+          },
+          {
+            "if": {
               "required": ["source_disposition"],
               "properties": {"source_disposition": {"const": "rebuild_required"}}
             },
@@ -257,7 +281,6 @@
       "then": {
         "required": ["archive_ref", "archive_digest"],
         "properties": {
-          "mapping_status": {"const": "verified"},
           "archive_ref": {"type": "string", "minLength": 1},
           "archive_digest": {"type": "string", "minLength": 1}
         }

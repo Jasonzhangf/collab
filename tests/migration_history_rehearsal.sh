@@ -23,24 +23,70 @@ done
 
 [ -f "$schema_path" ] || fail "missing local schema: $schema_path"
 
+schema_cases_root=$(mktemp -d "${TMPDIR:-/tmp}/migration-history-schema.XXXXXX")
+trap 'rm -rf "$schema_cases_root"' EXIT HUP INT TERM
+
+schema_accept() {
+    case_id=$1
+    manifest_path=$2
+    jsonschema -i "$manifest_path" "$schema_path" >/dev/null 2>&1 || fail "schema should accept: $case_id"
+}
+
+schema_reject() {
+    case_id=$1
+    manifest_path=$2
+    if jsonschema -i "$manifest_path" "$schema_path" >/dev/null 2>&1; then
+        fail "schema should reject: $case_id"
+    fi
+}
+
+# These mutations are isolated copies of a bounded fixture. They exercise the
+# schema contract directly, including the fact that project admission and the
+# migration transaction status are independent dimensions.
+collab_fixture="$fixture_root/collab/manifest.json"
+schema_case="$schema_cases_root/project-admission-verified-planned.json"
+jq '.project_admission = "verified" | .mapping_status = "planned" | .archive_ref = "archive/rehearsal" | .archive_digest = "sha256:archive-rehearsal"' \
+    "$collab_fixture" >"$schema_case"
+schema_accept 'project-admission-verified-with-planned-transaction' "$schema_case"
+
+schema_case="$schema_cases_root/unknown-adapt-null-blocker.json"
+jq ' .records |= map(if .mapping_class == "unknown" then .source_disposition = "adapt_reconcile" | .blocker_code = null else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'unknown-class-cannot-adapt-with-null-blocker' "$schema_case"
+
+schema_case="$schema_cases_root/reset-adapt.json"
+jq ' .records |= map(if .mapping_class == "reset" then .source_disposition = "adapt_reconcile" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'reset-class-requires-rebuild-disposition' "$schema_case"
+
+schema_case="$schema_cases_root/archive-mapped.json"
+jq ' .records |= map(if .source_disposition == "archive_only" then .mapping_status = "mapped" | .target_sequence = 0 | .target_entity_id = "forbidden-active-target" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'archive-only-record-cannot-be-mapped' "$schema_case"
+
+schema_case="$schema_cases_root/direct-replay-adapt-class.json"
+jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .source_disposition = "direct_replay" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'direct-replay-requires-direct-class' "$schema_case"
+
 expected_records='{
   "collab": [
-    {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
-    {"source_record_id":".agent-collab/server/events.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
-    {"source_record_id":".agent-collab/server/journal.jsonl","source_disposition":"rebuild_required","mapping_class":"reset","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"MULTIPLE_WRITERS:20_collab_serve_processes","first_failed_boundary":"writer-admission"}
+    {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","blocker_code":null,"target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
+    {"source_record_id":".agent-collab/server/events.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","blocker_code":"SOURCE_PROJECTION_MUTABLE","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
+    {"source_record_id":".agent-collab/server/journal.jsonl","source_disposition":"rebuild_required","mapping_class":"reset","mapping_status":"planned","blocker_code":"MULTIPLE_WRITERS","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"MULTIPLE_WRITERS:20_collab_serve_processes","first_failed_boundary":"writer-admission"}
   ],
   "appsdk": [
-    {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
-    {"source_record_id":".agent-collab/server/events.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
-    {"source_record_id":".agent-collab/server/journal.jsonl","source_disposition":"rebuild_required","mapping_class":"reset","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"UNRESOLVED_GIT_CONFLICTS:5","first_failed_boundary":"candidate"}
+    {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","blocker_code":null,"target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
+    {"source_record_id":".agent-collab/server/events.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","blocker_code":"SOURCE_PROJECTION_MUTABLE","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
+    {"source_record_id":".agent-collab/server/journal.jsonl","source_disposition":"rebuild_required","mapping_class":"reset","mapping_status":"planned","blocker_code":"UNRESOLVED_GIT_CONFLICTS","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"UNRESOLVED_GIT_CONFLICTS:5","first_failed_boundary":"candidate"}
   ],
   "routecodex": [
-    {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
-    {"source_record_id":".agent-collab/server/events.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
-    {"source_record_id":".agent-collab/server/journal.jsonl","source_disposition":"rebuild_required","mapping_class":"reset","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"DIRTY_MIXED_V3_V4_CANDIDATE:status_entries=50","first_failed_boundary":"candidate"}
+    {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","blocker_code":null,"target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
+    {"source_record_id":".agent-collab/server/events.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","blocker_code":"SOURCE_PROJECTION_MUTABLE","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
+    {"source_record_id":".agent-collab/server/journal.jsonl","source_disposition":"rebuild_required","mapping_class":"reset","mapping_status":"planned","blocker_code":"DIRTY_MIXED_V3_V4_CANDIDATE","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"DIRTY_MIXED_V3_V4_CANDIDATE:status_entries=50","first_failed_boundary":"candidate"}
   ],
   "codexapp": [
-    {"source_record_id":"/Users/fanzhang/.codex-communication/journal.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"ENDPOINT_CONNECT_FAILED:connect ECONNREFUSED /Users/fanzhang/.codex-communication/sockets/commd.sock","first_failed_boundary":"native-endpoint-bootstrap"}
+    {"source_record_id":"/Users/fanzhang/.codex-communication/journal.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","blocker_code":"BOOTSTRAP_REQUIRED","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"ENDPOINT_CONNECT_FAILED:connect ECONNREFUSED /Users/fanzhang/.codex-communication/sockets/commd.sock","first_failed_boundary":"native-endpoint-bootstrap"}
   ]
 }'
 
@@ -71,35 +117,39 @@ for project in collab appsdk routecodex codexapp; do
             expected_admission='reset_required'
             expected_authority='collab-migration-controller'
             expected_blocker='MULTIPLE_WRITERS'
+            expected_boundary='writer-admission'
             ;;
         appsdk)
             expected_admission='reset_required'
             expected_authority='appsdk-quality-owner'
             expected_blocker='UNRESOLVED_GIT_CONFLICTS'
+            expected_boundary='candidate'
             ;;
         routecodex)
             expected_admission='reset_required'
             expected_authority='routecodex-governance-owner'
             expected_blocker='DIRTY_MIXED_V3_V4_CANDIDATE'
+            expected_boundary='candidate'
             ;;
         codexapp)
             expected_admission='needs_operator'
             expected_authority='codexapp-operator'
             expected_blocker='BOOTSTRAP_REQUIRED'
+            expected_boundary='native-endpoint-bootstrap'
             ;;
     esac
 
     jsonschema -i "$manifest_path" "$schema_path" >/dev/null
     jq empty "$manifest_path" "$rehearsal_path"
 
-    jq -e --arg project "$project" --arg admission "$expected_admission" --arg authority "$expected_authority" --arg blocker "$expected_blocker" --argjson expected "$expected_records" '
+    jq -e --arg project "$project" --arg admission "$expected_admission" --arg authority "$expected_authority" --arg blocker "$expected_blocker" --arg boundary "$expected_boundary" --argjson expected "$expected_records" '
         (.source_project_id == $project)
         and (.mapping_status == "planned")
         and (.source_epoch == null)
         and (.project_admission == $admission)
         and (.owner_authority == $authority)
         and (.blocker_code == $blocker)
-        and (.first_failed_boundary | type == "string")
+        and (.first_failed_boundary == $boundary)
         and (.target_epoch == "unassigned-rehearsal-epoch")
         and (.archive_ref == null)
         and (.archive_digest == null)
@@ -125,6 +175,7 @@ for project in collab appsdk routecodex codexapp; do
             source_disposition,
             mapping_class,
             mapping_status,
+            blocker_code,
             target_epoch,
             target_sequence,
             target_entity_id,
