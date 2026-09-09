@@ -1,5 +1,7 @@
 pub(crate) mod keepalive;
 pub mod knock;
+pub mod mailbox;
+pub mod notification_contract;
 pub mod state;
 pub mod timers;
 
@@ -8,11 +10,17 @@ use crate::scope::Scope;
 use crate::server::knock::{
     append_log, knock_or_log, pane_alive, pane_idle, pane_presence, PanePresence,
 };
+use mailbox::{
+    batch_notification_text, compose_notification, default_direct_message_id,
+    is_explicit_notification, missing_recipient_projection_messages, notification_text,
+    read_recipient_mailbox, truncate_notification, DEFAULT_DIRECT_MESSAGE_TTL_SECONDS,
+    MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER, MAX_NOTIFICATION_TTL_SECONDS, NOTIFICATION_EVENTS,
+};
 use serde_json::json;
 use state::{
-    goal_deadline_key, now_ms, runtime_for_pane, task_resource_active, wait_cycle,
-    CleanupReceipt, Event, Message, MigrationRecord, NotificationSubscription, State, TaskRec,
-    WaitSpec, WorkerRec, MAX_WAKE_ATTEMPTS,
+    goal_deadline_key, now_ms, runtime_for_pane, task_resource_active, wait_cycle, CleanupReceipt,
+    Event, Message, MigrationRecord, NotificationSubscription, State, TaskRec, WaitSpec, WorkerRec,
+    WorktreeBinding, MAX_WAKE_ATTEMPTS,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,6 +45,9 @@ const TASK_STATUSES: [&str; 12] = [
     "cancelled",
 ];
 const MAX_WORKTREE_PATH_BYTES: usize = 80;
+
+#[cfg(test)]
+const DIRECT_MESSAGE_WAKE_COOLDOWN_MS: i64 = 60_000;
 
 fn validate_worktree_path(root: &Path, raw: &str) -> Result<(), String> {
     if raw.trim().is_empty() {
@@ -162,11 +173,12 @@ fn request_activity(req: &Req, resp: &Resp) -> serde_json::Value {
 }
 
 impl Server {
+    pub(crate) fn log_path_for(root: &Path) -> PathBuf {
+        root.join(".agent-collab").join("server").join("log.txt")
+    }
+
     pub fn log_path(&self) -> PathBuf {
-        self.root
-            .join(".agent-collab")
-            .join("server")
-            .join("log.txt")
+        Self::log_path_for(&self.root)
     }
 
     /// Apply events to memory and persist them atomically-ordered in the journal.
@@ -175,7 +187,80 @@ impl Server {
         self.commit_locked(&mut st, evs);
     }
 
+    /// Fallible reducer entry point used by typed producers. Legacy v1 call
+    /// sites still use `commit`; they retain the fail-closed panic boundary.
+    pub fn commit_checked(
+        &self,
+        evs: &[Event],
+    ) -> Result<notification_contract::CommitReceipt, notification_contract::JournalError> {
+        let mut st = self.state.lock().unwrap();
+        self.commit_locked_checked(&mut st, evs)
+    }
+
+    /// Commit one command and its outcome atomically. A retry with the same
+    /// command id returns the recorded outcome without appending another event.
+    /// Reusing a command id for a different operation is rejected explicitly.
+    pub fn commit_command(
+        &self,
+        command_id: &str,
+        operation_id: &str,
+        evs: &[Event],
+        outcome: serde_json::Value,
+    ) -> Result<notification_contract::CommandOutcome, notification_contract::JournalError> {
+        validate_command_id(command_id)?;
+        validate_command_id(operation_id)?;
+        let mut st = self.state.lock().unwrap();
+        if let Some(existing) = st.command_receipts.get(command_id) {
+            if existing.operation_id != operation_id {
+                return Err(notification_contract::JournalError::InvalidCommand(
+                    format!(
+                        "command_id {command_id} already belongs to operation {}",
+                        existing.operation_id
+                    ),
+                ));
+            }
+            return Ok(notification_contract::CommandOutcome {
+                receipt: notification_contract::CommitReceipt {
+                    sequence: existing.sequence,
+                    revision: existing.revision,
+                },
+                operation_id: existing.operation_id.clone(),
+                outcome: existing.outcome.clone(),
+                replayed: true,
+            });
+        }
+        let sequence = st.sequence.saturating_add(evs.len() as u64 + 1);
+        let revision = st.revision.saturating_add(evs.len() as u64 + 1);
+        let receipt = state::CommandReceipt {
+            operation_id: operation_id.to_owned(),
+            outcome: outcome.clone(),
+            sequence,
+            revision,
+        };
+        let mut events = evs.to_vec();
+        events.push(Event::CommandRecorded {
+            command_id: command_id.to_owned(),
+            receipt,
+        });
+        let commit = self.commit_locked_checked(&mut st, &events)?;
+        Ok(notification_contract::CommandOutcome {
+            receipt: commit,
+            operation_id: operation_id.to_owned(),
+            outcome,
+            replayed: false,
+        })
+    }
+
     pub(crate) fn commit_locked(&self, st: &mut State, evs: &[Event]) {
+        self.commit_locked_checked(st, evs)
+            .expect("journal append failed; refusing state mutation");
+    }
+
+    fn commit_locked_checked(
+        &self,
+        st: &mut State,
+        evs: &[Event],
+    ) -> Result<notification_contract::CommitReceipt, notification_contract::JournalError> {
         let mut j = self.journal.lock().unwrap();
         use std::io::Write;
         // Persist control truth before any state change or external notification.
@@ -187,11 +272,13 @@ impl Server {
             buf.push(b'\n');
         }
         j.write_all(&buf)
-            .expect("journal append failed; refusing state mutation");
+            .map_err(|error| notification_contract::JournalError::Append(error.to_string()))?;
         j.sync_data()
-            .expect("journal sync failed; refusing state mutation");
+            .map_err(|error| notification_contract::JournalError::Flush(error.to_string()))?;
         for ev in evs {
             st.apply(ev);
+            st.sequence = st.sequence.saturating_add(1);
+            st.revision = st.revision.saturating_add(1);
             if let Event::Sent { msg } = ev {
                 if let Err(error) = self.backup_message(msg) {
                     self.report_mailbox_projection_error(error);
@@ -224,9 +311,7 @@ impl Server {
         });
         let has_succeeded_scheduler_admission = evs.iter().any(|event| {
             let Event::SchedulerAdmissionStatus {
-                request_id,
-                status,
-                ..
+                request_id, status, ..
             } = event
             else {
                 return false;
@@ -237,13 +322,10 @@ impl Server {
                     .get(request_id)
                     .is_some_and(|admission| {
                         admission.status == "succeeded"
-                            && st
-                                .msgs
-                                .get(&admission.message_id)
-                                .is_some_and(|message| {
-                                    message.state == "pending"
-                                        && st.scheduler_message_deliverable(&message.id)
-                                })
+                            && st.msgs.get(&admission.message_id).is_some_and(|message| {
+                                message.state == "pending"
+                                    && st.scheduler_message_deliverable(&message.id)
+                            })
                     })
         });
         if (evs.iter().any(|event| matches!(event, Event::Sent { .. }))
@@ -252,6 +334,10 @@ impl Server {
         {
             self.mailbox_notify.notify_waiters();
         }
+        Ok(notification_contract::CommitReceipt {
+            sequence: st.sequence,
+            revision: st.revision,
+        })
     }
 
     fn report_mailbox_projection_error(&self, error: String) {
@@ -274,105 +360,27 @@ impl Server {
     }
 
     fn backup_message(&self, msg: &Message) -> Result<(), String> {
-        let dir = self.root.join(".agent-collab").join("mailbox");
-        std::fs::create_dir_all(&dir).map_err(|error| format!("create directory: {error}"))?;
-        let path = dir.join(format!("{}.json", msg.id));
-        let data = serde_json::to_string_pretty(msg)
-            .map_err(|error| format!("message serialize: {error}"))?;
-        std::fs::write(&path, data).map_err(|error| format!("message snapshot: {error}"))?;
-        let jsonl_path = dir.join(format!("recipient-{}.jsonl", msg.to));
-        if jsonl_path.exists() {
-            match read_recipient_mailbox(&jsonl_path, &msg.to) {
-                Ok(projection) => {
-                    if !projection.recoverable_errors.is_empty() {
-                        append_log(
-                            &self.log_path(),
-                            &format!(
-                                "MAILBOX_JSONL_RECOVERABLE: {}",
-                                projection.recoverable_errors.join(" | ")
-                            ),
-                        );
-                    }
-                    if projection.partial_tail {
-                        let content = std::fs::read(&jsonl_path)
-                            .map_err(|error| format!("read partial mailbox: {error}"))?;
-                        let valid_len = content
-                            .iter()
-                            .rposition(|byte| *byte == b'\n')
-                            .map(|index| index + 1)
-                            .unwrap_or(0);
-                        let file = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&jsonl_path)
-                            .map_err(|error| format!("open partial mailbox: {error}"))?;
-                        file.set_len(valid_len as u64)
-                            .map_err(|error| format!("truncate partial mailbox: {error}"))?;
-                    } else if projection.unterminated_tail {
-                        let mut file =
-                            std::fs::OpenOptions::new()
-                                .append(true)
-                                .open(&jsonl_path)
-                                .map_err(|error| format!("open unterminated mailbox: {error}"))?;
-                        use std::io::Write;
-                        file.write_all(b"\n")
-                            .map_err(|error| format!("terminate mailbox record: {error}"))?;
-                        file.sync_data()
-                            .map_err(|error| format!("sync mailbox separator: {error}"))?;
-                    }
-                }
-                Err(error) => {
-                    // Journal state is authoritative. A projection error is
-                    // queryable and recoverable; it must not prevent a later
-                    // durable message from being appended to the mailbox.
-                    let truncated = recover_malformed_mailbox_tail(&jsonl_path, &msg.to)?;
-                    append_log(
-                        &self.log_path(),
-                        &format!(
-                            "MAILBOX_JSONL_RECOVERABLE: {error}; malformed_tail_truncated={truncated}"
-                        ),
-                    );
-                }
-            }
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&jsonl_path)
-            .map_err(|error| format!("open: {error}"))?;
-        use std::io::Write;
-        let subject = msg.subject.as_deref().unwrap_or("notice");
-        let (priority, action) = notification_class(subject);
-        let record = json!({
-            "schema_version": 1,
-            "record_type": "message",
-            "recipient": msg.to,
-            "category": semantic_notification_category(subject, &msg.mtype),
-            "priority": priority,
-            "action": action,
-            "task_ids": [],
-            "created_ms": msg.created_ms,
-            "window_start_ms": serde_json::Value::Null,
-            "window_end_ms": serde_json::Value::Null,
-            "window_source": "not-attached-to-message-event",
-            "state": msg.state,
-            "exact_error": serde_json::Value::Null,
-            "message": msg,
-        });
-        let data = serde_json::to_string(&record).map_err(|error| format!("serialize: {error}"))?;
-        file.write_all(data.as_bytes())
-            .map_err(|error| format!("append: {error}"))?;
-        file.write_all(b"\n")
-            .map_err(|error| format!("newline: {error}"))?;
-        file.sync_data().map_err(|error| format!("sync: {error}"))?;
-        Ok(())
+        mailbox::backup_message(&self.root, msg)
     }
 
     fn rewrite_journal_locked(&self, st: &State) {
         let path = self.root.join(".agent-collab/server/journal.jsonl");
         let tmp = path.with_file_name("journal.jsonl.tmp");
         let mut body = String::new();
-        for event in st.snapshot_events() {
-            body.push_str(&serde_json::to_string(&event).expect("serialize compact event"));
+        let events = st.snapshot_events();
+        for (index, event) in events.iter().enumerate() {
+            body.push_str(&serde_json::to_string(event).expect("serialize compact event"));
+            let next_is_checkpoint = events
+                .get(index + 1)
+                .is_some_and(|next| matches!(next, Event::ReducerCheckpoint { .. }));
+            if index + 1 != events.len() && !next_is_checkpoint {
+                body.push('\n');
+            }
+        }
+        if events
+            .last()
+            .is_some_and(|event| matches!(event, Event::ReducerCheckpoint { .. }))
+        {
             body.push('\n');
         }
         std::fs::write(&tmp, body).expect("journal compact write failed");
@@ -386,12 +394,20 @@ impl Server {
     }
 }
 
+fn validate_command_id(value: &str) -> Result<(), notification_contract::JournalError> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(notification_contract::JournalError::InvalidCommand(
+            "command and operation ids must be non-empty, <=256 bytes, and control-free".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn purge_expired_storage(server: &Server, now: i64) -> usize {
     if server.state.lock().unwrap().admission_frozen() {
         return 0;
     }
     let cutoff = server.config.retention.cutoff_ms(now);
-    let mailbox = server.root.join(".agent-collab").join("mailbox");
     let mut st = server.state.lock().unwrap();
     let expired: Vec<String> = st
         .msgs
@@ -399,20 +415,7 @@ pub(crate) fn purge_expired_storage(server: &Server, now: i64) -> usize {
         .filter(|message| message.created_ms <= cutoff)
         .map(|message| message.id.clone())
         .collect();
-    if let Ok(entries) = std::fs::read_dir(&mailbox) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let Some(id) = name.strip_suffix(".json") else {
-                continue;
-            };
-            if expired.iter().any(|expired_id| expired_id == id) || !st.msgs.contains_key(id) {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
+    mailbox::purge_message_snapshot_files(&server.root, &expired, &st);
     if expired.is_empty() {
         return 0;
     }
@@ -430,366 +433,23 @@ pub fn gen_msg_id() -> String {
     format!("m{}-{}", now_ms(), n)
 }
 
-const MAX_NOTIFICATION_SUBJECT_CHARS: usize = 48;
-#[cfg(test)]
-const DIRECT_MESSAGE_WAKE_COOLDOWN_MS: i64 = 60_000;
-
-fn abbreviated_subject(subject: &str) -> Option<String> {
-    let normalized = subject.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
-    if normalized.chars().count() <= MAX_NOTIFICATION_SUBJECT_CHARS {
-        return Some(normalized);
-    }
-    let mut abbreviated = normalized
-        .chars()
-        .take(MAX_NOTIFICATION_SUBJECT_CHARS - 1)
-        .collect::<String>();
-    abbreviated.push('…');
-    Some(abbreviated)
-}
-
-fn visible_body(body: &str) -> String {
-    let mut visible = String::with_capacity(body.len());
-    for ch in body.chars() {
-        match ch {
-            '\n' => visible.push_str("\\n"),
-            '\r' => visible.push_str("\\r"),
-            '\t' => visible.push_str("\\t"),
-            ch if ch.is_control() => visible.push_str(&format!("\\u{{{:x}}}", ch as u32)),
-            ch => visible.push(ch),
-        }
-    }
-    visible
-}
-
-/// Priority class and the one thing this notification obliges, keyed by the
-/// subject the server itself generates. Unknown subjects are peer traffic.
-fn notification_class(subject: &str) -> (&'static str, &'static str) {
-    if subject.starts_with("worker-unresponsive") {
-        return ("P1", "snapshot the pane, then recover or close it");
-    }
-    if subject.starts_with("worker-idle") {
-        return ("P1", "dispatch work to this idle capacity");
-    }
-    if subject.starts_with("master-idle") {
-        return ("P1", "run the scheduling pass: inspect graph/load/liveness, dispatch authorized work, and resolve blockers");
-    }
-    if subject.starts_with("subagent-status") {
-        return ("P1", "re-dispatch, close, or leave the child idle");
-    }
-    if subject.starts_with("task-keepalive") {
-        return ("P1", "continue your own task or record a real blocker");
-    }
-    if subject.starts_with("goal") || subject.starts_with("deadline") {
-        return ("P0", "run the long-horizon briefing and schedule");
-    }
-    if subject.contains("blocker") || subject.contains("unblock") {
-        return ("P0", "resolve the blocker; you own it");
-    }
-    if subject.starts_with("release") || subject.contains("released") {
-        return (
-            "P1",
-            "the resource is free; resume the task that waited on it",
-        );
-    }
-    if subject.contains("recorded") || subject.contains("receipt") || subject.contains("delivered")
-    {
-        return ("P2", "note it and go straight back to your current task");
-    }
-    ("P1", "do the in-scope action the message asks for")
-}
-
-fn semantic_notification_category(subject: &str, mtype: &str) -> &'static str {
-    if subject.starts_with("master-idle") || subject.starts_with("worker-idle") {
-        return "idle";
-    }
-    if subject.starts_with("task-keepalive")
-        || subject.starts_with("subagent-status")
-        || subject.starts_with("progress")
-        || subject.starts_with("delivery")
-    {
-        return "progress";
-    }
-    if subject.starts_with("resource")
-        || subject.starts_with("deadline")
-        || subject.starts_with("worker-unresponsive")
-    {
-        return "system";
-    }
-    if mtype == "notify" {
-        return "direct";
-    }
-    "system"
-}
-
-/// A notification is an interrupt, not the turn's goal. Without an explicit
-/// resume instruction agents treat reading as the whole task and stop.
-const NOTIFY_PROTOCOL: &str =
-    "READ IS NOT DONE: never end your turn on an ACK, a read, or a summary. \
-     After handling, resume your current task; if you own none, run \
-     `appsdk longhorizon show` and take work.";
-
-const MAX_NOTIFICATION_CHARS: usize = 1024;
-
-fn notification_text(message: &Message) -> Option<String> {
-    let subject_raw = message.subject.as_deref()?;
-    Some(compose_notification(
-        &message.id,
-        subject_raw,
-        &visible_body(&message.body),
-    ))
-}
-
-fn is_explicit_notification(state: &State, message: &Message) -> bool {
-    message.mtype == "notify"
-        && state
-            .delivery_modes
-            .get(&message.id)
-            .is_some_and(|mode| mode == "explicit-notification")
-}
-
-fn batch_notification_text(
-    batch: &[(i64, String, String, String, String)],
-    remaining: usize,
-) -> String {
-    let message_ids = batch
-        .iter()
-        .map(|(_, id, _, _, _)| id.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    let actions = batch
-        .iter()
-        .map(|(_, _, _, _, text)| {
-            text.split_once('[')
-                .and_then(|(_, rest)| rest.split_once(']'))
-                .map(|(subject, _)| subject)
-                .unwrap_or("notification")
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    // Message does not carry a typed task association. Do not infer one from
-    // preview text; the durable inbox remains the source for task details.
-    let task_ids = "none";
-    let older = (remaining > 0)
-        .then(|| format!(" older_messages={remaining}; run collab inbox"))
-        .unwrap_or_default();
-    format!("Batch wake: message_ids={message_ids} task_ids={task_ids} action_categories={actions}. Read full durable details from collab inbox; execute the actions, do not ACK-only.{older}")
-}
-
-struct RecipientMailboxRead {
-    records: Vec<serde_json::Value>,
-    partial_tail: bool,
-    unterminated_tail: bool,
-    recoverable_errors: Vec<String>,
-}
-
-fn read_recipient_mailbox(path: &Path, recipient: &str) -> Result<RecipientMailboxRead, String> {
-    let content = std::fs::read_to_string(path).map_err(|error| format!("read: {error}"))?;
-    let lines = content.lines().collect::<Vec<_>>();
-    let has_unterminated_tail = !content.is_empty() && !content.ends_with('\n');
-    let mut partial_tail = false;
-    let mut records = Vec::new();
-    let mut recoverable_errors = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(record) => match normalize_mailbox_record(record, recipient, index + 1) {
-                Ok(record) => records.push(record),
-                Err(error) => {
-                    if has_unterminated_tail && index + 1 == lines.len() {
-                        return Err(error);
-                    }
-                    if lines
-                        .iter()
-                        .skip(index + 1)
-                        .any(|later| !later.trim().is_empty())
-                    {
-                        recoverable_errors.push(error);
-                    } else {
-                        return Err(error);
-                    }
-                }
-            },
-            Err(error) => {
-                let error = format!("malformed JSONL record {}: {error}", index + 1);
-                if has_unterminated_tail && index + 1 == lines.len() {
-                    partial_tail = true;
-                    break;
-                }
-                if lines
-                    .iter()
-                    .skip(index + 1)
-                    .any(|later| !later.trim().is_empty())
-                {
-                    recoverable_errors.push(error);
-                } else {
-                    return Err(error);
-                }
-            }
-        }
-    }
-    Ok(RecipientMailboxRead {
-        records,
-        partial_tail,
-        unterminated_tail: has_unterminated_tail,
-        recoverable_errors,
+fn worktree_binding_for_task(server: &Server, task: &TaskRec) -> Option<WorktreeBinding> {
+    let worktree_root = task.worktree_path.as_ref()?.clone();
+    let owning_project_scope = server.root.to_str()?.to_owned();
+    Some(WorktreeBinding {
+        worktree_root,
+        owning_project_scope,
+        task_id: task.id.clone(),
+        owner_agent_id: task.owner.clone(),
+        binding_id: format!("binding-task-{}", task.id),
+        base_commit: task.base_commit.clone().unwrap_or_default(),
     })
-}
-
-fn recover_malformed_mailbox_tail(path: &Path, recipient: &str) -> Result<bool, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|error| format!("read malformed mailbox: {error}"))?;
-    // Only remove a malformed run at EOF. Interior malformed records remain
-    // part of the append-only projection so later valid records are retained.
-    let mut statuses = Vec::new();
-    let mut offset = 0usize;
-    for segment in content.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let record_result = serde_json::from_str::<serde_json::Value>(line)
-            .map_err(|error| format!("malformed JSONL record: {error}"))
-            .and_then(|record| normalize_mailbox_record(record, recipient, 0));
-        statuses.push((offset, record_result.is_ok()));
-        offset += segment.len();
-    }
-
-    let mut trailing_malformed_start = None;
-    for (start, valid) in statuses.into_iter().rev() {
-        if valid {
-            break;
-        }
-        trailing_malformed_start = Some(start);
-    }
-    if let Some(valid_len) = trailing_malformed_start {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|error| format!("open malformed mailbox for truncation: {error}"))?;
-        file.set_len(valid_len as u64)
-            .map_err(|error| format!("truncate malformed mailbox: {error}"))?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn normalize_mailbox_record(
-    record: serde_json::Value,
-    recipient: &str,
-    index: usize,
-) -> Result<serde_json::Value, String> {
-    if record["schema_version"] == 1
-        && record["record_type"] == "message"
-        && record["recipient"] == recipient
-    {
-        return Ok(record);
-    }
-
-    // Before schema_version=1, recipient JSONL stored the bare Message. Keep
-    // those durable records readable and project them into the current shape
-    // in memory. New writes remain append-only v1 envelopes.
-    let message: Message = serde_json::from_value(record)
-        .map_err(|error| format!("invalid mailbox envelope at record {index}: {error}"))?;
-    if message.to != recipient {
-        return Err(format!("invalid mailbox envelope at record {index}"));
-    }
-    let subject = message.subject.as_deref().unwrap_or("notice");
-    let (priority, action) = notification_class(subject);
-    Ok(json!({
-        "schema_version": 1,
-        "record_type": "message",
-        "recipient": recipient,
-        "category": semantic_notification_category(subject, &message.mtype),
-        "priority": priority,
-        "action": action,
-        "task_ids": [],
-        "created_ms": message.created_ms,
-        "window_start_ms": serde_json::Value::Null,
-        "window_end_ms": serde_json::Value::Null,
-        "window_source": "legacy-message",
-        "state": message.state,
-        "exact_error": serde_json::Value::Null,
-        "message": message,
-    }))
-}
-
-fn missing_recipient_projection_messages(
-    state: &State,
-    recipient: &str,
-    projection: &RecipientMailboxRead,
-) -> Vec<String> {
-    let recorded = projection
-        .records
-        .iter()
-        .filter_map(|record| record["message"]["id"].as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let mut missing = state
-        .msgs
-        .values()
-        .filter(|message| message.to == recipient && !recorded.contains(message.id.as_str()))
-        .map(|message| message.id.clone())
-        .collect::<Vec<_>>();
-    missing.sort();
-    missing
-}
-
-/// Shared wake text for every channel. Keepalive and message delivery must not
-/// drift into different contracts.
-pub(super) fn compose_notification(id: &str, subject_raw: &str, body: &str) -> String {
-    let subject = abbreviated_subject(subject_raw).unwrap_or_else(|| "notice".to_string());
-    let (priority, action) = notification_class(subject_raw);
-
-    let head = format!("COLLAB_NOTIFY {} [{}] ", id, subject);
-    let tail = format!(
-        " | {} ACTION: {}. Details: collab msg {}. | {}",
-        priority, action, id, NOTIFY_PROTOCOL
-    );
-
-    // The protocol and action must survive a long body, so the body absorbs
-    // the truncation instead of the instructions being cut off the end.
-    let fixed = head.chars().count() + tail.chars().count();
-    let budget = MAX_NOTIFICATION_CHARS.saturating_sub(fixed);
-    let body = if body.chars().count() > budget {
-        const ELLIPSIS: &str = "… [collab inbox]";
-        let keep = budget.saturating_sub(ELLIPSIS.chars().count());
-        body.chars().take(keep).collect::<String>() + ELLIPSIS
-    } else {
-        body.to_string()
-    };
-
-    format!("{head}{body}{tail}")
-}
-
-fn truncate_notification(text: String) -> String {
-    if text.chars().count() <= MAX_NOTIFICATION_CHARS {
-        return text;
-    }
-    const SUFFIX: &str = "… [truncated; run collab inbox]";
-    let keep = MAX_NOTIFICATION_CHARS.saturating_sub(SUFFIX.chars().count());
-    let mut truncated = text.chars().take(keep).collect::<String>();
-    truncated.push_str(SUFFIX);
-    truncated
 }
 
 fn iso(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|d| d.to_rfc3339())
         .unwrap_or_default()
-}
-
-const MAX_NOTIFICATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
-const MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER: usize = 3;
-const NOTIFICATION_EVENTS: [&str; 5] = [
-    "direct-message",
-    "resource-released",
-    "deadline",
-    "async-result",
-    "master-idle",
-];
-const DEFAULT_DIRECT_MESSAGE_TTL_SECONDS: u64 = MAX_NOTIFICATION_TTL_SECONDS;
-
-fn default_direct_message_id(worker_id: &str) -> String {
-    format!("sub-default-direct-message-{worker_id}")
 }
 
 fn default_direct_message_events(
@@ -1082,14 +742,7 @@ fn attempt_notification_with_at(
     let Some(window_start_ms) = batch.first().map(|candidate| candidate.0) else {
         return false;
     };
-    let window_end = window_start_ms.saturating_add(delay);
-    batch.retain(|candidate| candidate.0 <= window_end);
-    const MAX_BATCH_DELIVERY: usize = 3;
-    let total_pending = batch.len();
-    let remaining = total_pending.saturating_sub(MAX_BATCH_DELIVERY);
-    if remaining > 0 {
-        batch.drain(..remaining);
-    }
+    let (batch, remaining) = mailbox::select_batch(batch, delay, window_start_ms);
     let Some(first) = batch.first() else {
         return false;
     };
@@ -1109,9 +762,7 @@ fn attempt_notification_with_at(
         })
         .max()
         .unwrap_or(0);
-    if now.saturating_sub(window_start_ms) < delay
-        || now.saturating_sub(last_attempt) < delay
-    {
+    if now.saturating_sub(window_start_ms) < delay || now.saturating_sub(last_attempt) < delay {
         return false;
     }
     let ids = batch.iter().map(|m| m.1.clone()).collect::<Vec<_>>();
@@ -1156,7 +807,8 @@ fn attempt_notification_with_at(
             });
         }
     }
-    server.commit(&events);
+    notification_contract::NotificationSink::submit(server, &events)
+        .expect("journal append failed; refusing state mutation");
     true
 }
 
@@ -1422,9 +1074,11 @@ mod notification_batch_tests {
             &|_, _| Ok(true),
             now,
         ));
-        assert!(delivered.lock().unwrap().iter().any(|text| {
-            text.contains("automatic-notice")
-        }));
+        assert!(delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|text| { text.contains("automatic-notice") }));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1488,7 +1142,10 @@ mod notification_batch_tests {
             &|_, _| Ok(true),
             now,
         ));
-        assert_eq!(server.state.lock().unwrap().msgs["reserved-once"].state, "pending");
+        assert_eq!(
+            server.state.lock().unwrap().msgs["reserved-once"].state,
+            "pending"
+        );
         assert_eq!(
             server.state.lock().unwrap().msgs["reserved-once"].wake_attempt_count,
             1
@@ -1580,9 +1237,7 @@ fn handle_notification_subscribe(
             || trigger_times_ms.len() > 1
             || (trigger_ms.is_none() && trigger_times_ms.is_empty()))
     {
-        return Resp::err(
-            "goal deadline subscriptions are one-shot and require one at-ms trigger",
-        );
+        return Resp::err("goal deadline subscriptions are one-shot and require one at-ms trigger");
     }
     let now = now_ms();
     let expires_ms = now.saturating_add((ttl_seconds as i64).saturating_mul(1000));
@@ -1608,7 +1263,11 @@ fn handle_notification_subscribe(
     if goal_deadline {
         let requested_key = trigger_ms
             .or_else(|| trigger_times_ms.first().copied())
-            .and_then(|trigger| subject.clone().map(|subject| (worker_id.clone(), subject, trigger)));
+            .and_then(|trigger| {
+                subject
+                    .clone()
+                    .map(|subject| (worker_id.clone(), subject, trigger))
+            });
         if let Some(existing) = state
             .notification_subscriptions
             .values()
@@ -3030,7 +2689,11 @@ pub(crate) fn handle_scheduler_dispatch(
             "reason": reason,
             "status": "pending",
         });
+        let binding = worktree_binding_for_task(server, &task);
         let mut events = scheduler_assignment_events(message, task, managed_child);
+        if let Some(binding) = binding {
+            events.push(Event::WorktreeBound { binding });
+        }
         let subscription = state
             .matching_subscription(&peer_id, "direct-message", None, now)
             .cloned();
@@ -3793,7 +3456,11 @@ fn handle_task_register_with_next(
         created_ms: now,
         updated_ms: now,
     };
-    server.commit_locked(&mut st, &[Event::TaskCreated { task: task.clone() }]);
+    let mut events = vec![Event::TaskCreated { task: task.clone() }];
+    if let Some(binding) = worktree_binding_for_task(server, &task) {
+        events.push(Event::WorktreeBound { binding });
+    }
+    server.commit_locked(&mut st, &events);
     Resp::data(json!({
         "task": task.id,
         "owner": task.owner,
@@ -3849,7 +3516,11 @@ fn handle_task_relocate(
         task.base_commit = base_commit;
     }
     task.updated_ms = now_ms();
-    server.commit_locked(&mut st, &[Event::TaskUpdated { task: task.clone() }]);
+    let mut events = vec![Event::TaskUpdated { task: task.clone() }];
+    if let Some(binding) = worktree_binding_for_task(server, &task) {
+        events.push(Event::WorktreeBound { binding });
+    }
+    server.commit_locked(&mut st, &events);
     Resp::data(json!({
         "task": task.id,
         "relocated": true,
@@ -5857,11 +5528,11 @@ fn replay(root: &Path) -> anyhow::Result<State> {
         let mut stream = serde_json::Deserializer::from_str(trimmed).into_iter::<Event>();
         while let Some(item) = stream.next() {
             let event = item.map_err(|error| {
-                anyhow::anyhow!(
-                    "journal replay failed at line {}: {}; manual journal edits are unsupported",
+                notification_contract::JournalError::Replay(format!(
+                    "line {}: {}; manual journal edits are unsupported",
                     index + 1,
                     error
-                )
+                ))
             })?;
             line_events.push(event);
         }
@@ -5869,19 +5540,25 @@ fn replay(root: &Path) -> anyhow::Result<State> {
         if byte_offset < trimmed.len() {
             let remainder = &trimmed[byte_offset..];
             if !remainder.trim().is_empty() {
-                anyhow::bail!(
-                    "journal replay failed at line {}: trailing characters; manual journal edits are unsupported",
+                return Err(notification_contract::JournalError::Replay(format!(
+                    "line {}: trailing characters; manual journal edits are unsupported",
                     index + 1
-                );
+                ))
+                .into());
             }
         }
         if line_events.is_empty() {
-            anyhow::bail!(
-                "journal replay failed at line {}: empty event; manual journal edits are unsupported",
+            return Err(notification_contract::JournalError::Replay(format!(
+                "line {}: empty event; manual journal edits are unsupported",
                 index + 1
-            );
+            ))
+            .into());
         }
-        if line_events.len() > 1 {
+        if line_events.len() > 1
+            && !line_events
+                .iter()
+                .any(|event| matches!(event, Event::ReducerCheckpoint { .. }))
+        {
             convert_root = true;
         }
         for event in line_events {
@@ -5891,7 +5568,14 @@ fn replay(root: &Path) -> anyhow::Result<State> {
             {
                 convert_root = true;
             }
-            st.apply(&event);
+            if let Event::ReducerCheckpoint { sequence, revision } = &event {
+                st.sequence = *sequence;
+                st.revision = *revision;
+            } else {
+                st.apply(&event);
+                st.sequence = st.sequence.saturating_add(1);
+                st.revision = st.revision.saturating_add(1);
+            }
             events.push(event);
         }
     }
@@ -5908,28 +5592,86 @@ fn replay(root: &Path) -> anyhow::Result<State> {
     Ok(st)
 }
 
+fn acquire_daemon_lock(server_dir: &Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = server_dir.join("daemon.lock");
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                use std::os::unix::io::AsRawFd;
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc == 0 {
+                    return Ok(file);
+                }
+                let flock_error = std::io::Error::last_os_error();
+                if flock_error.raw_os_error() != Some(libc::EPERM) {
+                    return Err(flock_error.into());
+                }
+                use std::io::Write;
+                writeln!(file, "{}", std::process::id())?;
+                file.sync_all()?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)?;
+                use std::os::unix::io::AsRawFd;
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc == 0 {
+                    return Ok(file);
+                }
+                let flock_error = std::io::Error::last_os_error();
+                if flock_error.raw_os_error() != Some(libc::EPERM) {
+                    let pid_str = std::fs::read_to_string(&lock_path).unwrap_or_default();
+                    anyhow::bail!(
+                        "server already running at {} (pid {}): {}",
+                        server_dir.join("server.sock").display(),
+                        pid_str.trim(),
+                        flock_error
+                    );
+                }
+                let pid_str = std::fs::read_to_string(&lock_path).unwrap_or_default();
+                let alive = pid_str
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+                    .map(|pid| {
+                        Command::new("kill")
+                            .arg("-0")
+                            .arg(pid.to_string())
+                            .status()
+                            .map(|status| status.success())
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    std::fs::remove_file(&lock_path)?;
+                    continue;
+                }
+                let sock_path = server_dir.join("server.sock");
+                anyhow::bail!(
+                    "server already running at {} (pid {})",
+                    sock_path.display(),
+                    pid_str.trim()
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 pub async fn run(scope: Scope) -> anyhow::Result<()> {
     let sock_path = scope.sock_path();
     let server_dir = scope.server_dir();
     std::fs::create_dir_all(&server_dir)?;
 
-    let lock_path = server_dir.join("daemon.lock");
-    let _lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&lock_path)?;
-    use std::os::unix::io::AsRawFd;
-    let fd = _lock_file.as_raw_fd();
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let pid_str = std::fs::read_to_string(server_dir.join("server.pid")).unwrap_or_default();
-        anyhow::bail!(
-            "server already running at {} (pid {})",
-            sock_path.display(),
-            pid_str.trim()
-        );
-    }
+    let _lock_file = acquire_daemon_lock(&server_dir)?;
 
     if sock_path.exists() {
         if crate::client::alive(&sock_path) {
@@ -5937,6 +5679,10 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
         }
         std::fs::remove_file(&sock_path)?;
     }
+
+    let listener = UnixListener::bind(&sock_path)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
 
     let state = replay(&scope.root)?;
     let journal_file = std::fs::OpenOptions::new()
@@ -5958,9 +5704,6 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     });
     restore_registered_peer_default_leases(&server);
     purge_expired_storage(&server, now_ms());
-    let listener = UnixListener::bind(&sock_path)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(
         server_dir.join("server.pid"),
         std::process::id().to_string(),
@@ -5993,6 +5736,74 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
             }
             Err(e) => append_log(&server_dir.join("log.txt"), &format!("accept error: {}", e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod reducer_binding_tests {
+    use super::*;
+
+    #[test]
+    fn task_register_wires_worktree_binding_and_replays_it() {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/collab-r2-binding-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let server_dir = root.join(".agent-collab/server");
+        std::fs::create_dir_all(&server_dir).unwrap();
+        let journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(server_dir.join("journal.jsonl"))
+            .unwrap();
+        let server = Server {
+            config: crate::config::Config::default(),
+            root: root.clone(),
+            state: Mutex::new(State::default()),
+            journal: Mutex::new(journal),
+            pane_alive_check: |_| PanePresence::Present,
+            pane_owner_check: |_, _| Ok(true),
+            pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            mailbox_notify: tokio::sync::Notify::new(),
+        };
+        peer_tests::register(&server, "worker", "%worker");
+        let worktree = "playground/task-1".to_string();
+        let registered = handle_task_register(
+            &server,
+            "worker".into(),
+            "token-worker".into(),
+            "task-1".into(),
+            None,
+            None,
+            Some(worktree.clone()),
+            Some("feature/branch".into()),
+            Some("abc123".into()),
+            "p2".into(),
+        );
+        assert!(registered.ok, "{registered:?}");
+        {
+            let state = server.state.lock().unwrap();
+            assert_eq!(
+                state.worktree_bindings["binding-task-task-1"].task_id,
+                "task-1"
+            );
+            assert_eq!(
+                state.worktree_bindings["binding-task-task-1"].worktree_root,
+                worktree
+            );
+        }
+        let replayed = replay(&root).unwrap();
+        assert_eq!(
+            replayed.worktree_bindings["binding-task-task-1"].task_id,
+            "task-1"
+        );
+        assert_eq!(
+            replayed.worktree_bindings["binding-task-task-1"].worktree_root,
+            worktree
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -6806,10 +6617,7 @@ mod scheduler_admission_tests {
                 },
             },
         ]);
-        std::fs::create_dir(
-            root.join(".agent-collab/server/events.jsonl"),
-        )
-        .unwrap();
+        std::fs::create_dir(root.join(".agent-collab/server/events.jsonl")).unwrap();
         let server = Arc::new(server);
         let dispatch_result = dispatch(
             &server,
@@ -6850,7 +6658,10 @@ mod scheduler_admission_tests {
             state.scheduler_admissions["req-managed-failed-audit-1"].status,
             "failed"
         );
-        assert_eq!(state.subagents["managed-child-failed-audit"].status, "assigned");
+        assert_eq!(
+            state.subagents["managed-child-failed-audit"].status,
+            "assigned"
+        );
         assert_eq!(
             state.tasks["task-scheduler-req-managed-failed-audit-1"].status,
             "assigned"
@@ -6909,7 +6720,10 @@ mod scheduler_admission_tests {
         assert_eq!(poll_result.data["timeout"], true);
         assert!(!dispatch_result.ok, "{dispatch_result:?}");
         let state = server.state.lock().unwrap();
-        assert_eq!(state.msgs["scheduler-req-long-poll-failed-audit-1"].wake_attempt_count, 0);
+        assert_eq!(
+            state.msgs["scheduler-req-long-poll-failed-audit-1"].wake_attempt_count,
+            0
+        );
         assert_eq!(state.inbox_of("peer").len(), 0);
         assert_eq!(
             state.scheduler_admissions["req-long-poll-failed-audit-1"].status,
@@ -6977,7 +6791,10 @@ mod scheduler_admission_tests {
             state.scheduler_admissions["req-long-poll-success-1"].status,
             "succeeded"
         );
-        assert_eq!(state.msgs["scheduler-req-long-poll-success-1"].state, "read");
+        assert_eq!(
+            state.msgs["scheduler-req-long-poll-success-1"].state,
+            "read"
+        );
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
