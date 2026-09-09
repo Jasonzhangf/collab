@@ -5,8 +5,11 @@ for migrating the existing project histories to the Collab v1 host-wide
 daemon. It does not authorize or perform a live archive, reset, replay,
 identity rebind, daemon restart, install, merge, push, or cleanup.
 
-The current observations are in
-[`governance-history-live-refresh-r2-20260909.md`](./evidence/governance-history-live-refresh-r2-20260909.md).
+The current observations are in the latest r4 field evidence
+[`governance-history-live-refresh-r4-20260909.md`](./evidence/governance-history-live-refresh-r4-20260909.md),
+whose reviewed candidate content is at commit `8c627beeb50b98f6e913906e233ae476a0bd8db7`.
+Older refresh documents are historical clues only and are not current
+migration inputs.
 The migration goal and contract are in
 [`collab-v1-governance-history-migration-plan.md`](./goals/collab-v1-governance-history-migration-plan.md),
 and the schema is
@@ -21,6 +24,14 @@ Each project keeps its own canonical project scope. Collab owns coordination
 facts; AppSDK owns quality and release records; mailbox JSONL and notification
 views are rebuildable projections. Raw source bytes, errors and historical
 relations remain available in an immutable archive.
+
+The target lineage is project-specific. Only the Collab project is integrated
+into the Collab v1 integration lineage. AppSDK records bind to an AppSDK
+owner-selected target and remain under AppSDK quality/release ownership;
+RouteCodex records bind to a RouteCodex owner-selected target and remain under
+RouteCodex ownership. Collab may retain immutable coordination references to
+those projects, but it is not their product or release integration target.
+codexapp first binds to its verified native AppServer target.
 
 `reset_required` means that safe historical replay cannot be proven. It does
 not mean that reset has happened, that old facts were deleted, or that the new
@@ -47,30 +58,31 @@ These rules apply to every project and every attempt:
 
 ## 2. Current classification to carry into the next inspect
 
-The refresh evidence is a bounded observation, not a live migration snapshot.
-Its hashes and counts must be refreshed immediately before a lease is taken.
-The expected starting disposition is:
+The r4 evidence is a bounded observation, not a live migration snapshot. Its
+hashes and counts must be refreshed immediately before a lease is taken. The
+expected starting disposition is:
 
 | Project | Source to inspect | Current disposition | Why a reset or operator gate is required |
 | --- | --- | --- | --- |
-| Collab | `/Volumes/extension/code/collab` and its `.agent-collab` data | `reset_required` | Dirty v2 root, 136 worktrees, 120 branches not merged to local `main`, four lost workers, no master, about 20 `collab serve` processes, and no verified scope/binding/generation/epoch fields. |
-| AppSDK | `/Users/fanzhang/Documents/github/appsdk` and its `.agent-collab` data | `reset_required` | Dirty root with five unresolved paths, 101 worktrees, 42 branches not merged to local `main`, mixed live/lost workers, active blocked tasks, and a recovery-required goal projection. |
-| RouteCodex | `/Users/fanzhang/Documents/github/routecodex` and its `.agent-collab` data | `reset_required` | Dirty mixed V3/V4 root, 74 worktrees, 378 branches not merged to local `main`, 23 lost and two unknown workers, and active tasks bound to lost identities. |
+| Collab | `/Volumes/extension/code/collab` and its `.agent-collab` data | `reset_required` | Dirty v2 root, 151 worktrees, 135 branches not merged to local `main`, one current-round `SubagentUpdated=closed` projection and four current-round `KeepaliveUpdated=absent` projections, 21 processes in the clean `collab serve` census, and no verified scope/binding/generation/epoch fields. |
+| AppSDK | `/Users/fanzhang/Documents/github/appsdk` and its `.agent-collab` data | `reset_required` | Dirty root with five unresolved paths, 101 worktrees, 42 branches not merged to local `main`, mixed historical worker projections, active blocked task/bug facts, and a recovery-required goal projection. |
+| RouteCodex | `/Users/fanzhang/Documents/github/routecodex` and its `.agent-collab` data | `reset_required` | Dirty mixed V3/V4 root, 74 worktrees, 378 branches not merged to local `main`, current keepalive projection of 22 absent, four idle, one unknown and one working, and task edges requiring fresh owner/runtime proof. |
 | codexapp | `/Users/fanzhang/Documents/github/codexapp` plus `/Users/fanzhang/.codex-communication` | `needs_operator` | No Git or Collab source, external journal only, no successful `commd.sock` connection, and no native initialize/capability/runtime binding receipt. |
 
-The refresh recorded these source projections, which are useful anchors for
+The r4 refresh recorded these source projections, which are useful anchors for
 the next inspect but are not reusable apply inputs:
 
 | Project | Journal/event source observation | Digest anchor |
 | --- | --- | --- |
-| Collab | 72 journal lines; 468 event lines | journal `c47e0f95…1fffc83`; events `222b07fa…1875452` |
-| AppSDK | 44,821 journal lines; 5,236 event lines | journal `446895d8…ebb7f44`; events `a2f5a685…231bf` |
-| RouteCodex | 39,431 journal lines; 26,243 event lines | journal `9dd93d73…941273`; events `2c57b294…724798` |
+| Collab | 72 journal lines; 476 event lines | journal `c47e0f95…1fffc83`; events `45710463…1709ad` |
+| AppSDK | 46,777 journal lines; 5,244 event lines | journal `316c9f58…f5b5d25`; events `cf8c5b1d…66d4dce` |
+| RouteCodex | 39,431 journal lines; 26,251 event lines | journal `9dd93d73…941273`; events `7ae997f8…f04c1a00` |
 | codexapp | 54 external journal lines; no external events file | journal `c3d995d8…f485a4` |
 
-The refresh explicitly observed drift while collecting data. Therefore, a
-later inspect must produce new source digests, counts, process ownership,
-worktree inventory, and classification before any operation lease.
+The r4 comparison found differences across evidence windows. It does not
+establish that the files changed during the nine-second main capture. A later
+inspect must produce new source digests, counts, process ownership, worktree
+inventory and classification before any operation lease.
 
 The admission decision has two separate layers. **Hard admission** concerns
 the operation that is about to write: an explicitly authorized migration
@@ -89,6 +101,14 @@ It does not require repairing every old owner before the source can be
 archived. Historical defects become hard admission blockers only when they
 prevent source-byte/digest integrity, writer fencing, scope isolation, or
 safe operation of the migration controller itself.
+
+`archive-only` is an import disposition, not a mapping class. A record that
+fails deterministic replay keeps `mapping_class=reset`; an ambiguous side
+effect keeps `mapping_class=unknown`. At manifest stage S1 (`planned`), the
+archive pointer is still null because no immutable archive receipt exists.
+Only after archive equality and immutability are verified may an archive-only
+record receive its archive reference. These record-level results do not change
+the project-level disposition above.
 
 ## 3. State machine and authority
 
@@ -187,6 +207,23 @@ AppServer capability. A historical missing owner, lost runtime or unresolved
 merge conflict is instead recorded as `archive-only` and blocks that record's
 active import; it does not by itself prevent an authorized preservation
 archive.
+
+### Read-only inspect versus lease and epoch admission
+
+The inspect phase and the write phase have different authorities and outputs:
+
+| Phase | Allowed work | Admission effect |
+| --- | --- | --- |
+| Read-only inspect/classify | Read source files and process/socket metadata; hash and frame JSONL; inventory branches/worktrees; classify project and record facts; write a new evidence record outside the source roots. | No lease, writer freeze, archive, reset, epoch, rebind, notification, task reassignment or source mutation. `reset_required` is only a classification. |
+| Operator admission | Verify explicit operator authorization, acquire one migration lease, bind it to the source digest/canonical cwd/target build and fencing token, and persist the immutable migration plan. | A rejected or unknown authorization/lease leaves the source untouched and stops the attempt. A lease does not by itself create an epoch or permit replay. |
+| Epoch apply | Freeze legacy writers, create and verify the immutable archive, fence the old epoch, allocate one fresh target epoch/writer, then map and reconcile records. | Only the authenticated migration controller may write. Archive/reset/replay/rebind cannot begin before the lease and writer-freeze receipts. |
+
+The operation therefore always starts with a fresh read-only inspect. Only
+after the operator admission receipt and lease are durable may the controller
+enter the archive/fencing path. Only after archive equality, immutability and
+old-epoch fencing are proven may it create the fresh epoch. A planned
+manifest, status row, historical receipt or local goal projection cannot stand
+in for any of these gates.
 
 ## 5. Worktree and branch inventory gate
 
@@ -496,13 +533,15 @@ fixed-interval retry and not a wakeup loop.
 
 ### Collab
 
-Start from the clean v1 integration lineage. Preserve the dirty v2 root,
-all unmerged worktrees and old v1 records in the archive. Acquire the
-migration lease, then resolve duplicate `collab serve` writers and establish
-one host daemon before any replay. With lost workers and no master, preserve
-their tasks and claims as archive-only; re-register only live endpoints and
-obtain a new user master grant. Do not treat the historical low-intervention
-migration receipt as current global ownership.
+Start from the clean v1 integration lineage; Collab is the only project that
+uses this integration target. Preserve the dirty v2 root, all unmerged
+worktrees and old v1 records in the archive. Acquire the migration lease, then
+resolve duplicate `collab serve` writers and establish one host daemon before
+any replay. The current round provides one closed worker projection and four
+absent keepalive projections; it does not establish a live master or current
+worker liveness. Keep old tasks and claims archive-only until live endpoints
+are re-registered and a new user master grant is obtained. Do not treat the
+historical low-intervention migration receipt as current global ownership.
 
 ### AppSDK
 
@@ -510,7 +549,9 @@ Keep the five unresolved paths and their ownership evidence in the archive;
 the AppSDK owner must resolve them before any affected quality candidate or
 task is admitted as active, but does not need to repair them before an
 authorized preservation archive. Keep `.appsdk` quality records under AppSDK
-ownership and import immutable references into Collab. The failed
+ownership and bind active records to the AppSDK owner-selected target. Collab
+may retain immutable coordination references, but it is not the AppSDK product
+or release integration target. The failed
 `GOAL_STATUS_SUBSCRIPTION_ID_MISSING` / reconciliation state remains a
 blocked fact; it is not a goal success. Preserve active bug IDs and reconcile
 their tasks only after owners and worktrees are proven. Do not use Collab
@@ -520,11 +561,15 @@ reset to delete AppSDK records.
 
 Keep V3 production evidence separate from V4 design/refactor experiments.
 Preserve the dirty root and all 378 unmerged branches until each entry is
-classified. Keep the 23 lost and two unknown workers and their active task
-edges archive-only until a current owner/runtime is proven; do not require
-that historical repair before the preservation archive. RouteCodex AppSDK
-records remain under their quality owner; AppSDK `reset-governance` is a
-separate authorized operation, never a Collab migration shortcut.
+classified. The current keepalive projection is 22 absent, four idle, one
+unknown and one working; task edges remain archive-only until a current
+owner/runtime is proven. Bind active records to a RouteCodex owner-selected
+target. Collab may retain immutable coordination references, but it is not the
+RouteCodex product or release integration target. The earlier 23-lost/two-
+unknown result is a prior-round clue only and does not require historical
+repair before the preservation archive. RouteCodex AppSDK records remain under
+their quality owner; AppSDK `reset-governance` is a separate authorized
+operation, never a Collab migration shortcut.
 
 ### codexapp
 
