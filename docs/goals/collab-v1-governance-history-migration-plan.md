@@ -58,11 +58,16 @@ new repair worktree is based on the explicit latest integration commit.
 One migration worker owns read-only inventory and classification for Collab,
 AppSDK, RouteCodex and codexapp. It records the exact checkout/data roots,
 source identity, journal/mailbox/socket digests, writer ownership and unknowns
-in the inventory evidence. It must produce a schema-valid manifest draft and
-classify each record as `direct/mapped`, `adapt/needs_reconciliation`,
-`reset_required` or `unknown`. It must not mutate any live root or start a
-daemon. The codexapp external journal and socket are mandatory inventory
-inputs even though the source directory has no `.agent-collab`.
+in the inventory evidence. It must produce a schema-valid manifest draft with
+top-level `mapping_status=planned`; every inspected record carries its
+`mapping_class` (`direct`, `adapt`, `reset` or `unknown`) and remains
+`mapping_status=planned` until S2 creates a target mapping. Target sequence,
+archive reference and final `mapped`/`reset_required` evidence are not invented
+in S1. A reset classification still records its exact error and first failed
+boundary, while its raw archive reference remains null until S2. S1 must not
+mutate any live root or start a daemon. The codexapp external journal and
+socket are mandatory inventory inputs even though the source directory has no
+`.agent-collab`.
 
 ### S2 — archive, map and rebuild
 
@@ -80,8 +85,15 @@ changed-cwd, dirty-candidate and unknown-outcome cases.
 Rollback is allowed only before the new epoch has admission or external side
 effects. Otherwise the worker freezes and supersedes the new epoch, revokes
 its bindings, fences the writer, reconciles every post-boundary fact and
-commits a reconciliation receipt before any epoch pointer changes. An unknown
-side effect or incomplete reconciliation keeps admission stopped.
+commits a reconciliation receipt before any epoch pointer changes. The durable
+rollback intent and receipt must bind `source_epoch`, `target_epoch`,
+`expected_active_epoch`, `expected_active_revision`, the migration-lease
+fencing token, `command_id` and `operation_id`. The reducer performs an atomic
+compare-and-set of the active epoch; a changed epoch/revision or fencing token
+rejects the transition. Switching the pointer never revives historical
+bindings or grants: live runtime, endpoint generation and user master grant
+must be revalidated before admission resumes. An unknown side effect,
+reconciliation gap or failed CAS keeps admission stopped.
 
 ### S3 — independent review and no-write rehearsal
 

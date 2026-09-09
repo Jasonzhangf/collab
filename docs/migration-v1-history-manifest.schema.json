@@ -71,7 +71,7 @@
           "appsdk_record_digest": {"type": ["string", "null"]},
           "mapping_class": {"enum": ["direct", "adapt", "reset", "unknown"]},
           "mapping_status": {
-            "enum": ["mapped", "needs_reconciliation", "blocked", "rejected", "unknown"]
+            "enum": ["planned", "mapped", "needs_reconciliation", "blocked", "rejected", "unknown"]
           },
           "raw_archive_ref": {"type": ["string", "null"]},
           "exact_error": {"type": ["string", "null"]},
@@ -118,11 +118,28 @@
               "properties": {"mapping_class": {"const": "reset"}}
             },
             "then": {
-              "required": ["raw_archive_ref", "exact_error", "first_failed_boundary"],
+              "required": ["exact_error", "first_failed_boundary"],
               "properties": {
-                "raw_archive_ref": {"type": "string", "minLength": 1},
                 "exact_error": {"type": "string", "minLength": 1},
                 "first_failed_boundary": {"type": "string", "minLength": 1}
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": ["mapping_status"],
+                    "properties": {"mapping_status": {"const": "planned"}}
+                  },
+                  "then": {},
+                  "else": {
+                    "required": ["raw_archive_ref"],
+                    "properties": {
+                      "raw_archive_ref": {"type": "string", "minLength": 1}
+                    }
+                  }
+                }
+              ],
+              "not": {
+                "properties": {"mapping_status": {"const": "mapped"}}
               }
             }
           },

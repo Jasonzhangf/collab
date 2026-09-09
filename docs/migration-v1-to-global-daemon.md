@@ -84,6 +84,16 @@ when the source is a non-Git path such as codexapp. Source/target identity
 fields are required to be present in every manifest; a non-Git source uses an
 explicit `null` branch/head/tree rather than omitting those fields.
 
+An inspection manifest uses top-level `mapping_status=planned`. Its records
+retain their classification in `mapping_class` and use `mapping_status=planned`
+until a target sequence or archive is actually committed. A `reset` record in
+this phase carries its exact error and first failed boundary but may leave
+`raw_archive_ref` null. The schema requires the archive reference and final
+error evidence only once that record leaves the planned phase; a top-level
+`reset_required` manifest likewise requires a real archive digest. This keeps
+classification separate from a completed reset and prevents a worker from
+inventing a future path, digest or target sequence.
+
 `target_epoch` is a new immutable epoch for every reset or schema cutover.
 `target_sequence` is allocated by the global journal writer. Old source
 sequence numbers are evidence only and are not reused as target ordering.
@@ -167,10 +177,17 @@ Reset is a controlled new epoch, not deletion:
 
 Rollback is a fenced transition. First freeze the new epoch, mark it
 `superseded/aborted`, revoke its active bindings and stop its projections, then
-reconcile any facts already appended after the epoch boundary. Only after the
-reconciliation receipt is committed may the active epoch pointer switch to the
-previous verified epoch. The archive and both journals remain immutable; no
-second writer is started. If the new epoch has an unknown side effect or the
+reconcile any facts already appended after the epoch boundary. The durable
+rollback intent and reconciliation receipt bind `source_epoch`, `target_epoch`,
+`expected_active_epoch`, `expected_active_revision`, the migration-lease
+fencing token, `command_id` and `operation_id`. The reducer atomically compares
+those values before committing the active-epoch pointer; a changed epoch,
+revision or fencing token rejects the transition. Only after that receipt and
+CAS succeed may the pointer switch to the previous verified epoch. Pointer
+switching never revives its historical bindings or grants: the target live
+runtime, endpoint generation and user master grant must be revalidated before
+admission resumes. The archive and both journals remain immutable; no second
+writer is started. If the new epoch has an unknown side effect or the
 reconciliation is incomplete, keep admission stopped and request an operator
 decision instead of switching pointers.
 
