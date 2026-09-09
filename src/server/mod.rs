@@ -251,9 +251,12 @@ impl Server {
         })
     }
 
-    pub(crate) fn commit_locked(&self, st: &mut State, evs: &[Event]) {
-        self.commit_locked_checked(st, evs)
-            .expect("journal append failed; refusing state mutation");
+    pub(crate) fn commit_locked(
+        &self,
+        st: &mut State,
+        evs: &[Event],
+    ) -> Result<(), notification_contract::JournalError> {
+        self.commit_locked_checked(st, evs).map(|_| ())
     }
 
     fn commit_locked_checked(
@@ -261,20 +264,36 @@ impl Server {
         st: &mut State,
         evs: &[Event],
     ) -> Result<notification_contract::CommitReceipt, notification_contract::JournalError> {
+        if let Some(error) = &st.journal_poison {
+            return Err(notification_contract::JournalError::Append(error.clone()));
+        }
         let mut j = self.journal.lock().unwrap();
         use std::io::Write;
         // Persist control truth before any state change or external notification.
         // A failed journal poisons this owner instead of silently resetting budgets.
         let mut buf = Vec::new();
         for ev in evs {
-            let line = serde_json::to_string(ev).expect("serialize event");
+            let line = match serde_json::to_string(ev) {
+                Ok(line) => line,
+                Err(error) => {
+                    let message = error.to_string();
+                    st.journal_poison = Some(message.clone());
+                    return Err(notification_contract::JournalError::Append(message));
+                }
+            };
             buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
         }
-        j.write_all(&buf)
-            .map_err(|error| notification_contract::JournalError::Append(error.to_string()))?;
-        j.sync_data()
-            .map_err(|error| notification_contract::JournalError::Flush(error.to_string()))?;
+        if let Err(error) = j.write_all(&buf) {
+            let message = error.to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Append(message));
+        }
+        if let Err(error) = j.sync_data() {
+            let message = error.to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Flush(message));
+        }
         for ev in evs {
             st.apply(ev);
             st.sequence = st.sequence.saturating_add(1);
@@ -363,13 +382,19 @@ impl Server {
         mailbox::backup_message(&self.root, msg)
     }
 
-    fn rewrite_journal_locked(&self, st: &State) {
+    fn rewrite_journal_locked(
+        &self,
+        st: &State,
+    ) -> Result<(), notification_contract::JournalError> {
         let path = self.root.join(".agent-collab/server/journal.jsonl");
         let tmp = path.with_file_name("journal.jsonl.tmp");
         let mut body = String::new();
         let events = st.snapshot_events();
         for (index, event) in events.iter().enumerate() {
-            body.push_str(&serde_json::to_string(event).expect("serialize compact event"));
+            let line = serde_json::to_string(event).map_err(|error| {
+                notification_contract::JournalError::Append(format!("compact serialize: {error}"))
+            })?;
+            body.push_str(&line);
             let next_is_checkpoint = events
                 .get(index + 1)
                 .is_some_and(|next| matches!(next, Event::ReducerCheckpoint { .. }));
@@ -383,14 +408,21 @@ impl Server {
         {
             body.push('\n');
         }
-        std::fs::write(&tmp, body).expect("journal compact write failed");
-        std::fs::rename(&tmp, &path).expect("journal compact rename failed");
+        std::fs::write(&tmp, body).map_err(|error| {
+            notification_contract::JournalError::Append(format!("compact write: {error}"))
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|error| {
+            notification_contract::JournalError::Append(format!("compact rename: {error}"))
+        })?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
-            .expect("journal compact reopen failed");
+            .map_err(|error| {
+                notification_contract::JournalError::Append(format!("compact reopen: {error}"))
+            })?;
         *self.journal.lock().unwrap() = file;
+        Ok(())
     }
 }
 
@@ -422,7 +454,10 @@ pub(crate) fn purge_expired_storage(server: &Server, now: i64) -> usize {
     for id in &expired {
         st.drop_message(id);
     }
-    server.rewrite_journal_locked(&st);
+    if let Err(error) = server.rewrite_journal_locked(&st) {
+        st.journal_poison = Some(error.to_string());
+        append_log(&server.log_path(), &format!("JOURNAL_COMPACTION_FAILED: {error}"));
+    }
     expired.len()
 }
 
@@ -5549,36 +5584,13 @@ fn replay(root: &Path) -> anyhow::Result<State> {
         if trimmed.is_empty() {
             continue;
         }
-        let mut line_events = Vec::new();
-        let mut stream = serde_json::Deserializer::from_str(trimmed).into_iter::<Event>();
-        while let Some(item) = stream.next() {
-            let event = item.map_err(|error| {
-                notification_contract::JournalError::Replay(format!(
-                    "line {}: {}; manual journal edits are unsupported",
-                    index + 1,
-                    error
-                ))
-            })?;
-            line_events.push(event);
-        }
-        let byte_offset = stream.byte_offset();
-        if byte_offset < trimmed.len() {
-            let remainder = &trimmed[byte_offset..];
-            if !remainder.trim().is_empty() {
-                return Err(notification_contract::JournalError::Replay(format!(
-                    "line {}: trailing characters; manual journal edits are unsupported",
-                    index + 1
-                ))
-                .into());
-            }
-        }
-        if line_events.is_empty() {
-            return Err(notification_contract::JournalError::Replay(format!(
-                "line {}: empty event; manual journal edits are unsupported",
-                index + 1
-            ))
-            .into());
-        }
+        let line_events = decode_journal_line(trimmed).map_err(|error| {
+            anyhow::anyhow!(
+                "journal replay failed at line {}: {}; manual journal edits are unsupported",
+                index + 1,
+                error
+            )
+        })?;
         if line_events.len() > 1
             && !line_events
                 .iter()
@@ -5615,6 +5627,28 @@ fn replay(root: &Path) -> anyhow::Result<State> {
         std::fs::rename(&tmp, &journal)?;
     }
     Ok(st)
+}
+
+fn decode_journal_line(
+    line: &str,
+) -> Result<Vec<Event>, notification_contract::JournalError> {
+    let mut events = Vec::new();
+    let mut stream = serde_json::Deserializer::from_str(line).into_iter::<Event>();
+    while let Some(item) = stream.next() {
+        events.push(item.map_err(|error| {
+            notification_contract::JournalError::Replay(error.to_string())
+        })?);
+    }
+    let offset = stream.byte_offset();
+    if offset < line.len() && !line[offset..].trim().is_empty() {
+        return Err(notification_contract::JournalError::Replay(
+            "trailing characters".into(),
+        ));
+    }
+    if events.is_empty() {
+        return Err(notification_contract::JournalError::Replay("empty event".into()));
+    }
+    Ok(events)
 }
 
 fn acquire_daemon_lock(server_dir: &Path) -> anyhow::Result<std::fs::File> {

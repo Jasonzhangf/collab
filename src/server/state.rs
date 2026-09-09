@@ -559,6 +559,9 @@ pub struct State {
     /// not business payload and are advanced only by the resident writer.
     pub revision: u64,
     pub sequence: u64,
+    /// A failed journal write makes the in-memory reducer unsafe to mutate.
+    /// Keep the exact first failure so admission can fail closed.
+    pub journal_poison: Option<String>,
     pub master_wake: MasterWakeAccumulator,
     pub keepalives: HashMap<String, super::keepalive::Record>,
     pub subagents: HashMap<String, crate::subagent::Record>,
@@ -976,9 +979,11 @@ impl State {
     }
 
     pub fn admission_frozen(&self) -> bool {
-        self.migration
-            .as_ref()
-            .is_some_and(|migration| migration.admission_frozen)
+        self.journal_poison.is_some()
+            || self
+                .migration
+                .as_ref()
+                .is_some_and(|migration| migration.admission_frozen)
     }
 
     /// Unread (not yet acked) inbox of a worker, oldest first.

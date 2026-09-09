@@ -380,17 +380,70 @@ fn failed_journal_cannot_apply_a_keepalive_reservation() {
     *server.journal.lock().unwrap() =
         std::fs::File::open(root.join(".agent-collab/server/journal.jsonl")).unwrap();
     let mut state = State::default();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        server.commit_locked(
-            &mut state,
-            &[Event::KeepaliveUpdated {
-                worker_id: "worker".into(),
-                record: crate::server::keepalive::Record::default(),
-            }],
-        );
-    }));
+    let result = server.commit_locked(
+        &mut state,
+        &[Event::KeepaliveUpdated {
+            worker_id: "worker".into(),
+            record: crate::server::keepalive::Record::default(),
+        }],
+    );
     assert!(result.is_err());
     assert!(state.keepalives.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_retry_returns_original_outcome_without_reapplying_events() {
+    let (server, root) = test_server();
+    let event = Event::KeepaliveUpdated {
+        worker_id: "worker".into(),
+        record: crate::server::keepalive::Record::default(),
+    };
+    let (first, replayed) = server
+        .commit_command(
+            "command-1",
+            "operation-1",
+            std::slice::from_ref(&event),
+            json!({"accepted": true}),
+        )
+        .unwrap();
+    assert!(!replayed);
+    let (second, replayed) = server
+        .commit_command(
+            "command-1",
+            "operation-1",
+            &[event],
+            json!({"accepted": false}),
+        )
+        .unwrap();
+    assert!(replayed);
+    assert_eq!(first, second);
+    assert_eq!(second.outcome, json!({"accepted": true}));
+    assert_eq!(
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_command_record_without_outcome_is_rejected() {
+    let (server, root) = test_server();
+    let journal = root.join(".agent-collab/server/journal.jsonl");
+    std::fs::write(
+        &journal,
+        r#"{"ev":"CommandRecorded","command_id":"legacy","receipt":{"operation_id":"op"}}\n"#,
+    )
+    .unwrap();
+    let error = match super::replay(&root) {
+        Ok(_) => panic!("legacy command record without outcome must be rejected"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("outcome"), "unexpected error: {error}");
+    drop(server);
     std::fs::remove_dir_all(root).unwrap();
 }
 
