@@ -69,6 +69,16 @@ jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .source_di
     "$collab_fixture" >"$schema_case"
 schema_reject 'direct-replay-requires-direct-class' "$schema_case"
 
+schema_case="$schema_cases_root/rebuild-mapped-direct-class.json"
+jq ' .records |= map(if .mapping_class == "reset" then .mapping_class = "direct" | .mapping_status = "mapped" | .target_sequence = 0 | .target_entity_id = "forbidden-active-target" else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'rebuild-required-record-cannot-be-mapped' "$schema_case"
+
+schema_case="$schema_cases_root/archive-missing-error.json"
+jq ' .records |= map(if .source_disposition == "adapt_reconcile" then .source_disposition = "archive_only" | .blocker_code = "PROJECT_ADMISSION_BLOCKED" | .first_failed_boundary = "candidate" | .exact_error = null else . end)' \
+    "$collab_fixture" >"$schema_case"
+schema_reject 'archive-only-record-requires-exact-error' "$schema_case"
+
 expected_records='{
   "collab": [
     {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","blocker_code":null,"target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},

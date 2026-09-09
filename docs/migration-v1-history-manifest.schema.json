@@ -150,9 +150,10 @@
               "properties": {"source_disposition": {"const": "archive_only"}}
             },
             "then": {
-              "required": ["blocker_code", "first_failed_boundary"],
+              "required": ["blocker_code", "exact_error", "first_failed_boundary"],
               "properties": {
                 "blocker_code": {"type": "string", "minLength": 1},
+                "exact_error": {"type": "string", "minLength": 1},
                 "first_failed_boundary": {"type": "string", "minLength": 1}
               },
               "not": {
@@ -190,10 +191,14 @@
               "properties": {"source_disposition": {"const": "rebuild_required"}}
             },
             "then": {
-              "required": ["blocker_code", "first_failed_boundary"],
+              "required": ["blocker_code", "exact_error", "first_failed_boundary"],
               "properties": {
                 "blocker_code": {"type": "string", "minLength": 1},
+                "exact_error": {"type": "string", "minLength": 1},
                 "first_failed_boundary": {"type": "string", "minLength": 1}
+              },
+              "not": {
+                "properties": {"mapping_status": {"const": "mapped"}}
               }
             }
           },
