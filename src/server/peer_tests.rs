@@ -436,7 +436,8 @@ fn legacy_command_record_without_outcome_is_rejected() {
     let journal = root.join(".agent-collab/server/journal.jsonl");
     std::fs::write(
         &journal,
-        r#"{"ev":"CommandRecorded","command_id":"legacy","receipt":{"operation_id":"op"}}\n"#,
+        r#"{"ev":"CommandRecorded","command_id":"legacy","receipt":{"operation_id":"op"}}
+"#,
     )
     .unwrap();
     let error = match super::replay(&root) {
