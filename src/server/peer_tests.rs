@@ -399,7 +399,7 @@ fn command_retry_returns_original_outcome_without_reapplying_events() {
         worker_id: "worker".into(),
         record: crate::server::keepalive::Record::default(),
     };
-    let (first, replayed) = server
+    let first = server
         .commit_command(
             "command-1",
             "operation-1",
@@ -407,8 +407,8 @@ fn command_retry_returns_original_outcome_without_reapplying_events() {
             json!({"accepted": true}),
         )
         .unwrap();
-    assert!(!replayed);
-    let (second, replayed) = server
+    assert!(!first.replayed);
+    let second = server
         .commit_command(
             "command-1",
             "operation-1",
@@ -416,8 +416,9 @@ fn command_retry_returns_original_outcome_without_reapplying_events() {
             json!({"accepted": false}),
         )
         .unwrap();
-    assert!(replayed);
-    assert_eq!(first, second);
+    assert!(second.replayed);
+    assert_eq!(first.receipt, second.receipt);
+    assert_eq!(first.operation_id, second.operation_id);
     assert_eq!(second.outcome, json!({"accepted": true}));
     assert_eq!(
         std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
