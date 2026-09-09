@@ -875,6 +875,7 @@ fn registered_peer_rebind_events(
     pane_for_worker: &dyn Fn(&str) -> Option<String>,
     owns_pane: &dyn Fn(&str, &str) -> bool,
 ) -> Vec<Event> {
+    let now = now_ms();
     state
         .workers
         .values()
@@ -891,9 +892,26 @@ fn registered_peer_rebind_events(
                 return None;
             }
             let mut rebound = worker.clone();
-            rebound.pane = Some(pane);
-            Some(Event::Registered { worker: rebound })
+            rebound.pane = Some(pane.clone());
+            let mut events = vec![Event::Registered { worker: rebound }];
+            events.extend(
+                state
+                    .notification_subscriptions
+                    .values()
+                    .filter(|subscription| {
+                        subscription.worker_id == worker.id
+                            && subscription.status == "armed"
+                            && subscription.pane != pane
+                    })
+                    .map(|subscription| Event::NotificationRebound {
+                        subscription_id: subscription.id.clone(),
+                        pane: pane.clone(),
+                        updated_ms: now,
+                    }),
+            );
+            Some(events)
         })
+        .flatten()
         .collect()
 }
 
