@@ -1,5 +1,103 @@
 use serde::{Deserialize, Serialize};
 
+use crate::identity::{
+    validate_binding, BindingId, CommandId, DispatchId, MessageId, OperationId, RuntimeIdentity,
+    TurnId,
+};
+use crate::scope::RouteScope;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandEnvelope {
+    pub command_id: CommandId,
+    pub operation_id: OperationId,
+    pub actor_binding_id: BindingId,
+    pub endpoint_generation: u64,
+    pub scope: RouteScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<MessageId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<DispatchId>,
+}
+
+impl CommandEnvelope {
+    pub fn new(
+        command_id: CommandId,
+        operation_id: OperationId,
+        actor_binding_id: BindingId,
+        endpoint_generation: u64,
+        scope: RouteScope,
+        expected_revision: Option<u64>,
+        turn_id: Option<TurnId>,
+        message_id: Option<MessageId>,
+        dispatch_id: Option<DispatchId>,
+    ) -> Self {
+        Self {
+            command_id,
+            operation_id,
+            actor_binding_id,
+            endpoint_generation,
+            scope,
+            expected_revision,
+            turn_id,
+            message_id,
+            dispatch_id,
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        crate::identity::validate_id_for_protocol(self.command_id.as_str())?;
+        crate::identity::validate_id_for_protocol(self.operation_id.as_str())?;
+        crate::identity::validate_id_for_protocol(self.actor_binding_id.as_str())?;
+        crate::identity::validate_id_for_protocol(self.scope.app_scope_id.as_str())?;
+        crate::identity::validate_id_for_protocol(self.scope.project_scope_id.as_str())?;
+        for id in [
+            self.turn_id.as_ref().map(TurnId::as_str),
+            self.message_id.as_ref().map(MessageId::as_str),
+            self.dispatch_id.as_ref().map(DispatchId::as_str),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            crate::identity::validate_id_for_protocol(id)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(
+        &self,
+        registered: &RuntimeIdentity,
+        registered_scope: &RouteScope,
+    ) -> anyhow::Result<()> {
+        self.validate()?;
+        let incoming = RuntimeIdentity {
+            agent_id: registered.agent_id.clone(),
+            runtime_id: registered.runtime_id.clone(),
+            appserver_id: registered.appserver_id.clone(),
+            endpoint_generation: self.endpoint_generation,
+            binding_id: self.actor_binding_id.clone(),
+            native_thread_id: registered.native_thread_id.clone(),
+        };
+        validate_binding(registered, &incoming)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.scope.validate_same_route(registered_scope)?;
+        if self.scope.app_scope_id != registered.appserver_id {
+            anyhow::bail!("command app scope does not match actor AppServer identity");
+        }
+        if self.endpoint_generation != registered.endpoint_generation {
+            anyhow::bail!(
+                "stale endpoint generation: expected {}, observed {}",
+                registered.endpoint_generation,
+                self.endpoint_generation
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub enum Req {
@@ -303,3 +401,169 @@ impl Resp {
 }
 
 pub const MSG_TYPES: [&str; 3] = ["notify", "request", "reply"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{
+        AgentId, AppServerId, BindingId, CommandId, NativeThreadId, OperationId, RuntimeId,
+    };
+    use crate::scope::RouteScope;
+    use std::path::Path;
+
+    fn registered_identity() -> RuntimeIdentity {
+        RuntimeIdentity {
+            agent_id: AgentId::new("agent-1").unwrap(),
+            runtime_id: RuntimeId::new("runtime-1").unwrap(),
+            appserver_id: AppServerId::new("appserver-1").unwrap(),
+            endpoint_generation: 7,
+            binding_id: BindingId::new("binding-1").unwrap(),
+            native_thread_id: Some(NativeThreadId::new("thread-1").unwrap()),
+        }
+    }
+
+    fn registered_scope() -> RouteScope {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        RouteScope::for_registered_project(AppServerId::new("appserver-1").unwrap(), root).unwrap()
+    }
+
+    fn envelope(scope: RouteScope) -> CommandEnvelope {
+        CommandEnvelope::new(
+            CommandId::new("command-1").unwrap(),
+            OperationId::new("operation-1").unwrap(),
+            BindingId::new("binding-1").unwrap(),
+            7,
+            scope,
+            Some(12),
+            Some(TurnId::new("turn-1").unwrap()),
+            Some(MessageId::new("message-1").unwrap()),
+            Some(DispatchId::new("dispatch-1").unwrap()),
+        )
+    }
+
+    #[test]
+    fn command_envelope_round_trips_all_wire_fields() {
+        let command = envelope(registered_scope());
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(encoded["command_id"], "command-1");
+        assert_eq!(encoded["operation_id"], "operation-1");
+        assert_eq!(encoded["actor_binding_id"], "binding-1");
+        assert_eq!(encoded["endpoint_generation"], 7);
+        assert_eq!(encoded["scope"]["app_scope_id"], "appserver-1");
+        assert_eq!(
+            encoded["scope"]["project_scope_id"],
+            env!("CARGO_MANIFEST_DIR")
+        );
+        assert_eq!(encoded["expected_revision"], 12);
+        assert_eq!(encoded["turn_id"], "turn-1");
+        assert_eq!(encoded["message_id"], "message-1");
+        assert_eq!(encoded["dispatch_id"], "dispatch-1");
+        assert_eq!(
+            serde_json::from_value::<CommandEnvelope>(encoded).unwrap(),
+            command
+        );
+    }
+
+    #[test]
+    fn command_envelope_accepts_matching_binding_and_scope() {
+        let identity = registered_identity();
+        let scope = registered_scope();
+        let command = envelope(scope.clone());
+        let before_command = command.clone();
+        let before_identity = identity.clone();
+        let before_scope = scope.clone();
+
+        command.validate_for(&identity, &scope).unwrap();
+        assert_eq!(command, before_command);
+        assert_eq!(identity, before_identity);
+        assert_eq!(scope, before_scope);
+    }
+
+    #[test]
+    fn command_envelope_rejects_stale_generation_without_mutation() {
+        let identity = registered_identity();
+        let scope = registered_scope();
+        let mut command = envelope(scope.clone());
+        command.endpoint_generation = 6;
+        let before_command = command.clone();
+        let before_identity = identity.clone();
+        let before_scope = scope.clone();
+
+        assert!(command.validate_for(&identity, &scope).is_err());
+        assert_eq!(command, before_command);
+        assert_eq!(identity, before_identity);
+        assert_eq!(scope, before_scope);
+    }
+
+    #[test]
+    fn command_envelope_rejects_wrong_binding_without_mutation() {
+        let identity = registered_identity();
+        let scope = registered_scope();
+        let mut command = envelope(scope.clone());
+        command.actor_binding_id = BindingId::new("binding-other").unwrap();
+        let before_command = command.clone();
+        let before_identity = identity.clone();
+        let before_scope = scope.clone();
+
+        assert!(command.validate_for(&identity, &scope).is_err());
+        assert_eq!(command, before_command);
+        assert_eq!(identity, before_identity);
+        assert_eq!(scope, before_scope);
+    }
+
+    #[test]
+    fn command_envelope_rejects_wrong_app_scope_without_mutation() {
+        let identity = registered_identity();
+        let registered_scope = registered_scope();
+        let wrong_scope = RouteScope::for_registered_project(
+            AppServerId::new("appserver-other").unwrap(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .unwrap();
+        let command = envelope(wrong_scope);
+        let before_command = command.clone();
+        let before_identity = identity.clone();
+        let before_scope = registered_scope.clone();
+
+        assert!(command.validate_for(&identity, &registered_scope).is_err());
+        assert_eq!(command, before_command);
+        assert_eq!(identity, before_identity);
+        assert_eq!(registered_scope, before_scope);
+    }
+
+    #[test]
+    fn command_envelope_rejects_scope_identity_mismatch_without_mutation() {
+        let identity = registered_identity();
+        let registered_scope = registered_scope();
+        let scope = RouteScope::for_registered_project(
+            AppServerId::new("appserver-other").unwrap(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .unwrap();
+        let command = envelope(scope);
+        let before_command = command.clone();
+        let before_identity = identity.clone();
+        let before_scope = registered_scope.clone();
+
+        assert!(command.validate_for(&identity, &registered_scope).is_err());
+        assert_eq!(command, before_command);
+        assert_eq!(identity, before_identity);
+        assert_eq!(registered_scope, before_scope);
+    }
+
+    #[test]
+    fn command_envelope_rejects_invalid_wire_identifier_without_mutation() {
+        let identity = registered_identity();
+        let scope = registered_scope();
+        let mut command = envelope(scope.clone());
+        command.command_id = serde_json::from_value(serde_json::json!("")).unwrap();
+        let before_command = command.clone();
+        let before_identity = identity.clone();
+        let before_scope = scope.clone();
+
+        assert!(command.validate_for(&identity, &scope).is_err());
+        assert_eq!(command, before_command);
+        assert_eq!(identity, before_identity);
+        assert_eq!(scope, before_scope);
+    }
+}

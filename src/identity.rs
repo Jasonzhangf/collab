@@ -1,7 +1,185 @@
 use crate::scope::Scope;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
+
+macro_rules! string_id {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> anyhow::Result<Self> {
+                let value = value.into();
+                validate_id(&value)?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+const MAX_ID_LENGTH: usize = 256;
+
+fn validate_id(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("identifier must not be empty");
+    }
+    if value.len() > MAX_ID_LENGTH {
+        anyhow::bail!("identifier exceeds {MAX_ID_LENGTH} bytes");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("identifier must not contain control characters");
+    }
+    Ok(())
+}
+
+string_id!(AgentId);
+string_id!(RuntimeId);
+string_id!(AppServerId);
+string_id!(BindingId);
+string_id!(NativeThreadId);
+string_id!(TurnId);
+string_id!(MessageId);
+string_id!(DispatchId);
+string_id!(CommandId);
+string_id!(OperationId);
+
+pub(crate) fn validate_id_for_protocol(value: &str) -> anyhow::Result<()> {
+    validate_id(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeIdentity {
+    pub agent_id: AgentId,
+    pub runtime_id: RuntimeId,
+    pub appserver_id: AppServerId,
+    pub endpoint_generation: u64,
+    pub binding_id: BindingId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_thread_id: Option<NativeThreadId>,
+}
+
+impl RuntimeIdentity {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_id(self.agent_id.as_str())?;
+        validate_id(self.runtime_id.as_str())?;
+        validate_id(self.appserver_id.as_str())?;
+        validate_id(self.binding_id.as_str())?;
+        if let Some(native_thread_id) = &self.native_thread_id {
+            validate_id(native_thread_id.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingValidationError {
+    StaleGeneration {
+        expected: u64,
+        observed: u64,
+    },
+    Mismatch {
+        field: &'static str,
+        expected: String,
+        observed: String,
+    },
+}
+
+impl fmt::Display for BindingValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleGeneration { expected, observed } => {
+                write!(
+                    f,
+                    "stale endpoint generation: expected {expected}, observed {observed}"
+                )
+            }
+            Self::Mismatch {
+                field,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "runtime binding mismatch for {field}: expected {expected}, observed {observed}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BindingValidationError {}
+
+/// Compare an incoming runtime binding with the currently registered binding.
+/// This is intentionally pure: callers decide whether a failed command is
+/// rejected or whether a separately authorized reconnect should rebind.
+pub fn validate_binding(
+    registered: &RuntimeIdentity,
+    incoming: &RuntimeIdentity,
+) -> Result<(), BindingValidationError> {
+    if registered.endpoint_generation != incoming.endpoint_generation {
+        return Err(BindingValidationError::StaleGeneration {
+            expected: registered.endpoint_generation,
+            observed: incoming.endpoint_generation,
+        });
+    }
+    for (field, expected, observed) in [
+        (
+            "agent_id",
+            registered.agent_id.as_str(),
+            incoming.agent_id.as_str(),
+        ),
+        (
+            "runtime_id",
+            registered.runtime_id.as_str(),
+            incoming.runtime_id.as_str(),
+        ),
+        (
+            "appserver_id",
+            registered.appserver_id.as_str(),
+            incoming.appserver_id.as_str(),
+        ),
+        (
+            "binding_id",
+            registered.binding_id.as_str(),
+            incoming.binding_id.as_str(),
+        ),
+    ] {
+        if expected != observed {
+            return Err(BindingValidationError::Mismatch {
+                field,
+                expected: expected.into(),
+                observed: observed.into(),
+            });
+        }
+    }
+    if registered.native_thread_id != incoming.native_thread_id {
+        return Err(BindingValidationError::Mismatch {
+            field: "native_thread_id",
+            expected: registered
+                .native_thread_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            observed: incoming
+                .native_thread_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        });
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
@@ -10,6 +188,8 @@ pub struct Identity {
     pub pane: Option<String>,
     #[serde(default)]
     pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeIdentity>,
 }
 
 fn hex(n: usize) -> String {
@@ -113,6 +293,7 @@ pub fn provision(
         token: hex(16),
         pane: Some(pane.into()),
         session: Some(session.into()),
+        runtime: None,
     });
     let ident = Identity {
         pane: Some(pane.into()),
@@ -166,6 +347,7 @@ pub fn load_or_create(
         token: hex(16),
         pane: Some(pane),
         session: Some(session),
+        runtime: None,
     };
     persist_identity(scope, &ident)?;
     Ok(ident)
@@ -216,5 +398,80 @@ mod tests {
         assert_eq!(loaded.token, provisioned.token);
         assert_eq!(loaded.pane.as_deref(), Some("%743"));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    fn runtime_identity(generation: u64, binding: &str) -> RuntimeIdentity {
+        RuntimeIdentity {
+            agent_id: AgentId::new("agent-1").unwrap(),
+            runtime_id: RuntimeId::new("runtime-1").unwrap(),
+            appserver_id: AppServerId::new("appserver-1").unwrap(),
+            endpoint_generation: generation,
+            binding_id: BindingId::new(binding).unwrap(),
+            native_thread_id: Some(NativeThreadId::new("thread-1").unwrap()),
+        }
+    }
+
+    #[test]
+    fn runtime_identity_serializes_typed_fields() {
+        let identity = runtime_identity(3, "binding-1");
+        let encoded = serde_json::to_value(&identity).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "agent_id": "agent-1",
+                "runtime_id": "runtime-1",
+                "appserver_id": "appserver-1",
+                "endpoint_generation": 3,
+                "binding_id": "binding-1",
+                "native_thread_id": "thread-1"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RuntimeIdentity>(encoded).unwrap(),
+            identity
+        );
+    }
+
+    #[test]
+    fn binding_validation_rejects_stale_generation_without_mutating_inputs() {
+        let registered = runtime_identity(4, "binding-1");
+        let incoming = runtime_identity(3, "binding-1");
+        let registered_before = registered.clone();
+        let incoming_before = incoming.clone();
+
+        assert!(matches!(
+            validate_binding(&registered, &incoming),
+            Err(BindingValidationError::StaleGeneration {
+                expected: 4,
+                observed: 3
+            })
+        ));
+        assert_eq!(registered, registered_before);
+        assert_eq!(incoming, incoming_before);
+    }
+
+    #[test]
+    fn binding_validation_rejects_wrong_binding_without_mutating_inputs() {
+        let registered = runtime_identity(4, "binding-1");
+        let incoming = runtime_identity(4, "binding-2");
+        let registered_before = registered.clone();
+        let incoming_before = incoming.clone();
+
+        assert!(matches!(
+            validate_binding(&registered, &incoming),
+            Err(BindingValidationError::Mismatch {
+                field: "binding_id",
+                ..
+            })
+        ));
+        assert_eq!(registered, registered_before);
+        assert_eq!(incoming, incoming_before);
+    }
+
+    #[test]
+    fn identifier_validation_rejects_empty_and_control_values() {
+        assert!(AgentId::new("").is_err());
+        assert!(RuntimeId::new("runtime\n1").is_err());
+        assert!(DispatchId::new("d".repeat(MAX_ID_LENGTH + 1)).is_err());
     }
 }

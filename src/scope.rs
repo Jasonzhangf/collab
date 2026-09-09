@@ -1,6 +1,66 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::identity::AppServerId;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectScopeId(String);
+
+impl ProjectScopeId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteScope {
+    pub app_scope_id: AppServerId,
+    pub project_scope_id: ProjectScopeId,
+}
+
+impl RouteScope {
+    pub fn for_registered_project(
+        app_scope_id: AppServerId,
+        registered_cwd: &Path,
+    ) -> anyhow::Result<Self> {
+        let root = normalize_registered_cwd(registered_cwd)?;
+        Ok(Self {
+            app_scope_id,
+            project_scope_id: ProjectScopeId(root.to_string_lossy().into_owned()),
+        })
+    }
+
+    pub fn validate_registered_cwd(&self, registered_cwd: &Path) -> anyhow::Result<()> {
+        let normalized = normalize_registered_cwd(registered_cwd)?;
+        if self.project_scope_id.as_str() != normalized.to_string_lossy() {
+            anyhow::bail!(
+                "project cwd is outside the registered project scope: {}",
+                normalized.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_same_route(&self, other: &Self) -> anyhow::Result<()> {
+        if self != other {
+            anyhow::bail!("route scope mismatch");
+        }
+        Ok(())
+    }
+}
+
+fn normalize_registered_cwd(cwd: &Path) -> anyhow::Result<PathBuf> {
+    if !cwd.is_absolute() || !cwd.is_dir() {
+        anyhow::bail!(
+            "registered project cwd must be an existing absolute directory: {}",
+            cwd.display()
+        );
+    }
+    Ok(std::fs::canonicalize(cwd)?)
+}
+
 fn validate_project_root(root: PathBuf) -> anyhow::Result<PathBuf> {
     if !root.is_absolute() || !root.is_dir() {
         anyhow::bail!(
@@ -402,6 +462,10 @@ impl Scope {
     pub fn sock_path(&self) -> PathBuf {
         self.server_dir().join("server.sock")
     }
+
+    pub fn route_scope(&self, app_scope_id: AppServerId) -> anyhow::Result<RouteScope> {
+        RouteScope::for_registered_project(app_scope_id, &self.root)
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +541,51 @@ mod tests {
         })
         .is_err());
         std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[test]
+    fn route_scope_uses_exact_registered_project_cwd() {
+        let parent = test_root("route-scope");
+        let registered = parent.join("registered");
+        let sibling = parent.join("sibling");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let route = RouteScope::for_registered_project(
+            AppServerId::new("appserver-1").unwrap(),
+            &registered,
+        )
+        .unwrap();
+
+        route.validate_registered_cwd(&registered).unwrap();
+        assert!(route.validate_registered_cwd(&sibling).is_err());
+        assert!(route.validate_registered_cwd(&parent).is_err());
+        assert_eq!(
+            route.project_scope_id.as_str(),
+            registered.canonicalize().unwrap().to_string_lossy()
+        );
+        std::fs::remove_dir_all(parent).ok();
+    }
+
+    #[test]
+    fn route_scope_serializes_two_levels_and_does_not_mutate_paths() {
+        let root = test_root("route-serialization");
+        std::fs::create_dir_all(&root).unwrap();
+        let route =
+            RouteScope::for_registered_project(AppServerId::new("appserver-1").unwrap(), &root)
+                .unwrap();
+        let before = route.clone();
+        let encoded = serde_json::to_value(&route).unwrap();
+        assert_eq!(encoded["app_scope_id"], "appserver-1");
+        assert_eq!(
+            encoded["project_scope_id"],
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            serde_json::from_value::<RouteScope>(encoded).unwrap(),
+            route
+        );
+        assert_eq!(route, before);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
