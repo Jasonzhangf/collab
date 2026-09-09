@@ -11,7 +11,12 @@
     "source_schema_version",
     "target_schema_version",
     "source_snapshot_digest",
+    "source_epoch",
     "target_epoch",
+    "project_admission",
+    "owner_authority",
+    "blocker_code",
+    "first_failed_boundary",
     "mapping_status",
     "records",
     "source_repo",
@@ -34,7 +39,14 @@
     "source_schema_version": {"type": "string", "minLength": 1},
     "target_schema_version": {"type": "string", "minLength": 1},
     "source_snapshot_digest": {"type": "string", "minLength": 1},
+    "source_epoch": {"type": ["string", "null"]},
     "target_epoch": {"type": "string", "minLength": 1},
+    "project_admission": {
+      "enum": ["verified", "reset_required", "needs_operator", "aborted"]
+    },
+    "owner_authority": {"type": "string", "minLength": 1},
+    "blocker_code": {"type": ["string", "null"], "minLength": 1},
+    "first_failed_boundary": {"type": ["string", "null"], "minLength": 1},
     "mapping_status": {
       "enum": ["planned", "running", "verified", "needs_operator", "reset_required", "aborted"]
     },
@@ -52,6 +64,10 @@
           "source_record_id",
           "source_record_type",
           "source_record_digest",
+          "source_disposition",
+          "owner_authority",
+          "blocker_code",
+          "first_failed_boundary",
           "mapping_class",
           "mapping_status",
           "target_epoch"
@@ -60,6 +76,9 @@
           "source_record_id": {"type": "string", "minLength": 1},
           "source_record_type": {"type": "string", "minLength": 1},
           "source_record_digest": {"type": "string", "minLength": 1},
+          "source_disposition": {
+            "enum": ["direct_replay", "adapt_reconcile", "archive_only", "rebuild_required"]
+          },
           "target_epoch": {"type": "string", "minLength": 1},
           "target_sequence": {"type": ["integer", "null"], "minimum": 0},
           "target_entity_id": {"type": ["string", "null"]},
@@ -69,6 +88,8 @@
           "endpoint_generation": {"type": ["integer", "null"], "minimum": 0},
           "appsdk_record_ref": {"type": ["string", "null"]},
           "appsdk_record_digest": {"type": ["string", "null"]},
+          "owner_authority": {"type": "string", "minLength": 1},
+          "blocker_code": {"type": ["string", "null"], "minLength": 1},
           "mapping_class": {"enum": ["direct", "adapt", "reset", "unknown"]},
           "mapping_status": {
             "enum": ["planned", "mapped", "needs_reconciliation", "blocked", "rejected", "unknown"]
@@ -109,6 +130,46 @@
               },
               "not": {
                 "properties": {"mapping_status": {"const": "mapped"}}
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["source_disposition"],
+              "properties": {"source_disposition": {"const": "direct_replay"}}
+            },
+            "then": {
+              "properties": {
+                "mapping_class": {"const": "direct"}
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["source_disposition"],
+              "properties": {"source_disposition": {"const": "archive_only"}}
+            },
+            "then": {
+              "required": ["blocker_code", "first_failed_boundary"],
+              "properties": {
+                "blocker_code": {"type": "string", "minLength": 1},
+                "first_failed_boundary": {"type": "string", "minLength": 1}
+              },
+              "not": {
+                "properties": {"mapping_status": {"const": "mapped"}}
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["source_disposition"],
+              "properties": {"source_disposition": {"const": "rebuild_required"}}
+            },
+            "then": {
+              "required": ["blocker_code", "first_failed_boundary"],
+              "properties": {
+                "blocker_code": {"type": "string", "minLength": 1},
+                "first_failed_boundary": {"type": "string", "minLength": 1}
               }
             }
           },
@@ -185,6 +246,33 @@
         "properties": {
           "archive_ref": {"type": "string", "minLength": 1},
           "archive_digest": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["project_admission"],
+        "properties": {"project_admission": {"const": "verified"}}
+      },
+      "then": {
+        "required": ["archive_ref", "archive_digest"],
+        "properties": {
+          "mapping_status": {"const": "verified"},
+          "archive_ref": {"type": "string", "minLength": 1},
+          "archive_digest": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["project_admission"],
+        "properties": {"project_admission": {"enum": ["reset_required", "needs_operator", "aborted"]}}
+      },
+      "then": {
+        "required": ["blocker_code", "first_failed_boundary"],
+        "properties": {
+          "blocker_code": {"type": "string", "minLength": 1},
+          "first_failed_boundary": {"type": "string", "minLength": 1}
         }
       }
     }

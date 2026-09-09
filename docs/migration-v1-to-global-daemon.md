@@ -68,15 +68,20 @@ canonical_project_cwd
 source_repo / source_branch / source_head / source_tree
 source_schema_version / target_schema_version
 source_snapshot_digest
+source_epoch
 target_epoch
+project_admission
+owner_authority
+blocker_code / first_failed_boundary
 archive_ref / archive_digest
 mapping_status
 ```
 
 Each source record has its own `source_record_id`, type and digest, plus the
 target epoch/sequence, target entity, AppSDK reference (when applicable),
-identity binding fields, mapping class/status, raw archive reference and the
-first failed boundary/error. The idempotency key is:
+identity binding fields, mapping class/status, source disposition, owner
+authority, blocker code, raw archive reference and the first failed
+boundary/error. The idempotency key is:
 
 ```text
 (source_project_id, source_record_id, source_record_digest, target_epoch)
@@ -86,6 +91,27 @@ Repeating inspect or apply with that key returns the existing mapping and
 outcome. It cannot create another task, bug, message, claim, wake or
 notification. A changed digest is a new source record or a conflict; it is
 never overwritten in place.
+
+`project_admission` and `mapping_status` are deliberately separate. The
+admission is the project-level decision (`verified`, `reset_required`,
+`needs_operator` or `aborted`) and controls whether the target may become
+active. `mapping_status` is the transaction lifecycle (`planned`, `running`,
+`verified`, and so on). A project can therefore be `reset_required` while its
+inspection manifest is still `planned` and its source bytes remain untouched.
+
+`mapping_class` is the classifier's backward-compatible observation
+(`direct`, `adapt`, `reset`, `unknown`). `source_disposition` is the migration
+controller's action boundary: `direct_replay`, `adapt_reconcile`,
+`archive_only` or `rebuild_required`. In particular, `unknown` records are
+`archive_only` until an operator supplies evidence; a `reset` classification is
+`rebuild_required`, not permission to delete the old source.
+
+`source_epoch` is nullable because legacy projects may have no trustworthy
+epoch. A null source epoch forces a fresh target epoch for active state. The
+manifest and every record carry `owner_authority`, `blocker_code` and
+`first_failed_boundary` so a reset or archive decision remains attributable
+and replay cannot silently convert a missing owner or unknown outcome into a
+new task, grant, message or notification.
 
 For a `mapped` record, `target_sequence` and `target_entity_id` are mandatory,
 and `target_epoch` must equal the manifest `target_epoch`. The schema checks

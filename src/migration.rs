@@ -34,6 +34,59 @@ pub enum MappingClass {
     Unknown,
 }
 
+/// Controller action for one inspected source.  This is intentionally
+/// separate from `MappingClass`: the classifier describes what was observed,
+/// while the controller decides whether the source may be replayed, adapted,
+/// preserved only as evidence, or rebuilt in a new epoch.
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SourceDisposition {
+    DirectReplay,
+    AdaptReconcile,
+    ArchiveOnly,
+    RebuildRequired,
+}
+
+impl SourceDisposition {
+    pub fn from_mapping_class(classification: MappingClass) -> Self {
+        match classification {
+            MappingClass::Direct => Self::DirectReplay,
+            MappingClass::Adapt => Self::AdaptReconcile,
+            MappingClass::Reset => Self::RebuildRequired,
+            MappingClass::Unknown => Self::ArchiveOnly,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectReplay => "direct_replay",
+            Self::AdaptReconcile => "adapt_reconcile",
+            Self::ArchiveOnly => "archive_only",
+            Self::RebuildRequired => "rebuild_required",
+        }
+    }
+}
+
+/// Project admission is a project-level gate and must not be inferred from a
+/// single source record or confused with the migration transaction phase.
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ProjectAdmission {
+    Verified,
+    ResetRequired,
+    NeedsOperator,
+    Aborted,
+}
+
+impl ProjectAdmission {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::ResetRequired => "reset_required",
+            Self::NeedsOperator => "needs_operator",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
 impl MappingClass {
     fn combine(self, other: Self) -> Self {
         self.max(other)
@@ -75,6 +128,7 @@ pub struct RecordInspection {
     pub base_commit: Option<String>,
     pub status: Option<String>,
     pub classification: MappingClass,
+    pub source_disposition: SourceDisposition,
     pub exact_error: Option<String>,
     pub first_failed_boundary: Option<String>,
 }
@@ -273,6 +327,9 @@ pub fn inspect_jsonl_with_options(bytes: &[u8], options: &InspectOptions) -> Ins
     mark_duplicate_record_ids(&mut records, &mut issues);
     mark_duplicate_registrations(&mut records, &mut issues);
     mark_sequence_issues(&mut records, &mut issues);
+    for record in &mut records {
+        record.source_disposition = SourceDisposition::from_mapping_class(record.classification);
+    }
 
     let has_valid_record = records.iter().any(|record| !is_parse_invalid(record));
     if has_valid_record
@@ -608,6 +665,7 @@ fn inspect_record(
         base_commit,
         status,
         classification,
+        source_disposition: SourceDisposition::from_mapping_class(classification),
         exact_error,
         first_failed_boundary,
     }
@@ -760,6 +818,7 @@ fn invalid_record(
         base_commit: None,
         status: None,
         classification: MappingClass::Unknown,
+        source_disposition: SourceDisposition::ArchiveOnly,
         exact_error: Some(exact_error.into()),
         first_failed_boundary: Some(first_failed_boundary.into()),
     }
@@ -1082,6 +1141,34 @@ fn as_non_empty_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_disposition_is_orthogonal_to_observed_mapping_class() {
+        assert_eq!(
+            SourceDisposition::from_mapping_class(MappingClass::Direct).as_str(),
+            "direct_replay"
+        );
+        assert_eq!(
+            SourceDisposition::from_mapping_class(MappingClass::Adapt).as_str(),
+            "adapt_reconcile"
+        );
+        assert_eq!(
+            SourceDisposition::from_mapping_class(MappingClass::Reset).as_str(),
+            "rebuild_required"
+        );
+        assert_eq!(
+            SourceDisposition::from_mapping_class(MappingClass::Unknown).as_str(),
+            "archive_only"
+        );
+    }
+
+    #[test]
+    fn project_admission_names_are_stable_contract_values() {
+        assert_eq!(ProjectAdmission::Verified.as_str(), "verified");
+        assert_eq!(ProjectAdmission::ResetRequired.as_str(), "reset_required");
+        assert_eq!(ProjectAdmission::NeedsOperator.as_str(), "needs_operator");
+        assert_eq!(ProjectAdmission::Aborted.as_str(), "aborted");
+    }
 
     fn direct_line(id: &str, sequence: u64) -> String {
         format!(

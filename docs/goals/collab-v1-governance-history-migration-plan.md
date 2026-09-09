@@ -66,11 +66,15 @@ AppSDK, RouteCodex and codexapp. It records the exact checkout/data roots,
 source identity, journal/mailbox/socket digests, writer ownership and unknowns
 in the inventory evidence. It must produce a schema-valid manifest draft with
 top-level `mapping_status=planned`; every inspected record carries its
-`mapping_class` (`direct`, `adapt`, `reset` or `unknown`) and remains
-`mapping_status=planned` until S2 creates a target mapping. Target sequence,
-archive reference and final `mapped`/`reset_required` evidence are not invented
-in S1. A reset classification still records its exact error and first failed
-boundary, while its raw archive reference remains null until S2. S1 must not
+`mapping_class` (`direct`, `adapt`, `reset` or `unknown`) and its
+`source_disposition` (`direct_replay`, `adapt_reconcile`, `archive_only` or
+`rebuild_required`). The project also records the independent
+`project_admission` decision and the responsible `owner_authority`.
+`mapping_status` remains `planned` until S2 creates a target mapping. Target
+sequence, archive reference and final `mapped`/`reset_required` evidence are
+not invented in S1. A reset classification still records its exact error and
+first failed boundary, while its raw archive reference remains null until S2.
+S1 must not
 mutate any live root or start a daemon. The codexapp external journal and
 socket are mandatory inventory inputs even though the source directory has no
 `.agent-collab`.

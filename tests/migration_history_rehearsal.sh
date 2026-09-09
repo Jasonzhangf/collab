@@ -25,22 +25,22 @@ done
 
 expected_records='{
   "collab": [
-    {"source_record_id":".agent-collab/mailbox","mapping_class":"adapt","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
-    {"source_record_id":".agent-collab/server/events.jsonl","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
-    {"source_record_id":".agent-collab/server/journal.jsonl","mapping_class":"reset","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"MULTIPLE_WRITERS:20_collab_serve_processes","first_failed_boundary":"writer-admission"}
+    {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
+    {"source_record_id":".agent-collab/server/events.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
+    {"source_record_id":".agent-collab/server/journal.jsonl","source_disposition":"rebuild_required","mapping_class":"reset","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"MULTIPLE_WRITERS:20_collab_serve_processes","first_failed_boundary":"writer-admission"}
   ],
   "appsdk": [
-    {"source_record_id":".agent-collab/mailbox","mapping_class":"adapt","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
-    {"source_record_id":".agent-collab/server/events.jsonl","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
-    {"source_record_id":".agent-collab/server/journal.jsonl","mapping_class":"reset","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"UNRESOLVED_GIT_CONFLICTS:5","first_failed_boundary":"candidate"}
+    {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
+    {"source_record_id":".agent-collab/server/events.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
+    {"source_record_id":".agent-collab/server/journal.jsonl","source_disposition":"rebuild_required","mapping_class":"reset","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"UNRESOLVED_GIT_CONFLICTS:5","first_failed_boundary":"candidate"}
   ],
   "routecodex": [
-    {"source_record_id":".agent-collab/mailbox","mapping_class":"adapt","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
-    {"source_record_id":".agent-collab/server/events.jsonl","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
-    {"source_record_id":".agent-collab/server/journal.jsonl","mapping_class":"reset","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"DIRTY_MIXED_V3_V4_CANDIDATE:status_entries=50","first_failed_boundary":"candidate"}
+    {"source_record_id":".agent-collab/mailbox","source_disposition":"adapt_reconcile","mapping_class":"adapt","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":null,"first_failed_boundary":null},
+    {"source_record_id":".agent-collab/server/events.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"SOURCE_PROJECTION_MUTABLE:events_digest_changed_during_inspect","first_failed_boundary":"snapshot"},
+    {"source_record_id":".agent-collab/server/journal.jsonl","source_disposition":"rebuild_required","mapping_class":"reset","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"DIRTY_MIXED_V3_V4_CANDIDATE:status_entries=50","first_failed_boundary":"candidate"}
   ],
   "codexapp": [
-    {"source_record_id":"/Users/fanzhang/.codex-communication/journal.jsonl","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"ENDPOINT_CONNECT_FAILED:connect ECONNREFUSED /Users/fanzhang/.codex-communication/sockets/commd.sock","first_failed_boundary":"native-endpoint-bootstrap"}
+    {"source_record_id":"/Users/fanzhang/.codex-communication/journal.jsonl","source_disposition":"archive_only","mapping_class":"unknown","mapping_status":"planned","target_epoch":"unassigned-rehearsal-epoch","target_sequence":null,"target_entity_id":null,"raw_archive_ref":null,"exact_error":"ENDPOINT_CONNECT_FAILED:connect ECONNREFUSED /Users/fanzhang/.codex-communication/sockets/commd.sock","first_failed_boundary":"native-endpoint-bootstrap"}
   ]
 }'
 
@@ -66,18 +66,49 @@ for project in collab appsdk routecodex codexapp; do
             ;;
     esac
 
+    case "$project" in
+        collab)
+            expected_admission='reset_required'
+            expected_authority='collab-migration-controller'
+            expected_blocker='MULTIPLE_WRITERS'
+            ;;
+        appsdk)
+            expected_admission='reset_required'
+            expected_authority='appsdk-quality-owner'
+            expected_blocker='UNRESOLVED_GIT_CONFLICTS'
+            ;;
+        routecodex)
+            expected_admission='reset_required'
+            expected_authority='routecodex-governance-owner'
+            expected_blocker='DIRTY_MIXED_V3_V4_CANDIDATE'
+            ;;
+        codexapp)
+            expected_admission='needs_operator'
+            expected_authority='codexapp-operator'
+            expected_blocker='BOOTSTRAP_REQUIRED'
+            ;;
+    esac
+
     jsonschema -i "$manifest_path" "$schema_path" >/dev/null
     jq empty "$manifest_path" "$rehearsal_path"
 
-    jq -e --arg project "$project" --argjson expected "$expected_records" '
+    jq -e --arg project "$project" --arg admission "$expected_admission" --arg authority "$expected_authority" --arg blocker "$expected_blocker" --argjson expected "$expected_records" '
         (.source_project_id == $project)
         and (.mapping_status == "planned")
+        and (.source_epoch == null)
+        and (.project_admission == $admission)
+        and (.owner_authority == $authority)
+        and (.blocker_code == $blocker)
+        and (.first_failed_boundary | type == "string")
         and (.target_epoch == "unassigned-rehearsal-epoch")
         and (.archive_ref == null)
         and (.archive_digest == null)
         and (.source_snapshot_digest | startswith("sha256:"))
         and (all(.records[];
             (.mapping_status == "planned")
+            and (.source_disposition | type == "string")
+            and (.owner_authority == $authority)
+            and ((.blocker_code == null) or (.blocker_code | type == "string"))
             and (.target_epoch == "unassigned-rehearsal-epoch")
             and (.target_sequence == null)
             and (.target_entity_id == null)
@@ -91,6 +122,7 @@ for project in collab appsdk routecodex codexapp; do
         ))
         and ([.records[] | {
             source_record_id,
+            source_disposition,
             mapping_class,
             mapping_status,
             target_epoch,
