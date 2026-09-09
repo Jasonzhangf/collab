@@ -7,6 +7,7 @@
 //! source journal while it is being inspected.
 
 use crate::server::state::Event;
+use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -238,7 +239,7 @@ pub fn inspect_jsonl_with_options(bytes: &[u8], options: &InspectOptions) -> Ins
             continue;
         }
 
-        let mut record = inspect_record(line_number, raw_bytes.to_vec(), &value, options);
+        let mut record = inspect_record(line_number, raw_bytes.to_vec(), content, &value, options);
         if record.record_id.is_none() {
             record.classification = record.classification.combine(MappingClass::Adapt);
             record.exact_error = record
@@ -419,6 +420,7 @@ const SHA256_CONSTANTS: [u32; 64] = [
 fn inspect_record(
     line_number: usize,
     raw_bytes: Vec<u8>,
+    raw_content: &[u8],
     value: &Value,
     options: &InspectOptions,
 ) -> RecordInspection {
@@ -466,7 +468,7 @@ fn inspect_record(
         .as_deref()
         .is_some_and(|name| name.starts_with("Task"))
         || value.get("task").is_some();
-    let event_error = event_schema_error(value);
+    let event_error = event_schema_error(raw_content, value);
     let mut classification = if record_id.is_some() && sequence.is_some() && event_error.is_none() {
         MappingClass::Direct
     } else {
@@ -770,12 +772,19 @@ fn is_parse_invalid(record: &RecordInspection) -> bool {
         .is_some_and(|error| error == "EMPTY_LINE" || error.starts_with("MALFORMED_JSON_"))
 }
 
-fn event_schema_error(value: &Value) -> Option<String> {
+fn event_schema_error(raw_content: &[u8], value: &Value) -> Option<String> {
+    if let Some(error) = duplicate_json_key_error(raw_content) {
+        return Some(error);
+    }
     let Some(event_value) = value.get("ev") else {
         return Some("EVENT_ABSENT".to_owned());
     };
     let event_name = event_value.as_str();
-    match serde_json::from_value::<Event>(value.clone()) {
+    // Validate the canonical event against the original bytes.  Parsing the
+    // Value first is still useful for extracting legacy fields, but Value
+    // collapses duplicate object keys and therefore cannot be the schema
+    // authority for a migration decision.
+    match serde_json::from_slice::<Event>(raw_content) {
         Ok(_) => None,
         Err(error) => {
             let detail = error.to_string();
@@ -789,6 +798,122 @@ fn event_schema_error(value: &Value) -> Option<String> {
                 Some(format!("INVALID_EVENT:ev:{detail}"))
             }
         }
+    }
+}
+
+fn duplicate_json_key_error(raw_content: &[u8]) -> Option<String> {
+    let mut deserializer = serde_json::Deserializer::from_slice(raw_content);
+    match deserializer.deserialize_any(DuplicateKeyVisitor) {
+        Ok(()) => None,
+        Err(error) => {
+            let detail = error.to_string();
+            let stable_detail = detail
+                .split(" at line ")
+                .next()
+                .unwrap_or(detail.as_str())
+                .to_owned();
+            if stable_detail.starts_with("DUPLICATE_JSON_KEY:") {
+                Some(stable_detail)
+            } else {
+                Some(format!("DUPLICATE_KEY_SCAN_FAILED:{stable_detail}"))
+            }
+        }
+    }
+}
+
+struct DuplicateKeyVisitor;
+
+impl<'de> Visitor<'de> for DuplicateKeyVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeMap::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if keys.insert(key.clone(), ()).is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "DUPLICATE_JSON_KEY:{key}"
+                )));
+            }
+            map.next_value_seed(DuplicateValueSeed)?;
+        }
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(DuplicateValueSeed)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+}
+
+struct DuplicateValueSeed;
+
+impl<'de> DeserializeSeed<'de> for DuplicateValueSeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateKeyVisitor)
     }
 }
 
@@ -1071,6 +1196,36 @@ mod tests {
         assert_eq!(report.classification, MappingClass::Unknown);
         assert!(report.has_error("MISSING_FINAL_NEWLINE"));
         assert!(!report.has_error("INVALID_EVENT"));
+    }
+
+    #[test]
+    fn duplicate_event_tag_is_unknown_even_when_value_collapses_it() {
+        let bytes = br#"{"record_id":"event-1","sequence":1,"ev":"FutureEvent","ev":"WakeAttempted","ids":["message-1"],"attempted_ms":42}
+"#;
+        let report = inspect_jsonl(bytes);
+
+        assert_eq!(report.classification, MappingClass::Unknown);
+        assert!(report.has_error("DUPLICATE_JSON_KEY:ev"));
+    }
+
+    #[test]
+    fn duplicate_canonical_event_field_is_unknown() {
+        let bytes = br#"{"record_id":"event-1","sequence":1,"ev":"WakeAttempted","ids":["message-1"],"ids":["message-2"],"attempted_ms":42}
+"#;
+        let report = inspect_jsonl(bytes);
+
+        assert_eq!(report.classification, MappingClass::Unknown);
+        assert!(report.has_error("DUPLICATE_JSON_KEY:ids"));
+    }
+
+    #[test]
+    fn duplicate_envelope_key_is_unknown_even_when_event_is_valid() {
+        let bytes = br#"{"record_id":"event-1","record_id":"event-2","sequence":1,"ev":"WakeAttempted","ids":["message-1"],"attempted_ms":42}
+"#;
+        let report = inspect_jsonl(bytes);
+
+        assert_eq!(report.classification, MappingClass::Unknown);
+        assert!(report.has_error("DUPLICATE_JSON_KEY:record_id"));
     }
 
     #[test]
