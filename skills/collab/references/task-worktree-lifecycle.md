@@ -56,7 +56,9 @@ collab task close <task-id>
 ```
 
 Last owned close cancels this peer's direct-message auto-notify. A leftover
-keepalive after the task is done is closed with `collab notify close`.
+keepalive after the task is done is stopped by task close; a specific
+owner-scoped lease can be cancelled with
+`collab notify unsubscribe <subscription-id>`.
 
 - One issue owns one clean worktree under
   `<project-main>/playground/<short-slug>`; the project ignores `playground/`.

@@ -386,10 +386,10 @@ master immediately. Do not wait. Do not lazy-think (symptoms without a
 fix, or idle hoping master will design it). Copy parent if parent is not
 master. If delivery or test conditions are unclear, propose the missing
 conditions instead of guessing. Last owned `collab task close` cancels this
-peer's direct-message auto-notify. Explicit `collab notify close` does the
-same at any time. After the task is done, a leftover keepalive or other
-notice may be closed that way so tmux stops injecting wakes. Do not
-unsubscribe another peer's lease. Next collaboration re-arms with
+peer's direct-message auto-notify. To cancel a specific owner-scoped lease,
+use `collab notify unsubscribe <subscription-id>`. After the task is done,
+the task close lifecycle stops the owner's auto-notify; there is no separate
+`collab notify close` command. Do not unsubscribe another peer's lease. Next collaboration re-arms with
 `collab init` or `collab notify subscribe --event direct-message`.
 
 AGY review is optional. If AGY is unavailable, use Codex review. If neither
@@ -417,7 +417,7 @@ reach this observer. Screen text is diagnostic, never task/control truth.
 | Delegate live master to another peer | `collab master delegate <peer>` |
 | Split work to a managed subagent | `appsdk subagent start --id <id>` then `send <id> --subject <topic> "<assignment with delivery and test conditions>"` |
 | Report a blocker to live master | `collab sendmessage --to <master> --subject blocker "<task_id; cause; proposed fix; decision needed>"` |
-| Close own notifications after the task is done | `collab notify close` |
+| Cancel one of your own notification leases | `collab notify unsubscribe <subscription-id>` |
 
 After a tmux preview, use its notification ID and abbreviated subject to weigh
 urgency against the current task. When selecting the notice, run
@@ -476,8 +476,9 @@ For subscription semantics or delivery diagnosis, read
   architecture/integration/acceptance; it does not take another peer's
   task. Workers and subagents find a solution first, then report blockers
   to master immediately; they do not wait or dump symptoms. Last owned
-  task close cancels that owner's auto-notify; `collab notify close` can
-  do the same after a leftover wake. AGY review is optional and may
+  task close cancels that owner's auto-notify; use
+  `collab notify unsubscribe <subscription-id>` for a specific leftover
+  lease. AGY review is optional and may
   degrade to Codex review or live master review; missing reviewers are
   not a blocker. Explicit
   managed subagent tasks may use the finite task-bound keepalive above;

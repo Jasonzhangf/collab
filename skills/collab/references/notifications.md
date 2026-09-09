@@ -19,16 +19,16 @@ collab notify subscribe --event async-result --subject <operation-id> \
   --ttl-seconds <bounded>
 collab notify status
 collab notify unsubscribe <subscription-id>
-collab notify close
 ```
 
 - AppSDK project initialization creates/refreshes the seven-day reusable default
   `direct-message` lease through official `collab init`. An explicit owner
   unsubscribe of that lease stays cancelled; later `register` / `context` /
   `ack` must not silently re-arm it. Last owned `collab task close` cancels
-  the owner's direct-message auto-notify. `collab notify close` cancels all
-  own armed subscriptions. After a finished task, a leftover keepalive can
-  be stopped the same way. `collab init` or
+  the owner's direct-message auto-notify. There is no `collab notify close`
+  command; cancel a specific owner-scoped lease with
+  `collab notify unsubscribe <subscription-id>`. After a finished task, the
+  task close lifecycle stops the owner's auto-notify. `collab init` or
   `collab notify subscribe --event direct-message` re-arms it for the next
   collaboration.
 - Direct-message leases are owner-scoped and reusable until expiry. Resource,
