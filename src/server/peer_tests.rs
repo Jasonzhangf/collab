@@ -1769,6 +1769,66 @@ fn daemon_restart_rebinds_stale_pane_before_restoring_default_lease() {
 }
 
 #[test]
+fn daemon_restart_rebinds_existing_deadline_without_recreating_it() {
+    let mut state = State::default();
+    state.apply(&Event::Registered {
+        worker: WorkerRec {
+            id: "peer".into(),
+            token: "token-peer".into(),
+            pane: Some("%stale".into()),
+            cwd: "/tmp".into(),
+            registered_ms: 1,
+        },
+    });
+    let original = NotificationSubscription {
+        id: "sub-goal".into(),
+        worker_id: "peer".into(),
+        event: "deadline".into(),
+        subject: Some("goal:sha256:test".into()),
+        pane: "%stale".into(),
+        method: "tmux".into(),
+        trigger_ms: Some(20_000),
+        trigger_times_ms: Vec::new(),
+        interval_ms: None,
+        repeat_count: 1,
+        fired_count: 0,
+        expires_ms: 60_000,
+        status: "armed".into(),
+        created_ms: 1,
+        updated_ms: 1,
+        status_reason: None,
+    };
+    state.apply(&Event::NotificationSubscribed {
+        subscription: original.clone(),
+    });
+
+    let events = registered_peer_rebind_events(
+        &state,
+        &|worker| (worker == "peer").then(|| "%current".into()),
+        &|worker, pane| worker == "peer" && pane == "%current",
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::NotificationRebound { subscription_id, pane, .. }
+            if subscription_id == "sub-goal" && pane == "%current"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        Event::NotificationSubscribed { subscription }
+            if subscription.id == "sub-goal"
+    )));
+    for event in &events {
+        state.apply(event);
+    }
+    let rebound = &state.notification_subscriptions["sub-goal"];
+    assert_eq!(rebound.id, original.id);
+    assert_eq!(rebound.pane, "%current");
+    assert_eq!(rebound.trigger_ms, original.trigger_ms);
+    assert_eq!(rebound.expires_ms, original.expires_ms);
+    assert_eq!(rebound.status, "armed");
+}
+
+#[test]
 fn daemon_restart_does_not_guess_between_multiple_or_unowned_panes() {
     let mut state = State::default();
     state.apply(&Event::Registered {

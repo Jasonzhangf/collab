@@ -453,6 +453,11 @@ pub enum Event {
         status: String,
         updated_ms: i64,
     },
+    NotificationRebound {
+        subscription_id: String,
+        pane: String,
+        updated_ms: i64,
+    },
     NotificationSuppressed {
         subscription_id: String,
         status: String,
@@ -633,6 +638,17 @@ impl State {
                 {
                     subscription.status = status.clone();
                     subscription.status_reason = None;
+                    subscription.updated_ms = *updated_ms;
+                }
+            }
+            Event::NotificationRebound {
+                subscription_id,
+                pane,
+                updated_ms,
+            } => {
+                if let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id)
+                {
+                    subscription.pane = pane.clone();
                     subscription.updated_ms = *updated_ms;
                 }
             }
