@@ -13,7 +13,15 @@
     "source_snapshot_digest",
     "target_epoch",
     "mapping_status",
-    "records"
+    "records",
+    "source_repo",
+    "source_branch",
+    "source_head",
+    "source_tree",
+    "archive_ref",
+    "archive_digest",
+    "created_at",
+    "updated_at"
   ],
   "properties": {
     "migration_id": {"type": "string", "minLength": 1},
@@ -36,6 +44,7 @@
     "updated_at": {"type": "string", "minLength": 1},
     "records": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -69,8 +78,98 @@
           "first_failed_boundary": {"type": ["string", "null"]},
           "created_at": {"type": "string", "minLength": 1},
           "updated_at": {"type": "string", "minLength": 1}
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": ["mapping_status"],
+              "properties": {"mapping_status": {"const": "mapped"}}
+            },
+            "then": {
+              "required": ["target_sequence", "target_entity_id"],
+              "properties": {
+                "target_sequence": {"type": "integer", "minimum": 0},
+                "target_entity_id": {"type": "string", "minLength": 1}
+              },
+              "not": {
+                "properties": {"mapping_class": {"const": "unknown"}}
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["mapping_class"],
+              "properties": {"mapping_class": {"const": "unknown"}}
+            },
+            "then": {
+              "required": ["exact_error", "first_failed_boundary"],
+              "properties": {
+                "exact_error": {"type": "string", "minLength": 1},
+                "first_failed_boundary": {"type": "string", "minLength": 1}
+              },
+              "not": {
+                "properties": {"mapping_status": {"const": "mapped"}}
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["mapping_class"],
+              "properties": {"mapping_class": {"const": "reset"}}
+            },
+            "then": {
+              "required": ["raw_archive_ref", "exact_error", "first_failed_boundary"],
+              "properties": {
+                "raw_archive_ref": {"type": "string", "minLength": 1},
+                "exact_error": {"type": "string", "minLength": 1},
+                "first_failed_boundary": {"type": "string", "minLength": 1}
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["mapping_status"],
+              "properties": {"mapping_status": {"enum": ["blocked", "rejected", "unknown"]}}
+            },
+            "then": {
+              "required": ["exact_error", "first_failed_boundary"],
+              "properties": {
+                "exact_error": {"type": "string", "minLength": 1},
+                "first_failed_boundary": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["mapping_status"],
+        "properties": {"mapping_status": {"const": "verified"}}
+      },
+      "then": {
+        "required": ["archive_ref", "archive_digest", "source_repo"],
+        "properties": {
+          "archive_ref": {"type": "string", "minLength": 1},
+          "archive_digest": {"type": "string", "minLength": 1},
+          "source_repo": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["mapping_status"],
+        "properties": {"mapping_status": {"const": "reset_required"}}
+      },
+      "then": {
+        "required": ["archive_ref", "archive_digest"],
+        "properties": {
+          "archive_ref": {"type": "string", "minLength": 1},
+          "archive_digest": {"type": "string", "minLength": 1}
         }
       }
     }
-  }
+  ]
 }

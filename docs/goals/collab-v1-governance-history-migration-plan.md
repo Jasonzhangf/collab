@@ -14,8 +14,8 @@ In scope: Collab `.agent-collab` history, AppSDK collaboration/evidence
 references, RouteCodex V3/V4 governance boundaries, and codexapp's native
 transport seam. Out of scope: repairing the dirty AppSDK or RouteCodex roots,
 rewriting RouteCodex V4, importing codexapp's Node registry, deleting old
-history, running Desktop `goal subscribe`, or production cutover before M8b
-approval.
+history, running Desktop `goal subscribe`, or production cutover before a
+separate release approval.
 
 ## Loop contract
 
@@ -33,90 +33,74 @@ The execution order is `Discover → Hand off → Verify → Persist → Schedul
 The dispatch intent and migration lease are durable before any writer or
 daemon side effect.
 
-## Milestones and worker contracts
+## Runtime prerequisite and ownership
 
-All code work starts from the current clean v1 integration branch in a new
-`playground/` worktree. Workers must report exact base/candidate/tree, allowed
+This goal owns migration of existing governance history. It does not redefine
+the runtime foundation that performs journal writes, identity checks, native
+transport, notification projection or task lifecycle. Those contracts have one
+source of truth in
+[`docs/design/collab-v1-refactor-architecture-20260909.md`](../design/collab-v1-refactor-architecture-20260909.md)
+and its R1–R5 implementation rounds. Migration starts only after the required
+rounds have exact reviewed candidate/tree receipts on the v1 integration line.
+If a receipt is missing, conflicting or not reproducible, this goal remains
+blocked at `runtime_prerequisite`; it must not reimplement that round inside a
+migration adapter.
+
+## Migration stages and worker contracts
+
+All implementation work starts from the current clean v1 integration branch in
+a new `playground/` worktree. Workers report exact base/candidate/tree, allowed
 files, tests and remaining boundaries. A failed candidate is preserved and a
 new repair worktree is based on the explicit latest integration commit.
 
-### M1 — journal/replay truth
+### S1 — inspect, classify and snapshot
 
-Owner: one GCM worker. Allowed paths are the existing server reducer, journal
-and focused contract tests. It must make append/sync/replay return typed
-outcomes, poison on ambiguous writes, preserve command idempotency and keep
-legacy missing outcomes as unknown. It must not change notification policy,
-adapters, skills or daemon bootstrap. Candidate requires focused tests, all
-targets, check, format and diff gates, then independent Astra review.
+One migration worker owns read-only inventory and classification for Collab,
+AppSDK, RouteCodex and codexapp. It records the exact checkout/data roots,
+source identity, journal/mailbox/socket digests, writer ownership and unknowns
+in the inventory evidence. It must produce a schema-valid manifest draft and
+classify each record as `direct/mapped`, `adapt/needs_reconciliation`,
+`reset_required` or `unknown`. It must not mutate any live root or start a
+daemon. The codexapp external journal and socket are mandatory inventory
+inputs even though the source directory has no `.agent-collab`.
 
-### M2–M5 — runtime foundation
+### S2 — archive, map and rebuild
 
-Run sequentially where ownership depends on M1; independent design/test work
-may run concurrently in separate worktrees:
+After S1 passes and the runtime prerequisite is available, one migration worker
+may acquire the lease and freeze legacy writers. It creates an immutable
+archive, replays only a complete direct prefix, adapts typed legacy fields,
+and creates a fresh target epoch for reset records. It re-registers stable
+identities, re-grants master only from a new user approval, imports only
+confirmed active bugs/tasks/goal state, and rebuilds JSONL/latest-state
+projections from committed facts. The worker must preserve exact errors and
+first failed boundaries and must not execute against the four live roots during
+development; copied fixtures cover corruption, duplicate, missing-owner,
+changed-cwd, dirty-candidate and unknown-outcome cases.
 
-- M2 owns the host singleton lock, global reducer, durable bindings and
-  projection seams.
-- M3 owns the native AppServer adapter: initialize/capability evidence,
-  accepted versus delivered/executed/replied/read, cursor watermark,
-  timeout/unknown lookup, stale generation and P0 stop observation.
-- M4 owns notification accumulation and project JSONL: direct messages are
-  immediate; idle/progress/delivery/bug/worker-idle updates are merged at most
-  every two minutes; one latest state is presented per entity; only the daemon
-  wakes a master; a worker `working→idle` transition is one idempotent episode;
-  three unchanged master-idle reminders stop.
-- M5 owns bug/worktree/Loop and skill contracts: active bugs enter the master
-  backlog by priority, P0 blocks the project, every fix has an independent
-  worktree/branch/review/merge/cleanup receipt, and each Loop has Trigger,
-  Work, Gate, State and Stop.
+Rollback is allowed only before the new epoch has admission or external side
+effects. Otherwise the worker freezes and supersedes the new epoch, revokes
+its bindings, fences the writer, reconciles every post-boundary fact and
+commits a reconciliation receipt before any epoch pointer changes. An unknown
+side effect or incomplete reconciliation keeps admission stopped.
 
-Each milestone has a red test before the smallest implementation and an
-independent review on the exact candidate. No milestone may claim live
-TUI/Desktop capability from mock tests.
+### S3 — independent review and no-write rehearsal
 
-### M6 — migration adapters and reset
+Astra independently reviews the exact migration candidate for schema/state
+constraints, archive immutability, idempotency, direct/adapt/reset mapping,
+unknown/error handling, rollback fencing, identity rebind and AppSDK/
+RouteCodex ownership. Any P0/P1 or owner ambiguity blocks integration. The
+integration owner then runs the replay and negative matrix with copied
+fixtures, records digests/counts/epoch/lock/projections/rollback receipt, and
+verifies that no live project root changed.
 
-Owner: one GCM worker after M1–M5 seams are available. Allowed paths are the
-migration manifest schema, server migration module, project adapters and
-focused migration tests. It must:
+### S4 — production cutover (separate approval)
 
-1. implement read-only inspect and classification for the four audited
-   projects;
-2. write an idempotent manifest keyed by source project/record/digest/epoch;
-3. preserve raw archive references and AppSDK record digests;
-4. direct-map only complete records, adapt only typed legacy fields, and mark
-   all other records reset/unknown;
-5. implement archive → new epoch → re-register/regrant → confirmed active
-   import → projection rebuild; and
-6. prove rollback by epoch pointer without deleting an archive or starting a
-   second writer.
-
-It must not execute migration against the four live roots during development.
-The first run uses copied read-only fixtures with corruption, duplicate,
-dirty-candidate, missing-owner, changed-cwd and unknown-outcome cases.
-
-### M7 — independent milestone review
-
-Astra reviews the plan and exact M6 candidate for source ownership, archive
-immutability, manifest/idempotency, direct/adapt/reset classification,
-unknown/error/poison handling, identity rebind, AppSDK/RouteCodex boundaries,
-and worktree/merge gates. Any P0/P1 or owner ambiguity blocks integration.
-
-### M8a — rehearsal
-
-The integration owner fast-forwards the reviewed candidates into a clean v1
-integration worktree, runs the full replay/negative matrix and a no-write
-rehearsal using copied fixtures. It records source and target digests, counts,
-epoch, lock owner, projections and rollback receipt. The old project roots and
-their daemons remain untouched.
-
-### M8b — production cutover (separate approval)
-
-Only after a separate explicit release approval: freeze each source, archive,
-install the exact reviewed build, restart one singleton daemon, rebind TUI and
-Desktop endpoints, and run real bidirectional send/read/reply, continuation,
-P0 stop, notification batching, bug backlog and Loop smoke tests. Any failure,
-unknown or P0/P1 halts the sequence. Main replacement, push, global install,
-daemon restart and cleanup are separate receipts.
+Only after a separate release approval may the owner freeze each live source,
+archive it, install the exact reviewed build, restart the single daemon,
+rebind TUI/Desktop endpoints, run real bidirectional transport and notification
+/bug/Loop smoke tests, and then record push and cleanup receipts. Any failure,
+unknown or P0/P1 halts the sequence. Main replacement, push, install, restart,
+replay and cleanup remain separate evidence facts.
 
 ## Project-specific runbooks
 
@@ -152,10 +136,11 @@ epoch.
 ### codexapp
 
 Create a source snapshot and digest because there is no Git or Collab history.
-Port only `app-server-adapter.js`/WebSocket transport behavior behind the M3
-adapter seam. Require native initialize/capability evidence and a real TUI or
-Desktop endpoint before registration. The Mock adapter and the two Node tests
-are fixtures, not migration evidence.
+Port only `app-server-adapter.js`/WebSocket transport behavior behind the
+native adapter seam defined by the canonical R3 round. Require native
+initialize/capability evidence and a real TUI or Desktop endpoint before
+registration. The Mock adapter and the two Node tests are fixtures, not
+migration evidence.
 
 ## Failure handling and operator escalation
 
@@ -180,8 +165,14 @@ The goal is complete only when every selected project has one of:
   graph, identity rebind and projection rebuild all pass;
 - `archived/reset`: immutable archive and new epoch pass, imported active facts
   are reconciled, and unresolved records are explicitly blocked; or
-- `operator_required`: the exact unresolved source fact and next decision are
-  recorded, with admission frozen.
+- an explicitly approved scope exclusion recorded with its owner, reason and
+  approval evidence.
+
+`needs_operator`, `reset_required` and `aborted` mean that an attempt stopped;
+they are blocked/incomplete states and do not satisfy the goal. A project is
+complete after reset only when its immutable archive, fresh epoch, confirmed
+active import and reconciliation receipt have all passed. `needs_operator` is
+therefore a handoff to the user, not a success status.
 
 The following do not satisfy completion: a file named `migration`, a historical
 PASS, an empty PID, a mock test, a goal projection, a mailbox ACK, a worker

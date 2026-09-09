@@ -1,9 +1,12 @@
 # Governance history migration to the Collab v1 global daemon
 
-Status: implementation contract for the v1 refactor. The inventory below is a
-read-only snapshot taken on 2026-09-09. Counts, PIDs, branches and live
-bindings are observations with an expiry time; they are not durable claims that
-the migration has already run.
+Status: migration-specific contract. Runtime ownership and implementation
+milestones remain in the canonical v1 refactor design. The inventory below is a
+read-only snapshot captured at `2026-09-09T16:12:32Z`; the command transcript and
+digests are in
+[`docs/evidence/governance-history-inventory-20260909.md`](./evidence/governance-history-inventory-20260909.md).
+Counts, PIDs, branches and live bindings are observations with an expiry time;
+they are not durable claims that the migration has already run.
 
 ## Decision
 
@@ -30,10 +33,10 @@ second daemon or converts an unknown result into success.
 
 | Project | Observed source and state | Migration decision |
 |---|---|---|
-| Collab | `/Volumes/extension/code/collab` contains the v1 integration branch `codex/v1-collab-refactor-main-20260909` at `ac54d09dcab14ec35d5a5291207af9edda00fcf7`; its `.agent-collab/server/journal.jsonl` had 72 lines and `events.jsonl` 442 lines at inspection. The journal includes a prior `MigrationUpdated` record with `from_version=v1-legacy`, `to_version=v1-low-intervention`, `phase=verified`. The v2 branch `codex/v2-cordis-architecture` is dirty and ahead of its remote with untracked governance/evidence files. The root has about 98 playground directories. `server.pid` and `daemon.lock` were empty, so current liveness and single-writer ownership are unknown. | The complete, hash-valid v1 journal prefix can be migrated directly after replay validation. Legacy role/heartbeat/continuation fields are adapted and discarded. v2 untracked records and playgrounds are archived as source evidence, not imported as active state. Any duplicate writer, malformed record, unresolved wait/owner or dirty candidate is `reset_required`. |
+| Collab | `/Volumes/extension/code/collab` contains the v1 integration branch `codex/v1-collab-refactor-main-20260909` at `ac54d09dcab14ec35d5a5291207af9edda00fcf7`; its `.agent-collab/server/journal.jsonl` had 72 lines (digest `c47e0f95…1fffc83`) and `events.jsonl` 442 lines (digest `08b65142…7999b1f`) at the snapshot. The journal includes a prior `MigrationUpdated` record with `from_version=v1-legacy`, `to_version=v1-low-intervention`, `phase=verified`. The v2 branch `codex/v2-cordis-architecture` is dirty and ahead of its remote with untracked governance/evidence files. The root has 98 playground directories. `server.pid` and `daemon.lock` were empty, so current liveness and single-writer ownership are unknown. | The complete, hash-valid v1 journal prefix can be migrated directly after replay validation. Legacy role/heartbeat/continuation fields are adapted and discarded. v2 untracked records and playgrounds are archived as source evidence, not imported as active state. Any duplicate writer, malformed record, unresolved wait/owner or dirty candidate is `reset_required`. |
 | AppSDK | `/Users/fanzhang/Documents/github/appsdk` is on `chore/project-memory-snapshot` at `2d14efed9d7f6454d119cb7a1aea24a384e966e0` with unresolved `UU`/`DU` paths in maps, migration contract, integration docs, Rust CLI and smoke tests. The root has `.appsdk-control/long-task-goal.json` with `active=false`, `desired=recovery_required`, `remote_state=unknown`, `GOAL_STATUS_SUBSCRIPTION_ID_MISSING` and `GOAL_SUBJECT_RECONCILIATION_FAILED`; it has no `.appsdk/` directory in this checkout. `.agent-collab` contains 98 run files, 541 mailbox files, 999 review files, 3 claims and 2 handoffs. | Do not migrate this dirty root as an active quality candidate. Preserve the AppSDK contract/migration files and collaboration records as references. Import only verified record references after the AppSDK owner resolves conflicts. A Collab reset must not delete or rewrite AppSDK source, contracts, Active or Protected history. |
-| RouteCodex | `/Users/fanzhang/Documents/github/routecodex` is on `codex/root-dirty-recovery-0908` at `d876adea1d5c57a73cf643f5c8d89b56bd3d42c4` with extensive staged and unstaged changes across `.appsdk`, V3 and UI files. `.agent-collab/server/journal.jsonl` had 39,162 lines, `events.jsonl` 26,086 and `log.txt` 70,212; `server.pid` and `daemon.lock` were empty. The `.appsdk` project declares protected/active/generated zones and an `appsdk-0.1.5-to-0.1.6` migration record with four map digests. Project memory records V3 as the production baseline and V4 as an architecture/refactor surface; this distinction is not inferred from filenames. | Keep AppSDK quality records under RouteCodex/AppSDK ownership and import only immutable references. Migrate Collab coordination facts only after journal prefix/count/hash and owner checks. V3 active evidence can be referenced; V4 experiments and dirty worktrees are archive/adapt inputs, never active runtime state. The existing `reset-governance --discard-legacy` command is a separate AppSDK operation and is not a substitute for Collab migration. |
-| codexapp | `/Users/fanzhang/Documents/github/codexapp` has no `.git`, no `.agent-collab`, and only a Node transport prototype (`src/bridge.js`, `src/app-server-adapter.js`, `src/ws-jsonrpc.js`, JSONL helper and two test files). The tests use `MockAppServerAdapter`; the six-test run observed earlier proves an in-memory bridge only. A later `npm test -- --runInBand` invocation failed at Node argument parsing (`bad option: --runInBand`), so that command is not test evidence. | Treat codexapp as a new transport endpoint bootstrap. Snapshot and hash the native adapter seam, then register it with Collab after capability negotiation. Do not import its in-memory registry, role, message, scheduler or mock receipts. |
+| RouteCodex | `/Users/fanzhang/Documents/github/routecodex` is on `codex/root-dirty-recovery-0908` at `d876adea1d5c57a73cf643f5c8d89b56bd3d42c4` with extensive staged and unstaged changes across `.appsdk`, V3 and UI files. `.agent-collab/server/journal.jsonl` had 39,190 lines (digest `905e96be…108aca`), `events.jsonl` 26,086 (digest `00a35bf5…8edd6`) and `log.txt` 70,558 at the snapshot; `server.pid` and `daemon.lock` were empty. The `.appsdk` project declares protected/active/generated zones and an `appsdk-0.1.5-to-0.1.6` migration record with four map digests. Project memory records V3 as the production baseline and V4 as an architecture/refactor surface; this distinction is not inferred from filenames. | Keep AppSDK quality records under RouteCodex/AppSDK ownership and import only immutable references. Migrate Collab coordination facts only after journal prefix/count/hash and owner checks. V3 active evidence can be referenced; V4 experiments and dirty worktrees are archive/adapt inputs, never active runtime state. The existing `reset-governance --discard-legacy` command is a separate AppSDK operation and is not a substitute for Collab migration. |
+| codexapp | `/Users/fanzhang/Documents/github/codexapp` has no `.git`, no `.agent-collab`, and only a Node transport prototype (`src/bridge.js`, `src/app-server-adapter.js`, `src/ws-jsonrpc.js`, JSONL helper and two test files). Its external runtime state is `/Users/fanzhang/.codex-communication/journal.jsonl` (54 lines, digest `c3d995d8…f485a4`) and `/Users/fanzhang/.codex-communication/sockets/commd.sock` (socket exists; writer ownership was not proven). The tests use `MockAppServerAdapter`; the six-test run observed earlier proves an in-memory bridge only. A later `npm test -- --runInBand` invocation failed at Node argument parsing (`bad option: --runInBand`), so that command is not test evidence. | Treat codexapp as a new transport endpoint bootstrap. Inspect and archive the external journal/socket before registration. Snapshot and hash the native adapter seam, then register it with Collab after capability negotiation. Do not import its in-memory registry, role, message, scheduler or mock receipts. |
 
 The inventory intentionally records `unknown` where an empty PID or missing
 directory cannot prove absence. A later `inspect` must refresh these values
@@ -71,6 +74,15 @@ Repeating inspect or apply with that key returns the existing mapping and
 outcome. It cannot create another task, bug, message, claim, wake or
 notification. A changed digest is a new source record or a conflict; it is
 never overwritten in place.
+
+For a `mapped` record, `target_sequence` and `target_entity_id` are mandatory,
+and `target_epoch` must equal the manifest `target_epoch`. The schema checks
+presence; the reducer checks equality, uniqueness and monotonic ordering. An
+`unknown` record can never be marked `mapped`. A `verified` manifest must carry
+an explicit non-empty source identity and immutable archive reference, even
+when the source is a non-Git path such as codexapp. Source/target identity
+fields are required to be present in every manifest; a non-Git source uses an
+explicit `null` branch/head/tree rather than omitting those fields.
 
 `target_epoch` is a new immutable epoch for every reset or schema cutover.
 `target_sequence` is allocated by the global journal writer. Old source
@@ -153,10 +165,14 @@ Reset is a controlled new epoch, not deletion:
    active-bug priority order, P0 stop policy and one-writer lock. Only then
    resume admission.
 
-Rollback changes the active epoch pointer to the previous verified epoch. It
-does not delete the archive, rewrite the journal or start a second writable
-daemon. If rollback itself is unknown, stop admission and request an operator
-decision.
+Rollback is a fenced transition. First freeze the new epoch, mark it
+`superseded/aborted`, revoke its active bindings and stop its projections, then
+reconcile any facts already appended after the epoch boundary. Only after the
+reconciliation receipt is committed may the active epoch pointer switch to the
+previous verified epoch. The archive and both journals remain immutable; no
+second writer is started. If the new epoch has an unknown side effect or the
+reconciliation is incomplete, keep admission stopped and request an operator
+decision instead of switching pointers.
 
 ## Error and retry contract
 
@@ -198,6 +214,20 @@ generation mutations. TUI may use tmux as wake evidence; Desktop uses its
 AppServer endpoint and never invents a tmux identity. `mcp_session_id` is query
 context only.
 
+## Runtime prerequisite and ownership
+
+This document owns only governance-history migration: inspect, classify,
+snapshot/archive, direct/adapt/reset mapping, reconciliation, rollback fencing
+and cutover evidence. It does not redefine the runtime foundation. The unique
+runtime contract is
+[`docs/design/collab-v1-refactor-architecture-20260909.md`](./design/collab-v1-refactor-architecture-20260909.md),
+which owns R1 identity/scope, R2 journal/reducer and daemon, R3 native
+adapters, R4 notification projection, and R5 bug/worktree/Loop integration.
+The migration controller may start only after the exact reviewed candidate and
+tree receipts for the required runtime rounds are available. A missing,
+conflicting or non-reproducible receipt leaves migration admission stopped; it
+does not create a second implementation of those rounds.
+
 ## Project execution order
 
 Migration itself is a finite Loop for every project:
@@ -212,19 +242,26 @@ Stop: verified target epoch, or frozen needs_operator/reset_required; never a
       timer-only retry and never a second daemon
 ```
 
-The implementation order on the v1 integration branch is:
+The migration-specific stages are:
 
-1. M1 journal writer/replay fail-closed and typed outcomes.
-2. M2 singleton daemon, durable binding and projection seams.
-3. M3 native TUI/Desktop adapter and cursor/operation lookup.
-4. M4 notification/mailbox projector and master-only wake policy.
-5. M5 bug, worktree and Loop contracts.
-6. M6 migration manifest, per-project adapters and reset archive/rebuild.
-7. M7 isolated replay/negative tests and Astra milestone review.
-8. M8a candidate integration and cutover rehearsal in a clean worktree.
-9. M8b, only after explicit release approval: replace main, push, install,
-   restart the singleton daemon, rebind endpoints, run real TUI/Desktop replay,
-   verify notifications/bugs/Loops, and clean worktrees with receipts.
+1. **Inspect and classify.** Refresh each source checkout, data root, writer
+   ownership, journal prefix and digest. Classify every record as
+   `direct/mapped`, `adapt/needs_reconciliation`, `reset_required` or
+   `unknown`; do not acquire a write lease while any source fact is unresolved.
+2. **Archive and map.** Acquire one migration lease, freeze legacy writers,
+   create an immutable archive, and write the schema-validated manifest. Replay
+   only the complete direct prefix; adapt legacy fields without retaining their
+   authority; keep reset and unknown records archive-only with exact error and
+   first-failed-boundary evidence.
+3. **Reconcile and rehearse.** Create a fresh target epoch, re-register live
+   identities and grants, import only confirmed active bugs/tasks/goal state,
+   rebuild JSONL/latest-state projections, and run corruption, duplicate,
+   missing-owner, changed-cwd, unknown-outcome and rollback tests on copied
+   fixtures. No live project root is changed during rehearsal.
+4. **Cut over after approval.** Only after a separate release approval may the
+   owner freeze each live source, archive it, install the exact reviewed build,
+   restart the one daemon, rebind endpoints, replay real TUI/Desktop and
+   notification/bug/Loop paths, then record push and cleanup receipts.
 
 Every implementation round uses a clean `playground/` worktree from the
 current integration branch, a single owner, independent review and exact
@@ -237,8 +274,9 @@ This document does not claim that migration or cutover has run. The following
 remain live gates: current daemon PID/socket ownership, complete source hashes,
 journal corruption classification, per-record owner mapping, real AppServer
 capability negotiation, cursor continuation, P0 stop observation, two-minute
-notification batching, reset archive receipt and post-restart replay. The GCM
-workers that were supposed to produce M1 and the detailed audit were interrupted
-by `unexpected status 502 Bad Gateway: network error, url:
+notification batching, reset archive receipt and post-restart replay. Earlier
+runtime worker attempts and the detailed audit were interrupted by
+`unexpected status 502 Bad Gateway: network error, url:
 http://127.0.0.1:4444/v1/responses`; their partial output is retained as a
-blocker, not a PASS.
+blocker, not a PASS. A later fallback candidate still needs its own independent
+review and runtime prerequisite receipt before migration admission can open.
