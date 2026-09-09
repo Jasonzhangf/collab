@@ -121,15 +121,39 @@ route_scope = (app_scope_id, project_scope_id)
 - `app_scope_id` identifies one logical AppServer instance. TUI and Desktop
   attached to different AppServers have different app scopes, even when they
   use the same project directory.
-- `project_scope_id` is derived from the normalized, exact project `cwd`.
-  Different `cwd` values are different project scopes, even under one
-  AppServer.
+- `project_scope_id` is derived from the normalized, exact **registered
+  project root `cwd`** supplied by an AppServer registration. Different
+  registered project roots are different project scopes, even under one
+  AppServer. The task worktree `cwd` is an execution location, not a new
+  project registration.
 - Same project with different AppServers is the same project scope but a
   different app scope.
 - `codex_app` and `codex_tui` are endpoint attributes, never scope identity.
 
 Every message and task command carries the sender binding and target
 `route_scope`. The daemon checks both levels before persisting a command.
+
+An implementation worktree is bound explicitly at dispatch:
+
+```text
+WorktreeBinding {
+  worktree_root,
+  owning_project_scope,
+  task_id,
+  owner_agent_id,
+  binding_id,
+  base_commit
+}
+```
+
+The daemon verifies that the worker's exact execution path matches this
+durable binding and that the path is an allowed `playground/` worktree. A
+worker may therefore report to its dispatching master even when its process
+`cwd` is the worktree path: that path is authorized by the parent task, not
+treated as an independently registered project. A path with no binding, a
+binding for another project, or a client-supplied ancestor guess is rejected.
+Ordinary peer-to-peer scope checks still use the registered project root and
+continue to reject cross-project communication.
 
 ### Stable identity versus an execution instance
 
@@ -264,8 +288,8 @@ ownership of another peer's worktree.
 | Sender → target | Same app + same project | Same app + different project | Different app scope | Cross project |
 | --- | --- | --- | --- | --- |
 | master → master | explicit coordination or bug reference | master-only coordination | master-only coordination | master-only command with target verification |
-| master → own worker/subagent | allowed through durable dispatch/message | rejected | rejected | rejected |
-| worker → own master/parent | allowed | rejected | rejected | rejected |
+| master → own worker/subagent | allowed through durable dispatch/message | allowed only through an active `WorktreeBinding` and parent grant | allowed only through an active `WorktreeBinding` and parent grant | rejected |
+| worker → own master/parent | allowed through the active task/binding | allowed only through the active task/binding | allowed only through the active task/binding | rejected |
 | peer → peer | allowed only when same project and both are independent peers; no inherited-subagent shortcut | rejected | rejected | rejected |
 | subagent → sibling/non-parent subagent | rejected | rejected | rejected | rejected |
 | Desktop → daemon | allowed after registered binding and user master grant where required | scope checked | scope checked | scope checked |
@@ -304,10 +328,20 @@ batched notification path.
   sends one reminder, and stops the episode after three consecutive reminders
   without an observed return to `working`. It does not stack reminders.
 - `working`, `unknown`, absent, stale or unverified runtime states do not accept
-  an operational wake. Unknown is diagnostic, never permission to retry.
-- A P0 notification may use the immediate policy. Immediate means it is
-  submitted to the adapter now; it does not imply that a working model turn is
-  interrupted.
+  an ordinary operational wake. Unknown is diagnostic, never permission to
+  retry.
+- A P0 issue is the only exception. Its durable record names the affected
+  project scope, target master `binding_id`, `endpoint_generation` and active
+  `turn_id`. The daemon submits one typed adapter interrupt request for that
+  exact generation/turn and records `accepted`, `failed` or `unknown`.
+  `accepted` is still not proof that the turn stopped: a separate observation
+  of the native stop/cancel result is required. `queued` or a normal immediate
+  message is never recorded as `interrupted`.
+- While an affected P0 remains unresolved, ordinary new dispatches in that
+  project scope are rejected. Only a remediation dispatch explicitly linked to
+  the P0 bug is allowed. An adapter that cannot interrupt returns an explicit
+  failure/unknown and leaves the P0 pending; it does not retry through tmux or
+  invent a stopped turn.
 - Timer ticks with unchanged accumulator state do not append a journal event.
 
 The accumulator stores only reasons, IDs and revisions. It never copies full
@@ -343,20 +377,33 @@ The per-round sequence is:
 ```text
 create clean worker worktree
 → reproduce and implement
+→ sync the current refactor branch into the worker worktree
 → candidate tests/build
 → independent review
-→ sync current refactor branch
-→ re-run affected gates on the exact candidate
-→ merge into refactor branch
+→ deliver the unchanged reviewed candidate
+→ merge that exact candidate into refactor branch
 → refactor-branch tests/build
 → push the refactor branch when authorized
 ```
 
-After all rounds pass, the final integration candidate must be checked against
-the latest `origin/main`, reviewed again if its tree changed, verified on the
-real public entrypoint, installed through the canonical path, and used to
-restart the one daemon. Only then may the release owner replace `main`, push
-the remote main ref, remove the refactor branch/worktrees, and close tasks.
+The sync happens before candidate verification and review. If the integration
+branch advances after review, the candidate must be rebased or merged again,
+then the affected tests and independent review must run on the new commit/tree
+before integration. A merge conflict resolution is a source change and cannot
+reuse the old review.
+
+After all rounds pass, the refactor branch is **integration-ready** when every
+candidate is reviewed and merged, required work is accounted for, and each
+worker worktree is clean or has an explicit open cleanup obligation. Cleanup
+receipts are not a prerequisite for this intermediate state.
+
+The release owner then syncs the refactor branch with the latest `origin/main`,
+runs the final verification and independent review on the exact resulting
+tree, verifies the real public entrypoint, pushes the tested main ref, installs
+the canonical binary and restarts the one daemon. Only after those mainline
+receipts may task owners perform their normal merged-task cleanup/close and may
+the owner remove the refactor branch and its worktrees. A cleanup receipt is a
+post-main delivery fact, never a pre-main permission to replace `main`.
 
 ## Error and recovery contract
 
@@ -433,32 +480,41 @@ round.
 ### R1 — runtime identity, scope and command envelope
 
 Owner: one GCM worker. Allowed paths: `src/identity.rs`, `src/scope.rs`,
-`src/proto.rs`, their focused tests and the matching contract docs. Establish
-`agent_id`/`runtime_id`/`binding_id`/generation, two-level scope, user-granted
-master capability and typed command IDs without changing task semantics.
+`src/proto.rs`, their focused tests and the matching contract docs. R1 only
+adds compileable typed fields, serialization and pure validation helpers for
+`agent_id`/`runtime_id`/`binding_id`/generation, two-level scope and
+`command_id`/`operation_id`. It does not claim durable ownership, write the
+journal, or enforce a master grant. Its done-iff is type/serialization/negative
+validation evidence with no task-state behavior change.
 
 ### R2 — global daemon and single reducer
 
 Owner: one GCM worker after R1. Allowed paths: `src/server/mod.rs`,
 `src/server/state.rs`, `src/config.rs`, daemon tests and protocol fixtures.
-Implement one resident writer, replay/sequence/idempotency and explicit
-journal errors. The worker must not add a second storage format.
+R2 is the sole owner of durable `WorktreeBinding`, master-grant enforcement,
+replay/sequence/idempotency, one resident writer and explicit journal errors.
+It consumes the R1 types and must not add a second storage format.
 
 ### R3 — AppServer adapters and real bidirectional Loop
 
-Owner: one GCM worker after R1/R2. Allowed paths: adapter modules,
+Owner: one GCM worker after R2. Allowed paths: new `src/adapters/` modules,
 `src/client.rs`, `src/bin/collab-mcp.rs`, adapter tests and replay fixtures.
-Map TUI and Desktop AppServer operations into the same typed surface; tmux is
-optional. Prove both directions with separate request/turn/cursor evidence and
-negative stale/unknown/timeout cases.
+R3 owns adapter detection/submission and the native P0 interrupt mapping; it
+does not edit reducer state or notification scheduling. Map TUI and Desktop
+AppServer operations into the same typed surface; tmux is optional. Prove both
+directions with separate request/turn/cursor evidence and negative
+stale/unknown/timeout/wrong-turn cases.
 
 ### R4 — notification accumulator, batching and JSONL projection
 
 Owner: one GCM worker after R2. Allowed paths: `src/server/timers.rs`,
-`src/server/keepalive.rs`, `src/server/knock.rs`, mailbox projector modules,
-notification tests and `skills/collab/references/notifications.md`.
-Implement two-minute batching, latest-state presentation, raw JSONL retention,
-master-only wake, worker idle episode idempotency and three-reminder stop.
+`src/server/keepalive.rs`, `src/server/knock.rs`, new
+`src/server/mailbox.rs`, notification tests and
+`skills/collab/references/notifications.md`. R4 owns only the accumulator,
+JSONL projection and wake policy; it consumes the R2 reducer interface and
+does not modify identity/role enforcement. Implement two-minute batching,
+latest-state presentation, raw JSONL retention, master-only wake, worker idle
+episode idempotency and three-reminder stop.
 
 ### R5 — bug/worktree/Loop integration and skill contract
 
@@ -494,14 +550,17 @@ The final branch is ready to replace `main` only when all of these are true:
    positive and negative tests across both scope levels.
 3. TUI ↔ Desktop AppServer communication passes both directions on the real
    entrypoints; stale binding, wrong turn, timeout/unknown and recovery cases
-   fail closed.
+   fail closed, and a working-turn P0 test observes an actual native stop
+   before the remediation dispatch continues.
 4. Master-only wake, worker-idle episode deduplication, two-minute batching,
    latest-state presentation, JSONL retention and three-reminder stop pass.
 5. Bug priority, independent worktree, review, merge, push, install, daemon
    restart, live replay and cleanup evidence are all separately recorded.
 6. The final candidate is based on the latest `origin/main`, the exact merged
-   tree has been reviewed, the remote ref is verified, and no unmerged
-   refactor worktree or branch contains required work.
+   tree has been reviewed, the remote ref is verified, and every unmerged
+   refactor worktree/branch is either clean and explicitly retained for
+   post-main cleanup or proven to contain no required work. Final task close
+   still requires the separate mainline cleanup receipt.
 
 No source implementation is considered complete from this design document
 alone. The next action is Astra's independent design review of this contract;
