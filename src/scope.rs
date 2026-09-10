@@ -49,12 +49,11 @@ impl HostPaths {
             )
         };
         let mut paths = Self::from_state_root(state_root)?;
-        if let Some(value) = first_env_path([COLLAB_SOCKET_PATH_ENV, COLLAB_HOST_SOCKET_ENV])? {
-            paths.socket_path = value;
-        }
-        if let Some(value) = first_env_path([COLLAB_LOCK_PATH_ENV, COLLAB_HOST_LOCK_ENV])? {
-            paths.lock_path = value;
-        }
+        apply_endpoint_overrides(
+            &mut paths,
+            first_env_path([COLLAB_SOCKET_PATH_ENV, COLLAB_HOST_SOCKET_ENV])?,
+            first_env_path([COLLAB_LOCK_PATH_ENV, COLLAB_HOST_LOCK_ENV])?,
+        )?;
         Ok(paths)
     }
 
@@ -113,6 +112,38 @@ impl HostPaths {
     pub fn ensure_root(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.state_root)
     }
+}
+
+fn apply_endpoint_overrides(
+    paths: &mut HostPaths,
+    socket_override: Option<PathBuf>,
+    lock_override: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    if let Some(value) = socket_override {
+        let parent = value.parent().ok_or_else(|| {
+            anyhow::anyhow!("host socket path has no parent: {}", value.display())
+        })?;
+        if parent != paths.state_root() {
+            anyhow::bail!(
+                "host socket path must be inside host state root {}: {}",
+                paths.state_root().display(),
+                value.display()
+            );
+        }
+        paths.socket_path = value;
+    }
+    if let Some(value) = lock_override {
+        let expected = paths.state_root().join("daemon.lock");
+        if value != expected {
+            anyhow::bail!(
+                "host lock path must be {} so client and daemon share one lock owner: {}",
+                expected.display(),
+                value.display()
+            );
+        }
+        paths.lock_path = value;
+    }
+    Ok(())
 }
 
 fn first_env_path<const N: usize>(names: [&str; N]) -> anyhow::Result<Option<PathBuf>> {
@@ -877,6 +908,30 @@ mod tests {
     fn host_endpoint_rejects_relative_state_roots() {
         let error = HostPaths::for_state_root("collab-state").unwrap_err();
         assert!(error.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn host_endpoint_rejects_split_socket_root() {
+        let root = test_root("host-socket-split");
+        let mut paths = HostPaths::for_state_root(&root).unwrap();
+        let error = apply_endpoint_overrides(
+            &mut paths,
+            Some(root.join("nested").join("server.sock")),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("inside host state root"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn host_endpoint_rejects_split_lock_owner() {
+        let root = test_root("host-lock-split");
+        let mut paths = HostPaths::for_state_root(&root).unwrap();
+        let error =
+            apply_endpoint_overrides(&mut paths, None, Some(root.join("other.lock"))).unwrap_err();
+        assert!(error.to_string().contains("one lock owner"));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -50,6 +50,10 @@ const TASK_STATUSES: [&str; 12] = [
     "cancelled",
 ];
 const MAX_WORKTREE_PATH_BYTES: usize = 80;
+/// Lock used by releases before the host-scoped state directory existed.
+/// A new daemon must fence this writer before it replays the project journal;
+/// otherwise an old binary could append concurrently under the new socket.
+const LEGACY_HOST_DAEMON_LOCK_PATH: &str = "/tmp/collab-host.lock";
 
 fn sanitize_identifier(value: &str) -> String {
     value
@@ -6634,6 +6638,85 @@ fn acquire_daemon_lock(lock_path: &Path, socket_path: &Path) -> anyhow::Result<s
     }
 }
 
+fn probe_lock(lock_path: &Path) -> anyhow::Result<bool> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        let unlock = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        if unlock != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
+    ) {
+        return Ok(true);
+    }
+    Err(error.into())
+}
+
+fn probe_legacy_socket(socket_path: &Path) -> anyhow::Result<bool> {
+    match crate::client::connect(socket_path) {
+        Ok(stream) => {
+            drop(stream);
+            Ok(true)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(anyhow::Error::new(error)),
+    }
+}
+
+/// Reject startup while a pre-host-endpoint daemon can still write the same
+/// project journal.  Stale sockets are preserved and are safe to classify as
+/// absent only when the connection probe returns `NotFound` or
+/// `ConnectionRefused`; any other probe error is unknown and fails closed.
+fn ensure_legacy_writer_absent(scope: &Scope, host_paths: &HostPaths) -> anyhow::Result<()> {
+    let project_server_dir = scope.server_dir();
+    let legacy_socket = project_server_dir.join("server.sock");
+    if legacy_socket != host_paths.socket_path() && probe_legacy_socket(&legacy_socket)? {
+        anyhow::bail!(
+            "DAEMON_MIGRATION_REQUIRED: legacy project daemon is reachable at {}; stop or migrate it before starting the host daemon",
+            legacy_socket.display()
+        );
+    }
+
+    let legacy_project_lock = project_server_dir.join("daemon.lock");
+    if legacy_project_lock != host_paths.lock_path() && probe_lock(&legacy_project_lock)? {
+        anyhow::bail!(
+            "DAEMON_MIGRATION_REQUIRED: legacy project daemon lock is held at {}; stop or migrate it before starting the host daemon",
+            legacy_project_lock.display()
+        );
+    }
+
+    let legacy_host_lock = Path::new(LEGACY_HOST_DAEMON_LOCK_PATH);
+    if probe_lock(legacy_host_lock)? {
+        anyhow::bail!(
+            "DAEMON_MIGRATION_REQUIRED: legacy host daemon lock is held at {}; stop or migrate it before starting the host daemon",
+            legacy_host_lock.display()
+        );
+    }
+    Ok(())
+}
+
 fn same_inode(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     left.dev() == right.dev() && left.ino() == right.ino()
@@ -6709,6 +6792,12 @@ async fn run_with_host_paths(scope: Scope, host_paths: HostPaths) -> anyhow::Res
     // roots still select their own journal/reducer storage, but never another
     // socket or a second host writer.
     let _lock_file = acquire_daemon_lock(&host_paths.lock_path(), &sock_path)?;
+
+    // Check legacy endpoints only after the current host lock is acquired. If
+    // the compatibility fixture uses the legacy path as its host path, the
+    // normal duplicate-daemon error remains authoritative; a real host-path
+    // migration still reaches this fence because its lock is distinct.
+    ensure_legacy_writer_absent(&scope, &host_paths)?;
 
     prepare_socket_path(&sock_path)?;
 
@@ -6904,6 +6993,55 @@ mod startup_tests {
             "startup failure must remove the socket it just published"
         );
 
+        std::fs::remove_dir_all(root).expect("remove startup test root");
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_a_reachable_legacy_project_daemon() {
+        let _startup_test_lock = startup_test_lock();
+        let root = test_root("legacy-socket");
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        host_paths.ensure_root().unwrap();
+        let legacy_socket = root.join(".agent-collab/server/server.sock");
+        let listener = UnixListener::bind(&legacy_socket).expect("bind legacy socket");
+
+        let error = run_with_host_paths(Scope { root: root.clone() }, host_paths.clone())
+            .await
+            .expect_err("a reachable legacy daemon must be fenced");
+        assert!(error.to_string().contains("DAEMON_MIGRATION_REQUIRED"));
+        assert!(error.to_string().contains("legacy project daemon"));
+        assert!(!host_paths.socket_path().exists());
+        assert!(legacy_socket.exists());
+
+        drop(listener);
+        std::fs::remove_dir_all(root).expect("remove startup test root");
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_a_held_legacy_project_lock() {
+        let _startup_test_lock = startup_test_lock();
+        let root = test_root("legacy-lock");
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        host_paths.ensure_root().unwrap();
+        let legacy_lock = root.join(".agent-collab/server/daemon.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&legacy_lock)
+            .expect("open legacy lock");
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test must hold the legacy lock");
+
+        let error = run_with_host_paths(Scope { root: root.clone() }, host_paths.clone())
+            .await
+            .expect_err("a held legacy writer lock must be fenced");
+        assert!(error.to_string().contains("DAEMON_MIGRATION_REQUIRED"));
+        assert!(error.to_string().contains("legacy project daemon lock"));
+        assert!(!host_paths.socket_path().exists());
+
+        drop(lock_file);
         std::fs::remove_dir_all(root).expect("remove startup test root");
     }
 
