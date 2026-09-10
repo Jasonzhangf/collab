@@ -615,6 +615,23 @@ impl Server {
                 "envelope scope does not match binding route scope".into(),
             ));
         }
+        if let Some(project) = st.global.lookup_project(&registration.project_scope) {
+            let bound_apps = project
+                .runtime_bindings
+                .values()
+                .map(|current| current.app_scope_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let ambiguous_existing_owner =
+                bound_apps.len() > 1 || (bound_apps.is_empty() && project.registrations.len() > 1);
+            let different_existing_owner =
+                bound_apps.len() == 1 && !bound_apps.contains(binding.app_scope_id.as_str());
+            if ambiguous_existing_owner || different_existing_owner {
+                return Err(notification_contract::JournalError::InvalidCommand(format!(
+                    "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: resident project {} already has a different or ambiguous runtime app owner",
+                    registration.project_scope.as_str()
+                )));
+            }
+        }
         let mut next = st.global.clone();
         for event in typed.command.global_events() {
             event.apply(&mut next).map_err(|error| {
@@ -7351,6 +7368,87 @@ mod host_route_registry_tests {
         assert_eq!(state.revision, before_revision);
         drop(state);
         assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delayed_second_app_register_is_rejected_without_resident_mutation() {
+        let (server, root, journal_path) = test_server();
+        let project_scope = GlobalState::canonical_project_scope(&root).unwrap();
+        let first_context = context_with_app(&root, "app-a");
+        let second_context = context_with_app(&root, "app-b");
+        let first_request = Req::Register {
+            worker_id: "worker-a".into(),
+            token: "token-worker-a".into(),
+            pane: Some("%worker-a".into()),
+            cwd: root.display().to_string(),
+        };
+        let second_request = Req::Register {
+            worker_id: "worker-b".into(),
+            token: "token-worker-b".into(),
+            pane: Some("%worker-b".into()),
+            cwd: root.display().to_string(),
+        };
+
+        // Both wire requests can pass host admission before either handler
+        // reaches the typed commit boundary.
+        assert!(validate_request_context(&server, &first_request, Some(&first_context)).is_ok());
+        assert!(validate_request_context(&server, &second_request, Some(&second_context)).is_ok());
+
+        let first = server
+            .typed_register_envelope_for_scope(
+                "worker-a",
+                "token-worker-a",
+                "%worker-a",
+                project_scope.clone(),
+                &root.display().to_string(),
+                AppServerId::new("app-a").unwrap(),
+                false,
+            )
+            .unwrap();
+        server.typed_dispatch(first).unwrap();
+
+        let before_second_journal = std::fs::read(&journal_path).unwrap();
+        let before_second_state = {
+            let state = server.state.lock().unwrap();
+            (
+                state.revision,
+                state.sequence,
+                state.workers.clone(),
+                state.global.clone(),
+            )
+        };
+
+        // The delayed handler builds its envelope after app-a committed, so
+        // its expected revision is current and a revision-only CAS cannot
+        // detect the stale route admission.
+        let second = server
+            .typed_register_envelope_for_scope(
+                "worker-b",
+                "token-worker-b",
+                "%worker-b",
+                project_scope.clone(),
+                &root.display().to_string(),
+                AppServerId::new("app-b").unwrap(),
+                false,
+            )
+            .unwrap();
+        let error = server.typed_dispatch(second).unwrap_err().to_string();
+        assert!(
+            error.starts_with("invalid command: PROJECT_ROUTE_NOT_READY/UNSUPPORTED:"),
+            "{error}"
+        );
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.revision, before_second_state.0);
+        assert_eq!(state.sequence, before_second_state.1);
+        assert_eq!(state.workers, before_second_state.2);
+        assert_eq!(state.global, before_second_state.3);
+        drop(state);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_second_journal);
+        assert!(validate_request_context(&server, &Req::StatusAll, Some(&first_context)).is_ok());
+        assert!(!validate_request_context(&server, &Req::StatusAll, Some(&second_context)).is_ok());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
