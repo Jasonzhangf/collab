@@ -6733,6 +6733,9 @@ pub(crate) fn validate_request_context(
     project_context
         .validate()
         .map_err(|error| format!("PROJECT_CONTEXT_INVALID: {error}"))?;
+    if matches!(req, Req::Shutdown { operator: true }) {
+        return validate_host_operator_route(server, project_context);
+    }
     let registry = HostRouteRegistry::for_server(server)?;
     let route_scope = RouteScope {
         app_scope_id: project_context.app_scope_id.clone(),
@@ -6798,6 +6801,34 @@ pub(crate) fn validate_request_context(
         );
     }
     validate_wire_route_principals(server, req, &route_scope)
+}
+
+/// Admit the explicit CLI host operator route independently of project
+/// registration. `collab up` can create a resident daemon before any app
+/// route has registered; the operator still needs a way to stop that daemon.
+/// Keep this path read-only and exact so it cannot become an unknown-route
+/// fallback for project requests or create a peer identity as a side effect.
+fn validate_host_operator_route(
+    server: &Server,
+    project_context: &ProjectContext,
+) -> Result<(), String> {
+    let resident_scope = GlobalState::canonical_project_scope(&server.root)
+        .map_err(|error| format!("PROJECT_SCOPE_UNKNOWN: {error}"))?;
+    if project_context.app_scope_id.as_str() != crate::identity::CLI_APP_SERVER_ID {
+        return Err(format!(
+            "PROJECT_SCOPE_UNKNOWN: host operator route requires app scope {}",
+            crate::identity::CLI_APP_SERVER_ID
+        ));
+    }
+    if project_context.canonical_root != resident_scope.as_str()
+        || project_context.project_scope != resident_scope
+    {
+        return Err(format!(
+            "PROJECT_SCOPE_UNKNOWN: host operator route must target resident project {}",
+            resident_scope.as_str()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_register_cwd(cwd: &str, expected_root: &Path) -> Result<(), String> {
@@ -6908,6 +6939,64 @@ mod host_route_registry_tests {
         assert!(error.starts_with("PROJECT_SCOPE_UNKNOWN:"), "{error}");
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_registry_admits_only_exact_cli_host_operator_shutdown() {
+        let (server, root, journal_path) = test_server();
+        let resident_context = context_with_app(&root, crate::identity::CLI_APP_SERVER_ID);
+        let before_journal = std::fs::read(&journal_path).unwrap();
+
+        let response = dispatch_wire(
+            server.clone(),
+            Some(resident_context.clone()),
+            Req::Shutdown { operator: true },
+        )
+        .await;
+        assert!(response.ok, "{response:?}");
+        {
+            let state = server.state.lock().unwrap();
+            assert!(state.workers.is_empty());
+            assert!(state.global.projects.is_empty());
+            assert_eq!(state.revision, 0);
+            assert_eq!(state.sequence, 0);
+        }
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+
+        let wrong_root = root.with_file_name(format!(
+            "{}-wrong-root",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&wrong_root).unwrap();
+        let wrong_root_error = validate_request_context(
+            &server,
+            &Req::Shutdown { operator: true },
+            Some(&context_with_app(
+                &wrong_root,
+                crate::identity::CLI_APP_SERVER_ID,
+            )),
+        )
+        .unwrap_err();
+        assert!(wrong_root_error.starts_with("PROJECT_SCOPE_UNKNOWN:"));
+
+        let wrong_app_error = validate_request_context(
+            &server,
+            &Req::Shutdown { operator: true },
+            Some(&context_with_app(&root, "other-app")),
+        )
+        .unwrap_err();
+        assert!(wrong_app_error.starts_with("PROJECT_SCOPE_UNKNOWN:"));
+
+        let non_operator_error = validate_request_context(
+            &server,
+            &Req::Shutdown { operator: false },
+            Some(&resident_context),
+        )
+        .unwrap_err();
+        assert!(non_operator_error.starts_with("PROJECT_SCOPE_UNKNOWN:"));
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(wrong_root).unwrap();
     }
 
     #[test]
