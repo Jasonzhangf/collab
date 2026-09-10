@@ -1,3 +1,6 @@
+#[path = "adapters/mod.rs"]
+pub mod adapters;
+
 use crate::identity::RuntimeIdentity;
 use crate::proto::{ProjectContext, Req, RequestEnvelope, Resp};
 use anyhow::Context;
@@ -164,8 +167,47 @@ pub fn call_with_runtime_identity_at_root<T: DeserializeOwned>(
     root: &Path,
     identity: &RuntimeIdentity,
 ) -> anyhow::Result<T> {
+    call_with_runtime_identity_at_root_selected_endpoint(sock, req, root, identity, None)
+}
+
+#[cfg(test)]
+pub(crate) fn call_with_runtime_identity_at_root_for_endpoint<T: DeserializeOwned>(
+    sock: &Path,
+    req: &Req,
+    root: &Path,
+    identity: &RuntimeIdentity,
+    endpoint: adapters::EndpointKind,
+) -> anyhow::Result<T> {
+    call_with_runtime_identity_at_root_selected_endpoint(sock, req, root, identity, Some(endpoint))
+}
+
+fn call_with_runtime_identity_at_root_selected_endpoint<T: DeserializeOwned>(
+    sock: &Path,
+    req: &Req,
+    root: &Path,
+    identity: &RuntimeIdentity,
+    explicit_endpoint: Option<adapters::EndpointKind>,
+) -> anyhow::Result<T> {
     let project_context = ProjectContext::for_registered_route(root, identity)?;
-    call_with_context(sock, req, Some(project_context))
+    let envelope = RequestEnvelope::new(req.clone(), Some(project_context));
+    let binding = match explicit_endpoint {
+        Some(endpoint) => Some(adapters::EndpointBinding::new(endpoint, identity)),
+        None => adapters::binding_for_request(identity, &envelope)?,
+    };
+    if let Some(binding) = binding {
+        // An explicitly selected AppServer owns this attempt. Adapter errors
+        // are returned directly; the daemon remains a separate compatibility
+        // route when no AppServer endpoint was selected.
+        let adapter = adapters::AdapterRegistry::new().adapter(binding.endpoint);
+        let receipt = adapters::submit_registered(&adapter, &binding, &envelope)?;
+        return serde_json::from_value(receipt.response).with_context(|| {
+            format!(
+                "ADAPTER_UNKNOWN_RESPONSE: unexpected response shape from {} endpoint",
+                binding.endpoint.as_str()
+            )
+        });
+    }
+    call_with_context(sock, req, envelope.project_context)
 }
 
 pub fn daemon_locked(server_dir: &Path) -> bool {
