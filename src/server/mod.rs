@@ -7077,7 +7077,6 @@ mod startup_tests {
         let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
         host_paths.ensure_root().unwrap();
         let legacy_host_lock = Path::new(LEGACY_HOST_DAEMON_LOCK_PATH);
-        let legacy_host_lock_existed = legacy_host_lock.exists();
         let socket = host_paths.socket_path();
         let running = tokio::spawn(run_with_host_paths(
             Scope { root: root.clone() },
@@ -7113,9 +7112,6 @@ mod startup_tests {
 
         running.abort();
         let _ = running.await;
-        if !legacy_host_lock_existed {
-            std::fs::remove_file(legacy_host_lock).ok();
-        }
         std::fs::remove_dir_all(root).expect("remove startup test root");
     }
 
