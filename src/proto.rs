@@ -161,7 +161,11 @@ impl ProjectContext {
         if let Some(runtime) = &self.runtime_context {
             runtime.validate()?;
             if runtime.appserver_id != self.app_scope_id {
-                anyhow::bail!("project context runtime app scope does not match context app scope");
+                anyhow::bail!(
+                    "project context app scope mismatch: expected {}, observed runtime {}",
+                    self.app_scope_id,
+                    runtime.appserver_id
+                );
             }
         }
         Ok(())
