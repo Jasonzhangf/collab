@@ -4263,6 +4263,7 @@ fn authenticated_send_returns_typed_durability_failure_before_wake() {
 
 #[tokio::test]
 async fn duplicate_daemon_rejection_preserves_authoritative_pid() {
+    let _startup_test_lock = startup_test_lock();
     let root = PathBuf::from(format!(
         "/tmp/collab-sd-{}-{}",
         std::process::id(),

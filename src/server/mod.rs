@@ -141,6 +141,17 @@ const MAX_WORKTREE_PATH_BYTES: usize = 80;
 /// otherwise an old binary could append concurrently under the new socket.
 const LEGACY_HOST_DAEMON_LOCK_PATH: &str = "/tmp/collab-host.lock";
 
+#[cfg(test)]
+static STARTUP_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn startup_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    STARTUP_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn sanitize_identifier(value: &str) -> String {
     value
         .chars()
@@ -9661,17 +9672,7 @@ mod startup_tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
-
-    static STARTUP_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn startup_test_lock() -> MutexGuard<'static, ()> {
-        STARTUP_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     fn test_root(name: &str) -> PathBuf {
         let root = PathBuf::from(format!(
