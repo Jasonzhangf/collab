@@ -1174,6 +1174,47 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_repair_preserves_syntactically_valid_invalid_schema_tail() {
+        let dir = std::env::temp_dir().join(format!(
+            "collab-mailbox-valid-json-invalid-schema-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mailbox = dir.join(".agent-collab/mailbox");
+        std::fs::create_dir_all(&mailbox).unwrap();
+        let path = mailbox.join("recipient-master.jsonl");
+        let raw = b"{\"schema_version\":999,\"record_type\":\"unknown\"}\n";
+        std::fs::write(&path, raw).unwrap();
+
+        assert!(!recover_malformed_mailbox_tail(&path, "master").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+        assert!(read_recipient_mailbox(&path, "master").is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mailbox_repair_truncates_only_syntactically_malformed_tail() {
+        let dir = std::env::temp_dir().join(format!(
+            "collab-mailbox-malformed-tail-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mailbox = dir.join(".agent-collab/mailbox");
+        std::fs::create_dir_all(&mailbox).unwrap();
+        let path = mailbox.join("recipient-master.jsonl");
+        let prefix = b"{\"schema_version\":999,\"record_type\":\"unknown\"}\n";
+        let mut raw = prefix.to_vec();
+        raw.extend_from_slice(b"{\"unterminated\":");
+        std::fs::write(&path, &raw).unwrap();
+
+        assert!(recover_malformed_mailbox_tail(&path, "master").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), prefix);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn mailbox_rejects_non_basename_recipients_before_writing() {
         for recipient in ["", ".", "..", "/", "../", "worker\n"] {
             let dir = std::env::temp_dir().join(format!(
