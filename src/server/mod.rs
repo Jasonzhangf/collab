@@ -5736,10 +5736,6 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
     }))
 }
 
-fn poll_messages(server: &Server, worker_id: &str) -> Option<Resp> {
-    poll_messages_with_context(server, worker_id, None, None)
-}
-
 fn poll_messages_with_context(
     server: &Server,
     worker_id: &str,
@@ -5788,10 +5784,6 @@ fn poll_messages_with_context(
         "count": msgs.len(),
         "fetched_at": iso(now_ms()),
     })))
-}
-
-async fn poll_messages_async(server: Arc<Server>, worker_id: &str) -> Option<Resp> {
-    poll_messages_async_with_context(server, worker_id, None, None).await
 }
 
 async fn poll_messages_async_with_context(
@@ -8902,12 +8894,13 @@ async fn dispatch_wire(
             }
         }
         req => tokio::task::spawn_blocking(move || {
-            let route_gate =
-                if mutation_blocked_during_migration(&req) || matches!(req, Req::Register { .. }) {
-                    Some(wire_route_mutation_gate(&server))
-                } else {
-                    None
-                };
+            let route_gate = if mutation_blocked_during_migration(&req)
+                || wire_mutation_principal(&req).is_some()
+            {
+                Some(wire_route_mutation_gate(&server))
+            } else {
+                None
+            };
             let _route_gate_guard = route_gate.as_ref().map(|gate| gate.lock().unwrap());
             if let Err(error) = validate_request_context(&server, &req, project_context.as_ref()) {
                 return Resp::err(error);
