@@ -3986,6 +3986,26 @@ pub(crate) fn handle_send(
     )
 }
 
+fn authoritative_send_binding<'a>(
+    state: &'a State,
+    route_scope: &RouteScope,
+    worker_id: &str,
+) -> Result<&'a RuntimeBinding, &'static str> {
+    let Some(project) = state.global.lookup_project(&route_scope.project_scope_id) else {
+        return Err("SEND_BINDING_REJECTED: authoritative runtime binding is missing");
+    };
+    let mut bindings = project.runtime_bindings.values().filter(|binding| {
+        binding.app_scope_id == route_scope.app_scope_id && binding.agent_id.as_str() == worker_id
+    });
+    let Some(binding) = bindings.next() else {
+        return Err("SEND_BINDING_REJECTED: authoritative runtime binding is missing");
+    };
+    if bindings.next().is_some() {
+        return Err("SEND_BINDING_REJECTED: authoritative runtime binding is ambiguous");
+    }
+    Ok(binding)
+}
+
 fn handle_authenticated_send_with_app_scope(
     server: &Server,
     raw_from: String,
@@ -4054,38 +4074,47 @@ fn handle_authenticated_send_with_app_scope(
             (runtime, binding.route_scope())
         }
         None => {
-            let appserver_id = match crate::identity::AppServerId::new("appserver-cli") {
+            // Direct in-process callers predate the wire ProjectContext and
+            // are bound to the compatibility tui-default route established by
+            // handle_register. Wire requests never use this branch: they are
+            // admitted with an explicit app scope above.
+            let appserver_id = match crate::identity::AppServerId::new("tui-default") {
                 Ok(id) => id,
                 Err(error) => return Resp::err(error.to_string()),
             };
-            let agent_id = match crate::identity::AgentId::new(&worker.id) {
-                Ok(agent_id) => agent_id,
-                Err(error) => return Resp::err(error.to_string()),
+            let registered_scope =
+                match RouteScope::for_registered_project(appserver_id, Path::new(&worker.cwd)) {
+                    Ok(scope) => scope,
+                    Err(error) => return Resp::err(error.to_string()),
+                };
+            let binding = match authoritative_send_binding(&st, &registered_scope, &worker_id) {
+                Ok(binding) => binding.clone(),
+                Err(error) => return Resp::err(error),
             };
-            let runtime_id = match crate::identity::RuntimeId::new(format!("runtime-{}", worker.id))
-            {
-                Ok(runtime_id) => runtime_id,
-                Err(error) => return Resp::err(error.to_string()),
-            };
-            let binding_id = match crate::identity::BindingId::new(format!("binding-{}", worker.id))
-            {
-                Ok(binding_id) => binding_id,
-                Err(error) => return Resp::err(error.to_string()),
-            };
+            if command.actor_binding_id != binding.binding_id {
+                return Resp::err(format!(
+                    "SEND_BINDING_REJECTED: actor binding mismatch: expected {}, observed {}",
+                    binding.binding_id, command.actor_binding_id
+                ));
+            }
+            if command.endpoint_generation != binding.endpoint_generation {
+                return Resp::err(format!(
+                    "SEND_BINDING_REJECTED: stale endpoint generation: expected {}, observed {}",
+                    binding.endpoint_generation, command.endpoint_generation
+                ));
+            }
+            if command.scope != registered_scope {
+                return Resp::err(
+                    "SEND_BINDING_REJECTED: envelope scope does not match authoritative route scope",
+                );
+            }
             let runtime = crate::identity::RuntimeIdentity {
-                agent_id,
-                runtime_id,
-                appserver_id: appserver_id.clone(),
-                endpoint_generation: 0,
-                binding_id,
-                native_thread_id: None,
-            };
-            let registered_scope = match crate::scope::RouteScope::for_registered_project(
-                appserver_id,
-                Path::new(&worker.cwd),
-            ) {
-                Ok(scope) => scope,
-                Err(error) => return Resp::err(error.to_string()),
+                agent_id: binding.agent_id.clone(),
+                runtime_id: binding.runtime_id.clone(),
+                appserver_id: binding.app_scope_id.clone(),
+                endpoint_generation: binding.endpoint_generation,
+                binding_id: binding.binding_id.clone(),
+                native_thread_id: binding.native_thread_id.clone(),
             };
             (runtime, registered_scope)
         }
