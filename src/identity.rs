@@ -349,6 +349,22 @@ fn persist_identity(scope: &Scope, ident: &Identity) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Update the live endpoint from an explicit pane/session binding.  A changed
+/// endpoint is a new runtime registration boundary; the old typed binding must
+/// not be reused for a later command envelope.
+fn refresh_endpoint(ident: &mut Identity, pane: &str, session: Option<&str>) -> bool {
+    let changed = ident.pane.as_deref() != Some(pane)
+        || session.is_some_and(|session| ident.session.as_deref() != Some(session));
+    ident.pane = Some(pane.to_owned());
+    if let Some(session) = session {
+        ident.session = Some(session.to_owned());
+    }
+    if changed {
+        ident.runtime = None;
+    }
+    changed
+}
+
 /// Persist a runtime binding recovered from a successful typed registration.
 /// Update the in-memory identity only after every mirrored identity file has
 /// been written successfully.
@@ -416,18 +432,14 @@ pub fn provision(
     if worker_id.is_empty() || session.is_empty() {
         anyhow::bail!("collab identity requires a session name");
     }
-    let ident = read_identity(&identity_path(scope, worker_id))?.unwrap_or_else(|| Identity {
+    let mut ident = read_identity(&identity_path(scope, worker_id))?.unwrap_or_else(|| Identity {
         worker_id: worker_id.into(),
         token: hex(16),
         pane: Some(pane.into()),
         session: Some(session.into()),
         runtime: None,
     });
-    let ident = Identity {
-        pane: Some(pane.into()),
-        session: Some(session.into()),
-        ..ident
-    };
+    refresh_endpoint(&mut ident, pane, Some(session));
     persist_identity(scope, &ident)?;
     Ok(ident)
 }
@@ -445,28 +457,24 @@ pub fn load_or_create(
         .filter(|pane| pane.starts_with('%'))
         .ok_or_else(|| anyhow::anyhow!("collab identity requires a live tmux pane"))?;
     let requested = worker_id.or_else(|| std::env::var("COLLAB_WORKER").ok());
-    if let Some(ident) = read_identity(&pane_identity_path(scope, &pane))? {
-        return Ok(Identity {
-            pane: Some(pane),
-            ..ident
-        });
+    if let Some(mut ident) = read_identity(&pane_identity_path(scope, &pane))? {
+        if refresh_endpoint(&mut ident, &pane, None) {
+            persist_identity(scope, &ident)?;
+        }
+        return Ok(ident);
     }
     if let Some(worker_id) = requested.clone() {
-        if let Some(ident) = read_identity(&identity_path(scope, &worker_id))? {
-            return Ok(Identity {
-                pane: Some(pane),
-                ..ident
-            });
+        if let Some(mut ident) = read_identity(&identity_path(scope, &worker_id))? {
+            if refresh_endpoint(&mut ident, &pane, None) {
+                persist_identity(scope, &ident)?;
+            }
+            return Ok(ident);
         }
     }
     let session = tmux_session(&pane)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve tmux session for pane {}", pane))?;
-    if let Some(ident) = read_identity(&session_identity_path(scope, &session))? {
-        let ident = Identity {
-            pane: Some(pane),
-            session: Some(session),
-            ..ident
-        };
+    if let Some(mut ident) = read_identity(&session_identity_path(scope, &session))? {
+        refresh_endpoint(&mut ident, &pane, Some(&session));
         persist_identity(scope, &ident)?;
         return Ok(ident);
     }
@@ -525,6 +533,62 @@ mod tests {
         assert_eq!(loaded.worker_id, "child-peer");
         assert_eq!(loaded.token, provisioned.token);
         assert_eq!(loaded.pane.as_deref(), Some("%743"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn endpoint_rebind_clears_runtime_and_updates_current_mirrors() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-identity-rebind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
+        let scope = Scope { root: root.clone() };
+
+        let mut registered = provision(&scope, "agent-1", "%743", "session-1").unwrap();
+        let runtime = runtime_identity(7, "binding-7");
+        persist_runtime(&scope, &mut registered, runtime.clone()).unwrap();
+
+        let same_endpoint =
+            load_or_create(&scope, Some("agent-1".into()), Some("%743".into())).unwrap();
+        assert_eq!(same_endpoint.runtime, Some(runtime));
+
+        let rebound = load_or_create(&scope, Some("agent-1".into()), Some("%744".into())).unwrap();
+        assert_eq!(rebound.pane.as_deref(), Some("%744"));
+        assert_eq!(rebound.session.as_deref(), Some("session-1"));
+        assert_eq!(rebound.runtime, None);
+
+        for path in [
+            identity_path(&scope, "agent-1"),
+            session_identity_path(&scope, "session-1"),
+            pane_identity_path(&scope, "%744"),
+        ] {
+            let mirror = read_identity(&path).unwrap().unwrap();
+            assert_eq!(mirror.worker_id, rebound.worker_id);
+            assert_eq!(mirror.token, rebound.token);
+            assert_eq!(mirror.pane, rebound.pane);
+            assert_eq!(mirror.session, rebound.session);
+            assert_eq!(mirror.runtime, None);
+        }
+
+        let mut session_rebound = rebound;
+        let session_runtime = runtime_identity(8, "binding-8");
+        persist_runtime(&scope, &mut session_rebound, session_runtime).unwrap();
+        let session_changed = provision(&scope, "agent-1", "%744", "session-2").unwrap();
+        assert_eq!(session_changed.runtime, None);
+        assert_eq!(session_changed.session.as_deref(), Some("session-2"));
+        assert_eq!(
+            read_identity(&session_identity_path(&scope, "session-2"))
+                .unwrap()
+                .unwrap()
+                .runtime,
+            None
+        );
+
         std::fs::remove_dir_all(root).ok();
     }
 
