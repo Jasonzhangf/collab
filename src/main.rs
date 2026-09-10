@@ -623,9 +623,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Down => {
             let scope = Scope::resolve()?;
             if client::alive(&scope.sock_path()) {
-                let ident = me(&scope, None)?;
-                let _: serde_json::Value =
-                    call_project(&scope, &ident, &Req::Shutdown { operator: true })?;
+                let _: serde_json::Value = client::call_with_context(
+                    &scope.sock_path(),
+                    &Req::Shutdown { operator: true },
+                    Some(cli_project_context(&scope.root)?),
+                )?;
             }
             let server_dir = scope.host_server_dir();
             std::fs::create_dir_all(&server_dir)?;
@@ -684,8 +686,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Status { all } => {
             let scope = Scope::resolve()?;
             let v: serde_json::Value = if all {
-                let ident = me(&scope, None)?;
-                call_project(&scope, &ident, &Req::StatusAll)?
+                client::call_with_context(
+                    &scope.sock_path(),
+                    &Req::StatusAll,
+                    Some(cli_project_context(&scope.root)?),
+                )?
             } else {
                 client::call(&scope.sock_path(), &Req::Ping)?
             };
@@ -696,17 +701,38 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let scope = Scope::resolve()?;
             match cmd {
                 MailboxCmd::Read { all, sort, worker } => {
-                    let ident = me(&scope, None)?;
-                    let worker_id = worker.or_else(|| (!all).then(|| ident.worker_id.clone()));
-                    let v: serde_json::Value = call_project(
-                        &scope,
-                        &ident,
-                        &Req::MailboxRead {
-                            all,
-                            sort: Some(sort),
-                            worker_id,
-                        },
-                    )?;
+                    let explicit_worker = worker.is_some();
+                    let actorless = all || explicit_worker;
+                    let mut identity = None;
+                    let worker_id = if actorless {
+                        worker
+                    } else if std::env::var_os("TMUX_PANE").is_none() {
+                        anyhow::bail!(
+                            "collab mailbox read outside tmux requires --all or --worker <id>"
+                        );
+                    } else {
+                        let ident = me(&scope, None)?;
+                        let worker_id = ident.worker_id.clone();
+                        identity = Some(ident);
+                        Some(worker_id)
+                    };
+                    let request = Req::MailboxRead {
+                        all,
+                        sort: Some(sort),
+                        worker_id,
+                    };
+                    let v: serde_json::Value = if actorless {
+                        client::call_with_context(
+                            &scope.sock_path(),
+                            &request,
+                            Some(cli_project_context(&scope.root)?),
+                        )?
+                    } else {
+                        let ident = identity
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("mailbox identity was not resolved"))?;
+                        call_project(&scope, ident, &request)?
+                    };
                     out(&v);
                     Ok(())
                 }
@@ -717,8 +743,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Who => {
             let scope = Scope::resolve()?;
-            let ident = me(&scope, None)?;
-            let v: serde_json::Value = call_project(&scope, &ident, &Req::Workers)?;
+            let v: serde_json::Value = client::call_with_context(
+                &scope.sock_path(),
+                &Req::Workers,
+                Some(cli_project_context(&scope.root)?),
+            )?;
             out(&v);
             Ok(())
         }

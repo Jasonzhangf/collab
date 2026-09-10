@@ -1,5 +1,6 @@
 use crate::{
     config,
+    identity::AppServerId,
     proto::Resp,
     server::{
         state::{now_ms, Event},
@@ -477,6 +478,7 @@ fn launch(
     record: &mut Record,
     settings: &config::Subagent,
     environment: std::collections::BTreeMap<String, String>,
+    app_scope: Option<&AppServerId>,
 ) -> Result<()> {
     crate::scope::init(&server.root).context("cannot write project MCP and CLI permissions")?;
     record.runtime = Some(settings.runtime.clone());
@@ -578,26 +580,47 @@ fn launch(
     let mut parts = binding.split_whitespace();
     record.session = Some(parts.next().context("missing session ID")?.into());
     record.pane = Some(parts.next().context("missing pane ID")?.into());
-    let ident = crate::identity::provision(
-        &crate::scope::Scope {
-            root: server.root.clone(),
-        },
+    let scope = crate::scope::Scope {
+        root: server.root.clone(),
+    };
+    let mut ident = crate::identity::provision(
+        &scope,
         &record.peer,
         record.pane.as_deref().context("missing pane")?,
         &record.peer,
     )?;
-    let registered = crate::server::handle_register(
-        server,
-        ident.worker_id,
-        ident.token,
-        ident.pane,
-        server.root.display().to_string(),
-    );
+    let registered = match app_scope {
+        Some(app_scope) => crate::server::handle_register_with_app_scope(
+            server,
+            ident.worker_id.clone(),
+            ident.token.clone(),
+            ident.pane.clone(),
+            server.root.display().to_string(),
+            Some(app_scope.clone()),
+        ),
+        None => crate::server::handle_register(
+            server,
+            ident.worker_id.clone(),
+            ident.token.clone(),
+            ident.pane.clone(),
+            server.root.display().to_string(),
+        ),
+    };
     if !registered.ok {
         bail!(
             "cannot register child identity: {}",
             registered.error.unwrap_or_default()
         );
+    }
+    if app_scope.is_some_and(|scope| scope.as_str() == crate::identity::CLI_APP_SERVER_ID) {
+        let runtime = crate::identity::runtime_from_registration_receipt(
+            &registered.data,
+            &ident.worker_id,
+            &scope.root,
+        )
+        .context("child registration receipt did not contain its runtime binding")?;
+        crate::identity::persist_runtime(&scope, &mut ident, runtime)
+            .context("cannot persist child runtime binding")?;
     }
     record.status = "starting".into();
     record.ready_deadline_ms = now_ms() + settings.startup.ready_timeout_seconds as i64 * 1000;
@@ -612,6 +635,30 @@ pub fn handle_with_env(
     actor: &str,
     token: &str,
     action: Action,
+    environment: std::collections::BTreeMap<String, String>,
+) -> Resp {
+    handle_with_env_route(server, actor, token, action, None, environment)
+}
+
+/// Production wire entry point. The app scope was admitted from the parent's
+/// validated ProjectContext and is carried into child registration explicitly.
+pub(crate) fn handle_with_env_for_app_scope(
+    server: &Server,
+    actor: &str,
+    token: &str,
+    action: Action,
+    app_scope: AppServerId,
+    environment: std::collections::BTreeMap<String, String>,
+) -> Resp {
+    handle_with_env_route(server, actor, token, action, Some(app_scope), environment)
+}
+
+fn handle_with_env_route(
+    server: &Server,
+    actor: &str,
+    token: &str,
+    action: Action,
+    app_scope: Option<AppServerId>,
     environment: std::collections::BTreeMap<String, String>,
 ) -> Resp {
     if let Action::Dispatch {
@@ -658,7 +705,7 @@ pub fn handle_with_env(
             Err(response) => return response,
         }
     }
-    match run(server, actor, token, action, environment) {
+    match run(server, actor, token, action, environment, app_scope) {
         Ok(value) => Resp::data(value),
         Err(e) => Resp::err(e.to_string()),
     }
@@ -669,6 +716,7 @@ fn run(
     token: &str,
     action: Action,
     environment: std::collections::BTreeMap<String, String>,
+    app_scope: Option<AppServerId>,
 ) -> Result<serde_json::Value> {
     {
         let state = server.state.lock().unwrap();
@@ -752,7 +800,13 @@ fn run(
                     .map_err(|error| anyhow::anyhow!("subagent start journal failure: {error}"))?;
             }
         }
-        if let Err(e) = launch(server, &mut record, &config.subagent, environment) {
+        if let Err(e) = launch(
+            server,
+            &mut record,
+            &config.subagent,
+            environment,
+            app_scope.as_ref(),
+        ) {
             let msg = e.to_string();
             record.error = Some(msg.clone());
             if msg.contains("timed out") {

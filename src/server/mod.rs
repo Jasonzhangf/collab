@@ -2753,7 +2753,7 @@ fn register_typed(
     }
 }
 
-fn handle_register_with_app_scope(
+pub(crate) fn handle_register_with_app_scope(
     server: &Server,
     worker_id: String,
     token: String,
@@ -5913,7 +5913,14 @@ fn dispatch_with_app_scope(server: &Arc<Server>, req: Req, app_scope: Option<App
             token,
             command,
             launch_env,
-        } => crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env),
+        } => match app_scope {
+            Some(app_scope) => crate::subagent::handle_with_env_for_app_scope(
+                server, &worker_id, &token, command, app_scope, launch_env,
+            ),
+            None => {
+                crate::subagent::handle_with_env(server, &worker_id, &token, command, launch_env)
+            }
+        },
         Req::Register {
             worker_id,
             token,
@@ -7223,6 +7230,80 @@ mod host_route_registry_tests {
         assert_eq!(state.revision, before_revision);
         drop(state);
         assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn subagent_wire_registration_keeps_parent_app_scope() {
+        let (server, root, _) = test_server();
+        let app = AppServerId::new(crate::identity::CLI_APP_SERVER_ID).unwrap();
+        let context = ProjectContext::for_registered_root_with_app(&root, app.clone()).unwrap();
+        let parent = dispatch_wire(
+            server.clone(),
+            Some(context.clone()),
+            Req::Register {
+                worker_id: "parent".into(),
+                token: "token-parent".into(),
+                pane: Some("%parent".into()),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(parent.ok, "{parent:?}");
+
+        let child = handle_register_with_app_scope(
+            &server,
+            "child".into(),
+            "token-child".into(),
+            Some("%child".into()),
+            root.display().to_string(),
+            Some(app.clone()),
+        );
+        assert!(child.ok, "{child:?}");
+
+        let listed = dispatch_wire(
+            server.clone(),
+            Some(context),
+            Req::Subagent {
+                worker_id: "parent".into(),
+                token: "token-parent".into(),
+                command: crate::subagent::Action::List,
+                launch_env: Default::default(),
+            },
+        )
+        .await;
+        assert!(listed.ok, "{listed:?}");
+
+        let forged = dispatch_wire(
+            server.clone(),
+            Some(context_with_app(&root, "other-app")),
+            Req::Subagent {
+                worker_id: "parent".into(),
+                token: "token-parent".into(),
+                command: crate::subagent::Action::List,
+                launch_env: Default::default(),
+            },
+        )
+        .await;
+        assert!(!forged.ok, "{forged:?}");
+        assert!(forged
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("PROJECT_SCOPE_UNKNOWN:")));
+
+        let project_scope = GlobalState::canonical_project_scope(&root).unwrap();
+        let state = server.state.lock().unwrap();
+        let project = state.global.lookup_project(&project_scope).unwrap();
+        assert!(project.lookup_registration(&app).is_some());
+        assert!(project
+            .lookup_registration(&AppServerId::new("tui-default").unwrap())
+            .is_none());
+        assert!(project
+            .runtime_bindings
+            .values()
+            .filter(|binding| binding.agent_id.as_str() == "child")
+            .all(|binding| binding.app_scope_id == app));
+        drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
 
