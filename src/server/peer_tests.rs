@@ -584,6 +584,145 @@ fn typed_rebinds_survive_journal_rewrite_and_replay_with_one_version_axis() {
 }
 
 #[test]
+fn legacy_command_record_rewrite_and_replay_preserve_checkpoint_version() {
+    let (server, root) = test_server();
+    let receipt = crate::server::state::CommandReceipt {
+        operation_id: "legacy-operation".into(),
+        outcome: json!({"accepted": true}),
+        sequence: 1,
+        revision: 1,
+    };
+    server
+        .commit_checked(&[Event::CommandRecorded {
+            command_id: "legacy-command".into(),
+            receipt: receipt.clone(),
+        }])
+        .unwrap();
+
+    let state = server.state.lock().unwrap();
+    assert_eq!((state.sequence, state.revision), (1, 1));
+    server.rewrite_journal_locked(&state).unwrap();
+    drop(state);
+
+    let compacted =
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    assert!(compacted.contains("\"ev\":\"CommandRecorded\""));
+    assert!(!compacted.contains("\"ev\":\"CommandStarted\""));
+    assert!(!compacted.contains("\"ev\":\"CommandCompleted\""));
+    let replayed =
+        super::replay(&root).expect("a compacted legacy CommandRecorded must replay successfully");
+    assert_eq!((replayed.sequence, replayed.revision), (1, 1));
+    assert_eq!(replayed.command_receipts["legacy-command"], receipt);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replay_rejects_a_checkpoint_that_regresses_real_history() {
+    let (server, root) = test_server();
+    let journal = root.join(".agent-collab/server/journal.jsonl");
+    let events = [
+        Event::Registered {
+            worker: crate::server::state::WorkerRec {
+                id: "checkpoint-worker".into(),
+                token: "checkpoint-token".into(),
+                pane: Some("%checkpoint-worker".into()),
+                cwd: "/tmp".into(),
+                registered_ms: 1,
+            },
+        },
+        Event::ReducerCheckpoint {
+            sequence: 0,
+            revision: 0,
+        },
+    ];
+    let body = events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&journal, &body).unwrap();
+
+    let error = match super::replay(&root) {
+        Ok(_) => panic!("a real checkpoint rollback must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("reducer checkpoint regresses version"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), body);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_registration_generation_reaches_max_then_fails_before_journaling_overflow() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+    let mut first = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    let crate::server::state::TypedCommand::RegisterWorker { binding, .. } = &mut first.command;
+    binding.endpoint_generation = u64::MAX - 1;
+    first.envelope.endpoint_generation = u64::MAX - 1;
+    first.envelope.command_id = crate::identity::CommandId::new("register-max-minus-one").unwrap();
+    first.envelope.operation_id =
+        crate::identity::OperationId::new("register-op-max-minus-one").unwrap();
+    let first = server
+        .typed_dispatch(first)
+        .expect("MAX-1 binding generation must be accepted");
+    assert!(!first.replayed);
+
+    let max = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    assert_eq!(max.envelope.endpoint_generation, u64::MAX);
+    let max = server
+        .typed_dispatch(max)
+        .expect("MAX binding generation must be accepted");
+    assert!(!max.replayed);
+    assert_eq!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .projects
+            .values()
+            .next()
+            .unwrap()
+            .runtime_bindings["binding-worker"]
+            .endpoint_generation,
+        u64::MAX
+    );
+
+    let journal_before_overflow =
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    let receipt_count_before_overflow = server.state.lock().unwrap().global.command_receipts.len();
+    let error = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .expect_err("MAX binding generation must fail explicitly on increment overflow");
+    assert!(
+        error.contains("endpoint generation overflow"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap(),
+        journal_before_overflow,
+        "generation overflow must happen before any journal append"
+    );
+    assert_eq!(
+        server.state.lock().unwrap().global.command_receipts.len(),
+        receipt_count_before_overflow,
+        "generation overflow must not masquerade as a replayed receipt"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn replay_rejects_invalid_command_receipt_without_rewriting_the_journal() {
     let (server, root) = test_server();
     let journal = root.join(".agent-collab/server/journal.jsonl");

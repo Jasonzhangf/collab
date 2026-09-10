@@ -280,10 +280,13 @@ impl Server {
         };
         let generation = {
             let st = self.state.lock().unwrap();
-            st.global
-                .lookup_binding_for(&route_scope, &binding_id)
-                .map(|existing| existing.endpoint_generation.saturating_add(1))
-                .unwrap_or(1)
+            match st.global.lookup_binding_for(&route_scope, &binding_id) {
+                Some(existing) => existing
+                    .endpoint_generation
+                    .checked_add(1)
+                    .ok_or_else(|| "endpoint generation overflow".to_string())?,
+                None => 1,
+            }
         };
         let (registration, registered_ms) = {
             let st = self.state.lock().unwrap();

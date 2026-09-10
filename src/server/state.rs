@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::global_state::{GlobalState, ProjectRegistration, RuntimeBinding, StateError};
 use crate::proto::CommandEnvelope;
@@ -684,6 +684,9 @@ pub struct State {
     /// command idempotency is owned by `global.command_receipts`; this map is
     /// updated from the same committed event and is never consulted first.
     pub command_receipts: HashMap<String, CommandReceipt>,
+    /// Keep the legacy event shape when compacting an old journal receipt.
+    /// Modern command transactions retain their Started/Completed framing.
+    legacy_command_ids: HashSet<String>,
     pub global: super::global_state::GlobalState,
     pub master_worker_id: Option<String>,
     pub master_assigned_by: Option<String>,
@@ -993,6 +996,7 @@ impl State {
                 receipt,
             } => {
                 self.project_command_receipt(command_id, receipt)?;
+                self.legacy_command_ids.insert(command_id.clone());
                 self.command_receipts
                     .insert(command_id.clone(), receipt.clone());
             }
@@ -1162,15 +1166,22 @@ impl State {
         let mut command_receipts: Vec<_> = self.command_receipts.iter().collect();
         command_receipts.sort_by(|a, b| a.0.cmp(b.0));
         for (command_id, receipt) in command_receipts {
-            events.push(Event::CommandStarted {
-                command_id: command_id.clone(),
-                operation_id: receipt.operation_id.clone(),
-            });
-            events.push(Event::CommandCompleted {
-                command_id: command_id.clone(),
-                operation_id: receipt.operation_id.clone(),
-                receipt: receipt.clone(),
-            });
+            if self.legacy_command_ids.contains(command_id) {
+                events.push(Event::CommandRecorded {
+                    command_id: command_id.clone(),
+                    receipt: receipt.clone(),
+                });
+            } else {
+                events.push(Event::CommandStarted {
+                    command_id: command_id.clone(),
+                    operation_id: receipt.operation_id.clone(),
+                });
+                events.push(Event::CommandCompleted {
+                    command_id: command_id.clone(),
+                    operation_id: receipt.operation_id.clone(),
+                    receipt: receipt.clone(),
+                });
+            }
         }
         if let Some(worker_id) = self.master_worker_id.clone() {
             events.push(Event::MasterAssigned {
