@@ -428,6 +428,13 @@ fn command_retry_returns_original_outcome_without_reapplying_events() {
     assert_eq!(first.receipt, second.receipt);
     assert_eq!(first.operation_id, second.operation_id);
     assert_eq!(second.outcome, json!({"accepted": true}));
+    assert!(server
+        .state
+        .lock()
+        .unwrap()
+        .global
+        .command_receipts
+        .contains_key("command-1"));
     assert_eq!(
         std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
             .unwrap()
@@ -435,6 +442,127 @@ fn command_retry_returns_original_outcome_without_reapplying_events() {
             .count(),
         3
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_registration_uses_global_binding_and_host_idempotency() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+    let typed = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    let first = server.typed_dispatch(typed.clone()).unwrap();
+    assert!(!first.replayed);
+    let project_scope = crate::server::global_state::GlobalState::canonical_project_scope(
+        Path::new(cwd),
+    )
+    .unwrap();
+    let state = server.state.lock().unwrap();
+    assert!(state
+        .global
+        .lookup_registration(
+            &project_scope,
+            &crate::identity::AppServerId::new("tui-default").unwrap(),
+        )
+        .is_some());
+    assert_eq!(state.global.projects[project_scope.as_str()].runtime_bindings.len(), 1);
+    assert!(state.global.command_receipts.contains_key(first.receipt.command_id.as_str()));
+    drop(state);
+
+    let replay = server.typed_dispatch(typed).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, first.receipt);
+    assert_eq!(
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        6
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_dispatch_rejects_stale_revision_without_appending() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+    let first = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    server.typed_dispatch(first).unwrap();
+    let mut stale = server
+        .typed_register_envelope("worker-2", "token-worker-2", "%worker-2", cwd)
+        .unwrap();
+    stale.envelope.command_id = crate::identity::CommandId::new("register-stale").unwrap();
+    stale.envelope.operation_id = crate::identity::OperationId::new("register-stale-op").unwrap();
+    stale.envelope.expected_revision = Some(0);
+    let error = server.typed_dispatch(stale).unwrap_err();
+    assert!(error.to_string().contains("compare-and-swap revision mismatch"));
+    assert_eq!(
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        6
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_dispatch_rejects_wrong_principal_and_scope() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+    let mut wrong_principal = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    if let crate::server::state::TypedCommand::RegisterWorker { binding, .. } =
+        &mut wrong_principal.command
+    {
+        binding.agent_id = crate::identity::AgentId::new("other-worker").unwrap();
+    }
+    let principal_error = server.typed_dispatch(wrong_principal).unwrap_err();
+    assert!(principal_error
+        .to_string()
+        .contains("runtime binding agent does not match worker identity"));
+
+    let mut wrong_scope = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    wrong_scope.envelope.scope.project_scope_id =
+        crate::scope::ProjectScopeId::new("/other-project").unwrap();
+    let scope_error = server.typed_dispatch(wrong_scope).unwrap_err();
+    assert!(scope_error
+        .to_string()
+        .contains("envelope scope does not match binding route scope"));
+    assert!(std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+        .unwrap()
+        .trim()
+        .is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn global_reducer_failure_is_explicit_and_poisoned_after_journal_append() {
+    let (server, root) = test_server();
+    let binding = crate::server::global_state::RuntimeBinding::new(
+        crate::scope::ProjectScopeId::new("/unregistered-project").unwrap(),
+        crate::identity::AppServerId::new("tui-default").unwrap(),
+        crate::identity::AgentId::new("worker").unwrap(),
+        crate::identity::RuntimeId::new("runtime-worker").unwrap(),
+        crate::identity::BindingId::new("binding-worker").unwrap(),
+        1,
+        None,
+    )
+    .unwrap();
+    let error = server
+        .commit_checked(&[Event::GlobalRuntimeBound { binding }])
+        .unwrap_err();
+    assert!(matches!(error, JournalError::Reducer(_)));
+    assert!(server.state.lock().unwrap().journal_poison.is_some());
+    assert_eq!(server.state.lock().unwrap().global.projects.len(), 0);
+    let journal = std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    assert!(journal.contains("GlobalRuntimeBound"));
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -1,10 +1,9 @@
 //! Host-wide typed state for the v1 global daemon.
 //!
-//! This module is deliberately an unconnected slice.  It describes the
-//! state owned by one host-wide reducer without importing the legacy
-//! project-local [`super::state::State`].  The existing reducer remains the
-//! owner of its current journal until the integration round wires this model
-//! into the daemon.
+//! This module owns the host-wide typed identity, scope and command projection
+//! used by the resident daemon.  It stays independent of the legacy
+//! project-local [`super::state::State`] data model; the daemon reducer imports
+//! these types without creating a second journal or notification store.
 
 use crate::identity::{
     AgentId, AppServerId, BindingId, CommandId, NativeThreadId, OperationId, RuntimeId,
@@ -560,18 +559,6 @@ impl GlobalState {
                     receipt.epoch, self.epoch
                 )));
             }
-            if receipt.sequence > self.sequence {
-                return Err(StateError::Invariant(format!(
-                    "command {command_key} sequence {} exceeds host sequence {}",
-                    receipt.sequence, self.sequence
-                )));
-            }
-            if receipt.revision > self.revision {
-                return Err(StateError::Invariant(format!(
-                    "command {command_key} revision {} exceeds host revision {}",
-                    receipt.revision, self.revision
-                )));
-            }
             if !operations.insert(receipt.operation_id.as_str().to_owned()) {
                 return Err(StateError::Invariant(format!(
                     "operation {} is recorded more than once",
@@ -651,6 +638,54 @@ impl GlobalState {
 
     pub fn lookup_command_receipt(&self, command_id: &CommandId) -> Option<&CommandReceipt> {
         self.command_receipts.get(command_id.as_str())
+    }
+
+    /// Install a receipt that was already committed by the host journal.
+    ///
+    /// The legacy reducer owns the journal sequence/revision while this
+    /// host-wide map owns command idempotency.  Consequently the receipt's
+    /// coordinates are validated as durable values but do not have to be
+    /// bounded by this reducer's independent version counters.
+    pub fn record_command_projection(
+        &mut self,
+        receipt: CommandReceipt,
+    ) -> Result<(), StateError> {
+        receipt.validate()?;
+        if receipt.epoch != self.epoch {
+            return Err(StateError::Invariant(format!(
+                "command {} belongs to epoch {}, expected {}",
+                receipt.command_id, receipt.epoch, self.epoch
+            )));
+        }
+        if let Some(existing) = self.lookup_command_receipt(&receipt.command_id) {
+            if existing == &receipt {
+                return Ok(());
+            }
+            if existing.operation_id != receipt.operation_id {
+                return Err(StateError::CommandIdReuse {
+                    command_id: receipt.command_id.as_str().to_owned(),
+                    existing_operation: existing.operation_id.as_str().to_owned(),
+                    observed_operation: receipt.operation_id.as_str().to_owned(),
+                });
+            }
+            return Err(StateError::ReceiptConflict(format!(
+                "command {} was already projected with a different receipt",
+                receipt.command_id
+            )));
+        }
+        if let Some(existing) = self
+            .command_receipts
+            .values()
+            .find(|current| current.operation_id == receipt.operation_id)
+        {
+            return Err(StateError::OperationIdReuse {
+                operation_id: receipt.operation_id.as_str().to_owned(),
+                existing_command: existing.command_id.as_str().to_owned(),
+            });
+        }
+        self.command_receipts
+            .insert(receipt.command_id.as_str().to_owned(), receipt);
+        Ok(())
     }
 
     /// A new registration advances the host version exactly once.  Repeating

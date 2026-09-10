@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::global_state::{GlobalState, ProjectRegistration, RuntimeBinding, StateError};
+use crate::proto::CommandEnvelope;
+
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -53,7 +56,7 @@ pub fn runtime_for_pane(pane: Option<&str>) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRec {
     pub id: String,
     pub token: String,
@@ -80,6 +83,92 @@ pub struct CommandReceipt {
     pub sequence: u64,
     #[serde(default)]
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "cmd")]
+pub enum TypedCommand {
+    RegisterWorker {
+        registration: ProjectRegistration,
+        binding: RuntimeBinding,
+        worker: WorkerRec,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "gr")]
+pub enum GlobalEvent {
+    ProjectRegistered { registration: ProjectRegistration },
+    RuntimeBound { binding: RuntimeBinding },
+}
+
+impl GlobalEvent {
+    pub fn apply(self, global: &mut GlobalState) -> Result<(), StateError> {
+        match self {
+            Self::ProjectRegistered { registration } => global.register_project(registration).map(|_| ()),
+            Self::RuntimeBound { binding } => global.bind_runtime(binding).map(|_| ()),
+        }
+    }
+}
+
+impl From<TypedCommand> for GlobalEvent {
+    fn from(command: TypedCommand) -> Self {
+        match command {
+            TypedCommand::RegisterWorker { registration, .. } => {
+                GlobalEvent::ProjectRegistered { registration }
+            }
+        }
+    }
+}
+
+impl TypedCommand {
+    pub fn global_events(&self) -> Vec<GlobalEvent> {
+        match self {
+            Self::RegisterWorker {
+                registration,
+                binding,
+                ..
+            } => vec![
+                GlobalEvent::ProjectRegistered {
+                    registration: registration.clone(),
+                }
+                .into(),
+                GlobalEvent::RuntimeBound {
+                    binding: binding.clone(),
+                }
+                .into(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TypedEnvelope {
+    pub command: TypedCommand,
+    pub envelope: CommandEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedApplyError(pub StateError);
+
+impl From<StateError> for TypedApplyError {
+    fn from(value: StateError) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Display for TypedApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for TypedApplyError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TypedOutcome {
+    pub receipt: super::global_state::CommandReceipt,
+    pub replayed: bool,
 }
 
 pub const MAX_WAKE_ATTEMPTS: u32 = 1;
@@ -561,6 +650,12 @@ pub enum Event {
     WorktreeBound {
         binding: WorktreeBinding,
     },
+    GlobalProjectRegistered {
+        registration: super::global_state::ProjectRegistration,
+    },
+    GlobalRuntimeBound {
+        binding: super::global_state::RuntimeBinding,
+    },
 }
 
 #[derive(Default)]
@@ -585,7 +680,11 @@ pub struct State {
     pub notification_subscriptions: HashMap<String, NotificationSubscription>,
     pub wake_bindings: HashMap<String, String>,
     pub migration: Option<MigrationRecord>,
+    /// Legacy journal projection kept for wire/replay compatibility.  Typed
+    /// command idempotency is owned by `global.command_receipts`; this map is
+    /// updated from the same committed event and is never consulted first.
     pub command_receipts: HashMap<String, CommandReceipt>,
+    pub global: super::global_state::GlobalState,
     pub master_worker_id: Option<String>,
     pub master_assigned_by: Option<String>,
     pub master_approval: Option<String>,
@@ -638,7 +737,16 @@ impl State {
         }
     }
 
+    /// Apply one event for legacy callers.  The journal writer uses
+    /// [`Self::apply_checked`] so a global reducer rejection is returned to
+    /// the command boundary instead of being mistaken for success.
     pub fn apply(&mut self, ev: &Event) {
+        if let Err(error) = self.apply_checked(ev) {
+            self.journal_poison.get_or_insert(error);
+        }
+    }
+
+    pub fn apply_checked(&mut self, ev: &Event) -> Result<(), String> {
         match ev {
             Event::MasterWakeSignal { signal, at_ms } => {
                 self.master_wake.note_signal(signal, *at_ms);
@@ -845,6 +953,7 @@ impl State {
                 command_id,
                 receipt,
             } => {
+                self.project_command_receipt(command_id, receipt)?;
                 self.command_receipts
                     .insert(command_id.clone(), receipt.clone());
             }
@@ -853,6 +962,7 @@ impl State {
                 operation_id: _,
                 receipt,
             } => {
+                self.project_command_receipt(command_id, receipt)?;
                 self.command_receipts
                     .insert(command_id.clone(), receipt.clone());
             }
@@ -871,7 +981,49 @@ impl State {
                 self.worktree_bindings
                     .insert(binding.binding_id.clone(), binding.clone());
             }
+            Event::GlobalProjectRegistered { registration } => {
+                self.apply_global_event(&GlobalEvent::ProjectRegistered {
+                    registration: registration.clone(),
+                })?;
+            }
+            Event::GlobalRuntimeBound { binding } => {
+                self.apply_global_event(&GlobalEvent::RuntimeBound {
+                    binding: binding.clone(),
+                })?;
+            }
         }
+        Ok(())
+    }
+
+    fn project_command_receipt(
+        &mut self,
+        command_id: &str,
+        receipt: &CommandReceipt,
+    ) -> Result<(), String> {
+        let command_id = crate::identity::CommandId::new(command_id.to_owned())
+            .map_err(|error| format!("global command receipt has invalid command id: {error}"))?;
+        let operation_id = crate::identity::OperationId::new(receipt.operation_id.clone())
+            .map_err(|error| format!("global command receipt has invalid operation id: {error}"))?;
+        self.global
+            .record_command_projection(super::global_state::CommandReceipt {
+                command_id,
+                operation_id,
+                epoch: self.global.epoch,
+                sequence: receipt.sequence,
+                revision: receipt.revision,
+                outcome: receipt.outcome.clone(),
+            })
+            .map_err(|error| format!("global command receipt rejected: {error}"))
+    }
+
+    pub fn apply_global_event(&mut self, event: &GlobalEvent) -> Result<(), String> {
+        let mut next = self.global.clone();
+        event
+            .clone()
+            .apply(&mut next)
+            .map_err(|error| format!("global reducer rejected event: {error}"))?;
+        self.global = next;
+        Ok(())
     }
 
     pub fn drop_message(&mut self, id: &str) {
@@ -995,6 +1147,18 @@ impl State {
                 .into_iter()
                 .map(|binding| Event::WorktreeBound { binding }),
         );
+        for (_, project) in &self.global.projects {
+            for registration in project.registrations.values() {
+                events.push(Event::GlobalProjectRegistered {
+                    registration: registration.clone(),
+                });
+            }
+            for binding in project.runtime_bindings.values() {
+                events.push(Event::GlobalRuntimeBound {
+                    binding: binding.clone(),
+                });
+            }
+        }
         events.push(Event::ReducerCheckpoint {
             sequence: self.sequence,
             revision: self.revision,
