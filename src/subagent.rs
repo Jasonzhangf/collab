@@ -742,12 +742,14 @@ fn run(
                 record = existing.clone();
                 record.runtime = Some(config.subagent.runtime.clone());
             } else {
-                server.commit_locked(
-                    &mut state,
-                    &[Event::SubagentUpdated {
-                        subagent: record.clone(),
-                    }],
-                );
+                server
+                    .commit_locked(
+                        &mut state,
+                        &[Event::SubagentUpdated {
+                            subagent: record.clone(),
+                        }],
+                    )
+                    .map_err(|error| anyhow::anyhow!("subagent start journal failure: {error}"))?;
             }
         }
         if let Err(e) = launch(server, &mut record, &config.subagent, environment) {
@@ -755,16 +757,26 @@ fn run(
             record.error = Some(msg.clone());
             if msg.contains("timed out") {
                 record.status = "probing".into();
-                server.commit(&[Event::SubagentUpdated {
-                    subagent: record.clone(),
-                }]);
+                server
+                    .commit_checked(&[Event::SubagentUpdated {
+                        subagent: record.clone(),
+                    }])
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "subagent start outcome unknown: probe timed out and journal commit failed: {error}"
+                        )
+                    })?;
                 return Ok(follow_up(&record, false));
             }
             record.status = "failed".into();
         }
-        server.commit(&[Event::SubagentUpdated {
-            subagent: record.clone(),
-        }]);
+        server
+            .commit_checked(&[Event::SubagentUpdated {
+                subagent: record.clone(),
+            }])
+            .map_err(|error| {
+                anyhow::anyhow!("subagent start outcome unknown: journal commit failed: {error}")
+            })?;
         return Ok(follow_up(&record, false));
     }
     if matches!(action, Action::List) {
@@ -804,13 +816,15 @@ fn run(
             return observe(server, Some(&record.id), Some(lines));
         }
         Action::Rearm { .. } => {
-            server.commit_locked(
-                &mut state,
-                &[Event::KeepaliveUpdated {
-                    worker_id: record.peer.clone(),
-                    record: crate::server::keepalive::Record::default(),
-                }],
-            );
+            server
+                .commit_locked(
+                    &mut state,
+                    &[Event::KeepaliveUpdated {
+                        worker_id: record.peer.clone(),
+                        record: crate::server::keepalive::Record::default(),
+                    }],
+                )
+                .map_err(|error| anyhow::anyhow!("subagent rearm journal failure: {error}"))?;
             return Ok(
                 json!({"subagent_id":record.id,"keepalive_rearmed":true,"notification":"none"}),
             );
@@ -905,7 +919,9 @@ fn run(
             if !events.is_empty() {
                 // Persist the task and managed-record transition together so
                 // replay cannot observe a half-claimed assignment.
-                server.commit_locked(&mut state, &events);
+                server.commit_locked(&mut state, &events).map_err(|error| {
+                    anyhow::anyhow!("subagent working journal failure: {error}")
+                })?;
             }
             drop(state);
             if ready {
@@ -941,12 +957,14 @@ fn run(
             }
             if stale_working_without_task {
                 record.status = "idle".into();
-                server.commit_locked(
-                    &mut state,
-                    &[Event::SubagentUpdated {
-                        subagent: record.clone(),
-                    }],
-                );
+                server
+                    .commit_locked(
+                        &mut state,
+                        &[Event::SubagentUpdated {
+                            subagent: record.clone(),
+                        }],
+                    )
+                    .map_err(|error| anyhow::anyhow!("subagent send journal failure: {error}"))?;
             }
             drop(state);
             let result = match notify(
@@ -964,10 +982,14 @@ fn run(
                     if let Some(mut current) = state.subagents.get(&record.id).cloned() {
                         if current.status == "idle" {
                             current.error = Some(error.to_string());
-                            server.commit_locked(
+                            if let Err(journal_error) = server.commit_locked(
                                 &mut state,
                                 &[Event::SubagentUpdated { subagent: current }],
-                            );
+                            ) {
+                                return Err(anyhow::anyhow!(
+                                    "subagent send outcome unknown: notification failed and journal commit failed: {journal_error}"
+                                ));
+                            }
                         }
                     }
                     return Err(error);
@@ -983,12 +1005,14 @@ fn run(
                 bail!("startup probe is in progress; check status, or close after its bounded completion");
             }
             record.status = "closing".into();
-            server.commit_locked(
-                &mut state,
-                &[Event::SubagentUpdated {
-                    subagent: record.clone(),
-                }],
-            );
+            server
+                .commit_locked(
+                    &mut state,
+                    &[Event::SubagentUpdated {
+                        subagent: record.clone(),
+                    }],
+                )
+                .map_err(|error| anyhow::anyhow!("subagent close journal failure: {error}"))?;
             drop(state);
             if let (Some(session), Some(pane)) = (&record.session, &record.pane) {
                 if crate::server::knock::pane_alive(pane) {
@@ -1026,9 +1050,13 @@ fn run(
                 Err(error) => return Err(error.into()),
             }
             record.status = "closed".into();
-            server.commit(&[Event::SubagentUpdated {
-                subagent: record.clone(),
-            }]);
+            server
+                .commit_checked(&[Event::SubagentUpdated {
+                    subagent: record.clone(),
+                }])
+                .map_err(|error| {
+                    anyhow::anyhow!("subagent close outcome unknown: external close completed but journal commit failed: {error}")
+                })?;
         }
         _ => unreachable!(),
     }

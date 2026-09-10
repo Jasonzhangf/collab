@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::notification_contract::JournalError;
 use crate::server::state::{default_priority, is_goal_deadline, TaskRec};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -283,7 +284,10 @@ fn goal_deadline_registration_deduplicates_same_deadline() {
     );
     assert!(second.ok, "{}", second.error.unwrap_or_default());
     assert_eq!(second.data["deduplicated"], true);
-    assert_eq!(second.data["subscription"]["id"], first.data["subscription"]["id"]);
+    assert_eq!(
+        second.data["subscription"]["id"],
+        first.data["subscription"]["id"]
+    );
     assert_eq!(
         server
             .state
@@ -293,7 +297,7 @@ fn goal_deadline_registration_deduplicates_same_deadline() {
             .values()
             .filter(|subscription| is_goal_deadline(subscription))
             .count(),
-            1
+        1
     );
 
     let next_revision = handle_notification_subscribe(
@@ -308,7 +312,11 @@ fn goal_deadline_registration_deduplicates_same_deadline() {
         1,
         86_400,
     );
-    assert!(next_revision.ok, "{}", next_revision.error.unwrap_or_default());
+    assert!(
+        next_revision.ok,
+        "{}",
+        next_revision.error.unwrap_or_default()
+    );
     assert!(next_revision.data.get("deduplicated").is_none());
     assert_ne!(
         next_revision.data["subscription"]["id"],
@@ -425,8 +433,176 @@ fn command_retry_returns_original_outcome_without_reapplying_events() {
             .unwrap()
             .lines()
             .count(),
-        2
+        3
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_start_append_and_sync_failures_fail_closed_before_business_apply() {
+    for fault in [
+        CommandJournalFault::StartAppend,
+        CommandJournalFault::StartSync,
+    ] {
+        let (server, root) = test_server();
+        inject_command_journal_fault(fault);
+        let result = server.commit_command(
+            "command-start-fault",
+            "operation-start-fault",
+            &[Event::KeepaliveUpdated {
+                worker_id: "worker".into(),
+                record: crate::server::keepalive::Record::default(),
+            }],
+            json!({"accepted": true}),
+        );
+        assert!(result.is_err());
+        assert!(server.state.lock().unwrap().keepalives.is_empty());
+        let replay = super::replay(&root);
+        match fault {
+            CommandJournalFault::StartAppend => {
+                assert!(replay.is_ok(), "failed first append must leave no command");
+            }
+            CommandJournalFault::StartSync => {
+                assert!(
+                    replay.is_err(),
+                    "sync failure after start append must poison replay"
+                );
+            }
+            _ => unreachable!(),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn command_completion_append_failure_leaves_incomplete_replay() {
+    let (server, root) = test_server();
+    inject_command_journal_fault(CommandJournalFault::CompletionAppend);
+    let result = server.commit_command(
+        "command-completion-append",
+        "operation-completion-append",
+        &[Event::KeepaliveUpdated {
+            worker_id: "worker".into(),
+            record: crate::server::keepalive::Record::default(),
+        }],
+        json!({"accepted": true}),
+    );
+    assert!(result.is_err());
+    assert!(server.state.lock().unwrap().keepalives.is_empty());
+    assert!(super::replay(&root).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_completion_sync_failure_is_explicit_and_replayable_if_marker_was_written() {
+    let (server, root) = test_server();
+    inject_command_journal_fault(CommandJournalFault::CompletionSync);
+    let result = server.commit_command(
+        "command-completion-sync",
+        "operation-completion-sync",
+        &[Event::KeepaliveUpdated {
+            worker_id: "worker".into(),
+            record: crate::server::keepalive::Record::default(),
+        }],
+        json!({"accepted": true}),
+    );
+    assert!(result.is_err());
+    assert!(server.state.lock().unwrap().keepalives.is_empty());
+    let replayed = super::replay(&root).expect("written completion marker must replay");
+    assert!(replayed.keepalives.contains_key("worker"));
+    assert_eq!(
+        replayed.command_receipts["command-completion-sync"].operation_id,
+        "operation-completion-sync"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replayed_command_is_idempotent_and_operation_conflict_fails_closed() {
+    let (server, root) = test_server();
+    server
+        .commit_command(
+            "command-replay",
+            "operation-replay",
+            &[Event::KeepaliveUpdated {
+                worker_id: "worker".into(),
+                record: crate::server::keepalive::Record::default(),
+            }],
+            json!({"accepted": true}),
+        )
+        .unwrap();
+    let restarted = {
+        let journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap();
+        Server {
+            config: crate::config::Config::default(),
+            root: root.clone(),
+            state: Mutex::new(super::replay(&root).unwrap()),
+            journal: Mutex::new(journal),
+            pane_alive_check: |_| PanePresence::Present,
+            pane_owner_check: |_, _| Ok(true),
+            pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            mailbox_notify: tokio::sync::Notify::new(),
+        }
+    };
+    let retry = restarted
+        .commit_command(
+            "command-replay",
+            "operation-replay",
+            &[Event::KeepaliveUpdated {
+                worker_id: "duplicate".into(),
+                record: crate::server::keepalive::Record::default(),
+            }],
+            json!({"accepted": false}),
+        )
+        .unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.outcome, json!({"accepted": true}));
+    let conflict = restarted.commit_command(
+        "command-other",
+        "operation-replay",
+        &[],
+        json!({"accepted": true}),
+    );
+    assert!(matches!(conflict, Err(JournalError::InvalidCommand(_))));
+    assert!(!restarted
+        .state
+        .lock()
+        .unwrap()
+        .keepalives
+        .contains_key("duplicate"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replay_rejects_business_event_persisted_without_command_completion() {
+    let (server, root) = test_server();
+    let journal = root.join(".agent-collab/server/journal.jsonl");
+    let events = [
+        Event::CommandStarted {
+            command_id: "incomplete".into(),
+            operation_id: "operation-incomplete".into(),
+        },
+        Event::KeepaliveUpdated {
+            worker_id: "worker".into(),
+            record: crate::server::keepalive::Record::default(),
+        },
+    ];
+    let body = events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&journal, format!("{body}\n")).unwrap();
+    let error = match super::replay(&root) {
+        Ok(_) => panic!("incomplete command replay must fail"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("incomplete"), "unexpected error: {error}");
+    drop(server);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -3615,7 +3791,11 @@ fn recipient_jsonl_accepts_legacy_bare_message_before_new_append() {
         wake_attempt_count: 0,
         last_wake_attempt_ms: 0,
     };
-    std::fs::write(&path, format!("{}\n", serde_json::to_string(&legacy).unwrap())).unwrap();
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+    )
+    .unwrap();
     server.commit(&[Event::Sent {
         msg: Message {
             id: "new-message".into(),

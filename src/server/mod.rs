@@ -47,6 +47,32 @@ const TASK_STATUSES: [&str; 12] = [
 const MAX_WORKTREE_PATH_BYTES: usize = 80;
 
 #[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum CommandJournalFault {
+    StartAppend = 1,
+    StartSync = 2,
+    CompletionAppend = 3,
+    CompletionSync = 4,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMMAND_JOURNAL_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_command_journal_fault(fault: CommandJournalFault) {
+    COMMAND_JOURNAL_FAULT.with(|injected| injected.set(fault as u8));
+}
+
+#[derive(Clone, Copy)]
+enum CommandJournalPhase {
+    Start,
+    Business,
+    Completion,
+}
+
+#[cfg(test)]
 const DIRECT_MESSAGE_WAKE_COOLDOWN_MS: i64 = 60_000;
 
 fn validate_worktree_path(root: &Path, raw: &str) -> Result<(), String> {
@@ -229,22 +255,87 @@ impl Server {
                 replayed: true,
             });
         }
-        let sequence = st.sequence.saturating_add(evs.len() as u64 + 1);
-        let revision = st.revision.saturating_add(evs.len() as u64 + 1);
+        if let Some((existing_command_id, _)) =
+            st.command_receipts
+                .iter()
+                .find(|(existing_command_id, receipt)| {
+                    *existing_command_id != command_id && receipt.operation_id == operation_id
+                })
+        {
+            return Err(notification_contract::JournalError::InvalidCommand(
+                format!(
+                    "operation_id {operation_id} already belongs to command_id {existing_command_id}"
+                ),
+            ));
+        }
+        let sequence = st.sequence.saturating_add(evs.len() as u64 + 2);
+        let revision = st.revision.saturating_add(evs.len() as u64 + 2);
         let receipt = state::CommandReceipt {
             operation_id: operation_id.to_owned(),
             outcome: outcome.clone(),
             sequence,
             revision,
         };
-        let mut events = evs.to_vec();
-        events.push(Event::CommandRecorded {
+        let started = Event::CommandStarted {
             command_id: command_id.to_owned(),
-            receipt,
+            operation_id: operation_id.to_owned(),
+        };
+        let completed = Event::CommandCompleted {
+            command_id: command_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            receipt: receipt.clone(),
+        };
+        self.append_command_phase_locked(
+            &mut st,
+            std::slice::from_ref(&started),
+            CommandJournalPhase::Start,
+        )?;
+        self.append_command_phase_locked(&mut st, evs, CommandJournalPhase::Business)?;
+        self.append_command_phase_locked(
+            &mut st,
+            std::slice::from_ref(&completed),
+            CommandJournalPhase::Completion,
+        )?;
+        let mut events = Vec::with_capacity(evs.len() + 2);
+        events.push(started);
+        events.extend_from_slice(evs);
+        events.push(completed);
+        self.apply_committed_events(&mut st, &events);
+        let has_pending_scheduler_admission = events.iter().any(|event| {
+            matches!(
+                event,
+                Event::SchedulerAdmission { admission } if admission.status == "pending"
+            )
         });
-        let commit = self.commit_locked_checked(&mut st, &events)?;
+        let has_succeeded_scheduler_admission = events.iter().any(|event| {
+            let Event::SchedulerAdmissionStatus {
+                request_id, status, ..
+            } = event
+            else {
+                return false;
+            };
+            status == "succeeded"
+                && st
+                    .scheduler_admissions
+                    .get(request_id)
+                    .is_some_and(|admission| {
+                        admission.status == "succeeded"
+                            && st.msgs.get(&admission.message_id).is_some_and(|message| {
+                                message.state == "pending"
+                                    && st.scheduler_message_deliverable(&message.id)
+                            })
+                    })
+        });
+        if (events
+            .iter()
+            .any(|event| matches!(event, Event::Sent { .. }))
+            && !has_pending_scheduler_admission)
+            || has_succeeded_scheduler_admission
+        {
+            self.mailbox_notify.notify_waiters();
+        }
         Ok(notification_contract::CommandOutcome {
-            receipt: commit,
+            receipt: notification_contract::CommitReceipt { sequence, revision },
             operation_id: operation_id.to_owned(),
             outcome,
             replayed: false,
@@ -267,7 +358,6 @@ impl Server {
         if let Some(error) = &st.journal_poison {
             return Err(notification_contract::JournalError::Append(error.clone()));
         }
-        let mut j = self.journal.lock().unwrap();
         use std::io::Write;
         // Persist control truth before any state change or external notification.
         // A failed journal poisons this owner instead of silently resetting budgets.
@@ -284,6 +374,7 @@ impl Server {
             buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
         }
+        let mut j = self.journal.lock().unwrap();
         if let Err(error) = j.write_all(&buf) {
             let message = error.to_string();
             st.journal_poison = Some(message.clone());
@@ -294,34 +385,7 @@ impl Server {
             st.journal_poison = Some(message.clone());
             return Err(notification_contract::JournalError::Flush(message));
         }
-        for ev in evs {
-            st.apply(ev);
-            st.sequence = st.sequence.saturating_add(1);
-            st.revision = st.revision.saturating_add(1);
-            if let Event::Sent { msg } = ev {
-                if let Err(error) = self.backup_message(msg) {
-                    self.report_mailbox_projection_error(error);
-                }
-            }
-            if let Event::Delivered { ids } = ev {
-                for id in ids {
-                    if let Some(msg) = st.msgs.get(id) {
-                        if let Err(error) = self.backup_message(msg) {
-                            self.report_mailbox_projection_error(error);
-                        }
-                    }
-                }
-            }
-            if let Event::Acked { ids } = ev {
-                for id in ids {
-                    if let Some(msg) = st.msgs.get(id) {
-                        if let Err(error) = self.backup_message(msg) {
-                            self.report_mailbox_projection_error(error);
-                        }
-                    }
-                }
-            }
-        }
+        self.apply_committed_events(st, evs);
         let has_pending_scheduler_admission = evs.iter().any(|event| {
             matches!(
                 event,
@@ -357,6 +421,117 @@ impl Server {
             sequence: st.sequence,
             revision: st.revision,
         })
+    }
+
+    fn append_command_phase_locked(
+        &self,
+        st: &mut State,
+        evs: &[Event],
+        phase: CommandJournalPhase,
+    ) -> Result<(), notification_contract::JournalError> {
+        if let Some(error) = &st.journal_poison {
+            return Err(notification_contract::JournalError::Append(error.clone()));
+        }
+        let mut body = Vec::new();
+        for ev in evs {
+            let line = match serde_json::to_string(ev) {
+                Ok(line) => line,
+                Err(error) => {
+                    let message = error.to_string();
+                    st.journal_poison = Some(message.clone());
+                    return Err(notification_contract::JournalError::Append(message));
+                }
+            };
+            body.extend_from_slice(line.as_bytes());
+            body.push(b'\n');
+        }
+        let mut journal = self.journal.lock().unwrap();
+        #[cfg(test)]
+        let append_fault = COMMAND_JOURNAL_FAULT.with(|injected| {
+            let expected = match phase {
+                CommandJournalPhase::Start => CommandJournalFault::StartAppend as u8,
+                CommandJournalPhase::Completion => CommandJournalFault::CompletionAppend as u8,
+                CommandJournalPhase::Business => 0,
+            };
+            if injected.get() == expected && expected != 0 {
+                injected.set(0);
+                true
+            } else {
+                false
+            }
+        });
+        #[cfg(not(test))]
+        let append_fault = false;
+        #[cfg(not(test))]
+        let _ = phase;
+        if append_fault {
+            let message = "injected command journal append failure".to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Append(message));
+        }
+        if let Err(error) = std::io::Write::write_all(&mut *journal, &body) {
+            let message = error.to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Append(message));
+        }
+        #[cfg(test)]
+        let sync_fault = COMMAND_JOURNAL_FAULT.with(|injected| {
+            let expected = match phase {
+                CommandJournalPhase::Start => CommandJournalFault::StartSync as u8,
+                CommandJournalPhase::Completion => CommandJournalFault::CompletionSync as u8,
+                CommandJournalPhase::Business => 0,
+            };
+            if injected.get() == expected && expected != 0 {
+                injected.set(0);
+                true
+            } else {
+                false
+            }
+        });
+        #[cfg(not(test))]
+        let sync_fault = false;
+        if sync_fault {
+            let message = "injected command journal sync failure".to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Flush(message));
+        }
+        if let Err(error) = journal.sync_data() {
+            let message = error.to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Flush(message));
+        }
+        Ok(())
+    }
+
+    fn apply_committed_events(&self, st: &mut State, evs: &[Event]) {
+        for ev in evs {
+            st.apply(ev);
+            st.sequence = st.sequence.saturating_add(1);
+            st.revision = st.revision.saturating_add(1);
+            if let Event::Sent { msg } = ev {
+                if let Err(error) = self.backup_message(msg) {
+                    self.report_mailbox_projection_error(error);
+                }
+            }
+            if let Event::Delivered { ids } = ev {
+                for id in ids {
+                    if let Some(msg) = st.msgs.get(id) {
+                        if let Err(error) = self.backup_message(msg) {
+                            self.report_mailbox_projection_error(error);
+                        }
+                    }
+                }
+            }
+            if let Event::Acked { ids } = ev {
+                for id in ids {
+                    if let Some(msg) = st.msgs.get(id) {
+                        if let Err(error) = self.backup_message(msg) {
+                            self.report_mailbox_projection_error(error);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn report_mailbox_projection_error(&self, error: String) {
@@ -456,7 +631,10 @@ pub(crate) fn purge_expired_storage(server: &Server, now: i64) -> usize {
     }
     if let Err(error) = server.rewrite_journal_locked(&st) {
         st.journal_poison = Some(error.to_string());
-        append_log(&server.log_path(), &format!("JOURNAL_COMPACTION_FAILED: {error}"));
+        append_log(
+            &server.log_path(),
+            &format!("JOURNAL_COMPACTION_FAILED: {error}"),
+        );
     }
     expired.len()
 }
@@ -5578,6 +5756,9 @@ fn replay(root: &Path) -> anyhow::Result<State> {
     }
     let content = std::fs::read_to_string(&journal)?;
     let mut events = Vec::new();
+    let mut pending_command: Option<(String, String, Vec<Event>)> = None;
+    let mut seen_command_ids = std::collections::HashSet::new();
+    let mut seen_operation_ids = std::collections::HashMap::new();
     let mut convert_root = false;
     for (index, line) in content.lines().enumerate() {
         let trimmed = line.trim();
@@ -5599,6 +5780,82 @@ fn replay(root: &Path) -> anyhow::Result<State> {
             convert_root = true;
         }
         for event in line_events {
+            if let Event::CommandStarted {
+                command_id,
+                operation_id,
+            } = &event
+            {
+                if !seen_command_ids.insert(command_id.clone()) {
+                    anyhow::bail!(
+                        "journal replay failed at line {}: duplicate command {}",
+                        index + 1,
+                        command_id
+                    );
+                }
+                if let Some(existing_command_id) =
+                    seen_operation_ids.insert(operation_id.clone(), command_id.clone())
+                {
+                    anyhow::bail!(
+                        "journal replay failed at line {}: operation {} already belongs to command {}",
+                        index + 1,
+                        operation_id,
+                        existing_command_id
+                    );
+                }
+                if pending_command.is_some() {
+                    anyhow::bail!(
+                        "journal replay failed at line {}: nested command {}",
+                        index + 1,
+                        command_id
+                    );
+                }
+                pending_command = Some((
+                    command_id.clone(),
+                    operation_id.clone(),
+                    vec![event.clone()],
+                ));
+                continue;
+            }
+            if let Some((command_id, operation_id, pending)) = pending_command.as_mut() {
+                match &event {
+                    Event::CommandCompleted {
+                        command_id: completed_id,
+                        operation_id: completed_operation,
+                        receipt,
+                    } => {
+                        if completed_id != command_id || completed_operation != operation_id {
+                            anyhow::bail!(
+                                "journal replay failed at line {}: command completion does not match start",
+                                index + 1
+                            );
+                        }
+                        if receipt.operation_id != *operation_id {
+                            anyhow::bail!(
+                                "journal replay failed at line {}: command receipt operation does not match start",
+                                index + 1
+                            );
+                        }
+                        pending.push(event.clone());
+                        let committed = std::mem::take(pending);
+                        pending_command = None;
+                        for event in committed {
+                            st.apply(&event);
+                            st.sequence = st.sequence.saturating_add(1);
+                            st.revision = st.revision.saturating_add(1);
+                            events.push(event);
+                        }
+                    }
+                    Event::CommandStarted { .. } => unreachable!(),
+                    _ => pending.push(event.clone()),
+                }
+                continue;
+            }
+            if matches!(event, Event::CommandCompleted { .. }) {
+                anyhow::bail!(
+                    "journal replay failed at line {}: command completion without start",
+                    index + 1
+                );
+            }
             if matches!(event, Event::MasterAssigned { .. })
                 && (line.contains("\"ev\":\"RootAssigned\"")
                     || line.contains("\"ev\": \"RootAssigned\""))
@@ -5616,6 +5873,11 @@ fn replay(root: &Path) -> anyhow::Result<State> {
             events.push(event);
         }
     }
+    if let Some((command_id, _, _)) = pending_command {
+        anyhow::bail!(
+            "journal replay failed: incomplete command {command_id}; completion marker missing"
+        );
+    }
     if convert_root {
         let mut body = String::new();
         for event in events {
@@ -5629,15 +5891,13 @@ fn replay(root: &Path) -> anyhow::Result<State> {
     Ok(st)
 }
 
-fn decode_journal_line(
-    line: &str,
-) -> Result<Vec<Event>, notification_contract::JournalError> {
+fn decode_journal_line(line: &str) -> Result<Vec<Event>, notification_contract::JournalError> {
     let mut events = Vec::new();
     let mut stream = serde_json::Deserializer::from_str(line).into_iter::<Event>();
     while let Some(item) = stream.next() {
-        events.push(item.map_err(|error| {
-            notification_contract::JournalError::Replay(error.to_string())
-        })?);
+        events.push(
+            item.map_err(|error| notification_contract::JournalError::Replay(error.to_string()))?,
+        );
     }
     let offset = stream.byte_offset();
     if offset < line.len() && !line[offset..].trim().is_empty() {
@@ -5646,7 +5906,9 @@ fn decode_journal_line(
         ));
     }
     if events.is_empty() {
-        return Err(notification_contract::JournalError::Replay("empty event".into()));
+        return Err(notification_contract::JournalError::Replay(
+            "empty event".into(),
+        ));
     }
     Ok(events)
 }
