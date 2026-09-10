@@ -9,6 +9,16 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+const READINESS_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug, serde::Deserialize)]
+struct PingReadiness {
+    workers: u64,
+    messages: u64,
+    tasks: u64,
+    now: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonAvailability {
     Alive,
@@ -202,15 +212,71 @@ fn wait_for_server(sock: &Path) -> anyhow::Result<()> {
     Err(status_error(sock, status, detail))
 }
 
-/// Check server liveness without full call.
+fn readiness_probe(sock: &Path) -> io::Result<()> {
+    let mut stream = connect(sock)?;
+    stream.set_write_timeout(Some(READINESS_TIMEOUT))?;
+    stream.set_read_timeout(Some(READINESS_TIMEOUT))?;
+    let request = serde_json::to_vec(&Req::Ping).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot encode daemon readiness request: {error}"),
+        )
+    })?;
+    stream.write_all(&request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut response = String::new();
+    let bytes_read = io::BufReader::new(&mut stream).read_line(&mut response)?;
+    if bytes_read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "daemon closed the readiness connection before replying",
+        ));
+    }
+    let response: Resp = serde_json::from_str(response.trim()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("daemon readiness response was malformed: {error}"),
+        )
+    })?;
+    if !response.ok {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            response
+                .error
+                .unwrap_or_else(|| "daemon readiness Ping failed".into()),
+        ));
+    }
+    let readiness: PingReadiness = serde_json::from_value(response.data).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("daemon readiness response did not match the Ping contract: {error}"),
+        )
+    })?;
+    let _ = (readiness.workers, readiness.messages, readiness.tasks);
+    if readiness.now.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon Ping returned an empty timestamp",
+        ));
+    }
+    Ok(())
+}
+
+/// Check whether the daemon endpoint is accepting connections.
+///
+/// This intentionally does not perform a Ping.  The shutdown command uses
+/// this predicate to decide whether it must send the shutdown request; a
+/// readiness timeout must never be treated as proof that a listening daemon
+/// has already stopped.
 pub fn alive(sock: &Path) -> bool {
     connect(sock).is_ok()
 }
 
 /// Classify an existing daemon endpoint without creating or deleting any file.
 pub fn daemon_status(sock: &Path) -> DaemonAvailability {
-    match connect(sock) {
-        Ok(_) => DaemonAvailability::Alive,
+    match readiness_probe(sock) {
+        Ok(()) => DaemonAvailability::Alive,
         Err(error) => failed_connection_status(sock, &error),
     }
 }
@@ -341,11 +407,44 @@ mod tests {
     fn daemon_status_reports_active_socket_as_alive() {
         let fixture = TempServerDir::new("alive");
         let listener = UnixListener::bind(fixture.socket()).expect("bind active socket");
+        let responder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept readiness probe");
+            stream
+                .write_all(
+                    br#"{"ok":true,"workers":0,"messages":0,"tasks":0,"now":"now"}
+"#,
+                )
+                .expect("write readiness response");
+            thread::sleep(Duration::from_millis(500));
+        });
 
-        assert!(alive(&fixture.socket()));
         assert_eq!(daemon_status(&fixture.socket()), DaemonAvailability::Alive);
+        assert!(alive(&fixture.socket()));
 
-        drop(listener);
+        responder.join().expect("readiness responder");
+    }
+
+    #[test]
+    fn ping_timeout_does_not_make_listening_socket_look_stopped_to_down() {
+        let fixture = TempServerDir::new("down-ping-timeout");
+        let listener = UnixListener::bind(fixture.socket()).expect("bind listening socket");
+        let responder = thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().expect("accept liveness connection");
+                thread::sleep(READINESS_TIMEOUT + Duration::from_millis(100));
+                drop(stream);
+            }
+        });
+
+        // Cmd::Down uses alive(), so a listening endpoint must still be
+        // considered present even when its typed Ping is not answering.
+        assert!(alive(&fixture.socket()));
+        assert_eq!(
+            daemon_status(&fixture.socket()),
+            DaemonAvailability::Unknown
+        );
+
+        responder.join().expect("liveness responder");
     }
 
     #[test]
@@ -426,6 +525,19 @@ mod tests {
 
         ensure_server_with_launcher(&fixture.socket(), move |sock| {
             let bound = UnixListener::bind(sock)?;
+            let responder = bound.try_clone()?;
+            thread::spawn(move || {
+                let (mut stream, _) = responder.accept().expect("accept readiness probe");
+                let mut request = String::new();
+                std::io::BufReader::new(&mut stream)
+                    .read_line(&mut request)
+                    .expect("read readiness request");
+                stream
+                    .write_all(
+                        b"{\"ok\":true,\"workers\":0,\"messages\":0,\"tasks\":0,\"now\":\"now\"}\n",
+                    )
+                    .expect("write readiness response");
+            });
             *retained.lock().expect("listener fixture lock") = Some(bound);
             Ok(())
         })

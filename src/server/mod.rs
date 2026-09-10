@@ -5988,76 +5988,90 @@ fn decode_journal_line(line: &str) -> Result<Vec<Event>, notification_contract::
 
 fn acquire_daemon_lock(server_dir: &Path) -> anyhow::Result<std::fs::File> {
     let lock_path = server_dir.join("daemon.lock");
-    loop {
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut file) => {
-                use std::os::unix::io::AsRawFd;
-                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                if rc == 0 {
-                    return Ok(file);
-                }
-                let flock_error = std::io::Error::last_os_error();
-                if flock_error.raw_os_error() != Some(libc::EPERM) {
-                    return Err(flock_error.into());
-                }
-                use std::io::Write;
-                writeln!(file, "{}", std::process::id())?;
-                file.sync_all()?;
-                return Ok(file);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&lock_path)?;
-                use std::os::unix::io::AsRawFd;
-                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                if rc == 0 {
-                    return Ok(file);
-                }
-                let flock_error = std::io::Error::last_os_error();
-                if flock_error.raw_os_error() != Some(libc::EPERM) {
-                    let pid_str = std::fs::read_to_string(&lock_path).unwrap_or_default();
-                    anyhow::bail!(
-                        "server already running at {} (pid {}): {}",
-                        server_dir.join("server.sock").display(),
-                        pid_str.trim(),
-                        flock_error
-                    );
-                }
-                let pid_str = std::fs::read_to_string(&lock_path).unwrap_or_default();
-                let alive = pid_str
-                    .trim()
-                    .parse::<i32>()
-                    .ok()
-                    .map(|pid| {
-                        Command::new("kill")
-                            .arg("-0")
-                            .arg(pid.to_string())
-                            .status()
-                            .map(|status| status.success())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if !alive {
-                    std::fs::remove_file(&lock_path)?;
-                    continue;
-                }
-                let sock_path = server_dir.join("server.sock");
-                anyhow::bail!(
-                    "server already running at {} (pid {})",
-                    sock_path.display(),
-                    pid_str.trim()
-                );
-            }
-            Err(error) => return Err(error.into()),
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)?;
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(file);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => anyhow::bail!(
+            "server already running at {}: {}",
+            server_dir.join("server.sock").display(),
+            error
+        ),
+        Some(code) if code == libc::EPERM => anyhow::bail!(
+            "cannot acquire daemon lock at {}: flock is unavailable or denied; refusing PID fallback: {}",
+            lock_path.display(),
+            error
+        ),
+        _ => Err(error.into()),
+    }
+}
+
+fn same_inode(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn prepare_socket_path(sock_path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let before = match std::fs::symlink_metadata(sock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !before.file_type().is_socket() {
+        anyhow::bail!(
+            "server socket path is occupied by {}; refusing to remove it",
+            sock_path.display()
+        );
+    }
+    match crate::client::connect(sock_path) {
+        Ok(_) => anyhow::bail!("server already running at {}", sock_path.display()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) => {}
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "cannot determine whether stale server socket {} can be removed",
+                sock_path.display()
+            )))
         }
     }
+    let after = match std::fs::symlink_metadata(sock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !same_inode(&before, &after) {
+        anyhow::bail!(
+            "server socket changed while checking {}; refusing to remove it",
+            sock_path.display()
+        );
+    }
+    std::fs::remove_file(sock_path)?;
+    Ok(())
+}
+
+fn remove_listener_socket(sock_path: &Path, captured: &std::fs::Metadata) -> anyhow::Result<()> {
+    let current = match std::fs::symlink_metadata(sock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if same_inode(captured, &current) {
+        std::fs::remove_file(sock_path)?;
+    }
+    Ok(())
 }
 
 pub async fn run(scope: Scope) -> anyhow::Result<()> {
@@ -6067,16 +6081,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
 
     let _lock_file = acquire_daemon_lock(&server_dir)?;
 
-    if sock_path.exists() {
-        if crate::client::alive(&sock_path) {
-            anyhow::bail!("server already running at {}", sock_path.display());
-        }
-        std::fs::remove_file(&sock_path)?;
-    }
-
-    let listener = UnixListener::bind(&sock_path)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
+    prepare_socket_path(&sock_path)?;
 
     let state = replay(&scope.root)?;
     let journal_file = std::fs::OpenOptions::new()
@@ -6098,9 +6103,30 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     });
     restore_registered_peer_default_leases(&server);
     purge_expired_storage(&server, now_ms());
+    let listener = UnixListener::bind(&sock_path)?;
+    let socket_metadata = std::fs::symlink_metadata(&sock_path)?;
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(error) = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
+    {
+        let cleanup = remove_listener_socket(&sock_path, &socket_metadata);
+        return match cleanup {
+            Ok(()) => Err(error.into()),
+            Err(cleanup_error) => Err(anyhow::Error::new(error).context(format!(
+                "failed to clean up startup socket: {cleanup_error}"
+            ))),
+        };
+    }
     std::fs::write(
         server_dir.join("server.pid"),
         std::process::id().to_string(),
+    )
+    .map_err(
+        |error| match remove_listener_socket(&sock_path, &socket_metadata) {
+            Ok(()) => anyhow::Error::new(error),
+            Err(cleanup_error) => anyhow::Error::new(error).context(format!(
+                "failed to clean up startup socket: {cleanup_error}"
+            )),
+        },
     )?;
     let _ = record_activity(
         &scope.root,
@@ -6198,6 +6224,104 @@ mod reducer_binding_tests {
             worktree
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn test_root(name: &str) -> PathBuf {
+        let root = PathBuf::from(format!(
+            "/tmp/collab-startup-{name}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(root.join(".agent-collab/server"))
+            .expect("create startup test root");
+        root
+    }
+
+    #[tokio::test]
+    async fn pid_publication_failure_removes_the_owned_socket() {
+        let root = test_root("pid-failure");
+        let server_dir = root.join(".agent-collab/server");
+        std::fs::create_dir(server_dir.join("server.pid")).expect("occupy pid path");
+
+        let error = run(Scope { root: root.clone() })
+            .await
+            .expect_err("a directory at server.pid must fail startup");
+        assert!(error.to_string().contains("directory"), "{error:#}");
+        assert!(
+            !server_dir.join("server.sock").exists(),
+            "startup failure must remove the socket it just published"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove startup test root");
+    }
+
+    #[test]
+    fn cleanup_preserves_a_replacement_socket_path() {
+        let root = test_root("replacement");
+        let socket = root.join(".agent-collab/server/server.sock");
+        let original = UnixListener::bind(&socket).expect("bind original socket");
+        let captured = std::fs::symlink_metadata(&socket).expect("capture socket metadata");
+        drop(original);
+        std::fs::remove_file(&socket).expect("remove original socket path");
+        let replacement = UnixListener::bind(&socket).expect("bind replacement socket");
+        let current = std::fs::symlink_metadata(&socket).expect("read replacement metadata");
+        assert!(!same_inode(&captured, &current));
+
+        remove_listener_socket(&socket, &captured).expect("replacement cleanup check");
+        assert!(
+            socket.exists(),
+            "cleanup must not unlink a replacement socket"
+        );
+
+        drop(replacement);
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_dir_all(root).expect("remove startup test root");
+    }
+
+    #[tokio::test]
+    async fn retry_after_pid_failure_succeeds_once_the_path_is_fixed() {
+        let root = test_root("retry");
+        let server_dir = root.join(".agent-collab/server");
+        let pid_path = server_dir.join("server.pid");
+        std::fs::create_dir(&pid_path).expect("occupy pid path");
+        let first_error = run(Scope { root: root.clone() })
+            .await
+            .expect_err("first startup must fail");
+        assert!(first_error.to_string().contains("directory"));
+        assert!(!server_dir.join("server.sock").exists());
+        std::fs::remove_dir(&pid_path).expect("remove pid directory");
+
+        let scope = Scope { root: root.clone() };
+        let running = tokio::spawn(run(Scope { root: root.clone() }));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let socket = scope.sock_path();
+            let status = tokio::task::spawn_blocking(move || crate::client::daemon_status(&socket))
+                .await
+                .expect("readiness probe task must complete");
+            if status == crate::client::DaemonAvailability::Alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let socket = scope.sock_path();
+        let status = tokio::task::spawn_blocking(move || crate::client::daemon_status(&socket))
+            .await
+            .expect("readiness probe task must complete");
+        assert_eq!(status, crate::client::DaemonAvailability::Alive);
+        assert!(pid_path.is_file());
+
+        running.abort();
+        let _ = running.await;
+        std::fs::remove_dir_all(root).expect("remove startup test root");
     }
 }
 
