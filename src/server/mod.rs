@@ -196,6 +196,23 @@ pub(crate) fn inject_subagent_journal_fault(fault: SubagentJournalFault) {
     SUBAGENT_JOURNAL_FAULT.with(|injected| injected.set(fault as u8));
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TaskRegisterJournalFault {
+    Append = 51,
+    Sync = 52,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TASK_REGISTER_JOURNAL_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_task_register_journal_fault(fault: TaskRegisterJournalFault) {
+    TASK_REGISTER_JOURNAL_FAULT.with(|injected| injected.set(fault as u8));
+}
+
 #[derive(Clone, Copy)]
 enum CommandJournalPhase {
     Start,
@@ -932,8 +949,35 @@ impl Server {
         });
         #[cfg(not(test))]
         let append_fault = false;
+        #[cfg(test)]
+        let (task_register_append_fault, task_register_sync_fault) = TASK_REGISTER_JOURNAL_FAULT
+            .with(|injected| {
+                let injected_fault = injected.get();
+                let has_task_registration = evs
+                    .iter()
+                    .any(|event| matches!(event, Event::TaskCreated { .. }));
+                if !has_task_registration {
+                    return (false, false);
+                }
+                if injected_fault == TaskRegisterJournalFault::Append as u8 {
+                    injected.set(0);
+                    (true, false)
+                } else if injected_fault == TaskRegisterJournalFault::Sync as u8 {
+                    injected.set(0);
+                    (false, true)
+                } else {
+                    (false, false)
+                }
+            });
+        #[cfg(not(test))]
+        let (task_register_append_fault, task_register_sync_fault) = (false, false);
         if append_fault {
             let message = "injected subagent journal append failure".to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Append(message));
+        }
+        if task_register_append_fault {
+            let message = "injected task register journal append failure".to_string();
             st.journal_poison = Some(message.clone());
             return Err(notification_contract::JournalError::Append(message));
         }
@@ -965,6 +1009,11 @@ impl Server {
         let sync_fault = false;
         if sync_fault {
             let message = "injected subagent journal sync failure".to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Flush(message));
+        }
+        if task_register_sync_fault {
+            let message = "injected task register journal sync failure".to_string();
             st.journal_poison = Some(message.clone());
             return Err(notification_contract::JournalError::Flush(message));
         }
@@ -4542,7 +4591,11 @@ fn handle_task_register_with_next(
             created_ms: now,
             updated_ms: now,
         };
-        server.commit_locked(&mut st, &[Event::TaskCreated { task: blocked_task }]);
+        if let Err(error) =
+            server.commit_locked_checked(&mut st, &[Event::TaskCreated { task: blocked_task }])
+        {
+            return Resp::err(format!("TASK_DURABILITY_FAILED: {error}"));
+        }
         return Resp::err_data(
             "TASK_RESOURCE_CONFLICT",
             json!({
@@ -4574,7 +4627,9 @@ fn handle_task_register_with_next(
     if let Some(binding) = worktree_binding_for_task(server, &task) {
         events.push(Event::WorktreeBound { binding });
     }
-    server.commit_locked(&mut st, &events);
+    if let Err(error) = server.commit_locked_checked(&mut st, &events) {
+        return Resp::err(format!("TASK_DURABILITY_FAILED: {error}"));
+    }
     Resp::data(json!({
         "task": task.id,
         "owner": task.owner,
@@ -8257,6 +8312,185 @@ mod reducer_binding_tests {
             canonical_worktree
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_register_journal_failures_are_explicit_and_read_only_after_normal_write() {
+        use TaskRegisterJournalFault::{Append, Sync};
+
+        for fault in [Append, Sync] {
+            let (server, root) = peer_tests::test_server();
+            assert!(peer_tests::register(&server, "worker", "%worker").ok);
+            let mailbox_dir = root.join(".agent-collab/mailbox");
+            std::fs::create_dir_all(&mailbox_dir).unwrap();
+            let mailbox_sentinel = mailbox_dir.join("sentinel");
+            std::fs::write(&mailbox_sentinel, b"unchanged").unwrap();
+            let journal_path = root.join(".agent-collab/server/journal.jsonl");
+            let journal_before = std::fs::read(&journal_path).unwrap();
+            let (sequence_before, revision_before) = {
+                let state = server.state.lock().unwrap();
+                (state.sequence, state.revision)
+            };
+            let server = Arc::new(server);
+
+            inject_task_register_journal_fault(fault);
+            let response = handle_task_register(
+                server.as_ref(),
+                "worker".into(),
+                "token-worker".into(),
+                "task-register-fault".into(),
+                None,
+                Some("feature-register-fault".into()),
+                None,
+                None,
+                None,
+                "p2".into(),
+            );
+            assert!(!response.ok, "{fault:?}: {response:?}");
+            assert!(response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("TASK_DURABILITY_FAILED: journal ")));
+
+            let state = server.state.lock().unwrap();
+            assert!(!state.tasks.contains_key("task-register-fault"));
+            assert_eq!(state.sequence, sequence_before);
+            assert_eq!(state.revision, revision_before);
+            assert!(state
+                .journal_poison
+                .as_deref()
+                .is_some_and(|error| error.contains("injected task register journal")));
+            drop(state);
+            assert_eq!(std::fs::read(&mailbox_sentinel).unwrap(), b"unchanged");
+            if matches!(fault, Append) {
+                assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+            }
+
+            let read_only = dispatch(&server, Req::TaskStatus { task_id: None });
+            assert!(read_only.ok, "{fault:?}: {read_only:?}");
+            assert_eq!(read_only.data["tasks"].as_array().unwrap().len(), 0);
+
+            let retry = handle_task_register(
+                server.as_ref(),
+                "worker".into(),
+                "token-worker".into(),
+                "task-register-retry".into(),
+                None,
+                Some("feature-register-retry".into()),
+                None,
+                None,
+                None,
+                "p2".into(),
+            );
+            assert!(!retry.ok, "{fault:?}: poisoned writes must fail closed");
+            assert!(retry
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("TASK_DURABILITY_FAILED: journal ")));
+            assert_eq!(std::fs::read(&mailbox_sentinel).unwrap(), b"unchanged");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn task_register_journal_failures_are_explicit_and_preserve_resource_holder() {
+        use TaskRegisterJournalFault::{Append, Sync};
+
+        for fault in [Append, Sync] {
+            let (server, root) = peer_tests::test_server();
+            assert!(peer_tests::register(&server, "holder", "%holder").ok);
+            assert!(peer_tests::register(&server, "waiter", "%waiter").ok);
+            let holder = handle_task_register(
+                &server,
+                "holder".into(),
+                "token-holder".into(),
+                "held-task".into(),
+                None,
+                Some("shared-resource".into()),
+                None,
+                None,
+                None,
+                "p2".into(),
+            );
+            assert!(holder.ok, "{holder:?}");
+            let mailbox_dir = root.join(".agent-collab/mailbox");
+            std::fs::create_dir_all(&mailbox_dir).unwrap();
+            let mailbox_sentinel = mailbox_dir.join("sentinel");
+            std::fs::write(&mailbox_sentinel, b"unchanged").unwrap();
+            let journal_path = root.join(".agent-collab/server/journal.jsonl");
+            let journal_before = std::fs::read(&journal_path).unwrap();
+            let (sequence_before, revision_before) = {
+                let state = server.state.lock().unwrap();
+                (state.sequence, state.revision)
+            };
+            let server = Arc::new(server);
+
+            inject_task_register_journal_fault(fault);
+            let response = handle_task_register(
+                server.as_ref(),
+                "waiter".into(),
+                "token-waiter".into(),
+                "blocked-task".into(),
+                None,
+                Some("shared-resource".into()),
+                None,
+                None,
+                None,
+                "p2".into(),
+            );
+            assert!(!response.ok, "{fault:?}: {response:?}");
+            assert!(response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("TASK_DURABILITY_FAILED: journal ")));
+
+            let state = server.state.lock().unwrap();
+            assert_eq!(state.tasks.len(), 1);
+            assert_eq!(state.tasks["held-task"].status, "working");
+            assert!(!state.tasks.contains_key("blocked-task"));
+            assert_eq!(state.sequence, sequence_before);
+            assert_eq!(state.revision, revision_before);
+            assert!(state
+                .journal_poison
+                .as_deref()
+                .is_some_and(|error| error.contains("injected task register journal")));
+            drop(state);
+            if matches!(fault, Append) {
+                assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+            }
+            assert_eq!(std::fs::read(&mailbox_sentinel).unwrap(), b"unchanged");
+
+            let read_only = dispatch(
+                &server,
+                Req::TaskConflicts {
+                    feature_id: Some("shared-resource".into()),
+                    worktree_path: None,
+                },
+            );
+            assert!(read_only.ok, "{fault:?}: {read_only:?}");
+            assert_eq!(read_only.data["conflicts"].as_array().unwrap().len(), 1);
+            assert_eq!(read_only.data["conflicts"][0]["id"], "held-task");
+
+            let retry = handle_task_register(
+                server.as_ref(),
+                "waiter".into(),
+                "token-waiter".into(),
+                "blocked-retry".into(),
+                None,
+                Some("another-resource".into()),
+                None,
+                None,
+                None,
+                "p2".into(),
+            );
+            assert!(!retry.ok, "{fault:?}: poisoned writes must fail closed");
+            assert!(retry
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("TASK_DURABILITY_FAILED: journal ")));
+            assert_eq!(std::fs::read(&mailbox_sentinel).unwrap(), b"unchanged");
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
 
