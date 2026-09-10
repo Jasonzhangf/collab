@@ -65,6 +65,29 @@ pub(crate) fn inject_command_journal_fault(fault: CommandJournalFault) {
     COMMAND_JOURNAL_FAULT.with(|injected| injected.set(fault as u8));
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SubagentJournalFault {
+    StartAppend = 11,
+    StartSync = 12,
+    CloseFirstAppend = 21,
+    CloseFirstSync = 22,
+    CloseFinalAppend = 31,
+    CloseFinalSync = 32,
+    WorkingAppend = 41,
+    WorkingSync = 42,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SUBAGENT_JOURNAL_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_subagent_journal_fault(fault: SubagentJournalFault) {
+    SUBAGENT_JOURNAL_FAULT.with(|injected| injected.set(fault as u8));
+}
+
 #[derive(Clone, Copy)]
 enum CommandJournalPhase {
     Start,
@@ -374,11 +397,61 @@ impl Server {
             buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
         }
+        #[cfg(test)]
+        let append_fault = SUBAGENT_JOURNAL_FAULT.with(|injected| {
+            let injected_fault = injected.get();
+            let close_final = injected_fault == SubagentJournalFault::CloseFinalAppend as u8
+                && evs.iter().any(|event| {
+                matches!(event, Event::SubagentUpdated { subagent } if subagent.status == "closed")
+            });
+            if close_final
+                || injected_fault == SubagentJournalFault::StartAppend as u8
+                || injected_fault == SubagentJournalFault::CloseFirstAppend as u8
+                || injected_fault == SubagentJournalFault::WorkingAppend as u8
+            {
+                injected.set(0);
+                true
+            } else {
+                false
+            }
+        });
+        #[cfg(not(test))]
+        let append_fault = false;
+        if append_fault {
+            let message = "injected subagent journal append failure".to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Append(message));
+        }
         let mut j = self.journal.lock().unwrap();
         if let Err(error) = j.write_all(&buf) {
             let message = error.to_string();
             st.journal_poison = Some(message.clone());
             return Err(notification_contract::JournalError::Append(message));
+        }
+        #[cfg(test)]
+        let sync_fault = SUBAGENT_JOURNAL_FAULT.with(|injected| {
+            let injected_fault = injected.get();
+            let close_final = injected_fault == SubagentJournalFault::CloseFinalSync as u8
+                && evs.iter().any(|event| {
+                matches!(event, Event::SubagentUpdated { subagent } if subagent.status == "closed")
+            });
+            if close_final
+                || injected_fault == SubagentJournalFault::StartSync as u8
+                || injected_fault == SubagentJournalFault::CloseFirstSync as u8
+                || injected_fault == SubagentJournalFault::WorkingSync as u8
+            {
+                injected.set(0);
+                true
+            } else {
+                false
+            }
+        });
+        #[cfg(not(test))]
+        let sync_fault = false;
+        if sync_fault {
+            let message = "injected subagent journal sync failure".to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Flush(message));
         }
         if let Err(error) = j.sync_data() {
             let message = error.to_string();

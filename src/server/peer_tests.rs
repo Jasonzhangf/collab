@@ -517,6 +517,213 @@ fn command_completion_sync_failure_is_explicit_and_replayable_if_marker_was_writ
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn subagent_record(id: &str, status: &str, peer: &str) -> crate::subagent::Record {
+    crate::subagent::Record {
+        id: id.into(),
+        parent: "parent".into(),
+        peer: peer.into(),
+        status: status.into(),
+        session: Some("$session".into()),
+        pane: Some("%child".into()),
+        profile: None,
+        created_ms: now_ms(),
+        ready_deadline_ms: now_ms() + 90_000,
+        last_message: None,
+        error: None,
+        probe_failures: Vec::new(),
+        runtime: Some("cursor".into()),
+    }
+}
+
+fn subagent_req(command: crate::subagent::Action) -> Req {
+    Req::Subagent {
+        worker_id: "parent".into(),
+        token: "token-parent".into(),
+        command,
+        launch_env: Default::default(),
+    }
+}
+
+#[test]
+fn subagent_start_journal_failure_does_not_launch_or_write_success() {
+    use crate::server::SubagentJournalFault::{StartAppend, StartSync};
+
+    for fault in [StartAppend, StartSync] {
+        let (mut server, root) = test_server();
+        register(&server, "parent", "%parent");
+        server.pane_alive_check = |_| PanePresence::Present;
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "parent".into(),
+            assigned_by: "operator".into(),
+            approval: Some("start journal regression".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let server = Arc::new(server);
+        crate::server::inject_subagent_journal_fault(fault);
+        let result = dispatch(
+            &server,
+            subagent_req(crate::subagent::Action::Start {
+                id: Some("start-journal-fault".into()),
+                runtime: Some("cursor".into()),
+            }),
+        );
+        assert!(!result.ok, "{fault:?}: {result:?}");
+        let state = server.state.lock().unwrap();
+        assert!(state.subagents.is_empty());
+        assert!(state.journal_poison.is_some());
+        drop(state);
+        assert!(!root
+            .join(".agent-collab/server/launch-start-journal-fault.json")
+            .exists());
+        let replayed = replay(&root).unwrap();
+        match fault {
+            StartAppend => assert!(replayed.subagents.is_empty()),
+            StartSync => {
+                assert!(replayed
+                    .subagents
+                    .values()
+                    .all(|record| record.status != "starting" && record.status != "failed"));
+            }
+            _ => unreachable!(),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn subagent_working_journal_failure_preserves_task_and_subagent_and_poison_rejects_mutation() {
+    use crate::server::SubagentJournalFault::{WorkingAppend, WorkingSync};
+
+    for fault in [WorkingAppend, WorkingSync] {
+        let (server, root) = test_server();
+        register(&server, "parent", "%parent");
+        register(&server, "child", "%child");
+        let now = now_ms();
+        let mut record = subagent_record("working-journal-fault", "assigned", "child");
+        record.last_message = Some("working-journal-fault".into());
+        server.commit(&[
+            Event::SubagentUpdated { subagent: record },
+            Event::TaskCreated {
+                task: TaskRec {
+                    id: "task-working-journal-fault".into(),
+                    owner: "child".into(),
+                    created_by: "parent".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p2".into(),
+                    status: "assigned".into(),
+                    next_step: None,
+                    wait: None,
+                    created_ms: now,
+                    updated_ms: now,
+                },
+            },
+        ]);
+        let server = Arc::new(server);
+        crate::server::inject_subagent_journal_fault(fault);
+        let result = dispatch(
+            &server,
+            Req::Subagent {
+                worker_id: "child".into(),
+                token: "token-child".into(),
+                command: crate::subagent::Action::Working {
+                    id: "working-journal-fault".into(),
+                },
+                launch_env: Default::default(),
+            },
+        );
+        assert!(!result.ok, "{fault:?}: {result:?}");
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.subagents["working-journal-fault"].status, "assigned");
+        assert_eq!(state.tasks["task-working-journal-fault"].status, "assigned");
+        assert!(state.journal_poison.is_some());
+        drop(state);
+        let rejected = dispatch(
+            &server,
+            Req::Subagent {
+                worker_id: "child".into(),
+                token: "token-child".into(),
+                command: crate::subagent::Action::Working {
+                    id: "working-journal-fault".into(),
+                },
+                launch_env: Default::default(),
+            },
+        );
+        assert!(!rejected.ok);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.subagents["working-journal-fault"].status, "assigned");
+        assert_eq!(state.tasks["task-working-journal-fault"].status, "assigned");
+        drop(state);
+        assert!(replay(&root).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn subagent_close_first_journal_failure_does_not_remove_external_manifest() {
+    use crate::server::SubagentJournalFault::{CloseFirstAppend, CloseFirstSync};
+
+    for fault in [CloseFirstAppend, CloseFirstSync] {
+        let (mut server, root) = test_server();
+        register(&server, "parent", "%parent");
+        server.pane_alive_check = |_| PanePresence::Missing;
+        server.commit(&[Event::SubagentUpdated {
+            subagent: subagent_record("close-first-fault", "idle", "child"),
+        }]);
+        let manifest = root.join(".agent-collab/server/launch-close-first-fault.json");
+        std::fs::write(&manifest, b"test-only manifest").unwrap();
+        let server = Arc::new(server);
+        crate::server::inject_subagent_journal_fault(fault);
+        let result = dispatch(
+            &server,
+            subagent_req(crate::subagent::Action::Close {
+                id: "close-first-fault".into(),
+            }),
+        );
+        assert!(!result.ok, "{fault:?}: {result:?}");
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.subagents["close-first-fault"].status, "idle");
+        assert!(state.journal_poison.is_some());
+        drop(state);
+        assert!(manifest.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn subagent_close_final_journal_failure_reports_unknown_and_stays_open() {
+    use crate::server::SubagentJournalFault::{CloseFinalAppend, CloseFinalSync};
+
+    for fault in [CloseFinalAppend, CloseFinalSync] {
+        let (mut server, root) = test_server();
+        register(&server, "parent", "%parent");
+        server.pane_alive_check = |_| PanePresence::Missing;
+        server.commit(&[Event::SubagentUpdated {
+            subagent: subagent_record("close-final-fault", "idle", "child"),
+        }]);
+        let manifest = root.join(".agent-collab/server/launch-close-final-fault.json");
+        std::fs::write(&manifest, b"test-only manifest").unwrap();
+        let server = Arc::new(server);
+        crate::server::inject_subagent_journal_fault(fault);
+        let result = dispatch(
+            &server,
+            subagent_req(crate::subagent::Action::Close {
+                id: "close-final-fault".into(),
+            }),
+        );
+        assert!(!result.ok, "{fault:?}: {result:?}");
+        assert!(result.error.unwrap().contains("outcome unknown"));
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.subagents["close-final-fault"].status, "closing");
+        assert!(state.journal_poison.is_some());
+        drop(state);
+        assert!(!manifest.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[test]
 fn replayed_command_is_idempotent_and_operation_conflict_fails_closed() {
     let (server, root) = test_server();
