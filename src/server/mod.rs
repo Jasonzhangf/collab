@@ -9,7 +9,9 @@ pub mod timers;
 
 pub use global_state::{GlobalState, ProjectRegistration, RuntimeBinding};
 
-use crate::identity::{AgentId, AppServerId, BindingId, CommandId, OperationId, RuntimeId};
+use crate::identity::{
+    AgentId, AppServerId, BindingId, CommandId, OperationId, RuntimeId, RuntimeIdentity,
+};
 use crate::proto::{CommandEnvelope, ProjectContext, Req, RequestEnvelope, Resp, MSG_TYPES};
 use crate::scope::{HostPaths, ProjectScopeId, RouteScope, Scope};
 use crate::server::knock::{
@@ -3780,6 +3782,9 @@ pub(crate) fn handle_send(
     in_reply_to: Option<String>,
     delivery_mode: String,
 ) -> Resp {
+    if mtype != "notify" {
+        return Resp::err("peer messaging requires type notify");
+    }
     handle_send_with_task(
         server,
         from,
@@ -3794,6 +3799,29 @@ pub(crate) fn handle_send(
     )
 }
 
+fn authoritative_send_binding<'a>(
+    state: &'a State,
+    route_scope: &RouteScope,
+    worker_id: &str,
+) -> Result<&'a RuntimeBinding, &'static str> {
+    let Some(project) = state.global.lookup_project(&route_scope.project_scope_id) else {
+        return Err("SEND_BINDING_REJECTED: authoritative runtime binding is missing");
+    };
+    let mut bindings = project.runtime_bindings.values().filter(|binding| {
+        binding.app_scope_id == route_scope.app_scope_id && binding.agent_id.as_str() == worker_id
+    });
+    let Some(binding) = bindings.next() else {
+        return Err("SEND_BINDING_REJECTED: authoritative runtime binding is missing");
+    };
+    if bindings.next().is_some() {
+        return Err("SEND_BINDING_REJECTED: authoritative runtime binding is ambiguous");
+    }
+    Ok(binding)
+}
+
+/// Typed PeerSend for the authenticated send path. Resolves the authoritative
+/// `RuntimeBinding` from `State.global` and preserves request cooldown plus
+/// reply supersession by delegating into `handle_send_with_task`.
 fn handle_authenticated_send(
     server: &Server,
     raw_from: String,
@@ -3819,42 +3847,52 @@ fn handle_authenticated_send(
             "LEGACY_SEND_REJECTED: authenticated sender binding and route scope are required",
         );
     };
-    let appserver_id = match crate::identity::AppServerId::new("appserver-cli") {
+    let appserver_id = match AppServerId::new("tui-default") {
         Ok(id) => id,
         Err(error) => return Resp::err(error.to_string()),
     };
-    let agent_id = match crate::identity::AgentId::new(&worker.id) {
-        Ok(agent_id) => agent_id,
-        Err(error) => return Resp::err(error.to_string()),
+    let registered_scope =
+        match RouteScope::for_registered_project(appserver_id.clone(), Path::new(&worker.cwd)) {
+            Ok(scope) => scope,
+            Err(error) => return Resp::err(error.to_string()),
+        };
+    let binding = match authoritative_send_binding(&st, &registered_scope, &worker_id) {
+        Ok(binding) => binding,
+        Err(error) => return Resp::err(error),
     };
-    let runtime_id = match crate::identity::RuntimeId::new(format!("runtime-{}", worker.id)) {
-        Ok(runtime_id) => runtime_id,
-        Err(error) => return Resp::err(error.to_string()),
+    if command.actor_binding_id != binding.binding_id {
+        return Resp::err(format!(
+            "SEND_BINDING_REJECTED: actor binding mismatch: expected {}, observed {}",
+            binding.binding_id, command.actor_binding_id
+        ));
+    }
+    if command.endpoint_generation != binding.endpoint_generation {
+        return Resp::err(format!(
+            "SEND_BINDING_REJECTED: stale endpoint generation: expected {}, observed {}",
+            binding.endpoint_generation, command.endpoint_generation
+        ));
+    }
+    if command.scope != registered_scope {
+        return Resp::err(
+            "SEND_BINDING_REJECTED: envelope scope does not match authoritative route scope",
+        );
+    }
+    let authoritative_runtime = RuntimeIdentity {
+        agent_id: binding.agent_id.clone(),
+        runtime_id: binding.runtime_id.clone(),
+        appserver_id: binding.app_scope_id.clone(),
+        endpoint_generation: binding.endpoint_generation,
+        binding_id: binding.binding_id.clone(),
+        native_thread_id: binding.native_thread_id.clone(),
     };
-    let binding_id = match crate::identity::BindingId::new(format!("binding-{}", worker.id)) {
-        Ok(binding_id) => binding_id,
-        Err(error) => return Resp::err(error.to_string()),
-    };
-    let runtime = crate::identity::RuntimeIdentity {
-        agent_id,
-        runtime_id,
-        appserver_id: appserver_id.clone(),
-        endpoint_generation: 0,
-        binding_id,
-        native_thread_id: None,
-    };
-    let registered_scope = match crate::scope::RouteScope::for_registered_project(
-        appserver_id,
-        Path::new(&worker.cwd),
-    ) {
-        Ok(scope) => scope,
-        Err(error) => return Resp::err(error.to_string()),
-    };
-    if let Err(error) = command.validate_for(&runtime, &registered_scope) {
+    if let Err(error) = command.validate_for(&authoritative_runtime, &registered_scope) {
         return Resp::err(format!("SEND_BINDING_REJECTED: {error}"));
     }
     if raw_from != worker_id {
         return Resp::err("sender identity is derived from the authenticated binding");
+    }
+    if mtype == "notification" {
+        return Resp::err("peer messaging requires type notify");
     }
     drop(st);
     handle_send_with_task(
@@ -3883,9 +3921,6 @@ pub(crate) fn handle_send_with_task(
     assign_task: bool,
     managed_subagent_id: Option<&str>,
 ) -> Resp {
-    if mtype != "notify" {
-        return Resp::err("peer messaging requires type notify");
-    }
     if delivery_mode != "immediate" {
         return Resp::err(
             "implicit idle delivery is removed; use an explicit notification subscription",

@@ -1,8 +1,10 @@
 use super::*;
+use crate::identity::{BindingId, RuntimeId};
 use crate::server::notification_contract::JournalError;
 use crate::server::state::{default_priority, is_goal_deadline, TaskRec};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub(crate) fn test_server() -> (Server, PathBuf) {
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -43,13 +45,13 @@ pub(super) fn register(server: &Server, id: &str, pane: &str) -> Resp {
 fn send_command(root: &Path, id: &str) -> crate::proto::CommandEnvelope {
     use crate::identity::{AppServerId, BindingId, CommandId, OperationId};
     use crate::proto::CommandEnvelope;
-    let app = AppServerId::new("appserver-cli").unwrap();
+    let app = AppServerId::new("tui-default").unwrap();
     let scope = crate::scope::RouteScope::for_registered_project(app, root).unwrap();
     CommandEnvelope::new(
         CommandId::new(format!("command-{id}")).unwrap(),
         OperationId::new(format!("operation-{id}")).unwrap(),
         BindingId::new(format!("binding-{id}")).unwrap(),
-        0,
+        1,
         scope,
         None,
         None,
@@ -137,6 +139,267 @@ fn master_idle_subscription_is_restricted_to_the_live_master_and_supported_inter
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn authenticated_send_rejects_missing_binding() {
+    let (server, root) = test_server();
+    register(&server, "sender", "%sender");
+    register(&server, "receiver", "%receiver");
+    {
+        let mut state = server.state.lock().unwrap();
+        let scope = send_command(&root, "sender").scope;
+        state
+            .global
+            .projects
+            .get_mut(scope.project_scope_id.as_str())
+            .unwrap()
+            .runtime_bindings
+            .remove("binding-sender");
+    }
+    let server_arc = Arc::new(server);
+    let resp = dispatch(
+        &server_arc,
+        Req::Send {
+            from: "sender".into(),
+            worker_id: Some("sender".into()),
+            token: Some("token-sender".into()),
+            command: Some(send_command(&root, "sender")),
+            to: "receiver".into(),
+            mtype: "notify".into(),
+            subject: Some("test".into()),
+            body: "body".into(),
+            in_reply_to: None,
+            delivery: "immediate".into(),
+        },
+    );
+    assert!(!resp.ok);
+    let err = resp.error.unwrap_or_default();
+    assert!(
+        err.contains("SEND_BINDING_REJECTED")
+            && err.contains("authoritative runtime binding is missing"),
+        "unexpected error: {err}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn authenticated_send_rejects_ambiguous_binding() {
+    let (server, root) = test_server();
+    register(&server, "sender", "%sender");
+    register(&server, "receiver", "%receiver");
+    let extra_binding = {
+        let state = server.state.lock().unwrap();
+        let mut binding = state
+            .global
+            .lookup_binding_for(
+                &send_command(&root, "sender").scope,
+                &BindingId::new("binding-sender").unwrap(),
+            )
+            .unwrap()
+            .clone();
+        binding.binding_id = BindingId::new("binding-sender-extra").unwrap();
+        binding.runtime_id = RuntimeId::new("runtime-sender-extra").unwrap();
+        binding
+    };
+    server.commit(&[Event::GlobalRuntimeBound {
+        binding: extra_binding,
+    }]);
+    let resp = dispatch(
+        &Arc::new(server),
+        Req::Send {
+            from: "sender".into(),
+            worker_id: Some("sender".into()),
+            token: Some("token-sender".into()),
+            command: Some(send_command(&root, "sender")),
+            to: "receiver".into(),
+            mtype: "notify".into(),
+            subject: Some("test".into()),
+            body: "body".into(),
+            in_reply_to: None,
+            delivery: "immediate".into(),
+        },
+    );
+    assert!(!resp.ok);
+    let err = resp.error.unwrap_or_default();
+    assert!(
+        err.contains("SEND_BINDING_REJECTED")
+            && err.contains("authoritative runtime binding is ambiguous"),
+        "unexpected error: {err}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn authenticated_send_rejects_another_workers_binding() {
+    let (server, root) = test_server();
+    register(&server, "sender", "%sender");
+    register(&server, "receiver", "%receiver");
+    let resp = dispatch(
+        &Arc::new(server),
+        Req::Send {
+            from: "sender".into(),
+            worker_id: Some("sender".into()),
+            token: Some("token-sender".into()),
+            command: Some(send_command(&root, "receiver")),
+            to: "receiver".into(),
+            mtype: "notify".into(),
+            subject: Some("test".into()),
+            body: "body".into(),
+            in_reply_to: None,
+            delivery: "immediate".into(),
+        },
+    );
+    assert!(!resp.ok);
+    let err = resp.error.unwrap_or_default();
+    assert!(
+        err.contains("SEND_BINDING_REJECTED") && err.contains("actor binding mismatch"),
+        "unexpected error: {err}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn authenticated_send_rejects_stale_generation() {
+    let (server, root) = test_server();
+    register(&server, "sender", "%sender");
+    register(&server, "receiver", "%receiver");
+    let server_arc = Arc::new(server);
+    let mut command = send_command(&root, "sender");
+    command.endpoint_generation = 0;
+    let resp = dispatch(
+        &server_arc,
+        Req::Send {
+            from: "sender".into(),
+            worker_id: Some("sender".into()),
+            token: Some("token-sender".into()),
+            command: Some(command),
+            to: "receiver".into(),
+            mtype: "notify".into(),
+            subject: Some("test".into()),
+            body: "body".into(),
+            in_reply_to: None,
+            delivery: "immediate".into(),
+        },
+    );
+    assert!(!resp.ok);
+    let err = resp.error.unwrap_or_default();
+    assert!(
+        err.contains("SEND_BINDING_REJECTED") && err.contains("stale endpoint generation"),
+        "unexpected error: {err}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn authenticated_send_enforces_request_cooldown() {
+    let (server, root) = test_server();
+    register(&server, "sender", "%sender");
+    register(&server, "receiver", "%receiver");
+    let server_arc = Arc::new(server);
+    let command = send_command(&root, "sender");
+    let first = dispatch(
+        &server_arc,
+        Req::Send {
+            from: "sender".into(),
+            worker_id: Some("sender".into()),
+            token: Some("token-sender".into()),
+            command: Some(command.clone()),
+            to: "receiver".into(),
+            mtype: "request".into(),
+            subject: Some("cooldown".into()),
+            body: "first".into(),
+            in_reply_to: None,
+            delivery: "immediate".into(),
+        },
+    );
+    assert!(first.ok, "{}", first.error.unwrap_or_default());
+    let second = dispatch(
+        &server_arc,
+        Req::Send {
+            from: "sender".into(),
+            worker_id: Some("sender".into()),
+            token: Some("token-sender".into()),
+            command: Some(command.clone()),
+            to: "receiver".into(),
+            mtype: "request".into(),
+            subject: Some("cooldown".into()),
+            body: "second".into(),
+            in_reply_to: None,
+            delivery: "immediate".into(),
+        },
+    );
+    assert!(!second.ok);
+    let err = second.error.unwrap_or_default();
+    assert!(
+        err.contains("request cooldown active"),
+        "unexpected error: {err}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn authenticated_send_supersedes_earlier_reply() {
+    let (server, root) = test_server();
+    register(&server, "sender", "%sender");
+    register(&server, "receiver", "%receiver");
+    let server_arc = Arc::new(server);
+    let command = send_command(&root, "sender");
+    let command_receiver = send_command(&root, "receiver");
+    let req_resp = dispatch(
+        &server_arc,
+        Req::Send {
+            from: "sender".into(),
+            worker_id: Some("sender".into()),
+            token: Some("token-sender".into()),
+            command: Some(command.clone()),
+            to: "receiver".into(),
+            mtype: "request".into(),
+            subject: Some("supersede".into()),
+            body: "ask".into(),
+            in_reply_to: None,
+            delivery: "immediate".into(),
+        },
+    );
+    assert!(req_resp.ok, "{}", req_resp.error.unwrap_or_default());
+    let request_id = req_resp.data["msg_id"].as_str().unwrap().to_owned();
+    let first = dispatch(
+        &server_arc,
+        Req::Send {
+            from: "receiver".into(),
+            worker_id: Some("receiver".into()),
+            token: Some("token-receiver".into()),
+            command: Some(command_receiver.clone()),
+            to: "sender".into(),
+            mtype: "reply".into(),
+            subject: Some("supersede".into()),
+            body: "first".into(),
+            in_reply_to: Some(request_id.clone()),
+            delivery: "immediate".into(),
+        },
+    );
+    assert!(first.ok, "{}", first.error.unwrap_or_default());
+    let first_id = first.data["msg_id"].as_str().unwrap().to_owned();
+    let second = dispatch(
+        &server_arc,
+        Req::Send {
+            from: "receiver".into(),
+            worker_id: Some("receiver".into()),
+            token: Some("token-receiver".into()),
+            command: Some(command_receiver.clone()),
+            to: "sender".into(),
+            mtype: "reply".into(),
+            subject: Some("supersede".into()),
+            body: "second".into(),
+            in_reply_to: Some(request_id.clone()),
+            delivery: "immediate".into(),
+        },
+    );
+    assert!(second.ok, "{}", second.error.unwrap_or_default());
+    let state = server_arc.state.lock().unwrap();
+    let first_msg = state.msgs.get(&first_id).unwrap();
+    assert_eq!(first_msg.state, "superseded");
+    drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
 #[test]
 fn cancelling_master_idle_subscription_supersedes_pending_wake() {
     let (server, root) = test_server();
@@ -487,10 +750,8 @@ fn typed_registration_uses_global_binding_and_host_idempotency() {
         .unwrap();
     let first = server.typed_dispatch(typed.clone()).unwrap();
     assert!(!first.replayed);
-    let project_scope = crate::server::global_state::GlobalState::canonical_project_scope(
-        Path::new(cwd),
-    )
-    .unwrap();
+    let project_scope =
+        crate::server::global_state::GlobalState::canonical_project_scope(Path::new(cwd)).unwrap();
     let state = server.state.lock().unwrap();
     assert!(state
         .global
@@ -499,8 +760,16 @@ fn typed_registration_uses_global_binding_and_host_idempotency() {
             &crate::identity::AppServerId::new("tui-default").unwrap(),
         )
         .is_some());
-    assert_eq!(state.global.projects[project_scope.as_str()].runtime_bindings.len(), 1);
-    assert!(state.global.command_receipts.contains_key(first.receipt.command_id.as_str()));
+    assert_eq!(
+        state.global.projects[project_scope.as_str()]
+            .runtime_bindings
+            .len(),
+        1
+    );
+    assert!(state
+        .global
+        .command_receipts
+        .contains_key(first.receipt.command_id.as_str()));
     drop(state);
 
     let replay = server.typed_dispatch(typed).unwrap();
@@ -551,7 +820,9 @@ fn typed_receipt_revision_is_the_next_cas_and_stale_after_another_mutation() {
     let error = server
         .typed_dispatch(stale)
         .expect_err("an intervening reducer mutation must reject the old CAS revision");
-    assert!(error.to_string().contains("compare-and-swap revision mismatch"));
+    assert!(error
+        .to_string()
+        .contains("compare-and-swap revision mismatch"));
     assert_eq!(
         std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap(),
         journal_before_stale,
@@ -834,7 +1105,9 @@ fn typed_dispatch_rejects_stale_revision_without_appending() {
     stale.envelope.operation_id = crate::identity::OperationId::new("register-stale-op").unwrap();
     stale.envelope.expected_revision = Some(0);
     let error = server.typed_dispatch(stale).unwrap_err();
-    assert!(error.to_string().contains("compare-and-swap revision mismatch"));
+    assert!(error
+        .to_string()
+        .contains("compare-and-swap revision mismatch"));
     assert_eq!(
         std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
             .unwrap()
@@ -871,10 +1144,12 @@ fn typed_dispatch_rejects_wrong_principal_and_scope() {
     assert!(scope_error
         .to_string()
         .contains("envelope scope does not match binding route scope"));
-    assert!(std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
-        .unwrap()
-        .trim()
-        .is_empty());
+    assert!(
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .trim()
+            .is_empty()
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
