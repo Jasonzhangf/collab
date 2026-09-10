@@ -329,7 +329,7 @@ impl Server {
             .map_err(|error| error.to_string())?;
         let expected_revision = {
             let st = self.state.lock().unwrap();
-            st.global.version().revision
+            st.revision
         };
         let envelope = CommandEnvelope::new(
             command_id,
@@ -621,15 +621,24 @@ impl Server {
             ));
         }
         if let Some(expected_revision) = expected_revision {
-            let observed_revision = st.global.version().revision;
+            let observed_revision = st.revision;
             if observed_revision != expected_revision {
                 return Err(notification_contract::JournalError::InvalidCommand(format!(
                     "compare-and-swap revision mismatch: expected {expected_revision}, observed {observed_revision}"
                 )));
             }
         }
-        let sequence = st.sequence.saturating_add(evs.len() as u64 + 2);
-        let revision = st.revision.saturating_add(evs.len() as u64 + 2);
+        let event_count = evs.len().checked_add(2).ok_or_else(|| {
+            notification_contract::JournalError::InvalidCommand(
+                "command event count overflow".into(),
+            )
+        })? as u64;
+        let sequence = st.sequence.checked_add(event_count).ok_or_else(|| {
+            notification_contract::JournalError::InvalidCommand("sequence counter overflow".into())
+        })?;
+        let revision = st.revision.checked_add(event_count).ok_or_else(|| {
+            notification_contract::JournalError::InvalidCommand("revision counter overflow".into())
+        })?;
         let receipt = state::CommandReceipt {
             operation_id: operation_id.to_owned(),
             outcome: outcome.clone(),
@@ -923,8 +932,10 @@ impl Server {
                 st.journal_poison.get_or_insert(error.clone());
                 return Err(notification_contract::JournalError::Reducer(error));
             }
-            st.sequence = st.sequence.saturating_add(1);
-            st.revision = st.revision.saturating_add(1);
+            if let Err(error) = st.advance_version() {
+                st.journal_poison.get_or_insert(error.clone());
+                return Err(notification_contract::JournalError::Reducer(error));
+            }
             if let Event::Sent { msg } = ev {
                 if let Err(error) = self.backup_message(msg) {
                     self.report_mailbox_projection_error(error);
@@ -6204,6 +6215,19 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
     }
 }
 
+fn apply_replayed_event(st: &mut State, event: &Event, line: usize) -> anyhow::Result<()> {
+    st.apply_checked(event)
+        .map_err(|error| anyhow::anyhow!("journal replay failed at line {line}: {error}"))?;
+    match event {
+        Event::ReducerCheckpoint { sequence, revision } => st
+            .set_checkpoint_version(*sequence, *revision)
+            .map_err(|error| anyhow::anyhow!("journal replay failed at line {line}: {error}")),
+        _ => st
+            .advance_version()
+            .map_err(|error| anyhow::anyhow!("journal replay failed at line {line}: {error}")),
+    }
+}
+
 fn replay(root: &Path) -> anyhow::Result<State> {
     let journal = root.join(".agent-collab/server/journal.jsonl");
     let mut st = State::default();
@@ -6295,31 +6319,7 @@ fn replay(root: &Path) -> anyhow::Result<State> {
                         let committed = std::mem::take(pending);
                         pending_command = None;
                         for event in committed {
-                            if let Event::GlobalProjectRegistered { registration } = &event {
-                                st.apply_global_event(&state::GlobalEvent::ProjectRegistered {
-                                    registration: registration.clone(),
-                                })
-                                .map_err(|error| {
-                                    anyhow::anyhow!(
-                                        "journal replay failed at line {}: {error}; global reducer reject",
-                                        index + 1
-                                    )
-                                })?;
-                            } else if let Event::GlobalRuntimeBound { binding } = &event {
-                                st.apply_global_event(&state::GlobalEvent::RuntimeBound {
-                                    binding: binding.clone(),
-                                })
-                                .map_err(|error| {
-                                    anyhow::anyhow!(
-                                        "journal replay failed at line {}: {error}; global reducer reject",
-                                        index + 1
-                                    )
-                                })?;
-                            } else {
-                                st.apply(&event);
-                            }
-                            st.sequence = st.sequence.saturating_add(1);
-                            st.revision = st.revision.saturating_add(1);
+                            apply_replayed_event(&mut st, &event, index + 1)?;
                             events.push(event);
                         }
                     }
@@ -6340,38 +6340,7 @@ fn replay(root: &Path) -> anyhow::Result<State> {
             {
                 convert_root = true;
             }
-            if let Event::ReducerCheckpoint { sequence, revision } = &event {
-                st.sequence = *sequence;
-                st.revision = *revision;
-            } else if let Event::GlobalProjectRegistered { registration } = &event {
-                st.apply_global_event(&state::GlobalEvent::ProjectRegistered {
-                    registration: registration.clone(),
-                })
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "journal replay failed at line {}: {error}; global reducer reject",
-                        index + 1
-                    )
-                })?;
-                st.sequence = st.sequence.saturating_add(1);
-                st.revision = st.revision.saturating_add(1);
-            } else if let Event::GlobalRuntimeBound { binding } = &event {
-                st.apply_global_event(&state::GlobalEvent::RuntimeBound {
-                    binding: binding.clone(),
-                })
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "journal replay failed at line {}: {error}; global reducer reject",
-                        index + 1
-                    )
-                })?;
-                st.sequence = st.sequence.saturating_add(1);
-                st.revision = st.revision.saturating_add(1);
-            } else {
-                st.apply(&event);
-                st.sequence = st.sequence.saturating_add(1);
-                st.revision = st.revision.saturating_add(1);
-            }
+            apply_replayed_event(&mut st, &event, index + 1)?;
             events.push(event);
         }
     }

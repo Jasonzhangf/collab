@@ -693,6 +693,45 @@ pub struct State {
 }
 
 impl State {
+    /// Keep the typed projection on the daemon journal's version axis.  The
+    /// resident reducer is the only owner of these counters; the nested
+    /// global state mirrors them for typed CAS and receipts.
+    pub(crate) fn sync_global_version(&mut self) {
+        self.global.set_counters(self.sequence, self.revision);
+    }
+
+    pub(crate) fn advance_version(&mut self) -> Result<(), String> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| "sequence counter overflow".to_string())?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "revision counter overflow".to_string())?;
+        self.sequence = sequence;
+        self.revision = revision;
+        self.sync_global_version();
+        Ok(())
+    }
+
+    pub(crate) fn set_checkpoint_version(
+        &mut self,
+        sequence: u64,
+        revision: u64,
+    ) -> Result<(), String> {
+        if sequence < self.sequence || revision < self.revision {
+            return Err(format!(
+                "reducer checkpoint regresses version: current ({}, {}), observed ({sequence}, {revision})",
+                self.sequence, self.revision
+            ));
+        }
+        self.sequence = sequence;
+        self.revision = revision;
+        self.sync_global_version();
+        Ok(())
+    }
+
     fn consume_notification(&mut self, subscription_id: &str, consumed_ms: Option<i64>) {
         let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id) else {
             return;
@@ -1022,6 +1061,7 @@ impl State {
             .clone()
             .apply(&mut next)
             .map_err(|error| format!("global reducer rejected event: {error}"))?;
+        next.set_counters(self.sequence, self.revision);
         self.global = next;
         Ok(())
     }

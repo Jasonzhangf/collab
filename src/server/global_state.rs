@@ -529,6 +529,15 @@ impl GlobalState {
         StateVersion::from_state(self)
     }
 
+    /// The daemon journal owns the host version when this projection is
+    /// nested in `server::state::State`.  Keep these counters synchronized
+    /// after the resident reducer commits an event; standalone callers still
+    /// advance them through the typed mutation methods below.
+    pub(crate) fn set_counters(&mut self, sequence: u64, revision: u64) {
+        self.sequence = sequence;
+        self.revision = revision;
+    }
+
     pub fn validate(&self) -> Result<(), StateError> {
         if self.epoch == 0 {
             return Err(StateError::invalid("epoch", "must be non-zero"));
