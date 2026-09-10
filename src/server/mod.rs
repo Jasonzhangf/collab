@@ -6638,31 +6638,29 @@ fn acquire_daemon_lock(lock_path: &Path, socket_path: &Path) -> anyhow::Result<s
     }
 }
 
-fn probe_lock(lock_path: &Path) -> anyhow::Result<bool> {
-    let file = match std::fs::OpenOptions::new()
+fn acquire_legacy_writer_lock(
+    lock_path: &Path,
+    description: &str,
+) -> anyhow::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(lock_path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
+        .create(true)
+        .open(lock_path)?;
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
-        let unlock = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        if unlock != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        return Ok(false);
+        return Ok(file);
     }
     let error = std::io::Error::last_os_error();
     if matches!(
         error.raw_os_error(),
         Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
     ) {
-        return Ok(true);
+        anyhow::bail!(
+            "DAEMON_MIGRATION_REQUIRED: legacy {description} lock is held at {}; stop or migrate the legacy writer before starting the host daemon",
+            lock_path.display()
+        );
     }
     Err(error.into())
 }
@@ -6685,11 +6683,19 @@ fn probe_legacy_socket(socket_path: &Path) -> anyhow::Result<bool> {
     }
 }
 
-/// Reject startup while a pre-host-endpoint daemon can still write the same
-/// project journal.  Stale sockets are preserved and are safe to classify as
-/// absent only when the connection probe returns `NotFound` or
-/// `ConnectionRefused`; any other probe error is unknown and fails closed.
-fn ensure_legacy_writer_absent(scope: &Scope, host_paths: &HostPaths) -> anyhow::Result<()> {
+struct LegacyWriterFence {
+    // These guards intentionally stay alive for the complete daemon lifetime.
+    // The legacy binary does not know the new host lock, so a one-shot probe is
+    // insufficient to prevent it from opening the same journal after startup.
+    _host_lock: Option<std::fs::File>,
+    _project_lock: Option<std::fs::File>,
+}
+
+/// Reject a reachable pre-host-endpoint socket after all compatible legacy
+/// locks are held.  A stale socket is safe to classify as absent only when the
+/// connection probe returns `NotFound` or `ConnectionRefused`; any other probe
+/// error is unknown and fails closed.
+fn ensure_legacy_socket_absent(scope: &Scope, host_paths: &HostPaths) -> anyhow::Result<()> {
     let project_server_dir = scope.server_dir();
     let legacy_socket = project_server_dir.join("server.sock");
     if legacy_socket != host_paths.socket_path() && probe_legacy_socket(&legacy_socket)? {
@@ -6698,23 +6704,42 @@ fn ensure_legacy_writer_absent(scope: &Scope, host_paths: &HostPaths) -> anyhow:
             legacy_socket.display()
         );
     }
+    Ok(())
+}
+
+/// Hold every lock understood by the pre-host-endpoint daemon until the new
+/// daemon exits.  Acquiring these locks before replay/journal open closes the
+/// check-to-open race: an old writer can neither start after the check nor
+/// acquire the same project lock while this process owns the journal.
+fn acquire_legacy_writer_fence(
+    scope: &Scope,
+    host_paths: &HostPaths,
+) -> anyhow::Result<LegacyWriterFence> {
+    let legacy_host_lock = Path::new(LEGACY_HOST_DAEMON_LOCK_PATH);
+    let project_server_dir = scope.server_dir();
+    let host_lock = if legacy_host_lock != host_paths.lock_path() {
+        Some(acquire_legacy_writer_lock(legacy_host_lock, "host daemon")?)
+    } else {
+        None
+    };
 
     let legacy_project_lock = project_server_dir.join("daemon.lock");
-    if legacy_project_lock != host_paths.lock_path() && probe_lock(&legacy_project_lock)? {
-        anyhow::bail!(
-            "DAEMON_MIGRATION_REQUIRED: legacy project daemon lock is held at {}; stop or migrate it before starting the host daemon",
-            legacy_project_lock.display()
-        );
-    }
+    let project_lock = if legacy_project_lock != host_paths.lock_path()
+        && legacy_project_lock != legacy_host_lock
+    {
+        Some(acquire_legacy_writer_lock(
+            &legacy_project_lock,
+            "project daemon",
+        )?)
+    } else {
+        None
+    };
 
-    let legacy_host_lock = Path::new(LEGACY_HOST_DAEMON_LOCK_PATH);
-    if probe_lock(legacy_host_lock)? {
-        anyhow::bail!(
-            "DAEMON_MIGRATION_REQUIRED: legacy host daemon lock is held at {}; stop or migrate it before starting the host daemon",
-            legacy_host_lock.display()
-        );
-    }
-    Ok(())
+    ensure_legacy_socket_absent(scope, host_paths)?;
+    Ok(LegacyWriterFence {
+        _host_lock: host_lock,
+        _project_lock: project_lock,
+    })
 }
 
 fn same_inode(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
@@ -6793,11 +6818,11 @@ async fn run_with_host_paths(scope: Scope, host_paths: HostPaths) -> anyhow::Res
     // socket or a second host writer.
     let _lock_file = acquire_daemon_lock(&host_paths.lock_path(), &sock_path)?;
 
-    // Check legacy endpoints only after the current host lock is acquired. If
+    // Keep every legacy writer lock through the journal writer lifetime. If
     // the compatibility fixture uses the legacy path as its host path, the
     // normal duplicate-daemon error remains authoritative; a real host-path
-    // migration still reaches this fence because its lock is distinct.
-    ensure_legacy_writer_absent(&scope, &host_paths)?;
+    // migration reaches this persistent fence because its locks are distinct.
+    let _legacy_writer_fence = acquire_legacy_writer_fence(&scope, &host_paths)?;
 
     prepare_socket_path(&sock_path)?;
 
@@ -7042,6 +7067,55 @@ mod startup_tests {
         assert!(!host_paths.socket_path().exists());
 
         drop(lock_file);
+        std::fs::remove_dir_all(root).expect("remove startup test root");
+    }
+
+    #[tokio::test]
+    async fn running_host_daemon_holds_legacy_writer_fence() {
+        let _startup_test_lock = startup_test_lock();
+        let root = test_root("legacy-fence");
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        host_paths.ensure_root().unwrap();
+        let legacy_host_lock = Path::new(LEGACY_HOST_DAEMON_LOCK_PATH);
+        let legacy_host_lock_existed = legacy_host_lock.exists();
+        let socket = host_paths.socket_path();
+        let running = tokio::spawn(run_with_host_paths(
+            Scope { root: root.clone() },
+            host_paths.clone(),
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !crate::client::alive(&socket) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            crate::client::alive(&socket),
+            "host daemon did not publish an accepting socket"
+        );
+
+        let legacy_socket = root.join(".agent-collab/server/server.sock");
+        let legacy_project_lock = root.join(".agent-collab/server/daemon.lock");
+        let journal = root.join(".agent-collab/server/journal.jsonl");
+        let journal_before =
+            std::fs::read(&journal).expect("host daemon must open project journal");
+
+        let old_host_attempt = acquire_daemon_lock(legacy_host_lock, &legacy_socket);
+        assert!(old_host_attempt
+            .expect_err("old writer must not reacquire its host lock")
+            .to_string()
+            .contains("server already running"));
+        let old_project_attempt = acquire_daemon_lock(&legacy_project_lock, &legacy_socket);
+        assert!(old_project_attempt
+            .expect_err("old writer must not reacquire its project lock")
+            .to_string()
+            .contains("server already running"));
+        assert_eq!(journal_before, std::fs::read(&journal).unwrap());
+
+        running.abort();
+        let _ = running.await;
+        if !legacy_host_lock_existed {
+            std::fs::remove_file(legacy_host_lock).ok();
+        }
         std::fs::remove_dir_all(root).expect("remove startup test root");
     }
 
