@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{
-    validate_binding, BindingId, CommandId, DispatchId, MessageId, OperationId, RuntimeIdentity,
-    TurnId,
+    validate_binding, AppServerId, BindingId, CommandId, DispatchId, MessageId, OperationId,
+    RuntimeIdentity, TurnId,
 };
 use crate::scope::{ProjectScopeId, RouteScope};
 
@@ -91,29 +91,55 @@ impl CommandEnvelope {
     }
 }
 
-/// The project identity carried by every project-scoped wire request.  The
-/// root and scope are deliberately both present: the root is the registered
-/// filesystem context, while the scope is the value used by route checks.
+/// The two-level project identity carried by every project-scoped wire
+/// request. The app scope identifies the real appserver route; the root and
+/// project scope identify the registered filesystem context used by checks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectContext {
+    pub app_scope_id: AppServerId,
     pub canonical_root: String,
     pub project_scope: ProjectScopeId,
 }
 
 impl ProjectContext {
+    /// The pre-route-context constructor cannot safely select an appserver.
+    /// Keep it as a source-compatible, fail-closed API for old callers; use
+    /// `for_registered_root_with_app` or `for_registered_route` for a project
+    /// request.
     pub fn for_registered_root(root: &std::path::Path) -> anyhow::Result<Self> {
+        let _ = root;
+        anyhow::bail!(
+            "project context requires an explicit appserver identity; use for_registered_root_with_app"
+        )
+    }
+
+    pub fn for_registered_root_with_app(
+        root: &std::path::Path,
+        app_scope_id: AppServerId,
+    ) -> anyhow::Result<Self> {
+        crate::identity::validate_id_for_protocol(app_scope_id.as_str())?;
         let canonical = std::fs::canonicalize(root)?;
         let canonical_root = canonical.to_str().ok_or_else(|| {
             anyhow::anyhow!("registered project root must be valid UTF-8 for the wire context")
         })?;
         let project_scope = ProjectScopeId::new(canonical_root.to_owned())?;
         Ok(Self {
+            app_scope_id,
             canonical_root: canonical_root.to_owned(),
             project_scope,
         })
     }
 
+    pub fn for_registered_route(
+        root: &std::path::Path,
+        identity: &RuntimeIdentity,
+    ) -> anyhow::Result<Self> {
+        identity.validate()?;
+        Self::for_registered_root_with_app(root, identity.appserver_id.clone())
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
+        crate::identity::validate_id_for_protocol(self.app_scope_id.as_str())?;
         if self.canonical_root.is_empty() {
             anyhow::bail!("project context canonical root must not be empty");
         }
@@ -132,8 +158,10 @@ impl ProjectContext {
 
     pub fn validate_registered_root(&self, root: &std::path::Path) -> anyhow::Result<()> {
         self.validate()?;
-        let expected = Self::for_registered_root(root)?;
-        if self != &expected {
+        let expected = Self::for_registered_root_with_app(root, self.app_scope_id.clone())?;
+        if self.canonical_root != expected.canonical_root
+            || self.project_scope != expected.project_scope
+        {
             anyhow::bail!(
                 "project context does not match registered project root {}",
                 root.display()
@@ -433,6 +461,13 @@ impl RequestEnvelope {
     pub fn into_parts(self) -> (Option<ProjectContext>, Req) {
         (self.project_context, self.request)
     }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(project_context) = &self.project_context {
+            project_context.validate()?;
+        }
+        Ok(())
+    }
 }
 
 fn default_delivery_mode() -> String {
@@ -702,9 +737,14 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let context = ProjectContext::for_registered_root(&root).unwrap();
+        let context = ProjectContext::for_registered_root_with_app(
+            &root,
+            AppServerId::new("appserver-1").unwrap(),
+        )
+        .unwrap();
         let request = RequestEnvelope::new(Req::Ping, Some(context.clone()));
         let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["project_context"]["app_scope_id"], "appserver-1");
         assert_eq!(
             encoded["project_context"]["canonical_root"],
             context.canonical_root
@@ -721,5 +761,67 @@ mod tests {
             serde_json::json!({"op": "Ping"})
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn project_context_requires_explicit_app_scope() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let error = ProjectContext::for_registered_root(root).unwrap_err();
+        assert!(error.to_string().contains("explicit appserver identity"));
+    }
+
+    #[test]
+    fn project_context_uses_runtime_appserver_identity() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let context = ProjectContext::for_registered_route(root, &registered_identity()).unwrap();
+        assert_eq!(context.app_scope_id.as_str(), "appserver-1");
+        context.validate_registered_root(root).unwrap();
+    }
+
+    #[test]
+    fn project_context_rejects_invalid_app_scope_and_root_shapes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut context = ProjectContext::for_registered_root_with_app(
+            root,
+            AppServerId::new("appserver-1").unwrap(),
+        )
+        .unwrap();
+        context.app_scope_id = serde_json::from_value(serde_json::json!("bad\napp")).unwrap();
+        assert!(context.validate().is_err());
+
+        context.app_scope_id = AppServerId::new("appserver-1").unwrap();
+        context.canonical_root = "relative/project".into();
+        assert!(context.validate().is_err());
+
+        context.canonical_root = env!("CARGO_MANIFEST_DIR").into();
+        context.project_scope =
+            serde_json::from_value(serde_json::json!("relative/project")).unwrap();
+        assert!(context.validate().is_err());
+
+        context.canonical_root = format!("{}\n", env!("CARGO_MANIFEST_DIR"));
+        assert!(context.validate().is_err());
+    }
+
+    #[test]
+    fn old_project_context_json_without_app_scope_fails_closed() {
+        let old = serde_json::json!({
+            "project_context": {
+                "canonical_root": env!("CARGO_MANIFEST_DIR"),
+                "project_scope": env!("CARGO_MANIFEST_DIR")
+            },
+            "op": "Register",
+            "worker_id": "worker-1",
+            "token": "token-1",
+            "pane": null,
+            "cwd": env!("CARGO_MANIFEST_DIR")
+        });
+        assert!(serde_json::from_value::<RequestEnvelope>(old).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_wire_context_is_rejected_before_decode() {
+        let mut bytes = br#"{"project_context":{"app_scope_id":"appserver-1","canonical_root":"/tmp","project_scope":"/tmp"},"op":"Ping"}"#.to_vec();
+        bytes.push(0xff);
+        assert!(serde_json::from_slice::<RequestEnvelope>(&bytes).is_err());
     }
 }

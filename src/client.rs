@@ -1,3 +1,4 @@
+use crate::identity::RuntimeIdentity;
 use crate::proto::{ProjectContext, Req, RequestEnvelope, Resp};
 use anyhow::Context;
 use serde::de::DeserializeOwned;
@@ -73,7 +74,7 @@ pub fn record_event(sock: &Path, kind: &str, detail: Value) {
 /// never creates a server directory, starts a process, or records a client
 /// event when the socket cannot be reached.
 pub fn call<T: DeserializeOwned>(sock: &Path, req: &Req) -> anyhow::Result<T> {
-    call_with_context(sock, req, infer_project_context())
+    call_with_context(sock, req, None)
 }
 
 /// Round-trip one request with an explicit registered project context.  The
@@ -84,6 +85,9 @@ pub fn call_with_context<T: DeserializeOwned>(
     req: &Req,
     project_context: Option<ProjectContext>,
 ) -> anyhow::Result<T> {
+    if let Some(project_context) = project_context.as_ref() {
+        project_context.validate()?;
+    }
     let mut stream = connect(sock).map_err(|error| connection_error(sock, error))?;
     let line = serde_json::to_string(&RequestEnvelope::new(req.clone(), project_context))?;
     stream.write_all(line.as_bytes()).with_context(|| {
@@ -139,9 +143,29 @@ pub fn call_with_context<T: DeserializeOwned>(
     })
 }
 
-fn infer_project_context() -> Option<ProjectContext> {
-    let root = crate::scope::project_root().ok()?;
-    ProjectContext::for_registered_root(&root).ok()
+/// Round-trip a request using the appserver identity registered by the
+/// caller.  The identity is typed and validated before it becomes route
+/// context; role labels and other user-provided strings are never consulted.
+pub fn call_with_runtime_identity<T: DeserializeOwned>(
+    sock: &Path,
+    req: &Req,
+    identity: &RuntimeIdentity,
+) -> anyhow::Result<T> {
+    let root = crate::scope::project_root()?;
+    call_with_runtime_identity_at_root(sock, req, &root, identity)
+}
+
+/// Variant for callers that already resolved the exact registered project
+/// root.  Keeping root resolution explicit avoids searching ancestors or
+/// silently selecting a project while constructing a route context.
+pub fn call_with_runtime_identity_at_root<T: DeserializeOwned>(
+    sock: &Path,
+    req: &Req,
+    root: &Path,
+    identity: &RuntimeIdentity,
+) -> anyhow::Result<T> {
+    let project_context = ProjectContext::for_registered_route(root, identity)?;
+    call_with_context(sock, req, Some(project_context))
 }
 
 pub fn daemon_locked(server_dir: &Path) -> bool {
@@ -287,6 +311,114 @@ fn readiness_probe(sock: &Path) -> io::Result<()> {
 /// has already stopped.
 pub fn alive(sock: &Path) -> bool {
     connect(sock).is_ok()
+}
+
+#[cfg(test)]
+mod route_context_tests {
+    use super::*;
+    use crate::identity::{AgentId, AppServerId, BindingId, NativeThreadId, RuntimeId};
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn explicit_runtime_identity_is_project_context_source() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-client-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/collab-r8-client-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let identity = RuntimeIdentity {
+            agent_id: AgentId::new("agent-1").unwrap(),
+            runtime_id: RuntimeId::new("runtime-1").unwrap(),
+            appserver_id: AppServerId::new("real-appserver-1").unwrap(),
+            endpoint_generation: 1,
+            binding_id: BindingId::new("binding-1").unwrap(),
+            native_thread_id: Some(NativeThreadId::new("thread-1").unwrap()),
+        };
+        let expected_root = std::fs::canonicalize(&root).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let envelope: RequestEnvelope = serde_json::from_str(line.trim()).unwrap();
+            let context = envelope.project_context.unwrap();
+            assert_eq!(context.app_scope_id.as_str(), "real-appserver-1");
+            assert_eq!(context.canonical_root, expected_root.to_str().unwrap());
+            assert_eq!(
+                context.project_scope.as_str(),
+                expected_root.to_str().unwrap()
+            );
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(
+                    br#"{"ok":true,"answer":1}
+"#,
+                )
+                .unwrap();
+        });
+
+        let response: Value =
+            call_with_runtime_identity_at_root(&socket, &Req::Ping, &root, &identity).unwrap();
+        assert_eq!(response["answer"], 1);
+        server.join().unwrap();
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn legacy_call_does_not_guess_an_app_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-client-no-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/collab-r8-no-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let envelope: RequestEnvelope = serde_json::from_str(line.trim()).unwrap();
+            assert!(envelope.project_context.is_none());
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(
+                    br#"{"ok":true,"answer":1}
+"#,
+                )
+                .unwrap();
+        });
+        let response: Value = call(&socket, &Req::Ping).unwrap();
+        assert_eq!(response["answer"], 1);
+        server.join().unwrap();
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
 }
 
 /// Classify an existing daemon endpoint without creating or deleting any file.
