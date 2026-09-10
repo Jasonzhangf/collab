@@ -472,7 +472,16 @@ pub fn daemon_status(sock: &Path) -> DaemonAvailability {
 }
 
 fn connection_error(sock: &Path, error: io::Error) -> anyhow::Error {
-    let status = failed_connection_status(sock, &error);
+    // A request must never treat a refused connection as permission to
+    // replace the endpoint.  Only the explicit `ensure_server` start path
+    // may use the unheld stale-socket classification to recover it.
+    let status = if error.kind() == io::ErrorKind::ConnectionRefused
+        && std::fs::symlink_metadata(sock).is_ok()
+    {
+        DaemonAvailability::Unknown
+    } else {
+        failed_connection_status(sock, &error)
+    };
     anyhow::Error::new(error).context(format!(
         "{}: cannot reach collab daemon at {}",
         status.code(),
@@ -485,7 +494,10 @@ fn status_error(sock: &Path, status: DaemonAvailability, detail: &str) -> anyhow
 }
 
 fn failed_connection_status(sock: &Path, error: &io::Error) -> DaemonAvailability {
-    if error.kind() != io::ErrorKind::NotFound {
+    if !matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    ) {
         return DaemonAvailability::Unknown;
     }
     let socket_present = match std::fs::symlink_metadata(sock) {
@@ -500,6 +512,14 @@ fn failed_connection_status(sock: &Path, error: &io::Error) -> DaemonAvailabilit
         (false, LockAvailability::Held) => DaemonAvailability::Starting,
         (true, LockAvailability::Held) => DaemonAvailability::Unknown,
         (false, LockAvailability::Unheld) => DaemonAvailability::Unavailable,
+        // A refused connection proves that the socket path is no longer
+        // accepting a daemon.  The server owns stale-socket cleanup and
+        // re-checks the inode before removing it, so an explicit `up` may
+        // safely launch while preserving the fail-closed result for other
+        // probe errors below.
+        (true, LockAvailability::Unheld) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            DaemonAvailability::Unavailable
+        }
         (true, LockAvailability::Unheld) => DaemonAvailability::Unknown,
         (_, LockAvailability::Unknown) => DaemonAvailability::Unknown,
     }
@@ -650,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_status_reports_stale_socket_as_unknown() {
+    fn daemon_status_reports_refused_stale_socket_as_unavailable() {
         let fixture = TempServerDir::new("stale");
         let listener = UnixListener::bind(fixture.socket()).expect("bind stale socket");
         drop(listener);
@@ -658,7 +678,7 @@ mod tests {
         assert!(fixture.socket().exists());
         assert_eq!(
             daemon_status(&fixture.socket()),
-            DaemonAvailability::Unknown
+            DaemonAvailability::Unavailable
         );
     }
 
@@ -737,25 +757,42 @@ mod tests {
     }
 
     #[test]
-    fn ensure_server_refuses_to_replace_stale_socket() {
+    fn ensure_server_launches_through_a_refused_stale_socket() {
         let fixture = TempServerDir::new("stale-ensure");
         let listener = UnixListener::bind(fixture.socket()).expect("bind stale socket");
         drop(listener);
         let launched = Arc::new(Mutex::new(false));
         let observed = Arc::clone(&launched);
+        let retained_listener = Arc::new(Mutex::new(None));
+        let retained = Arc::clone(&retained_listener);
 
-        let error = ensure_server_with_launcher(&fixture.socket(), move |_| {
+        ensure_server_with_launcher(&fixture.socket(), move |sock| {
             *observed.lock().expect("launcher fixture lock") = true;
+            std::fs::remove_file(sock)?;
+            let bound = UnixListener::bind(sock)?;
+            let responder = bound.try_clone()?;
+            thread::spawn(move || {
+                let (mut stream, _) = responder.accept().expect("accept readiness probe");
+                let mut request = String::new();
+                std::io::BufReader::new(&mut stream)
+                    .read_line(&mut request)
+                    .expect("read readiness request");
+                stream
+                    .write_all(
+                        b"{\"ok\":true,\"workers\":0,\"messages\":0,\"tasks\":0,\"now\":\"now\"}\n",
+                    )
+                    .expect("write readiness response");
+            });
+            *retained.lock().expect("listener fixture lock") = Some(bound);
             Ok(())
         })
-        .expect_err("ambiguous socket must fail closed");
+        .expect("refused stale socket should permit explicit recovery");
 
-        assert!(error.to_string().contains("DAEMON_UNKNOWN"));
-        assert!(!*launched.lock().expect("launcher fixture lock"));
-        assert!(
-            fixture.socket().exists(),
-            "client must not delete stale socket"
-        );
+        assert!(*launched.lock().expect("launcher fixture lock"));
+        assert!(retained_listener
+            .lock()
+            .expect("listener fixture lock")
+            .is_some());
     }
 
     #[test]
