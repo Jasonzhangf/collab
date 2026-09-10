@@ -183,8 +183,8 @@ mod tests {
             )
             .unwrap();
         assert!(!first.replayed);
-        assert_eq!(first.receipt.sequence, 2);
-        assert_eq!(first.receipt.revision, 2);
+        assert_eq!(first.receipt.sequence, 3);
+        assert_eq!(first.receipt.revision, 3);
 
         let retried = server
             .commit_command(
@@ -229,7 +229,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .count(),
-            2
+            3
         );
         std::fs::remove_dir_all(root).unwrap();
     }

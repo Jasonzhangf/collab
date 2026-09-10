@@ -538,8 +538,17 @@ pub enum Event {
         sequence: u64,
         revision: u64,
     },
+    CommandStarted {
+        command_id: String,
+        operation_id: String,
+    },
     CommandRecorded {
         command_id: String,
+        receipt: CommandReceipt,
+    },
+    CommandCompleted {
+        command_id: String,
+        operation_id: String,
         receipt: CommandReceipt,
     },
     #[serde(alias = "RootAssigned")]
@@ -831,8 +840,17 @@ impl State {
                 self.migration = Some(migration.clone());
             }
             Event::ReducerCheckpoint { .. } => {}
+            Event::CommandStarted { .. } => {}
             Event::CommandRecorded {
                 command_id,
+                receipt,
+            } => {
+                self.command_receipts
+                    .insert(command_id.clone(), receipt.clone());
+            }
+            Event::CommandCompleted {
+                command_id,
+                operation_id: _,
                 receipt,
             } => {
                 self.command_receipts
@@ -951,12 +969,17 @@ impl State {
         }
         let mut command_receipts: Vec<_> = self.command_receipts.iter().collect();
         command_receipts.sort_by(|a, b| a.0.cmp(b.0));
-        events.extend(command_receipts.into_iter().map(|(command_id, receipt)| {
-            Event::CommandRecorded {
+        for (command_id, receipt) in command_receipts {
+            events.push(Event::CommandStarted {
                 command_id: command_id.clone(),
+                operation_id: receipt.operation_id.clone(),
+            });
+            events.push(Event::CommandCompleted {
+                command_id: command_id.clone(),
+                operation_id: receipt.operation_id.clone(),
                 receipt: receipt.clone(),
-            }
-        }));
+            });
+        }
         if let Some(worker_id) = self.master_worker_id.clone() {
             events.push(Event::MasterAssigned {
                 worker_id,
