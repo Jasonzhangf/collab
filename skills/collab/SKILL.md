@@ -245,9 +245,13 @@ it does not need periodic activation to make progress. Unknown/absent produces
 no tmux input. On each `working` -> `idle` transition, a worker sends one
 idempotent worker-idle fact to the live master and then stops; it does not keep
 knocking. Idle, progress, delivery, bug, and worker-idle notices are
-auto-merged; explicit `collab sendmessage` remains immediate. The master stops
-its long-horizon schedule after three consecutive master scheduling turns with
-an idle fact and no working change; it does not automatically rearm.
+auto-merged; explicit `collab sendmessage` remains immediate. Master idle
+reminders are level-triggered: within the same master idle episode, each
+reminder attempt consumes the shared episode-local budget, up to three
+attempts. An observed change to `working` ends that episode; after three
+consecutive attempts without an observed `working` change, the episode stops.
+Worker-idle facts do not count toward this budget, and there is no
+scheduling-turn counter or automatic rearm.
 
 Managed subagents do not get child-targeted periodic liveness ACK loops. Their
 state is persisted by the daemon; a `working` -> `idle` transition contributes
@@ -394,9 +398,13 @@ worker does not. On an idle fact, master may:
 3. If all tasks and bugs are closed, report completion and propose next
    steps to the user.
 
-If three consecutive master scheduling turns after an idle fact produce no
-working change, master stops autonomous scheduling until explicit user action
-or a durable event. Master must not expect workers to be woken periodically.
+Master idle reminders are level-triggered. Within the same master idle episode,
+each reminder attempt consumes the shared episode-local budget, up to three
+attempts. An observed change to `working` ends that episode; after three
+consecutive attempts without an observed `working` change, the episode stops.
+Worker-idle facts do not count toward this budget, and there is no
+scheduling-turn counter.
+Master must not expect workers to be woken periodically.
 
 **Unacknowledged Workers & Snapshot Diagnostic Closure**:
 If a worker fails to acknowledge notifications or remains unresponsive across

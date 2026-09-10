@@ -19,8 +19,12 @@ Wake model:
 - On each worker `working` -> `idle` transition, the worker sends one idempotent
   worker-idle fact to the live master, then stops. Unknown/absent never causes
   input.
-- Master stops autonomous scheduling after three consecutive idle facts with no
-  working change; no automatic rearm.
+- Master idle reminders are level-triggered. Within the same master idle
+  episode, each reminder attempt consumes the shared episode-local budget, up
+  to three attempts. An observed `working` change ends that episode; after
+  three consecutive attempts without an observed `working` change, the episode
+  stops. Worker-idle facts do not count toward this budget, and there is no
+  scheduling-turn counter or automatic rearm.
 
 Failure and evidence:
 
