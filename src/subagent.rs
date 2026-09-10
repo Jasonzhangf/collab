@@ -743,7 +743,7 @@ fn run(
                 record.runtime = Some(config.subagent.runtime.clone());
             } else {
                 server
-                    .commit_locked(
+                    .commit_locked_checked(
                         &mut state,
                         &[Event::SubagentUpdated {
                             subagent: record.clone(),
@@ -817,7 +817,7 @@ fn run(
         }
         Action::Rearm { .. } => {
             server
-                .commit_locked(
+                .commit_locked_checked(
                     &mut state,
                     &[Event::KeepaliveUpdated {
                         worker_id: record.peer.clone(),
@@ -919,9 +919,11 @@ fn run(
             if !events.is_empty() {
                 // Persist the task and managed-record transition together so
                 // replay cannot observe a half-claimed assignment.
-                server.commit_locked(&mut state, &events).map_err(|error| {
-                    anyhow::anyhow!("subagent working journal failure: {error}")
-                })?;
+                server
+                    .commit_locked_checked(&mut state, &events)
+                    .map_err(|error| {
+                        anyhow::anyhow!("subagent working journal failure: {error}")
+                    })?;
             }
             drop(state);
             if ready {
@@ -958,7 +960,7 @@ fn run(
             if stale_working_without_task {
                 record.status = "idle".into();
                 server
-                    .commit_locked(
+                    .commit_locked_checked(
                         &mut state,
                         &[Event::SubagentUpdated {
                             subagent: record.clone(),
@@ -982,7 +984,7 @@ fn run(
                     if let Some(mut current) = state.subagents.get(&record.id).cloned() {
                         if current.status == "idle" {
                             current.error = Some(error.to_string());
-                            if let Err(journal_error) = server.commit_locked(
+                            if let Err(journal_error) = server.commit_locked_checked(
                                 &mut state,
                                 &[Event::SubagentUpdated { subagent: current }],
                             ) {
@@ -1006,7 +1008,7 @@ fn run(
             }
             record.status = "closing".into();
             server
-                .commit_locked(
+                .commit_locked_checked(
                     &mut state,
                     &[Event::SubagentUpdated {
                         subagent: record.clone(),

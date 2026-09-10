@@ -36,8 +36,41 @@ pub(super) fn register(server: &Server, id: &str, pane: &str) -> Resp {
         id.into(),
         format!("token-{id}"),
         Some(pane.into()),
-        "/tmp".into(),
+        server.root.display().to_string(),
     )
+}
+
+fn send_command(root: &Path, id: &str) -> crate::proto::CommandEnvelope {
+    use crate::identity::{AppServerId, BindingId, CommandId, OperationId};
+    use crate::proto::CommandEnvelope;
+    let app = AppServerId::new("appserver-cli").unwrap();
+    let scope = crate::scope::RouteScope::for_registered_project(app, root).unwrap();
+    CommandEnvelope::new(
+        CommandId::new(format!("command-{id}")).unwrap(),
+        OperationId::new(format!("operation-{id}")).unwrap(),
+        BindingId::new(format!("binding-{id}")).unwrap(),
+        0,
+        scope,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+fn authenticated_send(root: &Path, from: &str, to: &str, subject: &str) -> Req {
+    Req::Send {
+        from: from.into(),
+        worker_id: Some(from.into()),
+        token: Some(format!("token-{from}")),
+        command: Some(send_command(root, from)),
+        to: to.into(),
+        mtype: "notify".into(),
+        subject: Some(subject.into()),
+        body: "body".into(),
+        in_reply_to: None,
+        delivery: "immediate".into(),
+    }
 }
 
 #[test]
@@ -388,7 +421,7 @@ fn failed_journal_cannot_apply_a_keepalive_reservation() {
     *server.journal.lock().unwrap() =
         std::fs::File::open(root.join(".agent-collab/server/journal.jsonl")).unwrap();
     let mut state = State::default();
-    let result = server.commit_locked(
+    let result = server.commit_locked_checked(
         &mut state,
         &[Event::KeepaliveUpdated {
             worker_id: "worker".into(),
@@ -3315,6 +3348,9 @@ fn migration_freeze_rejects_mutations_but_allows_rebind_and_reads() {
     let mutations = vec![
         Req::Send {
             from: "peer".into(),
+            worker_id: Some("peer".into()),
+            token: Some("token-peer".into()),
+            command: Some(send_command(&root, "peer-freeze")),
             to: "peer".into(),
             mtype: "notify".into(),
             subject: Some("release".into()),
@@ -3389,6 +3425,65 @@ fn migration_freeze_rejects_mutations_but_allows_rebind_and_reads() {
         Some("MIGRATION_ADMISSION_FROZEN: only an existing tmux identity may rebind")
     );
     assert_eq!(server.state.lock().unwrap().workers.len(), 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn authenticated_send_uses_registered_cwd_for_authoritative_route_scope() {
+    let (server, root) = test_server();
+    let registered_cwd = root.join("registered");
+    std::fs::create_dir_all(&registered_cwd).unwrap();
+    assert!(
+        handle_register(
+            &server,
+            "sender".into(),
+            "token-sender".into(),
+            Some("%sender".into()),
+            registered_cwd.display().to_string(),
+        )
+        .ok
+    );
+    assert!(register(&server, "recipient", "%recipient").ok);
+
+    let mut request = authenticated_send(&root, "sender", "recipient", "scope");
+    if let Req::Send {
+        command: Some(command),
+        ..
+    } = &mut request
+    {
+        command.scope = crate::scope::RouteScope::for_registered_project(
+            crate::identity::AppServerId::new("appserver-cli").unwrap(),
+            &root,
+        )
+        .unwrap();
+    }
+    let response = dispatch(&Arc::new(server), request);
+    assert!(!response.ok);
+    assert!(response
+        .error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("SEND_BINDING_REJECTED:")));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn authenticated_send_returns_typed_durability_failure_before_wake() {
+    let (server, root) = test_server();
+    assert!(register(&server, "sender", "%sender").ok);
+    assert!(register(&server, "recipient", "%recipient").ok);
+    *server.journal.lock().unwrap() =
+        std::fs::File::open(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+
+    let response = dispatch(
+        &Arc::new(server),
+        authenticated_send(&root, "sender", "recipient", "durability"),
+    );
+    assert!(!response.ok);
+    assert!(response
+        .error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("SEND_DURABILITY_FAILED:")));
+    assert!(response.error.as_deref().unwrap().contains("journal"));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -3621,7 +3716,12 @@ fn concatenated_journal_events_replay_and_self_heal() {
 
 #[test]
 fn worktree_path_budget_accepts_short_slug_and_rejects_escape() {
-    let root = PathBuf::from("/tmp/project");
+    let root = std::env::temp_dir().join(format!(
+        "collab-worktree-path-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    std::fs::create_dir_all(root.join("playground")).unwrap();
     assert!(validate_worktree_path(&root, "./playground/ar03-0828").is_ok());
     assert!(validate_worktree_path(
         &root,
@@ -3629,6 +3729,12 @@ fn worktree_path_budget_accepts_short_slug_and_rejects_escape() {
     )
     .is_err());
     assert!(validate_worktree_path(&root, "./playground/../outside").is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/tmp", root.join("playground/link")).unwrap();
+        assert!(validate_worktree_path(&root, "./playground/link/escape").is_err());
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -3813,7 +3919,9 @@ fn send_without_subscription_is_mailbox_only_and_deduplicated() {
                         && record["window_start_ms"].is_null()
                         && record["window_end_ms"].is_null()
                         && record["state"] == "pending"
-                        && record["exact_error"].is_null()
+                        && record["exact_error"].as_str().is_some_and(|error| {
+                            error.starts_with("MAILBOX_SCOPE_BINDING_UNAVAILABLE:")
+                        })
                         && record["message"]["id"] == message_id
                 })
                 .unwrap_or(false)
@@ -3920,7 +4028,9 @@ fn recipient_jsonl_records_latest_delivery_and_journal_replay() {
         assert!(record["created_ms"].is_i64());
         assert!(record["window_start_ms"].is_null());
         assert!(record["window_end_ms"].is_null());
-        assert!(record["exact_error"].is_null());
+        assert!(record["exact_error"]
+            .as_str()
+            .is_some_and(|error| { error.starts_with("MAILBOX_SCOPE_BINDING_UNAVAILABLE:") }));
     }
     assert_eq!(records.last().unwrap()["message"]["state"], "read");
     assert_eq!(replay(&root).unwrap().msgs[id].state, "read");
@@ -4198,7 +4308,7 @@ fn malformed_recipient_jsonl_does_not_block_future_append_or_journal_replay() {
     }]);
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(content.lines().any(|line| line.contains("after-malformed")));
-    assert!(!content.lines().any(|line| line == "{\"bad\":true}"));
+    assert_eq!(content.matches("{\"bad\":true}").count(), 1);
     let projection = read_recipient_mailbox(&path, "recipient").unwrap();
     assert_eq!(projection.records.len(), 1);
     assert_eq!(projection.records[0]["message"]["id"], "after-malformed");
@@ -5093,6 +5203,9 @@ fn bulk_ack_with_empty_ids_acknowledges_all_inbox_messages() {
             &server_arc,
             Req::Send {
                 from: "sender-worker".into(),
+                worker_id: Some("sender-worker".into()),
+                token: Some("token-sender-worker".into()),
+                command: Some(send_command(&root, "sender-worker")),
                 to: "bulk-worker".into(),
                 mtype: "notify".into(),
                 subject: Some(format!("test-{i}")),

@@ -4,7 +4,8 @@
 //! the only `NotificationSink` implementation; consumers receive a snapshot
 //! through `NotificationStateView` and cannot mutate reducer state.
 
-use super::state::{Event, MasterWakeAccumulator, Message, NotificationSubscription, State};
+use super::notification_state::MasterWakeAccumulator;
+use super::state::{Event, Message, NotificationSubscription, State};
 use super::Server;
 
 #[derive(Debug, Clone, PartialEq)]

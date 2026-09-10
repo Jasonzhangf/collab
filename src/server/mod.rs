@@ -2,6 +2,7 @@ pub(crate) mod keepalive;
 pub mod knock;
 pub mod mailbox;
 pub mod notification_contract;
+pub mod notification_state;
 pub mod state;
 pub mod timers;
 
@@ -45,6 +46,7 @@ const TASK_STATUSES: [&str; 12] = [
     "cancelled",
 ];
 const MAX_WORKTREE_PATH_BYTES: usize = 80;
+const HOST_DAEMON_LOCK_PATH: &str = "/tmp/collab-host.lock";
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -98,7 +100,22 @@ enum CommandJournalPhase {
 #[cfg(test)]
 const DIRECT_MESSAGE_WAKE_COOLDOWN_MS: i64 = 60_000;
 
-fn validate_worktree_path(root: &Path, raw: &str) -> Result<(), String> {
+#[derive(Debug)]
+enum NotificationDeliveryError {
+    Journal(notification_contract::JournalError),
+}
+
+impl std::fmt::Display for NotificationDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Journal(error) => write!(f, "notification delivery commit failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for NotificationDeliveryError {}
+
+fn validate_worktree_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
     if raw.trim().is_empty() {
         return Err("worktree path must be non-empty".into());
     }
@@ -109,19 +126,33 @@ fn validate_worktree_path(root: &Path, raw: &str) -> Result<(), String> {
     {
         return Err("worktree path may not contain '..'".into());
     }
-    let playground = root.join("playground");
     let candidate = if path.is_absolute() {
         path.to_path_buf()
     } else {
         let relative = raw.strip_prefix("./").unwrap_or(raw);
         root.join(relative)
     };
-    let candidate = candidate.to_string_lossy();
-    let playground = playground.to_string_lossy();
-    if !candidate.starts_with(&format!("{}/", playground)) {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("project root cannot be canonicalized: {error}"))?;
+    let canonical_playground = canonical_root.join("playground");
+    let mut existing = candidate.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| "worktree path has no existing parent".to_string())?;
+    }
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|error| format!("worktree path cannot be canonicalized: {error}"))?;
+    let suffix = candidate
+        .strip_prefix(existing)
+        .map_err(|_| "worktree path cannot be resolved under project root".to_string())?;
+    let canonical_candidate = canonical_existing.join(suffix);
+    if !canonical_candidate.starts_with(&canonical_playground) {
         return Err("worktree path must be inside ./playground".into());
     }
-    if candidate.as_bytes().len() > MAX_WORKTREE_PATH_BYTES {
+    if raw.as_bytes().len() > MAX_WORKTREE_PATH_BYTES {
         return Err(format!(
             "worktree path exceeds {} bytes; use a short slug under ./playground",
             MAX_WORKTREE_PATH_BYTES
@@ -139,7 +170,7 @@ fn validate_worktree_path(root: &Path, raw: &str) -> Result<(), String> {
     {
         return Err("worktree basename must be a short slug (ASCII letters, digits, '.', '-' or '_'; max 32 chars)".into());
     }
-    Ok(())
+    Ok(canonical_candidate)
 }
 
 fn task_claim_held(status: &str) -> bool {
@@ -365,15 +396,12 @@ impl Server {
         })
     }
 
-    pub(crate) fn commit_locked(
-        &self,
-        st: &mut State,
-        evs: &[Event],
-    ) -> Result<(), notification_contract::JournalError> {
-        self.commit_locked_checked(st, evs).map(|_| ())
+    pub(crate) fn commit_locked(&self, st: &mut State, evs: &[Event]) {
+        self.commit_locked_checked(st, evs)
+            .unwrap_or_else(|error| panic!("collab journal commit failed: {error}"));
     }
 
-    fn commit_locked_checked(
+    pub(crate) fn commit_locked_checked(
         &self,
         st: &mut State,
         evs: &[Event],
@@ -1118,9 +1146,14 @@ fn attempt_notification_with_at(
             });
         }
     }
-    notification_contract::NotificationSink::submit(server, &events)
-        .expect("journal append failed; refusing state mutation");
-    true
+    match notification_contract::NotificationSink::submit(server, &events) {
+        Ok(_) => true,
+        Err(error) => {
+            let error = NotificationDeliveryError::Journal(error);
+            append_log(&server.log_path(), &error.to_string());
+            false
+        }
+    }
 }
 
 fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str) -> bool {
@@ -2832,7 +2865,7 @@ pub(crate) fn handle_scheduler_dispatch(
     subject: String,
     body: String,
     feature_id: Option<String>,
-    worktree_path: Option<String>,
+    mut worktree_path: Option<String>,
     branch: Option<String>,
     base_commit: Option<String>,
     priority: String,
@@ -2851,9 +2884,11 @@ pub(crate) fn handle_scheduler_dispatch(
         ));
     }
     if let Some(path) = &worktree_path {
-        if let Err(error) = validate_worktree_path(&server.root, path) {
-            return Resp::err(error);
-        }
+        let canonical = match validate_worktree_path(&server.root, path) {
+            Ok(path) => path,
+            Err(error) => return Resp::err(error),
+        };
+        worktree_path = Some(canonical.display().to_string());
     }
 
     let authenticated = {
@@ -3353,6 +3388,83 @@ pub(crate) fn handle_send(
     )
 }
 
+fn handle_authenticated_send(
+    server: &Server,
+    raw_from: String,
+    worker_id: String,
+    token: String,
+    command: Option<crate::proto::CommandEnvelope>,
+    to: String,
+    mtype: String,
+    subject: Option<String>,
+    body: String,
+    in_reply_to: Option<String>,
+    delivery_mode: String,
+) -> Resp {
+    let st = server.state.lock().unwrap();
+    let Some(worker) = st.workers.get(&worker_id).cloned() else {
+        return Resp::err(format!("worker {} not registered", worker_id));
+    };
+    if worker.token != token {
+        return Resp::err("token mismatch: identity does not own this worker_id");
+    }
+    let Some(command) = command else {
+        return Resp::err(
+            "LEGACY_SEND_REJECTED: authenticated sender binding and route scope are required",
+        );
+    };
+    let appserver_id = match crate::identity::AppServerId::new("appserver-cli") {
+        Ok(id) => id,
+        Err(error) => return Resp::err(error.to_string()),
+    };
+    let agent_id = match crate::identity::AgentId::new(&worker.id) {
+        Ok(agent_id) => agent_id,
+        Err(error) => return Resp::err(error.to_string()),
+    };
+    let runtime_id = match crate::identity::RuntimeId::new(format!("runtime-{}", worker.id)) {
+        Ok(runtime_id) => runtime_id,
+        Err(error) => return Resp::err(error.to_string()),
+    };
+    let binding_id = match crate::identity::BindingId::new(format!("binding-{}", worker.id)) {
+        Ok(binding_id) => binding_id,
+        Err(error) => return Resp::err(error.to_string()),
+    };
+    let runtime = crate::identity::RuntimeIdentity {
+        agent_id,
+        runtime_id,
+        appserver_id: appserver_id.clone(),
+        endpoint_generation: 0,
+        binding_id,
+        native_thread_id: None,
+    };
+    let registered_scope = match crate::scope::RouteScope::for_registered_project(
+        appserver_id,
+        Path::new(&worker.cwd),
+    ) {
+        Ok(scope) => scope,
+        Err(error) => return Resp::err(error.to_string()),
+    };
+    if let Err(error) = command.validate_for(&runtime, &registered_scope) {
+        return Resp::err(format!("SEND_BINDING_REJECTED: {error}"));
+    }
+    if raw_from != worker_id {
+        return Resp::err("sender identity is derived from the authenticated binding");
+    }
+    drop(st);
+    handle_send_with_task(
+        server,
+        worker_id,
+        to,
+        mtype,
+        subject,
+        body,
+        in_reply_to,
+        delivery_mode,
+        false,
+        None,
+    )
+}
+
 pub(crate) fn handle_send_with_task(
     server: &Server,
     from: String,
@@ -3516,7 +3628,9 @@ pub(crate) fn handle_send_with_task(
             ids: superseded_ids,
         });
     }
-    server.commit_locked(&mut st, &events);
+    if let Err(error) = server.commit_locked_checked(&mut st, &events) {
+        return Resp::err(format!("SEND_DURABILITY_FAILED: {error}"));
+    }
     drop(st);
     let notified = subscription
         .as_ref()
@@ -3671,7 +3785,7 @@ fn handle_task_register_with_next(
     task_id: String,
     owner: Option<String>,
     feature_id: Option<String>,
-    worktree_path: Option<String>,
+    mut worktree_path: Option<String>,
     branch: Option<String>,
     base_commit: Option<String>,
     priority: String,
@@ -3704,14 +3818,11 @@ fn handle_task_register_with_next(
     }
     let task_owner = worker_id.clone();
     if let Some(path) = &worktree_path {
-        let project_path = path.starts_with("./playground/")
-            || path.starts_with("playground/")
-            || path.contains("/playground/");
-        if project_path {
-            if let Err(e) = validate_worktree_path(&server.root, path) {
-                return Resp::err(e);
-            }
-        }
+        let canonical = match validate_worktree_path(&server.root, path) {
+            Ok(path) => path,
+            Err(error) => return Resp::err(error),
+        };
+        worktree_path = Some(canonical.display().to_string());
     }
     if let Some(existing) = st
         .tasks
@@ -3796,9 +3907,11 @@ fn handle_task_relocate(
     if worker.token != token {
         return Resp::err("token mismatch: identity does not own this worker_id");
     }
-    if let Err(e) = validate_worktree_path(&server.root, &worktree_path) {
-        return Resp::err(e);
-    }
+    let canonical_worktree = match validate_worktree_path(&server.root, &worktree_path) {
+        Ok(path) => path,
+        Err(error) => return Resp::err(error),
+    };
+    let worktree_path = canonical_worktree.display().to_string();
     let Some(mut task) = st.tasks.get(&task_id).cloned() else {
         return Resp::err(format!("task {} not found", task_id));
     };
@@ -5166,22 +5279,40 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
         } => handle_register(server, worker_id, token, pane, cwd),
         Req::Send {
             from,
+            worker_id,
+            token,
+            command,
             to,
             mtype,
             subject,
             body,
             in_reply_to,
             delivery,
-        } => handle_send(
-            server,
-            from,
-            to,
-            mtype,
-            subject,
-            body,
-            in_reply_to,
-            delivery,
-        ),
+        } => {
+            let Some(worker_id) = worker_id else {
+                return Resp::err(
+                    "LEGACY_SEND_REJECTED: authenticated sender binding and route scope are required",
+                );
+            };
+            let Some(token) = token else {
+                return Resp::err(
+                    "LEGACY_SEND_REJECTED: authenticated sender binding and route scope are required",
+                );
+            };
+            handle_authenticated_send(
+                server,
+                from,
+                worker_id,
+                token,
+                command,
+                to,
+                mtype,
+                subject,
+                body,
+                in_reply_to,
+                delivery,
+            )
+        }
         Req::CrossProjectSend {
             from,
             from_project,
@@ -5685,7 +5816,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
             worker_id,
         } => {
             let st = server.state.lock().unwrap();
-            let mut msgs: Vec<&Message> = st
+            let mut msgs: Vec<Message> = st
                 .msgs
                 .values()
                 .filter(|m| {
@@ -5697,7 +5828,15 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                         true
                     }
                 })
+                .cloned()
                 .collect();
+            let recipient_messages = worker_id.as_deref().map(|recipient| {
+                st.msgs
+                    .values()
+                    .filter(|message| message.to == recipient)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
             let sort_order = sort.as_deref().unwrap_or("time-asc");
             if sort_order == "time-desc" {
                 msgs.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
@@ -5705,6 +5844,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                 msgs.sort_by(|a, b| a.created_ms.cmp(&b.created_ms));
             }
             let count = msgs.len();
+            drop(st);
             let projection = worker_id.as_deref().and_then(|recipient| {
                 let path = server
                     .root
@@ -5712,7 +5852,11 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
                     .join(format!("recipient-{recipient}.jsonl"));
                 match read_recipient_mailbox(&path, recipient) {
                     Ok(read) => {
-                        let missing = missing_recipient_projection_messages(&st, recipient, &read);
+                        let missing = missing_recipient_projection_messages(
+                            recipient_messages.as_deref().unwrap_or_default(),
+                            recipient,
+                            &read,
+                        );
                         let status = if read.partial_tail {
                             "partial-tail"
                         } else if !read.recoverable_errors.is_empty() {
@@ -6074,11 +6218,31 @@ fn remove_listener_socket(sock_path: &Path, captured: &std::fs::Metadata) -> any
     Ok(())
 }
 
+fn acquire_host_daemon_lock(lock_path: &Path) -> anyhow::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(lock_path)?;
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let flock_error = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "server already running: another Collab daemon holds the host lock at {}: {}",
+            lock_path.display(),
+            flock_error
+        );
+    }
+    Ok(file)
+}
+
 pub async fn run(scope: Scope) -> anyhow::Result<()> {
     let sock_path = scope.sock_path();
     let server_dir = scope.server_dir();
     std::fs::create_dir_all(&server_dir)?;
 
+    let _host_lock_file = acquire_host_daemon_lock(Path::new(HOST_DAEMON_LOCK_PATH))?;
     let _lock_file = acquire_daemon_lock(&server_dir)?;
 
     prepare_socket_path(&sock_path)?;
@@ -6203,6 +6367,13 @@ mod reducer_binding_tests {
             "p2".into(),
         );
         assert!(registered.ok, "{registered:?}");
+        let canonical_worktree = server
+            .root
+            .canonicalize()
+            .unwrap()
+            .join("playground/task-1")
+            .to_string_lossy()
+            .into_owned();
         {
             let state = server.state.lock().unwrap();
             assert_eq!(
@@ -6211,7 +6382,7 @@ mod reducer_binding_tests {
             );
             assert_eq!(
                 state.worktree_bindings["binding-task-task-1"].worktree_root,
-                worktree
+                canonical_worktree
             );
         }
         let replayed = replay(&root).unwrap();
@@ -6221,7 +6392,7 @@ mod reducer_binding_tests {
         );
         assert_eq!(
             replayed.worktree_bindings["binding-task-task-1"].worktree_root,
-            worktree
+            canonical_worktree
         );
         std::fs::remove_dir_all(root).unwrap();
     }

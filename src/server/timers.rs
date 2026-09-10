@@ -1,4 +1,6 @@
-use crate::server::state::{goal_deadline_key, is_goal_deadline, now_ms, Event, Message, MAX_WAKE_ATTEMPTS};
+use crate::server::state::{
+    goal_deadline_key, is_goal_deadline, now_ms, Event, Message, MAX_WAKE_ATTEMPTS,
+};
 use crate::server::Server;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -96,7 +98,8 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
         let live_master_probe = super::live_master_id(server, &state);
         let live_master = live_master_probe.clone().ok().flatten();
         let mut subscriptions: Vec<_> = state.notification_subscriptions.values().collect();
-        subscriptions.sort_by_key(|subscription| (subscription.created_ms, subscription.id.clone()));
+        subscriptions
+            .sort_by_key(|subscription| (subscription.created_ms, subscription.id.clone()));
         for subscription in subscriptions {
             if subscription.status != "armed"
                 || !is_goal_deadline(subscription)
@@ -106,6 +109,13 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 continue;
             }
             let Ok(live_master) = &live_master_probe else {
+                crate::server::knock::append_log(
+                    &server.log_path(),
+                    &format!(
+                        "TIMER_LIVE_MASTER_UNKNOWN: {}",
+                        live_master_probe.as_ref().unwrap_err()
+                    ),
+                );
                 continue;
             };
             if live_master.as_deref() != Some(subscription.worker_id.as_str()) {
@@ -208,10 +218,17 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
             .collect::<HashSet<_>>();
         let live_master = match super::live_master_id(server, &state) {
             Ok(live_master) => live_master,
-            Err(_) => None,
+            Err(error) => {
+                crate::server::knock::append_log(
+                    &server.log_path(),
+                    &format!("TIMER_LIVE_MASTER_UNKNOWN: {error}"),
+                );
+                None
+            }
         };
         let mut subscriptions: Vec<_> = state.notification_subscriptions.values().collect();
-        subscriptions.sort_by_key(|subscription| (subscription.created_ms, subscription.id.clone()));
+        subscriptions
+            .sort_by_key(|subscription| (subscription.created_ms, subscription.id.clone()));
         for subscription in subscriptions {
             let next_trigger = subscription
                 .interval_ms
@@ -253,7 +270,7 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 true
             };
             let master_idle_ready = if subscription.event == "master-idle" {
-                matches!(super::live_master_id(server, &state), Ok(Some(id)) if id == subscription.worker_id)
+                live_master.as_deref() == Some(subscription.worker_id.as_str())
                     && state
                         .keepalives
                         .get(&subscription.worker_id)
@@ -883,10 +900,7 @@ mod tests {
         assert!(calls.borrow()[0].contains("message_ids=message-owner"));
         assert!(!calls.borrow()[0].contains("second"));
         assert!(calls.borrow()[0].contains("action_categories="));
-        assert_eq!(
-            server.state.lock().unwrap().msgs["second"].state,
-            "pending"
-        );
+        assert_eq!(server.state.lock().unwrap().msgs["second"].state, "pending");
         assert!(!super::super::attempt_notification_with_default(
             &server,
             &first,
@@ -1135,7 +1149,10 @@ mod tests {
         let (server, root) = test_server();
         register_master(&server);
         let now = now_ms();
-        for (subscription_id, created_ms) in [("sub-goal-duplicate-a", now - 2), ("sub-goal-duplicate-b", now - 1)] {
+        for (subscription_id, created_ms) in [
+            ("sub-goal-duplicate-a", now - 2),
+            ("sub-goal-duplicate-b", now - 1),
+        ] {
             server.commit(&[Event::NotificationSubscribed {
                 subscription: NotificationSubscription {
                     id: subscription_id.into(),
@@ -1204,7 +1221,10 @@ mod tests {
         tick_with_idle(&server, &|_| false);
         let state = server.state.lock().unwrap();
         assert!(state.msgs.is_empty());
-        assert_eq!(state.notification_subscriptions[&subscription_id].status, "suppressed");
+        assert_eq!(
+            state.notification_subscriptions[&subscription_id].status,
+            "suppressed"
+        );
         assert_eq!(
             state.notification_subscriptions[&subscription_id]
                 .status_reason

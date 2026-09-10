@@ -1,18 +1,21 @@
 mod client;
 mod config;
 mod identity;
+mod install_skills;
+pub(crate) mod migration;
 mod proto;
 mod scope;
 mod server;
 mod subagent;
-mod install_skills;
-pub(crate) mod migration;
 
 use clap::{Parser, Subcommand};
-use identity::Identity;
+use identity::{
+    AgentId, AppServerId, BindingId, CommandId, Identity, OperationId, RuntimeId, RuntimeIdentity,
+};
 use proto::{Req, Resp};
 use scope::Scope;
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(
@@ -410,6 +413,30 @@ fn me(scope: &Scope, worker: Option<String>) -> anyhow::Result<Identity> {
     Ok(ident)
 }
 
+fn command_envelope(scope: &Scope, ident: &Identity) -> anyhow::Result<proto::CommandEnvelope> {
+    let runtime = ident.runtime.clone().unwrap_or(RuntimeIdentity {
+        agent_id: AgentId::new(&ident.worker_id)?,
+        runtime_id: RuntimeId::new(format!("runtime-{}", ident.worker_id))?,
+        appserver_id: AppServerId::new("appserver-cli")?,
+        endpoint_generation: 0,
+        binding_id: BindingId::new(format!("binding-{}", ident.worker_id))?,
+        native_thread_id: None,
+    });
+    let route = scope.route_scope(runtime.appserver_id.clone())?;
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(proto::CommandEnvelope::new(
+        CommandId::new(format!("command-{}-{nonce}", std::process::id()))?,
+        OperationId::new(format!("operation-{}-{nonce}", std::process::id()))?,
+        runtime.binding_id,
+        runtime.endpoint_generation,
+        route,
+        None,
+        None,
+        None,
+        None,
+    ))
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli.cmd) {
@@ -648,7 +675,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         target_id: target,
                     }
                 }
-                MasterCmd::Send { project, to, subject, body } => {
+                MasterCmd::Send {
+                    project,
+                    to,
+                    subject,
+                    body,
+                } => {
                     let ident = me(&scope, None)?;
                     let local: serde_json::Value =
                         client::call(&scope.sock_path(), &Req::MasterStatus)?;
@@ -718,10 +750,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     Ok(())
                 }
                 WorkerCmd::Status { id } => {
-                    let v: serde_json::Value = client::call(
-                        &scope.sock_path(),
-                        &Req::WorkerStatus { worker_id: id },
-                    )?;
+                    let v: serde_json::Value =
+                        client::call(&scope.sock_path(), &Req::WorkerStatus { worker_id: id })?;
                     out(&v);
                     Ok(())
                 }
@@ -781,23 +811,25 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             body,
         } => {
             let scope = Scope::resolve()?;
-            let sender_id = if let Some(from_id) = from {
-                from_id
-            } else if let Ok(ident) = me(&scope, None) {
-                ident.worker_id
-            } else if let Ok(worker) = std::env::var("COLLAB_WORKER") {
-                worker
-            } else {
-                "operator".to_string()
-            };
+            let ident = me(&scope, None)?;
+            if from
+                .as_deref()
+                .is_some_and(|requested| requested != ident.worker_id)
+            {
+                anyhow::bail!("--from must match the authenticated worker identity");
+            }
             let body = body.join(" ");
             if body.is_empty() {
                 anyhow::bail!("empty message body");
             }
+            let command = command_envelope(&scope, &ident)?;
             let v: serde_json::Value = client::call(
                 &scope.sock_path(),
                 &Req::Send {
-                    from: sender_id,
+                    from: ident.worker_id.clone(),
+                    worker_id: Some(ident.worker_id),
+                    token: Some(ident.token),
+                    command: Some(command),
                     to,
                     mtype: r#type,
                     subject: Some(subject),
@@ -1074,14 +1106,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         .join(".agents")
                         .join("skills")
                         .join("collab"),
-                    None => anyhow::bail!(
-                        "install-skills default target requires $HOME; pass --target"
-                    ),
+                    None => {
+                        anyhow::bail!("install-skills default target requires $HOME; pass --target")
+                    }
                 },
             };
             let (outcomes, bytes, count) =
-                install_skills::install(&target, force)
-                    .map_err(|error| anyhow::anyhow!(error))?;
+                install_skills::install(&target, force).map_err(|error| anyhow::anyhow!(error))?;
             let written = outcomes
                 .iter()
                 .filter(|(_, o)| *o == install_skills::InstallOutcome::Written)

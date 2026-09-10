@@ -200,141 +200,7 @@ pub fn goal_deadline_key(subscription: &NotificationSubscription) -> Option<(Str
     ))
 }
 
-/// Durable, project-level scheduling signals.  The sets contain identifiers
-/// only; task, bug, and mailbox truth remains in their respective stores and
-/// is materialized when the master reads its briefing.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct MasterWakeAccumulator {
-    pub generation: u64,
-    pub goal_due: bool,
-    #[serde(default)]
-    pub idle_workers: Vec<String>,
-    #[serde(default)]
-    pub unresponsive_workers: Vec<String>,
-    #[serde(default)]
-    pub blocked_or_timed_out_tasks: Vec<String>,
-    #[serde(default)]
-    pub completed_or_freed_tasks: Vec<String>,
-    #[serde(default)]
-    pub highest_bug_revision: Option<u64>,
-    #[serde(default)]
-    pub active_goal_revision: Option<u64>,
-    pub ready_authorized_work: bool,
-    pub scheduling_decision_revision: u64,
-    pub first_pending_ms: i64,
-    pub last_updated_ms: i64,
-    #[serde(default)]
-    pub wake_hold: Option<WakeHold>,
-    #[serde(default = "default_delivery_state")]
-    pub delivery_state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct WakeHold {
-    pub reason: String,
-    pub held_by: String,
-    pub held_ms: i64,
-    pub until_ms: i64,
-}
-
-fn default_delivery_state() -> String {
-    "clean".into()
-}
-
-impl MasterWakeAccumulator {
-    fn add_unique(items: &mut Vec<String>, value: String) -> bool {
-        if items.contains(&value) {
-            return false;
-        }
-        items.push(value);
-        items.sort();
-        true
-    }
-
-    fn note_signal(&mut self, signal: &MasterWakeSignal, created_ms: i64) {
-        let changed = match signal {
-            MasterWakeSignal::GoalDue { revision } => {
-                let changed = !self.goal_due
-                    || self
-                        .active_goal_revision
-                        .is_none_or(|current| *revision > current);
-                self.goal_due = true;
-                if changed {
-                    self.active_goal_revision = Some(*revision);
-                }
-                changed
-            }
-            MasterWakeSignal::WorkerIdle { worker_id }
-            | MasterWakeSignal::MasterIdle { worker_id } => {
-                let added = Self::add_unique(&mut self.idle_workers, worker_id.clone());
-                let recovered = self
-                    .unresponsive_workers
-                    .iter()
-                    .position(|id| id == worker_id)
-                    .map(|index| self.unresponsive_workers.remove(index))
-                    .is_some();
-                added || recovered
-            }
-            MasterWakeSignal::WorkerUnresponsive { worker_id } => {
-                Self::add_unique(&mut self.unresponsive_workers, worker_id.clone())
-            }
-            MasterWakeSignal::WorkerRecovered { worker_id }
-            | MasterWakeSignal::WorkerWorking { worker_id } => {
-                let idle_removed = self.idle_workers.iter().position(|id| id == worker_id);
-                if let Some(index) = idle_removed {
-                    self.idle_workers.remove(index);
-                }
-                let unresponsive_removed = self
-                    .unresponsive_workers
-                    .iter()
-                    .position(|id| id == worker_id);
-                if let Some(index) = unresponsive_removed {
-                    self.unresponsive_workers.remove(index);
-                }
-                idle_removed.is_some() || unresponsive_removed.is_some()
-            }
-            MasterWakeSignal::TaskBlocked { task_id } => {
-                Self::add_unique(&mut self.blocked_or_timed_out_tasks, task_id.clone())
-            }
-            MasterWakeSignal::TaskFreed { task_id } => {
-                Self::add_unique(&mut self.completed_or_freed_tasks, task_id.clone())
-            }
-            MasterWakeSignal::SubagentStatus { subagent_id } => {
-                Self::add_unique(&mut self.idle_workers, format!("subagent:{subagent_id}"))
-            }
-            MasterWakeSignal::SubagentWorking { subagent_id } => {
-                let id = format!("subagent:{subagent_id}");
-                self.idle_workers
-                    .iter()
-                    .position(|existing| existing == &id)
-                    .map(|index| self.idle_workers.remove(index))
-                    .is_some()
-            }
-        };
-        if changed {
-            if self.generation == 0 {
-                self.generation = 1;
-                self.first_pending_ms = created_ms;
-            }
-            self.last_updated_ms = created_ms;
-            self.delivery_state = "pending".into();
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum MasterWakeSignal {
-    GoalDue { revision: u64 },
-    WorkerIdle { worker_id: String },
-    MasterIdle { worker_id: String },
-    WorkerUnresponsive { worker_id: String },
-    WorkerRecovered { worker_id: String },
-    WorkerWorking { worker_id: String },
-    TaskBlocked { task_id: String },
-    TaskFreed { task_id: String },
-    SubagentStatus { subagent_id: String },
-    SubagentWorking { subagent_id: String },
-}
+pub use super::notification_state::{MasterWakeAccumulator, MasterWakeSignal};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRec {
@@ -641,7 +507,11 @@ impl State {
     pub fn apply(&mut self, ev: &Event) {
         match ev {
             Event::MasterWakeSignal { signal, at_ms } => {
-                self.master_wake.note_signal(signal, *at_ms);
+                super::notification_state::accumulate_master_wake(
+                    &mut self.master_wake,
+                    signal,
+                    *at_ms,
+                );
             }
             Event::KeepaliveUpdated { worker_id, record } => {
                 self.keepalives.insert(worker_id.clone(), record.clone());
@@ -746,7 +616,7 @@ impl State {
                                 && self.master_worker_id.as_deref() == Some(message.to.as_str())
                         })
                 }) {
-                    self.master_wake.delivery_state = "notified_unconsumed".into();
+                    super::notification_state::mark_master_wake_delivered(&mut self.master_wake);
                 }
             }
             Event::Acked { ids } => {

@@ -113,6 +113,12 @@ pub enum Req {
     },
     Send {
         from: String,
+        #[serde(default)]
+        worker_id: Option<String>,
+        #[serde(default)]
+        token: Option<String>,
+        #[serde(default)]
+        command: Option<CommandEnvelope>,
         to: String,
         #[serde(rename = "type")]
         mtype: String,
