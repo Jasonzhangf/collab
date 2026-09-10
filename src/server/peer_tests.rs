@@ -4537,12 +4537,12 @@ fn tmux_notification_contains_id_subject_and_original_body() {
 
 #[test]
 fn tmux_notification_classifies_priority_and_names_one_action() {
-    let notify = |subject: &str| {
+    let message = |from: &str, mtype: &str, subject: &str| {
         notification_text(&Message {
             id: "m1".into(),
-            from: "collab-server".into(),
+            from: from.into(),
             to: "master".into(),
-            mtype: "notify".into(),
+            mtype: mtype.into(),
             subject: Some(subject.into()),
             body: "body".into(),
             in_reply_to: None,
@@ -4553,12 +4553,42 @@ fn tmux_notification_classifies_priority_and_names_one_action() {
         })
         .unwrap()
     };
+    let notify = |subject: &str| message("peer", "notify", subject);
+    let internal = |subject: &str| message("collab-server", "notification", subject);
 
     assert!(notify("worker-idle: w1").contains("P1 ACTION: dispatch work to this idle capacity"));
     assert!(notify("master-idle: master").contains("P1 ACTION: run the scheduling pass"));
     assert!(notify("worker-unresponsive: w1").contains("P1 ACTION: snapshot the pane"));
     assert!(notify("task-keepalive 1/3").contains("P1 ACTION: continue your own task"));
-    assert!(notify("goal:plan.md").contains("P0 ACTION: run the long-horizon briefing"));
+    assert!(notify("blocker:task").contains("P1 ACTION:"));
+    assert!(notify("unblock:task").contains("P1 ACTION:"));
+    assert!(notify("wait-timeout:task").contains("P1 ACTION:"));
+    assert!(notify("scheduling-blocker: queue stalled").contains("P1 ACTION:"));
+    assert!(compose_notification("batch", "notification-batch", "body").contains("P1 ACTION:"));
+    assert!(
+        notify("goal:plan.md").contains("P1 ACTION: do the in-scope action the message asks for")
+    );
+    assert!(notify("goal:<id>").contains("P1 ACTION:"));
+    assert!(notify("deadline:<id>").contains("P1 ACTION:"));
+    assert!(!notify("goal:plan.md").contains("P0 ACTION:"));
+    assert!(!notify("deadline:<id>").contains("P0 ACTION:"));
+    let goal = internal("goal:plan.md");
+    assert!(goal.starts_with("COLLAB_NOTIFY m1 [goal:plan.md] body | P0 ACTION:"));
+    assert!(goal.contains("P0 ACTION: run the long-horizon briefing"));
+    assert!(internal("goal:<id>").contains("P0 ACTION: run the long-horizon briefing"));
+    assert!(internal("deadline:<id>").contains("P0 ACTION: run the long-horizon briefing"));
+    assert!(!internal("goal:plan.md").contains("P1 ACTION:"));
+    assert!(!internal("deadline:<id>").contains("P1 ACTION:"));
+    assert!(message("peer", "notification", "goal:plan.md").contains("P1 ACTION:"));
+    assert!(message("peer", "notification", "deadline:<id>").contains("P1 ACTION:"));
+    assert!(message("collab-server", "notify", "goal:plan.md").contains("P1 ACTION:"));
+    assert!(message("collab-server", "notify", "deadline:<id>").contains("P1 ACTION:"));
+    assert!(internal("goal").contains("P1 ACTION:"));
+    assert!(internal("deadline").contains("P1 ACTION:"));
+    assert!(notify("goalpost: reached").contains("P1 ACTION:"));
+    assert!(notify("deadline-notice: task due").contains("P1 ACTION:"));
+    assert!(!notify("goalpost: reached").contains("P0 ACTION:"));
+    assert!(!notify("deadline-notice: task due").contains("P0 ACTION:"));
     assert!(notify("Settings delivery recorded").contains("P2 ACTION: note it"));
 
     // Every class carries the resume protocol, not just the operational ones.
@@ -4569,6 +4599,7 @@ fn tmux_notification_classifies_priority_and_names_one_action() {
     ] {
         assert!(notify(subject).contains("resume your current task"));
     }
+    assert!(internal("goal:plan.md").contains("resume your current task"));
 }
 
 #[test]
@@ -4616,6 +4647,52 @@ fn tmux_notification_abbreviates_subject_and_escapes_body_controls() {
         text,
         "COLLAB_NOTIFY message-id [this subject is deliberately longer than forty …] line one\\nline two\\t中文 | P1 ACTION: do the in-scope action the message asks for. Details: collab msg message-id. | READ IS NOT DONE: never end your turn on an ACK, a read, or a summary. After handling, resume your current task; if you own none, run `appsdk longhorizon show` and take work."
     );
+}
+
+#[test]
+fn tmux_notification_long_goal_deadline_subjects_keep_the_typed_prefix() {
+    for prefix in ["goal:", "deadline:"] {
+        let subject = format!("{prefix}{}", "x".repeat(80));
+        let text = notification_text(&Message {
+            id: "message-id".into(),
+            from: "collab-server".into(),
+            to: "master".into(),
+            mtype: "notification".into(),
+            subject: Some(subject),
+            body: "body".into(),
+            in_reply_to: None,
+            created_ms: now_ms(),
+            state: "pending".into(),
+            wake_attempt_count: 0,
+            last_wake_attempt_ms: 0,
+        })
+        .unwrap();
+        assert!(
+            text.starts_with(&format!("COLLAB_NOTIFY message-id [{prefix}")),
+            "{text}"
+        );
+        assert!(text.contains("] body | P0 ACTION: run the long-horizon briefing"));
+    }
+}
+
+#[test]
+fn authenticated_send_cannot_claim_internal_goal_deadline_owner() {
+    let (server, root) = test_server();
+    let server = Arc::new(server);
+    assert!(register(&server, "sender", "%sender").ok);
+    assert!(register(&server, "recipient", "%recipient").ok);
+
+    let mut request = authenticated_send(&root, "sender", "recipient", "goal:plan.md");
+    if let Req::Send { mtype, .. } = &mut request {
+        *mtype = "notification".into();
+    }
+    let response = dispatch(&server, request);
+    assert_eq!(
+        response.error.as_deref(),
+        Some("peer messaging requires type notify")
+    );
+    assert!(server.state.lock().unwrap().msgs.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

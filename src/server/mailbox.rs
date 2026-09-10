@@ -57,7 +57,7 @@ pub fn visible_body(body: &str) -> String {
     visible
 }
 
-pub fn notification_class(subject: &str) -> (&'static str, &'static str) {
+pub fn notification_class(subject: &str, from: &str, mtype: &str) -> (&'static str, &'static str) {
     if subject.starts_with("worker-unresponsive") {
         return ("P1", "snapshot the pane, then recover or close it");
     }
@@ -73,11 +73,11 @@ pub fn notification_class(subject: &str) -> (&'static str, &'static str) {
     if subject.starts_with("task-keepalive") {
         return ("P1", "continue your own task or record a real blocker");
     }
-    if subject.starts_with("goal") || subject.starts_with("deadline") {
+    if from == "collab-server"
+        && mtype == "notification"
+        && (subject.starts_with("goal:") || subject.starts_with("deadline:"))
+    {
         return ("P0", "run the long-horizon briefing and schedule");
-    }
-    if subject.contains("blocker") || subject.contains("unblock") {
-        return ("P0", "resolve the blocker; you own it");
     }
     if subject.starts_with("release") || subject.contains("released") {
         return (
@@ -122,10 +122,12 @@ const NOTIFY_PROTOCOL: &str =
 
 pub fn notification_text(message: &Message) -> Option<String> {
     let subject_raw = message.subject.as_deref()?;
-    Some(compose_notification(
+    Some(compose_notification_with_mtype(
         &message.id,
         subject_raw,
         &visible_body(&message.body),
+        &message.from,
+        &message.mtype,
     ))
 }
 
@@ -303,7 +305,7 @@ pub fn normalize_mailbox_record(
     validate_message_event_state(&message.state)
         .map_err(|error| format!("invalid mailbox envelope at record {index}: {error}"))?;
     let subject = message.subject.as_deref().unwrap_or("notice");
-    let (priority, action) = notification_class(subject);
+    let (priority, action) = notification_class(subject, &message.from, &message.mtype);
     Ok(json!({
         "schema_version": 1,
         "record_type": "message",
@@ -349,9 +351,15 @@ pub fn missing_recipient_projection_messages(
     missing
 }
 
-pub fn compose_notification(id: &str, subject_raw: &str, body: &str) -> String {
+fn compose_notification_with_mtype(
+    id: &str,
+    subject_raw: &str,
+    body: &str,
+    from: &str,
+    mtype: &str,
+) -> String {
     let subject = abbreviated_subject(subject_raw).unwrap_or_else(|| "notice".to_string());
-    let (priority, action) = notification_class(subject_raw);
+    let (priority, action) = notification_class(subject_raw, from, mtype);
 
     let head = format!("COLLAB_NOTIFY {} [{}] ", id, subject);
     let tail = format!(
@@ -372,6 +380,10 @@ pub fn compose_notification(id: &str, subject_raw: &str, body: &str) -> String {
     };
 
     format!("{head}{body}{tail}")
+}
+
+pub fn compose_notification(id: &str, subject_raw: &str, body: &str) -> String {
+    compose_notification_with_mtype(id, subject_raw, body, "", "notify")
 }
 
 pub fn truncate_notification(text: String) -> String {
@@ -602,7 +614,7 @@ fn mailbox_event_envelope(msg: &Message) -> serde_json::Value {
         "MAILBOX_RAW_RECORD_METADATA_MISSING".to_string()
     };
     let subject = msg.subject.as_deref().unwrap_or("notice");
-    let (priority, action) = notification_class(subject);
+    let (priority, action) = notification_class(subject, &msg.from, &msg.mtype);
     let entity_key = mailbox_entity_key(msg);
     let projection_key = mailbox_projection_key(msg);
     json!({
@@ -1245,6 +1257,51 @@ mod tests {
             .join(".agent-collab/mailbox/recipient-master.jsonl")
             .is_file());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mailbox_projection_keeps_goal_deadline_p0_only_for_internal_notification() {
+        for (id, from, mtype, subject, expected_priority) in [
+            ("ordinary-goal", "server", "notify", "goal:plan.md", "P1"),
+            ("forged-type", "peer", "notification", "goal:plan.md", "P1"),
+            (
+                "forged-sender",
+                "collab-server",
+                "notify",
+                "deadline:goal:plan.md",
+                "P1",
+            ),
+            (
+                "internal-goal",
+                "collab-server",
+                "notification",
+                "goal:plan.md",
+                "P0",
+            ),
+            (
+                "internal-deadline",
+                "collab-server",
+                "notification",
+                "deadline:goal:plan.md",
+                "P0",
+            ),
+        ] {
+            let message = Message {
+                id: id.into(),
+                from: from.into(),
+                mtype: mtype.into(),
+                subject: Some(subject.into()),
+                ..msg(id)
+            };
+            let envelope = mailbox_event_envelope(&message);
+            let text = notification_text(&message).unwrap();
+            let action = envelope["action"].as_str().unwrap();
+            assert_eq!(envelope["priority"], expected_priority);
+            assert!(
+                text.contains(&format!("{expected_priority} ACTION: {action}")),
+                "{text}"
+            );
+        }
     }
 
     #[test]
