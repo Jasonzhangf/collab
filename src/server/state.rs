@@ -105,7 +105,9 @@ pub enum GlobalEvent {
 impl GlobalEvent {
     pub fn apply(self, global: &mut GlobalState) -> Result<(), StateError> {
         match self {
-            Self::ProjectRegistered { registration } => global.register_project(registration).map(|_| ()),
+            Self::ProjectRegistered { registration } => {
+                global.register_project(registration).map(|_| ())
+            }
             Self::RuntimeBound { binding } => global.bind_runtime(binding).map(|_| ()),
         }
     }
