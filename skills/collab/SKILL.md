@@ -1,7 +1,7 @@
 ---
 name: collab
 description: >
-  Coordinate independent peers with reusable finite direct-message leases,
+  Coordinate registered peers only with reusable finite direct-message leases,
   one-shot event subscriptions, task/worktree ownership, resource waits,
   controlled daemon maintenance, and explicit user-approved master promotion
   when no live master exists. Guidance: (1) recovery: inspect durable status,
@@ -21,6 +21,23 @@ description: >
 Durable truth lives in the project server. tmux carries only a bounded wake
 preview. Production projects use the globally installed Collab v1.
 
+## One lifecycle loop
+
+Every master goal, bug report/fix, master-to-subagent assignment, and peer task
+uses one authoritative `Trigger -> Work -> Gate -> State -> Stop` loop:
+
+1. Discover current durable truth, ownership, dependencies, and evidence.
+2. Persist durable dispatch intent before attempting notification.
+3. Hand off one scoped assignment with delivery and test conditions.
+4. Verify the real result; unknown, timeout, and failure remain explicit.
+5. Persist the verified state, evidence, blocker, or failure.
+6. Schedule the next eligible work, or stop at the loop's terminal condition.
+
+No ACK, fallback, retry, snapshot, or notification may fabricate success or
+replace a missing gate. Bug reports and fixes enter the AppSDK or git-bug
+backlog with investigation evidence. P0 is highest priority and blocks the
+affected project.
+
 ## Recovery, Failure, Reset, Regression
 
 ### 1. Recovery
@@ -39,7 +56,7 @@ If the pane is stale, use the explicit pane-scoped re-registration/rebind
 path for that peer, then send one registration/report request. Do not inject
 `collab init` into a foreign pane, guess among multiple panes, or replay an
 old message batch. A recovery request is a maintenance action, not a normal
-keepalive.
+notification.
 
 ### 2. Failure
 
@@ -85,7 +102,7 @@ After a fix, verify the same user path again and classify the first divergence:
 - `recv` returns messages: the read is consumed atomically; no follow-up ACK is
   required. `msg`, `inbox`, and `context` remain read-only.
 - task remains open: inspect owner identity, master responsibility, cleanup
-  receipt, and keepalive supersession.
+  receipt, and notification supersession.
 
 Record the tested source commit, binary digest, daemon PID/socket, exact
 commands, and live replay result in the bug system. A test pass without
@@ -108,6 +125,12 @@ contract:
 - `managed-subagent`: execute the assigned scoped task, obey master/parent for
   that assignment, and return root-cause/evidence rather than build a global
   schedule.
+
+The default identity is peer. Master authority is explicit and
+user-authorized: initial promotion requires the user's approval, and
+delegation is accepted only from the current live master and records that
+handoff. Registration, a process, inferred `/goal`, or `role_brief` never
+silently creates master authority.
 
 On trouble, every non-master investigates first and reports the live master:
 root cause, attempted actions, proposed fix, and exact decision needed. A role
@@ -149,13 +172,19 @@ policy. All eligible unsent messages for that recipient are combined
 into one single-line tmux write and one Enter (up to 3 previews per knock, with
 overflow retained in the inbox). Cursor gets literal keys, a 250ms settle, then
 `C-m` in a second tmux process. Codex keeps `paste-buffer -p` and `C-m` in the
-same tmux queue. Delivery requires the agent to be in safe waiting/idle state;
-actively working panes defer delivery without burning attempts so in-flight tasks
-are not polluted. If delivered-but-unconsumed notifications reach the throttle
-threshold (default 3), further push knocks pause until `collab recv` consumes
-them, preventing terminal pollution and storms. Each batch has one attempt;
-the default window is 120 seconds. Daemon-generated notifications batch in this window; explicit `collab sendmessage` remains immediate. Policy changes require controlled daemon restart,
-not task reset.
+same tmux queue. Daemon-generated notifications require a safe waiting/idle
+agent; actively working panes defer them without burning attempts so in-flight
+tasks are not polluted. Explicit `collab sendmessage` is immediate and follows
+the explicit-message adapter gate, including while the recipient is working.
+If delivered-but-unconsumed notifications reach the throttle threshold (default
+3), further push knocks pause until `collab recv` consumes them, preventing
+terminal pollution and storms. Each batch has one attempt; the default window
+is 120 seconds. Policy changes require controlled daemon restart, not task
+reset.
+
+Explicit `collab sendmessage` is immediate. Idle, progress, delivery, bug, and
+worker-idle notices are auto-merged by the daemon in the 120-second batch
+window; they are not repeated as heartbeat storms.
 
 Do not retry a failed send automatically. Return its exact error and durable
 status. Never call `tmux send-keys` directly.
@@ -208,20 +237,26 @@ Use explicit `collab ack` only for legacy clients or recovery of an already
 delivered message. Inspect peer/worker health, identity validity, and throttle
 status at any time with `collab worker status [id]` or `collab who`.
 
-Task keepalive: only unfinished actionable tasks plus explicit idle qualify;
-one activation per 15 minutes, grouped per worker. Consume a keepalive with
-`collab recv`, then work or record a blocker. Sending a message or positive
-working observation also counts as activity. Three unconfirmed attempts stop;
-never automatically `subagent rearm` to bypass exhaustion. Unknown stays unknown.
+Worker wake model: only master has long-horizon wake; workers are not
+long-horizon wake targets and are not automatically woken from idle. A worker
+acts on an explicit dispatch, a bounded direct-message lease, or its own open
+task state;
+it does not need periodic activation to make progress. Unknown/absent produces
+no tmux input. On each `working` -> `idle` transition, a worker sends one
+idempotent worker-idle fact to the live master and then stops; it does not keep
+knocking. Idle, progress, delivery, bug, and worker-idle notices are
+auto-merged; explicit `collab sendmessage` remains immediate. The master stops
+its long-horizon schedule after three consecutive master scheduling turns with
+an idle fact and no working change; it does not automatically rearm.
 
-Managed subagents do not get child-targeted keepalive ACK loops. When the
-daemon probes a managed subagent and finds it `idle` or `working`, it persists
-that state on the subagent and sends one durable `subagent-status` message to
-the live master. The master, not the child, owns the outcome and decides
-whether to re-dispatch, force-close, or leave the child idle. A subagent with
-an unfinished task is not repeatedly woken just because its task is not closed.
-`subagent status` includes tasks, parent mailbox, counters and notification/ACK
-history. `subagent snapshot <id> --lines 40` reads the screen only on request.
+Managed subagents do not get child-targeted periodic liveness ACK loops. Their
+state is persisted by the daemon; a `working` -> `idle` transition contributes
+one durable `subagent-status` fact to the live master. The master, not the
+child, owns the outcome and decides whether to re-dispatch, force-close, or
+leave the child idle. A subagent with an unfinished task is not repeatedly
+woken just because its task is not closed. `subagent status` includes tasks,
+parent mailbox, counters and notification/ACK history.
+`subagent snapshot <id> --lines 40` reads the screen only on request.
 
 ## Cross-project master communication
 
@@ -239,15 +274,16 @@ collab master send --project /abs/path/to/target --to <target-master> \
 sender-side `assigned_by` / `approval` / `assigned_ms` from the local master
 status before accepting the message.
 
-Task liveness is an obligation, not an ACK ceremony. Every assigned task that
-has not reached verified cleanup/close is checked at least once per 15 minutes.
-When the check arrives, continue the task immediately if actionable; if it is
-blocked, find a concrete solution first, then report it to the live master
-in the same cycle. Do not leave a
-task at `assigned`, `working`, `blocked`, `waiting`, `delivered`, or
-`cleanup_pending` merely because the last wake was acknowledged. After delivery
-or merge, perform the real cleanup and close the task; a reminder does not
-create a second task or a duplicate dispatch.
+Task liveness is an obligation, not an ACK ceremony. A worker owns its assigned
+tasks and drives them to verified cleanup/close during its working cycle. This
+is a task-bound inspect obligation, not a tmux activation schedule: it does not
+wake idle workers and does not generate worker tmux input. If an actionable
+task is open, continue it; if it is blocked, find a concrete solution first,
+then report it to the live master in the same activation. Do not leave a task
+at `assigned`, `working`, `blocked`, `waiting`, `delivered`, or
+`cleanup_pending` merely because the last direct message was acknowledged.
+After delivery or merge, perform the real cleanup and close the task; a
+reminder does not create a second task or a duplicate dispatch.
 
 Escalation routing is explicit:
 
@@ -275,8 +311,8 @@ Escalation routing is explicit:
 - If a blocker or wait cannot be executed locally after a real solution is
   found, report that solution to the live master immediately instead of
   silently waiting. Keep the durable wait/task state, continue any
-  independent work, and recheck the escalation on the next 15-minute
-  liveness cycle.
+  independent work, and re-escalate on the next direct master communication or
+  when the situation changes; do not wait for a periodic worker wake.
 
 ## Master owns the outcome, not the excuse
 
@@ -288,15 +324,14 @@ worker's blocker. Concretely:
 - A live master must close any task that cannot otherwise be closed,
   including stuck or merged-but-unclean tasks, with `collab task close
   <id> --force --reason "<text>"`. The reason is recorded in the cleanup
-  receipt so the manual close is auditable; keepalives for that task owner
-  are superseded and the worker pane stops waking.
+  receipt so the manual close is auditable; notification obligations for that
+  task owner are superseded.
 - When a worker reports a blocker the master must take over ownership of
   the resolution: re-dispatch, close manually, or revise the assignment
   conditions. Master is not allowed to send an "I'm waiting on you"
-  reply, mark the task blocked, and idle. If master cannot unblock the
-  worker within the same liveness cycle, master force-closes the task
-  with a reason so the wake loop stops and the worker's identity stays
-  clean.
+  reply, mark the task blocked, and idle. If master cannot unblock the worker
+  promptly, master force-closes the task with a reason so the loop stops and
+  the worker's identity stays clean.
 - An ordinary peer that cannot reach a live master within one escalation
   cycle may self-close its own task with `collab task close <id> --force
   --reason "<text>"`. If a task owner's tmux identity is lost and no live
@@ -348,15 +383,20 @@ Master operates under two prime directives:
   dispatches open bugs in strict priority order (P0 > P1 > P2) to keep
   worker capacity saturated before suggesting closure.
 
-**Worker Free Trigger & Light Interruption**:
-When a worker transitions from `working` to `idle` (and has no active task),
-this state change acts as a primary scheduling trigger. Collab delivers a
-lightweight, non-intrusive wake knock to Master. Master must immediately:
+**Worker->Master idle fact and master long-horizon wake**:
+When a worker transitions from `working` to `idle`, it emits one idempotent
+worker-idle fact to the live master. The master has long-horizon wake; the
+worker does not. On an idle fact, master may:
 1. Check the active task graph for unblocked downstream tasks and dispatch;
-2. If the main graph is clear, pull the highest-priority open issue from
-   `appsdk bug list --status open`;
+2. If the main graph is clear, pull the highest-priority open issue from the
+   bug backlog (`appsdk bug list --status open`), with P0 first; P0 blocks the
+   affected project;
 3. If all tasks and bugs are closed, report completion and propose next
    steps to the user.
+
+If three consecutive master scheduling turns after an idle fact produce no
+working change, master stops autonomous scheduling until explicit user action
+or a durable event. Master must not expect workers to be woken periodically.
 
 **Unacknowledged Workers & Snapshot Diagnostic Closure**:
 If a worker fails to acknowledge notifications or remains unresponsive across
@@ -392,9 +432,10 @@ the task close lifecycle stops the owner's auto-notify; there is no separate
 `collab notify close` command. Do not unsubscribe another peer's lease. Next collaboration re-arms with
 `collab init` or `collab notify subscribe --event direct-message`.
 
-AGY review is optional. If AGY is unavailable, use Codex review. If neither
-exists, the live master reviews. Missing AGY or Codex review is not a
-Collab blocker.
+AGY review is not used for Collab v1 lifecycle gates. Ordinary review uses an
+independent review path when review is required; a milestone may use Astra when
+required. Missing AGY is not a blocker because it is excluded; missing a
+declared review gate is a failure.
 
 Without tmux, initialization and observer queries report no notification channel.
 Use local `appsdk subagent list/status/snapshot` without fake registration;
@@ -457,6 +498,10 @@ The sender never inspects or configures the recipient's subscription.
 For subscription semantics or delivery diagnosis, read
 [references/notifications.md](references/notifications.md).
 
+Desktop does not register goal subscribe. Goal subscribe is master-only
+long-horizon scheduling; workers and Desktop clients must not infer or
+register it.
+
 ## Hard boundaries
 
 - Never attach production work to v2 or `.agent-collab-v2`.
@@ -478,11 +523,10 @@ For subscription semantics or delivery diagnosis, read
   to master immediately; they do not wait or dump symptoms. Last owned
   task close cancels that owner's auto-notify; use
   `collab notify unsubscribe <subscription-id>` for a specific leftover
-  lease. AGY review is optional and may
-  degrade to Codex review or live master review; missing reviewers are
-  not a blocker. Explicit
-  managed subagent tasks may use the finite task-bound keepalive above;
-  it is not a free-form task queue.
+  lease. AGY review is not a Collab v1 gate; ordinary review is independent,
+  and a milestone may use Astra when required. Explicit managed subagent tasks
+  use the task-bound inspect obligation above; it is not a free-form task queue
+  and does not create worker tmux input.
 - Each peer owns its complete task/worktree/integration/resource/cleanup
   lifecycle. Never mutate or close another peer's work.
 - Send only explicit notices, shared-resource coordination, or subscribed async
@@ -507,3 +551,8 @@ For subscription semantics or delivery diagnosis, read
   [references/verification.md](references/verification.md)
 
 Do not load references for ordinary `sendmessage`, `msg`, or `inbox`.
+
+If any reference still describes 15-minute periodic worker liveness, that
+wording is deprecated and non-authoritative for the current v1 contract; the
+current rules are this SKILL, `docs/collab-v1-lifecycle.manifest.json`, and
+`docs/task-keepalive-plan.md`.
