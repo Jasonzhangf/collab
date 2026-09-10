@@ -6556,6 +6556,154 @@ fn request_requires_project_context(req: &Req) -> bool {
     !matches!(req, Req::Ping)
 }
 
+enum WireRoutePrincipal<'a> {
+    Authenticated { worker_id: &'a str },
+    Selected { worker_id: &'a str },
+}
+
+fn wire_route_principals(req: &Req) -> Result<Vec<WireRoutePrincipal<'_>>, String> {
+    match req {
+        Req::Subagent { worker_id, .. }
+        | Req::Register { worker_id, .. }
+        | Req::NotificationSubscribe { worker_id, .. }
+        | Req::NotificationStatus { worker_id, .. }
+        | Req::NotificationUnsubscribe { worker_id, .. }
+        | Req::Poll { worker_id, .. }
+        | Req::Ack { worker_id, .. }
+        | Req::Inbox { worker_id, .. }
+        | Req::Context { worker_id, .. }
+        | Req::TaskRegister { worker_id, .. }
+        | Req::TaskRelocate { worker_id, .. }
+        | Req::TaskUpdate { worker_id, .. }
+        | Req::TaskAccept { worker_id, .. }
+        | Req::TaskClaim { worker_id, .. }
+        | Req::TaskWait { worker_id, .. }
+        | Req::TaskDeliver { worker_id, .. }
+        | Req::TaskReview { worker_id, .. }
+        | Req::TaskIntegrated { worker_id, .. }
+        | Req::TaskClose { worker_id, .. }
+        | Req::TaskDispatch { worker_id, .. }
+        | Req::MigrationInspect { worker_id, .. }
+        | Req::MigrationPlan { worker_id, .. }
+        | Req::MigrationApply { worker_id, .. }
+        | Req::MigrationVerify { worker_id, .. }
+        | Req::MasterPromote { worker_id, .. }
+        | Req::MasterDelegate { worker_id, .. }
+        | Req::WorkerClose { worker_id, .. }
+        | Req::MasterRecover { worker_id, .. }
+        | Req::TransferMaster { worker_id, .. }
+        | Req::RemoveWorker { worker_id, .. } => {
+            Ok(vec![WireRoutePrincipal::Authenticated { worker_id }])
+        }
+        Req::Send {
+            worker_id, token, ..
+        } => match (worker_id.as_deref(), token.as_deref()) {
+            (Some(worker_id), Some(_)) => Ok(vec![WireRoutePrincipal::Authenticated { worker_id }]),
+            (None, None) => Ok(Vec::new()),
+            _ => Err(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: wire send requires worker_id and token together"
+                    .into(),
+            ),
+        },
+        Req::Role { worker_id } => Ok(vec![WireRoutePrincipal::Selected { worker_id }]),
+        Req::WorkerStatus {
+            worker_id: Some(worker_id),
+        }
+        | Req::MailboxRead {
+            worker_id: Some(worker_id),
+            ..
+        } => Ok(vec![WireRoutePrincipal::Selected { worker_id }]),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn validate_wire_route_principals(
+    server: &Server,
+    req: &Req,
+    route_scope: &RouteScope,
+) -> Result<(), String> {
+    let principals = wire_route_principals(req)?;
+    if principals.is_empty() {
+        return Ok(());
+    }
+
+    let state = server.state.lock().unwrap();
+    for principal in principals {
+        let worker_id = match principal {
+            WireRoutePrincipal::Authenticated { worker_id, .. }
+            | WireRoutePrincipal::Selected { worker_id } => worker_id,
+        };
+        let bindings = state
+            .global
+            .projects
+            .values()
+            .flat_map(|project| project.runtime_bindings.values())
+            .filter(|binding| binding.agent_id.as_str() == worker_id)
+            .collect::<Vec<_>>();
+
+        // A new wire Register is the only request allowed to create its first
+        // binding.  A same-named binding in another project remains a route
+        // conflict even when the resident legacy worker projection is absent.
+        if matches!(req, Req::Register { .. }) && state.workers.get(worker_id).is_none() {
+            if bindings.is_empty() {
+                continue;
+            }
+            return Err(format!(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: worker {} is already bound to another project route",
+                worker_id
+            ));
+        }
+
+        let mut routes = std::collections::BTreeSet::new();
+        for binding in bindings {
+            routes.insert((
+                binding.app_scope_id.as_str().to_owned(),
+                binding.project_scope.as_str().to_owned(),
+            ));
+        }
+        let Some((app_scope_id, project_scope_id)) = routes.iter().next() else {
+            return Err(format!(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: worker {} has no registered runtime binding",
+                worker_id
+            ));
+        };
+        if routes.len() != 1
+            || app_scope_id != route_scope.app_scope_id.as_str()
+            || project_scope_id != route_scope.project_scope_id.as_str()
+        {
+            return Err(format!(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: worker {} runtime binding route does not match request route",
+                worker_id
+            ));
+        }
+
+        let Some(worker) = state.workers.get(worker_id) else {
+            return Err(format!(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: worker {} has no resident identity",
+                worker_id
+            ));
+        };
+        let worker_scope =
+            GlobalState::canonical_project_scope(Path::new(&worker.cwd)).map_err(|error| {
+                format!(
+                    "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: worker {} cwd is not a project route: {}",
+                    worker_id, error
+                )
+            })?;
+        if worker_scope != route_scope.project_scope_id {
+            return Err(format!(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: worker {} cwd does not match request project route",
+                worker_id
+            ));
+        }
+
+        // Authenticated handlers retain the established token check.  This
+        // admission only binds the worker identity to the incoming route;
+        // direct in-process callers continue to use the legacy handlers.
+    }
+    Ok(())
+}
+
 /// Validate the route carried by a host-daemon request before the legacy
 /// project reducer sees it.  The first host-routing seam intentionally admits
 /// only the project loaded by this daemon instance; a different canonical
@@ -6579,6 +6727,10 @@ pub(crate) fn validate_request_context(
         .validate()
         .map_err(|error| format!("PROJECT_CONTEXT_INVALID: {error}"))?;
     let registry = HostRouteRegistry::for_server(server)?;
+    let route_scope = RouteScope {
+        app_scope_id: project_context.app_scope_id.clone(),
+        project_scope_id: project_context.project_scope.clone(),
+    };
     match registry.lookup(project_context) {
         Some(HostRouteOwner::ResidentProject { root, .. }) => {
             if project_context.canonical_root != root.to_string_lossy() {
@@ -6591,12 +6743,13 @@ pub(crate) fn validate_request_context(
             if let Req::Register { cwd, .. } = req {
                 validate_register_cwd(cwd, root)?;
             }
-            Ok(())
         }
-        Some(HostRouteOwner::RegisteredNotReady { root }) => Err(format!(
-            "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: project route {} is registered but has no migrated reducer/journal owner",
-            root.display()
-        )),
+        Some(HostRouteOwner::RegisteredNotReady { root }) => {
+            return Err(format!(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: project route {} is registered but has no migrated reducer/journal owner",
+                root.display()
+            ))
+        }
         None => {
             // Registration is the one operation that may create the first
             // app route for this resident project.  It still has to carry an
@@ -6617,15 +6770,27 @@ pub(crate) fn validate_request_context(
             {
                 if let Req::Register { cwd, .. } = req {
                     validate_register_cwd(cwd, Path::new(resident_scope.as_str()))?;
-                    return Ok(());
+                } else {
+                    return Err(format!(
+                        "PROJECT_SCOPE_UNKNOWN: no host route is registered for {}",
+                        project_context.canonical_root
+                    ));
                 }
+            } else {
+                return Err(format!(
+                    "PROJECT_SCOPE_UNKNOWN: no host route is registered for {}",
+                    project_context.canonical_root
+                ));
             }
-            Err(format!(
-                "PROJECT_SCOPE_UNKNOWN: no host route is registered for {}",
-                project_context.canonical_root
-            ))
         }
     }
+
+    if matches!(req, Req::CrossProjectSend { .. }) {
+        return Err(
+            "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: cross-project wire requests require independently verified source and target route owners".into(),
+        );
+    }
+    validate_wire_route_principals(server, req, &route_scope)
 }
 
 fn validate_register_cwd(cwd: &str, expected_root: &Path) -> Result<(), String> {
@@ -6706,6 +6871,24 @@ mod host_route_registry_tests {
     }
 
     #[test]
+    fn malformed_project_context_is_not_reinterpreted_as_unscoped_request() {
+        let line = serde_json::json!({
+            "project_context": {
+                "app_scope_id": "app-wire",
+                "canonical_root": "/tmp",
+                "project_scope": 42
+            },
+            "op": "Ping"
+        })
+        .to_string();
+        let error = parse_wire_request(&line).unwrap_err();
+        assert!(
+            error.starts_with("bad request: invalid project context envelope:"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn unknown_project_route_fails_closed() {
         let (server, root, _) = test_server();
         let other_root = root.with_file_name(format!(
@@ -6777,6 +6960,105 @@ mod host_route_registry_tests {
         assert_eq!(server.state.lock().unwrap().revision, before_revision);
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_project_wire_request_is_rejected_without_resident_mutation() {
+        let (server, root, journal_path) = test_server();
+        let project_context = context_with_app(&root, "app-wire");
+        let registered = dispatch_wire(
+            server.clone(),
+            Some(project_context.clone()),
+            Req::Register {
+                worker_id: "target-master".into(),
+                token: "token-target-master".into(),
+                pane: Some("%target-master".into()),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(registered.ok, "{registered:?}");
+        let promoted = handle_master_promote(
+            &server,
+            "target-master".into(),
+            "token-target-master".into(),
+            "user approved target-master".into(),
+        );
+        assert!(promoted.ok, "{promoted:?}");
+
+        let mailbox_dir = root.join(".agent-collab/mailbox");
+        std::fs::create_dir_all(&mailbox_dir).unwrap();
+        let mailbox_path = mailbox_dir.join("recipient-target-master.jsonl");
+        std::fs::write(&mailbox_path, b"sentinel\n").unwrap();
+        let mailbox_snapshot = |directory: &Path| {
+            let mut entries = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_string_lossy().into_owned(),
+                        std::fs::read(path).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            entries
+        };
+        let before_mailbox = mailbox_snapshot(&mailbox_dir);
+        let before_journal = std::fs::read(&journal_path).unwrap();
+        let message_snapshot = |messages: &std::collections::HashMap<String, Message>| {
+            let mut entries = messages
+                .iter()
+                .map(|(id, message)| (id.clone(), serde_json::to_string(message).unwrap()))
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            entries
+        };
+        let before_state = {
+            let state = server.state.lock().unwrap();
+            (
+                state.revision,
+                state.sequence,
+                message_snapshot(&state.msgs),
+                state.delivery_modes.clone(),
+                state.wake_bindings.clone(),
+                state.global.clone(),
+            )
+        };
+
+        let response = dispatch_wire(
+            server.clone(),
+            Some(project_context),
+            Req::CrossProjectSend {
+                from: "source-master".into(),
+                from_project: "/foreign/project".into(),
+                source_master_assigned_by: "source-master".into(),
+                source_master_approval: Some("user approved source-master".into()),
+                source_master_assigned_ms: 1,
+                to: "target-master".into(),
+                subject: "cross-project".into(),
+                body: "must remain outside resident reducer".into(),
+                in_reply_to: None,
+            },
+        )
+        .await;
+        assert!(!response.ok, "{response:?}");
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("PROJECT_ROUTE_NOT_READY/UNSUPPORTED:")));
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.revision, before_state.0);
+        assert_eq!(state.sequence, before_state.1);
+        assert_eq!(message_snapshot(&state.msgs), before_state.2);
+        assert_eq!(state.delivery_modes, before_state.3);
+        assert_eq!(state.wake_bindings, before_state.4);
+        assert_eq!(state.global, before_state.5);
+        drop(state);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        assert_eq!(mailbox_snapshot(&mailbox_dir), before_mailbox);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
