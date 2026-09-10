@@ -29,7 +29,7 @@ use state::{
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
@@ -336,6 +336,24 @@ pub struct Server {
     pub pane_owner_check: fn(&str, &str) -> Result<bool, ()>,
     pub pane_state_check: fn(&str) -> crate::server::knock::AgentState,
     pub mailbox_notify: Notify,
+}
+
+// Wire admission and the legacy handlers share the state reducer, but the
+// admission check itself cannot hold `State` while a handler runs.  Keep a
+// process-local gate per daemon root so a rebind cannot slip between those
+// two phases.  This mutex is synchronization only; route and generation
+// truth remains in `State`/the journal.
+static WIRE_ROUTE_MUTATION_GATES: OnceLock<
+    Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>,
+> = OnceLock::new();
+
+fn wire_route_mutation_gate(server: &Server) -> Arc<Mutex<()>> {
+    let gates = WIRE_ROUTE_MUTATION_GATES.get_or_init(|| Mutex::new(Default::default()));
+    let mut gates = gates.lock().unwrap();
+    gates
+        .entry(server.root.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 fn record_activity(root: &Path, kind: &str, detail: serde_json::Value) -> Result<(), String> {
@@ -889,6 +907,9 @@ impl Server {
             .any(|event| matches!(event, Event::Sent { .. }))
             && !has_pending_scheduler_admission)
             || has_succeeded_scheduler_admission
+            || events
+                .iter()
+                .any(|event| matches!(event, Event::GlobalRuntimeBound { .. }))
         {
             self.mailbox_notify.notify_waiters();
         }
@@ -1051,6 +1072,9 @@ impl Server {
         if (evs.iter().any(|event| matches!(event, Event::Sent { .. }))
             && !has_pending_scheduler_admission)
             || has_succeeded_scheduler_admission
+            || evs
+                .iter()
+                .any(|event| matches!(event, Event::GlobalRuntimeBound { .. }))
         {
             self.mailbox_notify.notify_waiters();
         }
@@ -2832,6 +2856,21 @@ pub(crate) fn handle_register_with_app_scope(
         return Resp::err("collab registration requires a live tmux pane");
     };
     if let Some(pane) = pane.as_deref() {
+        match (server.pane_owner_check)(&worker_id, pane) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Resp::err(format!(
+                    "worker {} cannot bind pane {} owned by another tmux session",
+                    worker_id, pane
+                ))
+            }
+            Err(()) => {
+                return Resp::err(format!(
+                    "cannot verify tmux session ownership for pane {}",
+                    pane
+                ))
+            }
+        }
         if let Some(session) = tmux_session_for_pane(pane) {
             if session != worker_id {
                 return Resp::err(format!(
@@ -5698,9 +5737,29 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
 }
 
 fn poll_messages(server: &Server, worker_id: &str) -> Option<Resp> {
+    poll_messages_with_context(server, worker_id, None, None)
+}
+
+fn poll_messages_with_context(
+    server: &Server,
+    worker_id: &str,
+    token: Option<&str>,
+    project_context: Option<&ProjectContext>,
+) -> Option<Resp> {
     let ids: Vec<String>;
     let msgs: Vec<Message>;
     let mut st = server.state.lock().unwrap();
+    match (token, project_context) {
+        (Some(token), Some(project_context)) => {
+            if let Err(response) = project_route_actor(&st, project_context, worker_id, token) {
+                return Some(response);
+            }
+        }
+        (None, None) => {}
+        _ => return Some(Resp::err(
+            "PROJECT_CONTEXT_REQUIRED: poll runtime admission requires token and project context",
+        )),
+    }
     let unread = st.inbox_of(worker_id);
     if unread.is_empty() {
         return None;
@@ -5732,20 +5791,53 @@ fn poll_messages(server: &Server, worker_id: &str) -> Option<Resp> {
 }
 
 async fn poll_messages_async(server: Arc<Server>, worker_id: &str) -> Option<Resp> {
+    poll_messages_async_with_context(server, worker_id, None, None).await
+}
+
+async fn poll_messages_async_with_context(
+    server: Arc<Server>,
+    worker_id: &str,
+    token: Option<String>,
+    project_context: Option<ProjectContext>,
+) -> Option<Resp> {
     let worker_id = worker_id.to_owned();
-    tokio::task::spawn_blocking(move || poll_messages(&server, &worker_id))
-        .await
-        .unwrap_or_else(|error| Some(Resp::err(format!("poll handler join error: {}", error))))
+    tokio::task::spawn_blocking(move || {
+        poll_messages_with_context(
+            &server,
+            &worker_id,
+            token.as_deref(),
+            project_context.as_ref(),
+        )
+    })
+    .await
+    .unwrap_or_else(|error| Some(Resp::err(format!("poll handler join error: {}", error))))
 }
 
 async fn handle_poll_async(server: Arc<Server>, worker_id: String, timeout_ms: u64) -> Resp {
+    handle_poll_async_with_context(server, worker_id, None, timeout_ms, None).await
+}
+
+async fn handle_poll_async_with_context(
+    server: Arc<Server>,
+    worker_id: String,
+    token: Option<String>,
+    timeout_ms: u64,
+    project_context: Option<ProjectContext>,
+) -> Resp {
     let timeout_ms = timeout_ms.min(MAX_POLL_MS);
     let mut notified = Box::pin(server.mailbox_notify.notified());
     let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
     tokio::pin!(timeout);
     loop {
         notified.as_mut().enable();
-        if let Some(response) = poll_messages_async(server.clone(), &worker_id).await {
+        if let Some(response) = poll_messages_async_with_context(
+            server.clone(),
+            &worker_id,
+            token.clone(),
+            project_context.clone(),
+        )
+        .await
+        {
             return response;
         }
         tokio::select! {
@@ -6117,6 +6209,32 @@ fn validate_wire_runtime_binding(
             }
             return Ok(());
         }
+
+        // A CLI process may lose its persisted runtime when its tmux pane is
+        // recreated.  Permit that one recovery shape to reach the Register
+        // owner, but do not treat the provisional identity as a capability for
+        // any other mutation.  Token and pane ownership are checked against
+        // the resident worker before the typed registrar can advance the
+        // binding generation.
+        if let Req::Register {
+            worker_id,
+            token,
+            pane,
+            ..
+        } = req
+        {
+            let provisional = crate::identity::RuntimeIdentity::cli_adapter(worker_id)
+                .map_err(|error| format!("PROJECT_CONTEXT_INVALID: {error}"))?;
+            if project_context.runtime_context.as_ref() == Some(&provisional) {
+                return validate_cli_register_rebind(
+                    server,
+                    project_context,
+                    worker_id,
+                    token,
+                    pane,
+                );
+            }
+        }
     }
 
     let Some((worker_id, token)) = wire_mutation_principal(req) else {
@@ -6130,6 +6248,88 @@ fn validate_wire_runtime_binding(
                 "RUNTIME_BINDING_REJECTED: runtime binding admission failed".into()
             })
         })
+}
+
+fn validate_cli_register_rebind(
+    server: &Server,
+    project_context: &ProjectContext,
+    worker_id: &str,
+    token: &str,
+    pane: &Option<String>,
+) -> Result<(), String> {
+    let route_scope = RouteScope {
+        app_scope_id: project_context.app_scope_id.clone(),
+        project_scope_id: project_context.project_scope.clone(),
+    };
+    let expected_binding_id = BindingId::new(sanitize_identifier(&format!("binding-{worker_id}")))
+        .map_err(|error| format!("PROJECT_CONTEXT_INVALID: {error}"))?;
+    {
+        let state = server.state.lock().unwrap();
+        let worker = verify(&state, worker_id, token).map_err(|response| {
+            response.error.unwrap_or_else(|| {
+                "RUNTIME_BINDING_REJECTED: worker token does not match the registered identity"
+                    .into()
+            })
+        })?;
+        let worker_scope =
+            GlobalState::canonical_project_scope(Path::new(&worker.cwd)).map_err(|error| {
+                format!("RUNTIME_BINDING_REJECTED: worker cwd is not a project route: {error}")
+            })?;
+        if worker_scope != route_scope.project_scope_id {
+            return Err(
+                "RUNTIME_BINDING_REJECTED: worker cwd does not match the requested project route"
+                    .into(),
+            );
+        }
+        let Some(project) = state.global.lookup_project_for_route(&route_scope) else {
+            return Err(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: worker has no registered runtime route"
+                    .into(),
+            );
+        };
+        let bindings = project
+            .runtime_bindings
+            .values()
+            .filter(|binding| binding.agent_id.as_str() == worker_id)
+            .collect::<Vec<_>>();
+        if bindings.len() != 1 {
+            return Err(
+                "RUNTIME_BINDING_REJECTED: authoritative runtime binding is ambiguous".into(),
+            );
+        }
+        let binding = bindings[0];
+        if binding.binding_id != expected_binding_id {
+            return Err(
+                "RUNTIME_BINDING_REJECTED: registered worker binding does not match the CLI route"
+                    .into(),
+            );
+        }
+        if binding.endpoint_generation == 0 {
+            return Err(
+                "RUNTIME_BINDING_REJECTED: authoritative runtime binding has no live endpoint generation"
+                    .into(),
+            );
+        }
+        binding
+            .validate()
+            .map_err(|error| format!("RUNTIME_BINDING_REJECTED: {error}"))?;
+    }
+
+    let Some(pane) = pane.as_deref() else {
+        return Err("RUNTIME_BINDING_REJECTED: CLI rebind requires a live tmux pane".into());
+    };
+    if runtime_for_pane(Some(pane)).is_none() {
+        return Err("RUNTIME_BINDING_REJECTED: CLI rebind requires a live tmux pane".into());
+    }
+    match (server.pane_owner_check)(worker_id, pane) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "RUNTIME_BINDING_REJECTED: pane {pane} is not owned by worker {worker_id}"
+        )),
+        Err(()) => Err(format!(
+            "RUNTIME_BINDING_REJECTED: pane ownership for {pane} is unknown"
+        )),
+    }
 }
 
 fn project_route_actor(
@@ -8327,6 +8527,303 @@ mod host_route_registry_tests {
         assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn wire_cli_recover_rebinds_generation_and_fences_old_context() {
+        let (server, root, journal_path) = test_server();
+        let app = crate::identity::CLI_APP_SERVER_ID;
+        let worker_id = "recover-worker";
+        let token = "token-recover-worker";
+        let first = dispatch_wire(
+            server.clone(),
+            Some(context_with_app(&root, app)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                pane: Some(format!("%{worker_id}")),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(first.ok, "{first:?}");
+        let old_runtime = runtime_for_registered(&server, &root, worker_id, app);
+        let old_context = context_with_runtime(&root, app, &old_runtime);
+        let stale_request = notification_subscribe_request(worker_id, token);
+        // The request is valid at admission time.  Rebind must make the
+        // subsequent execution fail closed instead of relying on this stale
+        // preflight result.
+        assert!(validate_request_context(&server, &stale_request, Some(&old_context)).is_ok());
+
+        let provisional = RuntimeIdentity::cli_adapter(worker_id).unwrap();
+        let recovered = dispatch_wire(
+            server.clone(),
+            Some(context_with_runtime(&root, app, &provisional)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                pane: Some(format!("%{worker_id}-recovered")),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(recovered.ok, "{recovered:?}");
+        let new_runtime = runtime_for_registered(&server, &root, worker_id, app);
+        assert_eq!(
+            new_runtime.endpoint_generation,
+            old_runtime.endpoint_generation + 1
+        );
+        assert_ne!(new_runtime.runtime_id, old_runtime.runtime_id);
+        assert_eq!(
+            recovered.data["command"]["binding"]["endpoint_generation"],
+            new_runtime.endpoint_generation
+        );
+
+        let accepted = dispatch_wire(
+            server.clone(),
+            Some(context_with_runtime(&root, app, &new_runtime)),
+            notification_subscribe_request(worker_id, token),
+        )
+        .await;
+        assert!(accepted.ok, "{accepted:?}");
+
+        let before = mutation_snapshot(&server);
+        let before_journal = std::fs::read(&journal_path).unwrap();
+        let before_mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+        let rejected = dispatch_wire(server.clone(), Some(old_context), stale_request).await;
+        assert!(!rejected.ok, "{rejected:?}");
+        assert!(rejected
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("RUNTIME_BINDING_REJECTED:")));
+        assert_eq!(mutation_snapshot(&server), before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        assert_eq!(
+            directory_snapshot(&root.join(".agent-collab/mailbox")),
+            before_mailbox
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wire_cli_recover_rejects_forged_token_pane_and_route() {
+        fn only_named_worker_pane(worker_id: &str, pane: &str) -> Result<bool, ()> {
+            Ok(pane == format!("%{worker_id}"))
+        }
+
+        let (mut server, root, journal_path) = test_server();
+        Arc::get_mut(&mut server).unwrap().pane_owner_check = only_named_worker_pane;
+        let app = crate::identity::CLI_APP_SERVER_ID;
+        let worker_id = "recover-negative-worker";
+        let token = "token-recover-negative-worker";
+        let registered = dispatch_wire(
+            server.clone(),
+            Some(context_with_app(&root, app)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                pane: Some(format!("%{worker_id}")),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(registered.ok, "{registered:?}");
+        let runtime = runtime_for_registered(&server, &root, worker_id, app);
+        let provisional = RuntimeIdentity::cli_adapter(worker_id).unwrap();
+
+        let before = mutation_snapshot(&server);
+        let before_journal = std::fs::read(&journal_path).unwrap();
+        let before_mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+        let wrong_token = dispatch_wire(
+            server.clone(),
+            Some(context_with_runtime(&root, app, &provisional)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: "forged-token".into(),
+                pane: Some(format!("%{worker_id}")),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(!wrong_token.ok, "{wrong_token:?}");
+        assert_eq!(mutation_snapshot(&server), before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        assert_eq!(
+            directory_snapshot(&root.join(".agent-collab/mailbox")),
+            before_mailbox
+        );
+
+        let before = mutation_snapshot(&server);
+        let before_journal = std::fs::read(&journal_path).unwrap();
+        let before_mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+        let wrong_pane = dispatch_wire(
+            server.clone(),
+            Some(context_with_runtime(&root, app, &provisional)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                pane: Some("%another-worker".into()),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(!wrong_pane.ok, "{wrong_pane:?}");
+        assert!(wrong_pane
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("RUNTIME_BINDING_REJECTED:")));
+        assert_eq!(mutation_snapshot(&server), before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        assert_eq!(
+            directory_snapshot(&root.join(".agent-collab/mailbox")),
+            before_mailbox
+        );
+
+        let wrong_root = root.with_file_name(format!(
+            "{}-wrong-route",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&wrong_root).unwrap();
+        let before = mutation_snapshot(&server);
+        let before_journal = std::fs::read(&journal_path).unwrap();
+        let before_mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+        let wrong_route = dispatch_wire(
+            server.clone(),
+            Some(context_with_runtime(&wrong_root, app, &provisional)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                pane: Some(format!("%{worker_id}-wrong-route")),
+                cwd: wrong_root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(!wrong_route.ok, "{wrong_route:?}");
+        assert!(wrong_route
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("PROJECT_SCOPE_UNKNOWN:")));
+        assert_eq!(mutation_snapshot(&server), before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        assert_eq!(
+            directory_snapshot(&root.join(".agent-collab/mailbox")),
+            before_mailbox
+        );
+
+        let forged_worker = "forged-worker";
+        let forged_context = context_with_runtime(
+            &root,
+            app,
+            &RuntimeIdentity::cli_adapter(forged_worker).unwrap(),
+        );
+        let before = mutation_snapshot(&server);
+        let before_journal = std::fs::read(&journal_path).unwrap();
+        let before_mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+        let forged = dispatch_wire(
+            server.clone(),
+            Some(forged_context),
+            Req::Register {
+                worker_id: forged_worker.into(),
+                token: "token-forged-worker".into(),
+                pane: Some(format!("%{worker_id}")),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(!forged.ok, "{forged:?}");
+        assert!(forged
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cannot bind pane")));
+        assert_eq!(mutation_snapshot(&server), before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        assert_eq!(
+            directory_snapshot(&root.join(".agent-collab/mailbox")),
+            before_mailbox
+        );
+
+        assert_eq!(runtime.endpoint_generation, 1);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(wrong_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wire_poll_rechecks_generation_before_delivering_after_rebind() {
+        let (server, root, _) = test_server();
+        let app = crate::identity::CLI_APP_SERVER_ID;
+        let worker_id = "poll-recover-worker";
+        let token = "token-poll-recover-worker";
+        let registered = dispatch_wire(
+            server.clone(),
+            Some(context_with_app(&root, app)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                pane: Some(format!("%{worker_id}")),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(registered.ok, "{registered:?}");
+        let old_runtime = runtime_for_registered(&server, &root, worker_id, app);
+        let old_context = context_with_runtime(&root, app, &old_runtime);
+        let provisional = RuntimeIdentity::cli_adapter(worker_id).unwrap();
+        let recovery_context = context_with_runtime(&root, app, &provisional);
+        let poll_server = server.clone();
+        let rebind_server = server.clone();
+        let rebind_root = root.clone();
+        let poll = dispatch_wire(
+            poll_server,
+            Some(old_context),
+            Req::Poll {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                timeout_ms: 1_000,
+            },
+        );
+        let rebind = async move {
+            let response = dispatch_wire(
+                rebind_server.clone(),
+                Some(recovery_context),
+                Req::Register {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    pane: Some(format!("%{worker_id}-recovered")),
+                    cwd: rebind_root.display().to_string(),
+                },
+            )
+            .await;
+            assert!(response.ok, "{response:?}");
+            rebind_server.commit(&[Event::Sent {
+                msg: Message {
+                    id: "poll-rebind-message".into(),
+                    from: "sender".into(),
+                    to: worker_id.into(),
+                    mtype: "notify".into(),
+                    subject: Some("rebind".into()),
+                    body: "must remain pending".into(),
+                    in_reply_to: None,
+                    created_ms: now_ms(),
+                    state: "pending".into(),
+                    wake_attempt_count: 0,
+                    last_wake_attempt_ms: 0,
+                },
+            }]);
+            response
+        };
+        let (poll_result, rebind_result) = tokio::join!(poll, rebind);
+        assert!(!poll_result.ok, "{poll_result:?}");
+        assert!(poll_result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("RUNTIME_BINDING_REJECTED:")));
+        assert!(rebind_result.ok, "{rebind_result:?}");
+        let state = server.state.lock().unwrap();
+        let message = state.msgs.get("poll-rebind-message").unwrap();
+        assert_eq!(message.state, "pending");
+        assert_eq!(message.wake_attempt_count, 0);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn parse_wire_request(line: &str) -> Result<(Option<ProjectContext>, Req), String> {
@@ -8364,15 +8861,22 @@ async fn dispatch_wire(
     project_context: Option<ProjectContext>,
     req: Req,
 ) -> Resp {
-    if let Err(error) = validate_request_context(&server, &req, project_context.as_ref()) {
-        return Resp::err(error);
-    }
     match req {
         Req::Poll {
             worker_id,
             token,
             timeout_ms,
         } => {
+            let poll_req = Req::Poll {
+                worker_id: worker_id.clone(),
+                token: token.clone(),
+                timeout_ms,
+            };
+            if let Err(error) =
+                validate_request_context(&server, &poll_req, project_context.as_ref())
+            {
+                return Resp::err(error);
+            }
             let admission = {
                 let check = server.state.lock().unwrap();
                 if let Err(error) = verify(&check, &worker_id, &token) {
@@ -8385,10 +8889,29 @@ async fn dispatch_wire(
             };
             match admission {
                 Some(response) => response,
-                None => handle_poll_async(server, worker_id, timeout_ms).await,
+                None => {
+                    handle_poll_async_with_context(
+                        server,
+                        worker_id,
+                        Some(token),
+                        timeout_ms,
+                        project_context,
+                    )
+                    .await
+                }
             }
         }
         req => tokio::task::spawn_blocking(move || {
+            let route_gate =
+                if mutation_blocked_during_migration(&req) || matches!(req, Req::Register { .. }) {
+                    Some(wire_route_mutation_gate(&server))
+                } else {
+                    None
+                };
+            let _route_gate_guard = route_gate.as_ref().map(|gate| gate.lock().unwrap());
+            if let Err(error) = validate_request_context(&server, &req, project_context.as_ref()) {
+                return Resp::err(error);
+            }
             dispatch_with_route_context(&server, req, project_context)
         })
         .await
