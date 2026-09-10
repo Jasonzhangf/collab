@@ -176,20 +176,31 @@ impl Server {
     }
 
     pub(crate) fn commit_locked(&self, st: &mut State, evs: &[Event]) {
+        self.try_commit_locked(st, evs)
+            .expect("journal commit failed; refusing state mutation");
+    }
+
+    pub(crate) fn try_commit(&self, evs: &[Event]) -> Result<(), String> {
+        let mut st = self.state.lock().unwrap();
+        self.try_commit_locked(&mut st, evs)
+    }
+
+    pub(crate) fn try_commit_locked(&self, st: &mut State, evs: &[Event]) -> Result<(), String> {
         let mut j = self.journal.lock().unwrap();
         use std::io::Write;
         // Persist control truth before any state change or external notification.
         // A failed journal poisons this owner instead of silently resetting budgets.
         let mut buf = Vec::new();
         for ev in evs {
-            let line = serde_json::to_string(ev).expect("serialize event");
+            let line =
+                serde_json::to_string(ev).map_err(|error| format!("journal serialize: {error}"))?;
             buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
         }
         j.write_all(&buf)
-            .expect("journal append failed; refusing state mutation");
+            .map_err(|error| format!("journal append: {error}"))?;
         j.sync_data()
-            .expect("journal sync failed; refusing state mutation");
+            .map_err(|error| format!("journal sync: {error}"))?;
         for ev in evs {
             st.apply(ev);
             if let Event::Sent { msg } = ev {
@@ -252,6 +263,7 @@ impl Server {
         {
             self.mailbox_notify.notify_waiters();
         }
+        Ok(())
     }
 
     fn report_mailbox_projection_error(&self, error: String) {

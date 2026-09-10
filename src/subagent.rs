@@ -742,12 +742,14 @@ fn run(
                 record = existing.clone();
                 record.runtime = Some(config.subagent.runtime.clone());
             } else {
-                server.commit_locked(
-                    &mut state,
-                    &[Event::SubagentUpdated {
-                        subagent: record.clone(),
-                    }],
-                );
+                server
+                    .try_commit_locked(
+                        &mut state,
+                        &[Event::SubagentUpdated {
+                            subagent: record.clone(),
+                        }],
+                    )
+                    .map_err(anyhow::Error::msg)?;
             }
         }
         if let Err(e) = launch(server, &mut record, &config.subagent, environment) {
@@ -755,16 +757,20 @@ fn run(
             record.error = Some(msg.clone());
             if msg.contains("timed out") {
                 record.status = "probing".into();
-                server.commit(&[Event::SubagentUpdated {
-                    subagent: record.clone(),
-                }]);
+                server
+                    .try_commit(&[Event::SubagentUpdated {
+                        subagent: record.clone(),
+                    }])
+                    .map_err(anyhow::Error::msg)?;
                 return Ok(follow_up(&record, false));
             }
             record.status = "failed".into();
         }
-        server.commit(&[Event::SubagentUpdated {
-            subagent: record.clone(),
-        }]);
+        server
+            .try_commit(&[Event::SubagentUpdated {
+                subagent: record.clone(),
+            }])
+            .map_err(anyhow::Error::msg)?;
         return Ok(follow_up(&record, false));
     }
     if matches!(action, Action::List) {
@@ -804,13 +810,15 @@ fn run(
             return observe(server, Some(&record.id), Some(lines));
         }
         Action::Rearm { .. } => {
-            server.commit_locked(
-                &mut state,
-                &[Event::KeepaliveUpdated {
-                    worker_id: record.peer.clone(),
-                    record: crate::server::keepalive::Record::default(),
-                }],
-            );
+            server
+                .try_commit_locked(
+                    &mut state,
+                    &[Event::KeepaliveUpdated {
+                        worker_id: record.peer.clone(),
+                        record: crate::server::keepalive::Record::default(),
+                    }],
+                )
+                .map_err(anyhow::Error::msg)?;
             return Ok(
                 json!({"subagent_id":record.id,"keepalive_rearmed":true,"notification":"none"}),
             );
@@ -905,7 +913,8 @@ fn run(
             if !events.is_empty() {
                 // Persist the task and managed-record transition together so
                 // replay cannot observe a half-claimed assignment.
-                server.commit_locked(&mut state, &events);
+                server.try_commit_locked(&mut state, &events)
+                    .map_err(anyhow::Error::msg)?;
             }
             drop(state);
             if ready {
@@ -941,12 +950,14 @@ fn run(
             }
             if stale_working_without_task {
                 record.status = "idle".into();
-                server.commit_locked(
-                    &mut state,
-                    &[Event::SubagentUpdated {
-                        subagent: record.clone(),
-                    }],
-                );
+                server
+                    .try_commit_locked(
+                        &mut state,
+                        &[Event::SubagentUpdated {
+                            subagent: record.clone(),
+                        }],
+                    )
+                    .map_err(anyhow::Error::msg)?;
             }
             drop(state);
             let result = match notify(
@@ -964,10 +975,12 @@ fn run(
                     if let Some(mut current) = state.subagents.get(&record.id).cloned() {
                         if current.status == "idle" {
                             current.error = Some(error.to_string());
-                            server.commit_locked(
-                                &mut state,
-                                &[Event::SubagentUpdated { subagent: current }],
-                            );
+                            server
+                                .try_commit_locked(
+                                    &mut state,
+                                    &[Event::SubagentUpdated { subagent: current }],
+                                )
+                                .map_err(anyhow::Error::msg)?;
                         }
                     }
                     return Err(error);
@@ -983,12 +996,14 @@ fn run(
                 bail!("startup probe is in progress; check status, or close after its bounded completion");
             }
             record.status = "closing".into();
-            server.commit_locked(
-                &mut state,
-                &[Event::SubagentUpdated {
-                    subagent: record.clone(),
-                }],
-            );
+            server
+                .try_commit_locked(
+                    &mut state,
+                    &[Event::SubagentUpdated {
+                        subagent: record.clone(),
+                    }],
+                )
+                .map_err(anyhow::Error::msg)?;
             drop(state);
             if let (Some(session), Some(pane)) = (&record.session, &record.pane) {
                 if crate::server::knock::pane_alive(pane) {
@@ -1026,9 +1041,11 @@ fn run(
                 Err(error) => return Err(error.into()),
             }
             record.status = "closed".into();
-            server.commit(&[Event::SubagentUpdated {
+            if let Err(error) = server.try_commit(&[Event::SubagentUpdated {
                 subagent: record.clone(),
-            }]);
+            }]) {
+                bail!("subagent close outcome unknown: session close succeeded but durable commit failed: {error}");
+            }
         }
         _ => unreachable!(),
     }
