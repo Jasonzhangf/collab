@@ -14,6 +14,7 @@ const MAX_NOTIFICATION_CHARS: usize = 1024;
 
 pub const MAX_NOTIFICATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER: usize = 3;
+pub(super) const AUTOMATIC_BATCH_WINDOW_MS: i64 = 120_000;
 pub const NOTIFICATION_EVENTS: [&str; 5] = [
     "direct-message",
     "resource-released",

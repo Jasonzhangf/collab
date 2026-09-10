@@ -310,7 +310,8 @@ pub(crate) fn tick_with(
                     && record.idle_episode_notices < 3
                     && ((record.working_seen && record.idle_episode_notices == 0)
                         || (record.idle_episode_notices > 0
-                            && now.saturating_sub(record.last_notice_ms) >= 120_000))
+                            && now.saturating_sub(record.last_notice_ms)
+                                >= super::mailbox::AUTOMATIC_BATCH_WINDOW_MS))
             } else {
                 is_idle
                     && record.working_seen
@@ -944,9 +945,15 @@ mod tests {
     fn master_three_reminders_are_bounded_across_replay() {
         let (server, root, base) = episode_server();
         observe(&server, base, "master", AgentState::Working);
-        for offset in [1_000, 121_000, 241_000] {
+        for offset in [1_000, 2_000, 120_999] {
             observe(&server, base + offset, "master", AgentState::Waiting);
         }
+        assert_eq!(idle_count(&server, "master"), 1);
+        for offset in [121_000, 121_001, 240_999] {
+            observe(&server, base + offset, "master", AgentState::Waiting);
+        }
+        assert_eq!(idle_count(&server, "master"), 2);
+        observe(&server, base + 241_000, "master", AgentState::Waiting);
         assert_eq!(idle_count(&server, "master"), 3);
         let mut replay = State::default();
         for line in std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))

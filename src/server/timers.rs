@@ -5,8 +5,6 @@ use crate::server::Server;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-const WAKE_ATTEMPT_LEASE_MS: i64 = 10_000;
-
 /// Server-side scheduler for finite subscriptions and bounded waits. It never
 /// creates task continuations or infers that ordinary work needs a wake.
 pub fn tick(server: &Arc<Server>) {
@@ -371,7 +369,6 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 (message.state == "pending"
                     && !unknown_sub_ids.contains(subscription_id)
                     && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
-                    && now - message.last_wake_attempt_ms >= WAKE_ATTEMPT_LEASE_MS
                     && subscription.status == "armed"
                     && subscription.expires_ms > now)
                     .then(|| (message_id.clone(), subscription_id.clone()))
@@ -981,6 +978,45 @@ mod tests {
             &|_, _| panic!("late replay")
         ));
         assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_timer_ticks_wait_for_batch_window_and_attempt_once() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let sub = subscribe(&server, "owner", "direct-message", None, None);
+        let id = bind_message(&server, "owner", &sub);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .msgs
+            .get_mut(&id)
+            .unwrap()
+            .created_ms = now_ms();
+
+        for _ in 0..4 {
+            tick_with_idle(&server, &|_| true);
+        }
+        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 0);
+
+        server
+            .state
+            .lock()
+            .unwrap()
+            .msgs
+            .get_mut(&id)
+            .unwrap()
+            .created_ms -= super::super::mailbox::AUTOMATIC_BATCH_WINDOW_MS + 1;
+        tick_with_idle(&server, &|_| true);
+        for _ in 0..4 {
+            tick_with_idle(&server, &|_| true);
+        }
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&id].wake_attempt_count,
+            MAX_WAKE_ATTEMPTS
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2344,10 +2380,22 @@ mod tests {
         }]);
         Arc::get_mut(&mut server).unwrap().pane_state_check =
             |_| crate::server::knock::AgentState::Absent;
-        tick_with_idle(&server, &|_| true);
+        let message = bind_message_with_id(&server, "mismatch-worker", &sub2, "msg-absent");
+        assert!(!super::super::attempt_notification_with(
+            &server,
+            &message,
+            &sub2,
+            &|_| panic!("absent agent must not reach delivery readiness"),
+            &|_, _| panic!("absent agent must not receive tmux input"),
+            &server.pane_owner_check,
+        ));
         assert_eq!(
             server.state.lock().unwrap().notification_subscriptions[&sub2].status,
             "pane-lost"
+        );
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&message].wake_attempt_count,
+            0
         );
 
         std::fs::remove_dir_all(root).ok();
