@@ -6403,7 +6403,17 @@ mod startup_tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
+
+    static STARTUP_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn startup_test_lock() -> MutexGuard<'static, ()> {
+        STARTUP_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn test_root(name: &str) -> PathBuf {
         let root = PathBuf::from(format!(
@@ -6418,6 +6428,7 @@ mod startup_tests {
 
     #[tokio::test]
     async fn pid_publication_failure_removes_the_owned_socket() {
+        let _startup_test_lock = startup_test_lock();
         let root = test_root("pid-failure");
         let server_dir = root.join(".agent-collab/server");
         std::fs::create_dir(server_dir.join("server.pid")).expect("occupy pid path");
@@ -6459,6 +6470,7 @@ mod startup_tests {
 
     #[tokio::test]
     async fn retry_after_pid_failure_succeeds_once_the_path_is_fixed() {
+        let _startup_test_lock = startup_test_lock();
         let root = test_root("retry");
         let server_dir = root.join(".agent-collab/server");
         let pid_path = server_dir.join("server.pid");
