@@ -539,6 +539,27 @@ impl Server {
         self.commit_locked_checked(&mut st, evs)
     }
 
+    /// Compatibility entry point for callers that only need a string error.
+    /// The checked reducer remains the single journal/state owner.
+    pub(crate) fn try_commit(&self, evs: &[Event]) -> Result<(), String> {
+        self.commit_checked(evs)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Compatibility entry point for callers holding the state lock.
+    /// This delegates to the typed reducer and never applies state after a
+    /// journal failure.
+    pub(crate) fn try_commit_locked(
+        &self,
+        st: &mut State,
+        evs: &[Event],
+    ) -> Result<(), String> {
+        self.commit_locked_checked(st, evs)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     /// Commit one command and its outcome atomically. A retry with the same
     /// command id returns the recorded outcome without appending another event.
     /// Reusing a command id for a different operation is rejected explicitly.

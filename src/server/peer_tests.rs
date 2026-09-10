@@ -1297,6 +1297,74 @@ fn legacy_command_record_without_outcome_is_rejected() {
 }
 
 #[test]
+fn try_commit_reports_journal_failure_without_applying_state() {
+    let (server, root) = test_server();
+    *server.journal.lock().unwrap() =
+        std::fs::File::open(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    let mut state = State::default();
+    let error = server
+        .try_commit_locked(
+            &mut state,
+            &[Event::KeepaliveUpdated {
+                worker_id: "worker".into(),
+                record: crate::server::keepalive::Record::default(),
+            }],
+        )
+        .expect_err("read-only journal must be reported to the caller");
+    assert!(error.contains("journal append"));
+    assert!(state.keepalives.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn subagent_close_does_not_report_success_when_transition_cannot_persist() {
+    use crate::subagent::{Action, Record};
+
+    let (server, root) = test_server();
+    register(&server, "parent", "%parent");
+    register(&server, "child", "%child");
+    server.commit(&[Event::SubagentUpdated {
+        subagent: Record {
+            id: "managed-close".into(),
+            parent: "parent".into(),
+            peer: "child".into(),
+            status: "idle".into(),
+            session: None,
+            pane: None,
+            profile: None,
+            created_ms: now_ms(),
+            ready_deadline_ms: 0,
+            last_message: None,
+            error: None,
+            probe_failures: Vec::new(),
+            runtime: None,
+        },
+    }]);
+    *server.journal.lock().unwrap() =
+        std::fs::File::open(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+
+    let response = crate::subagent::handle(
+        &server,
+        "parent",
+        "token-parent",
+        Action::Close {
+            id: "managed-close".into(),
+        },
+    );
+    assert!(!response.ok);
+    assert!(response
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("journal append"));
+    assert_eq!(
+        server.state.lock().unwrap().subagents["managed-close"].status,
+        "idle"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn activity_log_never_copies_launch_credentials() {
     let request = Req::Subagent {
         worker_id: "parent".into(),
