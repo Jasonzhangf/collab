@@ -612,7 +612,7 @@ fn launch(
             registered.error.unwrap_or_default()
         );
     }
-    if app_scope.is_some_and(|scope| scope.as_str() == crate::identity::CLI_APP_SERVER_ID) {
+    if app_scope.is_some() {
         let runtime = crate::identity::runtime_from_registration_receipt(
             &registered.data,
             &ident.worker_id,

@@ -61,10 +61,10 @@ pub(crate) fn validate_id_for_protocol(value: &str) -> anyhow::Result<()> {
     validate_id(value)
 }
 
-/// The stable AppServer route owned by the CLI adapter.  A first registration
+/// The stable AppServer route owned by the CLI adapter. A first registration
 /// has no persisted runtime binding yet, so it may use this contract only to
-/// construct the request context.  The registration receipt remains the sole
-/// source of the current runtime binding afterwards.
+/// construct the request context. Existing bindings retain the AppServer
+/// scope established by their native endpoint.
 pub const CLI_APP_SERVER_ID: &str = "appserver-cli";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,10 +123,11 @@ struct RegistrationBinding {
 /// Recover the current runtime identity from the typed Register response.
 ///
 /// The daemon may include a human-readable runtime channel beside the typed
-/// command.  That channel is deliberately ignored: only
+/// command. That channel is deliberately ignored: only
 /// `typed.command.binding` contains the runtime/binding fields that authorize
-/// later commands.  The project root, worker and CLI app route are checked
-/// before the identity can be persisted.
+/// later commands. The project root and worker are checked before the
+/// identity can be persisted; the caller compares the returned app scope with
+/// the scope used for its request.
 pub fn runtime_from_registration_receipt(
     receipt: &serde_json::Value,
     expected_worker_id: &str,
@@ -164,13 +165,6 @@ pub fn runtime_from_registration_receipt(
             binding.project_scope
         );
     }
-    if binding.app_scope_id.as_str() != CLI_APP_SERVER_ID {
-        anyhow::bail!(
-            "registration receipt app scope mismatch: expected {CLI_APP_SERVER_ID}, observed {}",
-            binding.app_scope_id
-        );
-    }
-
     let runtime = RuntimeIdentity {
         agent_id: binding.agent_id,
         runtime_id: binding.runtime_id,
@@ -673,6 +667,39 @@ mod tests {
             runtime.native_thread_id.as_ref().unwrap().as_str(),
             "thread-1"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn registration_receipt_recovers_a_non_cli_app_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-registration-tui-receipt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let receipt = serde_json::json!({
+            "typed": true,
+            "worker_id": "worker-1",
+            "command": {
+                "cmd": "RegisterWorker",
+                "binding": {
+                    "project_scope": canonical_root.to_str().unwrap(),
+                    "app_scope_id": "tui-default",
+                    "agent_id": "worker-1",
+                    "runtime_id": "runtime-tui",
+                    "binding_id": "binding-tui",
+                    "endpoint_generation": 4
+                }
+            }
+        });
+
+        let runtime = runtime_from_registration_receipt(&receipt, "worker-1", &root).unwrap();
+        assert_eq!(runtime.appserver_id.as_str(), "tui-default");
         std::fs::remove_dir_all(root).ok();
     }
 
