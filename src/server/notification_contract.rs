@@ -27,6 +27,7 @@ pub enum JournalError {
     Append(String),
     Flush(String),
     Replay(String),
+    Reducer(String),
     InvalidCommand(String),
 }
 
@@ -36,6 +37,7 @@ impl std::fmt::Display for JournalError {
             Self::Append(error) => write!(f, "journal append failed: {error}"),
             Self::Flush(error) => write!(f, "journal flush failed: {error}"),
             Self::Replay(error) => write!(f, "journal replay failed: {error}"),
+            Self::Reducer(error) => write!(f, "journal reducer failed: {error}"),
             Self::InvalidCommand(error) => write!(f, "invalid command: {error}"),
         }
     }

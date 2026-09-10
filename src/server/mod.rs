@@ -5,9 +5,15 @@ pub mod notification_contract;
 pub mod notification_state;
 pub mod state;
 pub mod timers;
+pub mod global_state;
 
-use crate::proto::{Req, Resp, MSG_TYPES};
-use crate::scope::Scope;
+pub use global_state::{GlobalState, ProjectRegistration, RuntimeBinding};
+
+use crate::identity::{
+    AgentId, AppServerId, BindingId, CommandId, OperationId, RuntimeId,
+};
+use crate::proto::{CommandEnvelope, Req, Resp, MSG_TYPES};
+use crate::scope::{ProjectScopeId, RouteScope, Scope};
 use crate::server::knock::{
     append_log, knock_or_log, pane_alive, pane_idle, pane_presence, PanePresence,
 };
@@ -20,8 +26,8 @@ use mailbox::{
 use serde_json::json;
 use state::{
     goal_deadline_key, now_ms, runtime_for_pane, task_resource_active, wait_cycle, CleanupReceipt,
-    Event, Message, MigrationRecord, NotificationSubscription, State, TaskRec, WaitSpec, WorkerRec,
-    WorktreeBinding, MAX_WAKE_ATTEMPTS,
+    Event, GlobalEvent, Message, MigrationRecord, NotificationSubscription, State, TaskRec,
+    TypedCommand, TypedEnvelope, WaitSpec, WorkerRec, WorktreeBinding, MAX_WAKE_ATTEMPTS,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,6 +53,19 @@ const TASK_STATUSES: [&str; 12] = [
 ];
 const MAX_WORKTREE_PATH_BYTES: usize = 80;
 const HOST_DAEMON_LOCK_PATH: &str = "/tmp/collab-host.lock";
+
+fn sanitize_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -261,6 +280,249 @@ impl Server {
         Self::log_path_for(&self.root)
     }
 
+    /// Build the R1 typed envelope that the compatible CLI registration path
+    /// commits through the same daemon journal as legacy lifecycle events.
+    pub fn typed_register_envelope(
+        &self,
+        worker_id: &str,
+        token: &str,
+        pane: &str,
+        cwd: &str,
+    ) -> Result<TypedEnvelope, String> {
+        let project_scope = GlobalState::canonical_project_scope(Path::new(cwd))
+            .map_err(|error| error.to_string())?;
+        self.typed_register_envelope_for_scope(worker_id, token, pane, project_scope, cwd)
+    }
+
+    fn typed_register_envelope_for_scope(
+        &self,
+        worker_id: &str,
+        token: &str,
+        pane: &str,
+        project_scope: ProjectScopeId,
+        worker_cwd: &str,
+    ) -> Result<TypedEnvelope, String> {
+        let app_scope = AppServerId::new("tui-default").map_err(|error| error.to_string())?;
+        let binding_text = sanitize_identifier(&format!("binding-{worker_id}"));
+        let binding_id = BindingId::new(binding_text.clone()).map_err(|error| error.to_string())?;
+        let route_scope = RouteScope {
+            app_scope_id: app_scope.clone(),
+            project_scope_id: project_scope.clone(),
+        };
+        let generation = {
+            let st = self.state.lock().unwrap();
+            match st.global.lookup_binding_for(&route_scope, &binding_id) {
+                Some(existing) => existing
+                    .endpoint_generation
+                    .checked_add(1)
+                    .ok_or_else(|| "endpoint generation overflow".to_string())?,
+                None => 1,
+            }
+        };
+        let (registration, registered_ms) = {
+            let st = self.state.lock().unwrap();
+            let registration = st
+                .global
+                .lookup_registration(&project_scope, &app_scope)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    global_state::ProjectRegistration::with_registered_at(
+                        project_scope.clone(),
+                        app_scope.clone(),
+                        now_ms(),
+                    )
+                })
+                .map_err(|error| error.to_string())?;
+            let registered_ms = st
+                .workers
+                .get(worker_id)
+                .map(|worker| worker.registered_ms)
+                .unwrap_or_else(now_ms);
+            (registration, registered_ms)
+        };
+        let agent_id = AgentId::new(worker_id.to_string()).map_err(|error| error.to_string())?;
+        let runtime_id = RuntimeId::new(format!(
+            "runtime-{}",
+            sanitize_identifier(pane)
+        ))
+        .map_err(|error| error.to_string())?;
+        let binding = RuntimeBinding::new(
+            project_scope.clone(),
+            app_scope,
+            agent_id,
+            runtime_id,
+            binding_id.clone(),
+            generation,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let command_id = CommandId::new(format!("register-{binding_text}-{generation}"))
+            .map_err(|error| error.to_string())?;
+        let operation_id = OperationId::new(format!("register-op-{binding_text}-{generation}"))
+            .map_err(|error| error.to_string())?;
+        let expected_revision = {
+            let st = self.state.lock().unwrap();
+            st.revision
+        };
+        let envelope = CommandEnvelope::new(
+            command_id,
+            operation_id,
+            binding_id,
+            generation,
+            route_scope,
+            Some(expected_revision),
+            None,
+            None,
+            None,
+        );
+        let worker = WorkerRec {
+            id: worker_id.to_string(),
+            token: token.to_string(),
+            pane: Some(pane.to_string()),
+            cwd: worker_cwd.to_string(),
+            registered_ms,
+        };
+        Ok(TypedEnvelope {
+            command: TypedCommand::RegisterWorker {
+                registration,
+                binding,
+                worker,
+            },
+            envelope,
+        })
+    }
+
+    /// Dispatch one typed command through validation, journal append, flush
+    /// and reducer apply. This is the production typed seam above the legacy
+    /// CLI adapters; the legacy v1 call site routes through it.
+    pub fn typed_dispatch(
+        &self,
+        typed: TypedEnvelope,
+    ) -> Result<state::TypedOutcome, notification_contract::JournalError> {
+        typed
+            .envelope
+            .validate()
+            .map_err(|error| notification_contract::JournalError::InvalidCommand(error.to_string()))?;
+        let mut st = self.state.lock().unwrap();
+        self.validate_typed_register(&st, &typed)?;
+        let mut events = Vec::new();
+        for global_event in typed.command.global_events() {
+            match global_event {
+                GlobalEvent::ProjectRegistered { registration } => {
+                    events.push(Event::GlobalProjectRegistered { registration })
+                }
+                GlobalEvent::RuntimeBound { binding } => {
+                    events.push(Event::GlobalRuntimeBound { binding })
+                }
+            }
+        }
+        let TypedCommand::RegisterWorker { worker, .. } = &typed.command;
+        events.push(Event::Registered {
+            worker: worker.clone(),
+        });
+        if let Some(pane) = worker.pane.as_deref() {
+            events.extend(default_direct_message_events(
+                &st,
+                &worker.id,
+                pane,
+                now_ms(),
+            ));
+        }
+        let outcome = serde_json::json!({
+            "command_id": typed.envelope.command_id.as_str(),
+            "operation_id": typed.envelope.operation_id.as_str(),
+            "scope": typed.envelope.scope,
+        });
+        let committed = self.commit_command_locked(
+            &mut st,
+            typed.envelope.command_id.as_str(),
+            typed.envelope.operation_id.as_str(),
+            &events,
+            outcome,
+            typed.envelope.expected_revision,
+        )?;
+        Ok(state::TypedOutcome {
+            receipt: global_state::CommandReceipt {
+                command_id: typed.envelope.command_id.clone(),
+                operation_id: typed.envelope.operation_id.clone(),
+                epoch: global_state::INITIAL_EPOCH,
+                sequence: committed.receipt.sequence,
+                revision: committed.receipt.revision,
+                outcome: committed.outcome,
+            },
+            replayed: committed.replayed,
+        })
+    }
+
+    fn validate_typed_register(
+        &self,
+        st: &State,
+        typed: &TypedEnvelope,
+    ) -> Result<(), notification_contract::JournalError> {
+        let TypedCommand::RegisterWorker {
+            registration,
+            binding,
+            worker,
+        } = &typed.command;
+        if binding.agent_id.as_str() != worker.id {
+            return Err(notification_contract::JournalError::InvalidCommand(
+                "runtime binding agent does not match worker identity".into(),
+            ));
+        }
+        if registration.route_scope() != binding.route_scope() {
+            return Err(notification_contract::JournalError::InvalidCommand(
+                "project registration scope does not match runtime binding scope".into(),
+            ));
+        }
+        if let Some(existing) = st.workers.get(&worker.id) {
+            if existing.token != worker.token {
+                let same_session = worker
+                    .pane
+                    .as_deref()
+                    .and_then(tmux_session_for_pane)
+                    .is_some_and(|session| session == worker.id)
+                    && existing
+                        .pane
+                        .as_deref()
+                        .and_then(tmux_session_for_pane)
+                        .is_some_and(|session| session == worker.id);
+                if !same_session {
+                    return Err(notification_contract::JournalError::InvalidCommand(
+                        "worker token does not belong to the registered runtime identity".into(),
+                    ));
+                }
+            }
+        }
+        if typed.envelope.actor_binding_id != binding.binding_id {
+            return Err(notification_contract::JournalError::InvalidCommand(format!(
+                "actor binding {} does not match command binding {}",
+                typed.envelope.actor_binding_id, binding.binding_id
+            )));
+        }
+        if typed.envelope.endpoint_generation != binding.endpoint_generation {
+            return Err(notification_contract::JournalError::InvalidCommand(format!(
+                "envelope generation {} does not match binding generation {}",
+                typed.envelope.endpoint_generation, binding.endpoint_generation
+            )));
+        }
+        if typed.envelope.scope != binding.route_scope() {
+            return Err(notification_contract::JournalError::InvalidCommand(
+                "envelope scope does not match binding route scope".into(),
+            ));
+        }
+        let mut next = st.global.clone();
+        for event in typed.command.global_events() {
+            event
+                .apply(&mut next)
+                .map_err(|error| notification_contract::JournalError::InvalidCommand(error.to_string()))?;
+        }
+        next.validate_binding(binding).map_err(|error| {
+            notification_contract::JournalError::InvalidCommand(error.to_string())
+        })?;
+        Ok(())
+    }
+
     /// Apply events to memory and persist them atomically-ordered in the journal.
     pub(crate) fn commit(&self, evs: &[Event]) {
         let mut st = self.state.lock().unwrap();
@@ -290,6 +552,61 @@ impl Server {
         validate_command_id(command_id)?;
         validate_command_id(operation_id)?;
         let mut st = self.state.lock().unwrap();
+        self.commit_command_locked(&mut st, command_id, operation_id, evs, outcome, None)
+    }
+
+    fn commit_command_at_revision(
+        &self,
+        command_id: &str,
+        operation_id: &str,
+        evs: &[Event],
+        outcome: serde_json::Value,
+        expected_revision: u64,
+    ) -> Result<notification_contract::CommandOutcome, notification_contract::JournalError> {
+        validate_command_id(command_id)?;
+        validate_command_id(operation_id)?;
+        let mut st = self.state.lock().unwrap();
+        self.commit_command_locked(
+            &mut st,
+            command_id,
+            operation_id,
+            evs,
+            outcome,
+            Some(expected_revision),
+        )
+    }
+
+    fn commit_command_locked(
+        &self,
+        st: &mut State,
+        command_id: &str,
+        operation_id: &str,
+        evs: &[Event],
+        outcome: serde_json::Value,
+        expected_revision: Option<u64>,
+    ) -> Result<notification_contract::CommandOutcome, notification_contract::JournalError> {
+        let typed_command_id = CommandId::new(command_id.to_owned()).map_err(|error| {
+            notification_contract::JournalError::InvalidCommand(error.to_string())
+        })?;
+        if let Some(existing) = st.global.lookup_command_receipt(&typed_command_id) {
+            if existing.operation_id.as_str() != operation_id {
+                return Err(notification_contract::JournalError::InvalidCommand(
+                    format!(
+                        "command_id {command_id} already belongs to operation {}",
+                        existing.operation_id
+                    ),
+                ));
+            }
+            return Ok(notification_contract::CommandOutcome {
+                receipt: notification_contract::CommitReceipt {
+                    sequence: existing.sequence,
+                    revision: existing.revision,
+                },
+                operation_id: existing.operation_id.as_str().to_owned(),
+                outcome: existing.outcome.clone(),
+                replayed: true,
+            });
+        }
         if let Some(existing) = st.command_receipts.get(command_id) {
             if existing.operation_id != operation_id {
                 return Err(notification_contract::JournalError::InvalidCommand(
@@ -309,12 +626,14 @@ impl Server {
                 replayed: true,
             });
         }
-        if let Some((existing_command_id, _)) =
-            st.command_receipts
-                .iter()
-                .find(|(existing_command_id, receipt)| {
-                    *existing_command_id != command_id && receipt.operation_id == operation_id
-                })
+        if let Some((existing_command_id, _)) = st
+            .global
+            .command_receipts
+            .iter()
+            .find(|(existing_command_id, receipt)| {
+                *existing_command_id != command_id
+                    && receipt.operation_id.as_str() == operation_id
+            })
         {
             return Err(notification_contract::JournalError::InvalidCommand(
                 format!(
@@ -322,8 +641,38 @@ impl Server {
                 ),
             ));
         }
-        let sequence = st.sequence.saturating_add(evs.len() as u64 + 2);
-        let revision = st.revision.saturating_add(evs.len() as u64 + 2);
+        if let Some((existing_command_id, _)) = st
+            .command_receipts
+            .iter()
+            .find(|(existing_command_id, receipt)| {
+                *existing_command_id != command_id && receipt.operation_id == operation_id
+            })
+        {
+            return Err(notification_contract::JournalError::InvalidCommand(
+                format!(
+                    "operation_id {operation_id} already belongs to command_id {existing_command_id}"
+                ),
+            ));
+        }
+        if let Some(expected_revision) = expected_revision {
+            let observed_revision = st.revision;
+            if observed_revision != expected_revision {
+                return Err(notification_contract::JournalError::InvalidCommand(format!(
+                    "compare-and-swap revision mismatch: expected {expected_revision}, observed {observed_revision}"
+                )));
+            }
+        }
+        let event_count = evs.len().checked_add(2).ok_or_else(|| {
+            notification_contract::JournalError::InvalidCommand(
+                "command event count overflow".into(),
+            )
+        })? as u64;
+        let sequence = st.sequence.checked_add(event_count).ok_or_else(|| {
+            notification_contract::JournalError::InvalidCommand("sequence counter overflow".into())
+        })?;
+        let revision = st.revision.checked_add(event_count).ok_or_else(|| {
+            notification_contract::JournalError::InvalidCommand("revision counter overflow".into())
+        })?;
         let receipt = state::CommandReceipt {
             operation_id: operation_id.to_owned(),
             outcome: outcome.clone(),
@@ -340,13 +689,13 @@ impl Server {
             receipt: receipt.clone(),
         };
         self.append_command_phase_locked(
-            &mut st,
+            st,
             std::slice::from_ref(&started),
             CommandJournalPhase::Start,
         )?;
-        self.append_command_phase_locked(&mut st, evs, CommandJournalPhase::Business)?;
+        self.append_command_phase_locked(st, evs, CommandJournalPhase::Business)?;
         self.append_command_phase_locked(
-            &mut st,
+            st,
             std::slice::from_ref(&completed),
             CommandJournalPhase::Completion,
         )?;
@@ -354,7 +703,7 @@ impl Server {
         events.push(started);
         events.extend_from_slice(evs);
         events.push(completed);
-        self.apply_committed_events(&mut st, &events);
+        self.apply_committed_events(st, &events)?;
         let has_pending_scheduler_admission = events.iter().any(|event| {
             matches!(
                 event,
@@ -486,7 +835,7 @@ impl Server {
             st.journal_poison = Some(message.clone());
             return Err(notification_contract::JournalError::Flush(message));
         }
-        self.apply_committed_events(st, evs);
+        self.apply_committed_events(st, evs)?;
         let has_pending_scheduler_admission = evs.iter().any(|event| {
             matches!(
                 event,
@@ -604,11 +953,20 @@ impl Server {
         Ok(())
     }
 
-    fn apply_committed_events(&self, st: &mut State, evs: &[Event]) {
+    fn apply_committed_events(
+        &self,
+        st: &mut State,
+        evs: &[Event],
+    ) -> Result<(), notification_contract::JournalError> {
         for ev in evs {
-            st.apply(ev);
-            st.sequence = st.sequence.saturating_add(1);
-            st.revision = st.revision.saturating_add(1);
+            if let Err(error) = st.apply_checked(ev) {
+                st.journal_poison.get_or_insert(error.clone());
+                return Err(notification_contract::JournalError::Reducer(error));
+            }
+            if let Err(error) = st.advance_version() {
+                st.journal_poison.get_or_insert(error.clone());
+                return Err(notification_contract::JournalError::Reducer(error));
+            }
             if let Event::Sent { msg } = ev {
                 if let Err(error) = self.backup_message(msg) {
                     self.report_mailbox_projection_error(error);
@@ -633,6 +991,7 @@ impl Server {
                 }
             }
         }
+        Ok(())
     }
 
     fn report_mailbox_projection_error(&self, error: String) {
@@ -2170,6 +2529,56 @@ fn handle_migration_verify(server: &Server, worker_id: String, token: String) ->
     }))
 }
 
+fn register_typed(
+    server: &Server,
+    worker_id: &str,
+    token: &str,
+    pane: Option<&str>,
+    cwd: &str,
+    project_scope: Option<ProjectScopeId>,
+) -> Resp {
+    let Some(pane) = pane else {
+        return Resp::err("collab registration requires a live tmux pane");
+    };
+    let typed = match project_scope {
+        Some(project_scope) => server
+            .typed_register_envelope_for_scope(worker_id, token, pane, project_scope, cwd),
+        None => server.typed_register_envelope(worker_id, token, pane, cwd),
+    };
+    match typed {
+        Ok(typed) => match server.typed_dispatch(typed.clone()) {
+            Ok(outcome) => {
+                let Some(runtime) = runtime_for_pane(Some(pane)) else {
+                    return Resp::err("collab registration requires a live tmux pane");
+                };
+                let (role_brief, registered_at) = {
+                    let st = server.state.lock().unwrap();
+                    let registered_at = match &typed.command {
+                        TypedCommand::RegisterWorker { worker, .. } => worker.registered_ms,
+                    };
+                    (role_brief(&st, worker_id), registered_at)
+                };
+                Resp::data(json!({
+                    "worker_id": worker_id,
+                    "identity_kind": "peer",
+                    "runtime": runtime,
+                    "registered_at": iso(registered_at),
+                    "role_brief": role_brief,
+                    "typed": true,
+                    "command_id": outcome.receipt.command_id.as_str(),
+                    "operation_id": outcome.receipt.operation_id.as_str(),
+                    "sequence": outcome.receipt.sequence,
+                    "revision": outcome.receipt.revision,
+                    "replayed": outcome.replayed,
+                    "command": typed.command,
+                }))
+            }
+            Err(error) => Resp::err(format!("typed registrar rejected registration: {error}")),
+        },
+        Err(error) => Resp::err(format!("typed registrar failed to build command: {error}")),
+    }
+}
+
 pub(crate) fn handle_register(
     server: &Server,
     worker_id: String,
@@ -2177,7 +2586,7 @@ pub(crate) fn handle_register(
     pane: Option<String>,
     cwd: String,
 ) -> Resp {
-    let mut st = server.state.lock().unwrap();
+    let st = server.state.lock().unwrap();
     let Some(runtime) = runtime_for_pane(pane.as_deref()) else {
         return Resp::err("collab registration requires a live tmux pane");
     };
@@ -2195,6 +2604,10 @@ pub(crate) fn handle_register(
         return Resp::err("MIGRATION_ADMISSION_FROZEN: only an existing tmux identity may rebind");
     }
     if let Some(existing) = st.workers.get(&worker_id).cloned() {
+        let existing_project_scope = match existing_project_scope(&st, &worker_id) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
         if existing.token != token {
             // The tmux session name is the sole external identity. When the
             // same session comes back after a restart, its persisted token is
@@ -2210,32 +2623,20 @@ pub(crate) fn handle_register(
                     .and_then(tmux_session_for_pane)
                     .is_some_and(|session| session == worker_id);
             if same_session {
-                let refreshed_pane = pane.clone();
-                let refreshed = WorkerRec {
-                    id: worker_id.clone(),
-                    token,
-                    pane,
-                    cwd,
-                    registered_ms: existing.registered_ms,
-                };
-                let mut events = vec![Event::Registered { worker: refreshed }];
-                if let Some(pane) = refreshed_pane.as_deref() {
-                    events.extend(default_direct_message_events(
-                        &st,
-                        &worker_id,
-                        pane,
-                        now_ms(),
-                    ));
+                drop(st);
+                let mut resp = register_typed(
+                    server,
+                    &worker_id,
+                    &token,
+                    pane.as_deref(),
+                    &cwd,
+                    existing_project_scope,
+                );
+                if resp.ok {
+                    resp.data["recovered"] = json!(true);
+                    resp.data["identity_source"] = json!("tmux_session");
                 }
-                server.commit_locked(&mut st, &events);
-                return Resp::data(json!({
-                    "worker_id": worker_id,
-                    "identity_kind": "peer",
-                    "runtime": runtime,
-                    "recovered": true,
-                    "identity_source": "tmux_session",
-                    "role_brief": role_brief(&st, &worker_id)
-                }));
+                return resp;
             }
             return Resp::err(format!(
                 "worker_id {} already registered by another token",
@@ -2251,59 +2652,55 @@ pub(crate) fn handle_register(
                 worker_id, existing_runtime, runtime
             ));
         }
-        let refreshed = WorkerRec {
-            id: worker_id.clone(),
-            token: existing.token.clone(),
-            pane: pane.or_else(|| existing.pane.clone()),
-            cwd,
-            registered_ms: existing.registered_ms,
-        };
-        let mut events = vec![Event::Registered {
-            worker: refreshed.clone(),
-        }];
-        if let Some(pane) = refreshed.pane.as_deref() {
-            events.extend(default_direct_message_events(
-                &st,
-                &worker_id,
-                pane,
-                now_ms(),
-            ));
-        }
-        server.commit_locked(&mut st, &events);
-        return Resp::data(json!({
-            "worker_id": worker_id,
-            "identity_kind": "peer",
-            "runtime": runtime,
-            "reused": true,
-            "role_brief": role_brief(&st, &worker_id)
-        }));
-    }
-    let rec = WorkerRec {
-        id: worker_id.clone(),
-        token,
-        pane,
-        cwd,
-        registered_ms: now_ms(),
-    };
-    let mut events = vec![Event::Registered {
-        worker: rec.clone(),
-    }];
-    if let Some(pane) = rec.pane.as_deref() {
-        events.extend(default_direct_message_events(
-            &st,
+        let refreshed_pane = pane.clone().or_else(|| existing.pane.clone());
+        drop(st);
+        let mut resp = register_typed(
+            server,
             &worker_id,
-            pane,
-            now_ms(),
-        ));
+            &token,
+            refreshed_pane.as_deref(),
+            &cwd,
+            existing_project_scope,
+        );
+        if resp.ok {
+            resp.data["reused"] = json!(true);
+        }
+        return resp;
     }
-    server.commit_locked(&mut st, &events);
-    Resp::data(json!({
-        "worker_id": worker_id,
-        "identity_kind": "peer",
-        "runtime": runtime,
-        "registered_at": iso(rec.registered_ms),
-        "role_brief": role_brief(&st, &worker_id)
-    }))
+    drop(st);
+    register_typed(
+        server,
+        &worker_id,
+        &token,
+        pane.as_deref(),
+        &cwd,
+        None,
+    )
+}
+
+fn existing_project_scope(
+    state: &State,
+    worker_id: &str,
+) -> Result<Option<ProjectScopeId>, Resp> {
+    let mut found = None;
+    for project in state.global.projects.values() {
+        for binding in project.runtime_bindings.values() {
+            if binding.agent_id.as_str() != worker_id {
+                continue;
+            }
+            if found
+                .as_ref()
+                .is_some_and(|scope| scope != &binding.project_scope)
+            {
+                return Err(Resp::err(format!(
+                    "worker {} has ambiguous registered project scope",
+                    worker_id
+                )));
+            }
+            found = Some(binding.project_scope.clone());
+        }
+    }
+    Ok(found)
 }
 
 fn role_brief(state: &State, worker_id: &str) -> serde_json::Value {
@@ -5965,6 +6362,19 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
     }
 }
 
+fn apply_replayed_event(st: &mut State, event: &Event, line: usize) -> anyhow::Result<()> {
+    st.apply_checked(event)
+        .map_err(|error| anyhow::anyhow!("journal replay failed at line {line}: {error}"))?;
+    match event {
+        Event::ReducerCheckpoint { sequence, revision } => st
+            .set_checkpoint_version(*sequence, *revision)
+            .map_err(|error| anyhow::anyhow!("journal replay failed at line {line}: {error}")),
+        _ => st
+            .advance_version()
+            .map_err(|error| anyhow::anyhow!("journal replay failed at line {line}: {error}")),
+    }
+}
+
 fn replay(root: &Path) -> anyhow::Result<State> {
     let journal = root.join(".agent-collab/server/journal.jsonl");
     let mut st = State::default();
@@ -6056,9 +6466,7 @@ fn replay(root: &Path) -> anyhow::Result<State> {
                         let committed = std::mem::take(pending);
                         pending_command = None;
                         for event in committed {
-                            st.apply(&event);
-                            st.sequence = st.sequence.saturating_add(1);
-                            st.revision = st.revision.saturating_add(1);
+                            apply_replayed_event(&mut st, &event, index + 1)?;
                             events.push(event);
                         }
                     }
@@ -6079,14 +6487,7 @@ fn replay(root: &Path) -> anyhow::Result<State> {
             {
                 convert_root = true;
             }
-            if let Event::ReducerCheckpoint { sequence, revision } = &event {
-                st.sequence = *sequence;
-                st.revision = *revision;
-            } else {
-                st.apply(&event);
-                st.sequence = st.sequence.saturating_add(1);
-                st.revision = st.revision.saturating_add(1);
-            }
+            apply_replayed_event(&mut st, &event, index + 1)?;
             events.push(event);
         }
     }

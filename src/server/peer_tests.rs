@@ -461,6 +461,13 @@ fn command_retry_returns_original_outcome_without_reapplying_events() {
     assert_eq!(first.receipt, second.receipt);
     assert_eq!(first.operation_id, second.operation_id);
     assert_eq!(second.outcome, json!({"accepted": true}));
+    assert!(server
+        .state
+        .lock()
+        .unwrap()
+        .global
+        .command_receipts
+        .contains_key("command-1"));
     assert_eq!(
         std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
             .unwrap()
@@ -468,6 +475,430 @@ fn command_retry_returns_original_outcome_without_reapplying_events() {
             .count(),
         3
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_registration_uses_global_binding_and_host_idempotency() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+    let typed = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    let first = server.typed_dispatch(typed.clone()).unwrap();
+    assert!(!first.replayed);
+    let project_scope = crate::server::global_state::GlobalState::canonical_project_scope(
+        Path::new(cwd),
+    )
+    .unwrap();
+    let state = server.state.lock().unwrap();
+    assert!(state
+        .global
+        .lookup_registration(
+            &project_scope,
+            &crate::identity::AppServerId::new("tui-default").unwrap(),
+        )
+        .is_some());
+    assert_eq!(state.global.projects[project_scope.as_str()].runtime_bindings.len(), 1);
+    assert!(state.global.command_receipts.contains_key(first.receipt.command_id.as_str()));
+    drop(state);
+
+    let replay = server.typed_dispatch(typed).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, first.receipt);
+    assert_eq!(
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        6
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_receipt_revision_is_the_next_cas_and_stale_after_another_mutation() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+
+    let first = server
+        .typed_dispatch(
+            server
+                .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+                .unwrap(),
+        )
+        .unwrap();
+    let mut second = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    second.envelope.expected_revision = Some(first.receipt.revision);
+    let second = server
+        .typed_dispatch(second)
+        .expect("a receipt revision must be reusable as the next CAS revision");
+
+    let mut stale = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    stale.envelope.expected_revision = Some(second.receipt.revision);
+    server
+        .commit_checked(&[Event::KeepaliveUpdated {
+            worker_id: "other-reducer".into(),
+            record: crate::server::keepalive::Record::default(),
+        }])
+        .unwrap();
+    let journal_before_stale =
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    let error = server
+        .typed_dispatch(stale)
+        .expect_err("an intervening reducer mutation must reject the old CAS revision");
+    assert!(error.to_string().contains("compare-and-swap revision mismatch"));
+    assert_eq!(
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap(),
+        journal_before_stale,
+        "a stale CAS must not append a journal event"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_rebinds_survive_journal_rewrite_and_replay_with_one_version_axis() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+    let mut previous_revision = 0;
+    for _ in 0..3 {
+        let mut typed = server
+            .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+            .unwrap();
+        typed.envelope.expected_revision = Some(previous_revision);
+        let outcome = server.typed_dispatch(typed).unwrap();
+        previous_revision = outcome.receipt.revision;
+    }
+
+    let (version, binding_generation, receipts) = {
+        let state = server.state.lock().unwrap();
+        (
+            (state.sequence, state.revision, state.global.version()),
+            state
+                .global
+                .projects
+                .values()
+                .next()
+                .unwrap()
+                .runtime_bindings["binding-worker"]
+                .endpoint_generation,
+            state.global.command_receipts.clone(),
+        )
+    };
+    let state = server.state.lock().unwrap();
+    state.global.validate().unwrap();
+    server.rewrite_journal_locked(&state).unwrap();
+    drop(state);
+
+    let replayed = super::replay(&root).unwrap();
+    replayed.global.validate().unwrap();
+    assert_eq!(
+        (replayed.sequence, replayed.revision),
+        (version.0, version.1)
+    );
+    assert_eq!(replayed.global.version(), version.2);
+    assert_eq!(
+        replayed
+            .global
+            .projects
+            .values()
+            .next()
+            .unwrap()
+            .runtime_bindings["binding-worker"]
+            .endpoint_generation,
+        binding_generation
+    );
+    assert_eq!(replayed.global.command_receipts, receipts);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_command_record_rewrite_and_replay_preserve_checkpoint_version() {
+    let (server, root) = test_server();
+    let receipt = crate::server::state::CommandReceipt {
+        operation_id: "legacy-operation".into(),
+        outcome: json!({"accepted": true}),
+        sequence: 1,
+        revision: 1,
+    };
+    server
+        .commit_checked(&[Event::CommandRecorded {
+            command_id: "legacy-command".into(),
+            receipt: receipt.clone(),
+        }])
+        .unwrap();
+
+    let state = server.state.lock().unwrap();
+    assert_eq!((state.sequence, state.revision), (1, 1));
+    server.rewrite_journal_locked(&state).unwrap();
+    drop(state);
+
+    let compacted =
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    assert!(compacted.contains("\"ev\":\"CommandRecorded\""));
+    assert!(!compacted.contains("\"ev\":\"CommandStarted\""));
+    assert!(!compacted.contains("\"ev\":\"CommandCompleted\""));
+    let replayed =
+        super::replay(&root).expect("a compacted legacy CommandRecorded must replay successfully");
+    assert_eq!((replayed.sequence, replayed.revision), (1, 1));
+    assert_eq!(replayed.command_receipts["legacy-command"], receipt);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replay_rejects_a_checkpoint_that_regresses_real_history() {
+    let (server, root) = test_server();
+    let journal = root.join(".agent-collab/server/journal.jsonl");
+    let events = [
+        Event::Registered {
+            worker: crate::server::state::WorkerRec {
+                id: "checkpoint-worker".into(),
+                token: "checkpoint-token".into(),
+                pane: Some("%checkpoint-worker".into()),
+                cwd: "/tmp".into(),
+                registered_ms: 1,
+            },
+        },
+        Event::ReducerCheckpoint {
+            sequence: 0,
+            revision: 0,
+        },
+    ];
+    let body = events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&journal, &body).unwrap();
+
+    let error = match super::replay(&root) {
+        Ok(_) => panic!("a real checkpoint rollback must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("reducer checkpoint regresses version"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), body);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_registration_generation_reaches_max_then_fails_before_journaling_overflow() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+    let mut first = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    let crate::server::state::TypedCommand::RegisterWorker { binding, .. } = &mut first.command;
+    binding.endpoint_generation = u64::MAX - 1;
+    first.envelope.endpoint_generation = u64::MAX - 1;
+    first.envelope.command_id = crate::identity::CommandId::new("register-max-minus-one").unwrap();
+    first.envelope.operation_id =
+        crate::identity::OperationId::new("register-op-max-minus-one").unwrap();
+    let first = server
+        .typed_dispatch(first)
+        .expect("MAX-1 binding generation must be accepted");
+    assert!(!first.replayed);
+
+    let max = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    assert_eq!(max.envelope.endpoint_generation, u64::MAX);
+    let max = server
+        .typed_dispatch(max)
+        .expect("MAX binding generation must be accepted");
+    assert!(!max.replayed);
+    assert_eq!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .projects
+            .values()
+            .next()
+            .unwrap()
+            .runtime_bindings["binding-worker"]
+            .endpoint_generation,
+        u64::MAX
+    );
+
+    let journal_before_overflow =
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    let receipt_count_before_overflow = server.state.lock().unwrap().global.command_receipts.len();
+    let error = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .expect_err("MAX binding generation must fail explicitly on increment overflow");
+    assert!(
+        error.contains("endpoint generation overflow"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap(),
+        journal_before_overflow,
+        "generation overflow must happen before any journal append"
+    );
+    assert_eq!(
+        server.state.lock().unwrap().global.command_receipts.len(),
+        receipt_count_before_overflow,
+        "generation overflow must not masquerade as a replayed receipt"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replay_rejects_invalid_command_receipt_without_rewriting_the_journal() {
+    let (server, root) = test_server();
+    let journal = root.join(".agent-collab/server/journal.jsonl");
+    let event = Event::CommandRecorded {
+        command_id: "invalid-receipt".into(),
+        receipt: crate::server::state::CommandReceipt {
+            operation_id: "invalid-receipt-operation".into(),
+            outcome: json!({"accepted": true}),
+            sequence: 0,
+            revision: 0,
+        },
+    };
+    let body = format!("{}\n", serde_json::to_string(&event).unwrap());
+    std::fs::write(&journal, &body).unwrap();
+
+    let error = match super::replay(&root) {
+        Ok(_) => panic!("replay must apply command receipt validation before exposing state"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("command receipt sequence"));
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), body);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replay_rejects_invalid_command_completion_receipt_without_rewriting_the_journal() {
+    let (server, root) = test_server();
+    let journal = root.join(".agent-collab/server/journal.jsonl");
+    let events = [
+        Event::CommandStarted {
+            command_id: "invalid-completion".into(),
+            operation_id: "invalid-completion-operation".into(),
+        },
+        Event::CommandCompleted {
+            command_id: "invalid-completion".into(),
+            operation_id: "invalid-completion-operation".into(),
+            receipt: crate::server::state::CommandReceipt {
+                operation_id: "invalid-completion-operation".into(),
+                outcome: json!({"accepted": true}),
+                sequence: 1,
+                revision: 0,
+            },
+        },
+    ];
+    let body = events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&journal, &body).unwrap();
+
+    let error = match super::replay(&root) {
+        Ok(_) => panic!("replay must validate a command completion receipt"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("command receipt revision"));
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), body);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_dispatch_rejects_stale_revision_without_appending() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+    let first = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    server.typed_dispatch(first).unwrap();
+    let mut stale = server
+        .typed_register_envelope("worker-2", "token-worker-2", "%worker-2", cwd)
+        .unwrap();
+    stale.envelope.command_id = crate::identity::CommandId::new("register-stale").unwrap();
+    stale.envelope.operation_id = crate::identity::OperationId::new("register-stale-op").unwrap();
+    stale.envelope.expected_revision = Some(0);
+    let error = server.typed_dispatch(stale).unwrap_err();
+    assert!(error.to_string().contains("compare-and-swap revision mismatch"));
+    assert_eq!(
+        std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        6
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_dispatch_rejects_wrong_principal_and_scope() {
+    let (server, root) = test_server();
+    let cwd = root.to_str().unwrap();
+    let mut wrong_principal = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    if let crate::server::state::TypedCommand::RegisterWorker { binding, .. } =
+        &mut wrong_principal.command
+    {
+        binding.agent_id = crate::identity::AgentId::new("other-worker").unwrap();
+    }
+    let principal_error = server.typed_dispatch(wrong_principal).unwrap_err();
+    assert!(principal_error
+        .to_string()
+        .contains("runtime binding agent does not match worker identity"));
+
+    let mut wrong_scope = server
+        .typed_register_envelope("worker", "token-worker", "%worker", cwd)
+        .unwrap();
+    wrong_scope.envelope.scope.project_scope_id =
+        crate::scope::ProjectScopeId::new("/other-project").unwrap();
+    let scope_error = server.typed_dispatch(wrong_scope).unwrap_err();
+    assert!(scope_error
+        .to_string()
+        .contains("envelope scope does not match binding route scope"));
+    assert!(std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl"))
+        .unwrap()
+        .trim()
+        .is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn global_reducer_failure_is_explicit_and_poisoned_after_journal_append() {
+    let (server, root) = test_server();
+    let binding = crate::server::global_state::RuntimeBinding::new(
+        crate::scope::ProjectScopeId::new("/unregistered-project").unwrap(),
+        crate::identity::AppServerId::new("tui-default").unwrap(),
+        crate::identity::AgentId::new("worker").unwrap(),
+        crate::identity::RuntimeId::new("runtime-worker").unwrap(),
+        crate::identity::BindingId::new("binding-worker").unwrap(),
+        1,
+        None,
+    )
+    .unwrap();
+    let error = server
+        .commit_checked(&[Event::GlobalRuntimeBound { binding }])
+        .unwrap_err();
+    assert!(matches!(error, JournalError::Reducer(_)));
+    assert!(server.state.lock().unwrap().journal_poison.is_some());
+    assert_eq!(server.state.lock().unwrap().global.projects.len(), 0);
+    let journal = std::fs::read_to_string(root.join(".agent-collab/server/journal.jsonl")).unwrap();
+    assert!(journal.contains("GlobalRuntimeBound"));
     std::fs::remove_dir_all(root).unwrap();
 }
 
