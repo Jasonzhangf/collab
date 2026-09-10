@@ -4,13 +4,29 @@
   "owner_feature": "task.self-lifecycle",
   "entrypoint": "dispatch",
   "return_path": "Resp",
+  "lifecycle_rules": {
+    "loop": "Every master goal, bug report/fix, master-to-subagent assignment, and peer task follows Trigger -> Work -> Gate -> State -> Stop.",
+    "sequence": "Discover -> durable dispatch intent -> Hand off -> Verify -> Persist -> Schedule.",
+    "role_default": "Default identity is peer; master authority is user-authorized through explicit promotion or delegation by the current live master.",
+    "wake": "Only master has long-horizon wake; workers are not long-horizon wake targets and are not automatically woken from idle.",
+    "worker_idle_fact": "On each worker working -> idle transition, emit one idempotent worker-idle fact to the live master; this fact does not count or control the master idle reminder episode.",
+    "master_idle_episode": "Master idle reminders are level-triggered. Within the same master idle episode, each reminder attempt consumes the shared episode-local budget, up to three attempts. An observed working change ends that episode; after three consecutive attempts without an observed working change, the episode stops. Worker-idle facts do not count toward this budget, and there is no scheduling-turn counter or automatic rearm.",
+    "sendmessage": "Explicit collab sendmessage is immediate; idle, progress, delivery, bug, and worker-idle notices are auto-merged by the daemon in the 120-second batch window.",
+    "bug_backlog": "Bugs enter AppSDK or git-bug backlog with investigation evidence; P0 blocks the affected project.",
+    "desktop": "Desktop does not register goal subscribe.",
+    "unknown_failure": "Unknown, timeout, and failure are preserved explicitly; no ACK/fallback fake success.",
+    "review_gates": "AGY review is not used for Collab v1 lifecycle gates; ordinary review uses an independent review path, and a milestone may use Astra when required.",
+    "legacy": "Any 15-minute periodic worker liveness wording is deprecated and non-authoritative; current v1 contract uses the task-bound inspect obligation and master-only long-horizon wake."
+  },
   "canonical_docs": [
     "README.md",
     "docs/resource-map.md",
     "docs/function-map.md",
     "docs/mainline-call-map.json",
     "docs/verification-map.md",
-    "docs/migration-v1-to-low-intervention.md"
+    "docs/migration-v1-to-low-intervention.md",
+    "docs/task-keepalive-plan.md",
+    "skills/collab/SKILL.md"
   ],
   "resources": [
     {"id": "peer-identity", "kind": "truth", "owner": "handle_register"},
@@ -43,6 +59,19 @@
     "cargo build --release",
     "isolated-real-tmux-blackbox",
     "isolated-migration-replay-blackbox",
-    "agy-review"
-  ]
+    "independent-review"
+  ],
+  "review_policy": {
+    "ordinary": "independent-review",
+    "milestone": "Astra when required",
+    "excluded": "AGY review"
+  },
+  "gate_descriptions": {
+    "independent-review": "Ordinary Collab v1 review uses an independent review path; AGY review is not used.",
+    "milestone-review": "A milestone review may use Astra when required; it is not an ordinary lifecycle gate.",
+    "loop-rules": "Documented gate: each lifecycle is Trigger -> Work -> Gate -> State -> Stop and follows Discover -> durable dispatch intent -> Hand off -> Verify -> Persist -> Schedule.",
+    "bug-backlog": "Documented gate: bugs are tracked in AppSDK/git-bug backlog and P0 blocks affected projects.",
+    "role-default": "Documented gate: default identity is peer; master is explicit and user-approved.",
+    "worker-wake": "Documented gate: workers are not long-horizon woken; working -> idle sends one idempotent fact; unknown does not wake. Master idle reminders are level-triggered: within the same master idle episode, each reminder attempt consumes the shared episode-local budget, up to three attempts; an observed working change ends that episode; after three consecutive attempts without an observed working change, the episode stops."
+  }
 }

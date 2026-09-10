@@ -1,0 +1,91 @@
+{
+  "fixture_version": 1,
+  "project_id": "appsdk",
+  "manifest": "manifest.json",
+  "mode": "no_write",
+  "source_observation": {
+    "captured_at": "2026-09-09T19:54:14Z",
+    "raw_log": "/private/tmp/governance-history-live-refresh-20260909-repair-raw.log",
+    "capture": "capture-03 (journal/events) and capture-11 (mailbox, 2026-09-09T19:56:01Z)",
+    "inputs": [
+      {
+        "source_record_id": ".agent-collab/mailbox",
+        "source_path": "/Users/fanzhang/Documents/github/appsdk/.agent-collab/mailbox",
+        "file_count": 552,
+        "line_count": 7216,
+        "digest": "sha256:ef6982dbe95db02492af522f3a0236a215ec3599b8db43e4047aae50097417ac"
+      },
+      {
+        "source_record_id": ".agent-collab/server/events.jsonl",
+        "source_path": "/Users/fanzhang/Documents/github/appsdk/.agent-collab/server/events.jsonl",
+        "line_count": 5223,
+        "byte_count": 1346139,
+        "digest": "sha256:4880d81c5ecfb5e34c39dde6d369847277b114cb292317cc4e6de3af6ff6b2f6"
+      },
+      {
+        "source_record_id": ".agent-collab/server/journal.jsonl",
+        "source_path": "/Users/fanzhang/Documents/github/appsdk/.agent-collab/server/journal.jsonl",
+        "line_count": 42470,
+        "byte_count": 12730859,
+        "digest": "sha256:5e6243e7754c18fe079c8b56f877502782a4faeb9d751f4c48b41ef40c87c270"
+      }
+    ]
+  },
+  "expected": {
+    "manifest_mapping_status": "planned",
+    "archive_ref": null,
+    "archive_digest": null,
+    "target_mappings_created": false,
+    "source_mutations": false
+  },
+  "cases": [
+    {
+      "case_id": "unresolved-candidate-conflicts",
+      "trigger": "five Git paths are unresolved in the source checkout",
+      "expected_mapping_class": "reset",
+      "expected_boundary": "candidate"
+    },
+    {
+      "case_id": "mutable-mailbox-projection",
+      "trigger": "the mailbox is a mutable projection and includes audit deliveries",
+      "expected_mapping_class": "adapt",
+      "expected_boundary": "projection-rebuild"
+    },
+    {
+      "case_id": "source-digest-drift",
+      "trigger": "the source journal or events projection changes between inspect reads",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "snapshot"
+    },
+    {
+      "case_id": "malformed-middle",
+      "trigger": "a copied JSONL stream contains malformed JSON before its tail",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "schema"
+    },
+    {
+      "case_id": "duplicate-record-id",
+      "trigger": "two copied records claim one source record ID",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "schema"
+    },
+    {
+      "case_id": "missing-owner",
+      "trigger": "an active task has no durable owner relation",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "owner"
+    },
+    {
+      "case_id": "changed-cwd",
+      "trigger": "a task or identity points outside the canonical project cwd",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "scope"
+    },
+    {
+      "case_id": "unknown-outcome",
+      "trigger": "a command result cannot distinguish failure from an ambiguous side effect",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "operation"
+    }
+  ]
+}

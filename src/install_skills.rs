@@ -8,10 +8,7 @@
 pub const SKILL_ROOT: &str = "skills/collab";
 
 pub const SKILL_FILES: &[(&str, &str)] = &[
-    (
-        "SKILL.md",
-        include_str!("../skills/collab/SKILL.md"),
-    ),
+    ("SKILL.md", include_str!("../skills/collab/SKILL.md")),
     (
         "references/migration-daemon.md",
         include_str!("../skills/collab/references/migration-daemon.md"),
@@ -52,7 +49,10 @@ pub fn install(
     if target.as_os_str().is_empty() {
         return Err("install-skills target must be a non-empty path".into());
     }
-    let bytes_total = SKILL_FILES.iter().map(|(_, body)| body.len()).sum::<usize>();
+    let bytes_total = SKILL_FILES
+        .iter()
+        .map(|(_, body)| body.len())
+        .sum::<usize>();
     let mut outcomes = Vec::with_capacity(SKILL_FILES.len());
     for (relative, body) in SKILL_FILES {
         let dest = target.join(relative);
@@ -64,8 +64,7 @@ pub fn install(
             outcomes.push((*relative, InstallOutcome::Skipped));
             continue;
         }
-        std::fs::write(&dest, body)
-            .map_err(|e| format!("write {} failed: {e}", dest.display()))?;
+        std::fs::write(&dest, body).map_err(|e| format!("write {} failed: {e}", dest.display()))?;
         outcomes.push((*relative, InstallOutcome::Written));
     }
     Ok((outcomes, bytes_total, SKILL_FILES.len()))
@@ -89,7 +88,10 @@ mod tests {
         let target = temp_target("write");
         let (outcomes, bytes, count) = install(&target, false).unwrap();
         assert_eq!(count, SKILL_FILES.len());
-        assert_eq!(bytes, SKILL_FILES.iter().map(|(_, b)| b.len()).sum::<usize>());
+        assert_eq!(
+            bytes,
+            SKILL_FILES.iter().map(|(_, b)| b.len()).sum::<usize>()
+        );
         for (rel, outcome) in &outcomes {
             assert_eq!(outcome, &InstallOutcome::Written, "expected written: {rel}");
             assert!(target.join(rel).is_file(), "missing: {rel}");
@@ -102,9 +104,7 @@ mod tests {
         let target = temp_target("skip");
         install(&target, false).unwrap();
         let (outcomes, _, _) = install(&target, false).unwrap();
-        assert!(outcomes
-            .iter()
-            .all(|(_, o)| *o == InstallOutcome::Skipped));
+        assert!(outcomes.iter().all(|(_, o)| *o == InstallOutcome::Skipped));
         std::fs::remove_dir_all(target).ok();
     }
 
@@ -115,9 +115,7 @@ mod tests {
         let first = std::fs::read_to_string(target.join("SKILL.md")).unwrap();
         std::fs::write(target.join("SKILL.md"), "tampered").unwrap();
         let (outcomes, _, _) = install(&target, true).unwrap();
-        assert!(outcomes
-            .iter()
-            .all(|(_, o)| *o == InstallOutcome::Written));
+        assert!(outcomes.iter().all(|(_, o)| *o == InstallOutcome::Written));
         let restored = std::fs::read_to_string(target.join("SKILL.md")).unwrap();
         assert_eq!(restored, first);
         std::fs::remove_dir_all(target).ok();

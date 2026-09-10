@@ -56,6 +56,9 @@ collab notify unsubscribe <subscription-id>
   `[ACK REQUIRED: ...]` notice. Combine previews into one line with one final Enter;
   at most one batch attempt per recipient per 120-second window. Reserve attempts before sending;
   failed, absent, unknown, or uncertain delivery does not cause later automatic replay.
+- P0 urgency is explicit: only a typed goal/deadline interrupt is marked P0. A blocked
+  task, wait-timeout, or scheduling blocker is P1 operational work and must not be
+  reclassified as a P0 interrupt by subject text alone.
 - One safe preview contains notification ID, abbreviated subject, and one-line
   original body. Control characters are escaped. Cursor delivery is two tmux
   processes: literal payload, then `C-m` after 250ms, so bracketed paste cannot

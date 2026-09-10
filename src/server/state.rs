@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use super::global_state::{GlobalState, ProjectRegistration, RuntimeBinding, StateError};
+use crate::proto::CommandEnvelope;
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -53,13 +56,121 @@ pub fn runtime_for_pane(pane: Option<&str>) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRec {
     pub id: String,
     pub token: String,
     pub pane: Option<String>,
     pub cwd: String,
     pub registered_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeBinding {
+    pub worktree_root: String,
+    pub owning_project_scope: String,
+    pub task_id: String,
+    pub owner_agent_id: String,
+    pub binding_id: String,
+    pub base_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandReceipt {
+    pub operation_id: String,
+    pub outcome: serde_json::Value,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "cmd")]
+pub enum TypedCommand {
+    RegisterWorker {
+        registration: ProjectRegistration,
+        binding: RuntimeBinding,
+        worker: WorkerRec,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "gr")]
+pub enum GlobalEvent {
+    ProjectRegistered { registration: ProjectRegistration },
+    RuntimeBound { binding: RuntimeBinding },
+}
+
+impl GlobalEvent {
+    pub fn apply(self, global: &mut GlobalState) -> Result<(), StateError> {
+        match self {
+            Self::ProjectRegistered { registration } => {
+                global.register_project(registration).map(|_| ())
+            }
+            Self::RuntimeBound { binding } => global.bind_runtime(binding).map(|_| ()),
+        }
+    }
+}
+
+impl From<TypedCommand> for GlobalEvent {
+    fn from(command: TypedCommand) -> Self {
+        match command {
+            TypedCommand::RegisterWorker { registration, .. } => {
+                GlobalEvent::ProjectRegistered { registration }
+            }
+        }
+    }
+}
+
+impl TypedCommand {
+    pub fn global_events(&self) -> Vec<GlobalEvent> {
+        match self {
+            Self::RegisterWorker {
+                registration,
+                binding,
+                ..
+            } => vec![
+                GlobalEvent::ProjectRegistered {
+                    registration: registration.clone(),
+                }
+                .into(),
+                GlobalEvent::RuntimeBound {
+                    binding: binding.clone(),
+                }
+                .into(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TypedEnvelope {
+    pub command: TypedCommand,
+    pub envelope: CommandEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedApplyError(pub StateError);
+
+impl From<StateError> for TypedApplyError {
+    fn from(value: StateError) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Display for TypedApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for TypedApplyError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TypedOutcome {
+    pub receipt: super::global_state::CommandReceipt,
+    pub replayed: bool,
 }
 
 pub const MAX_WAKE_ATTEMPTS: u32 = 1;
@@ -90,7 +201,9 @@ pub struct NotificationSubscription {
     pub status_reason: Option<String>,
 }
 
-pub fn default_repeat_count() -> u32 { 1 }
+pub fn default_repeat_count() -> u32 {
+    1
+}
 
 impl NotificationSubscription {
     pub fn matches(&self, worker_id: &str, event: &str, subject: Option<&str>, now: i64) -> bool {
@@ -113,6 +226,7 @@ pub struct Message {
     #[serde(default)]
     pub subject: Option<String>,
     pub body: String,
+    #[serde(default)]
     pub in_reply_to: Option<String>,
     pub created_ms: i64,
     /// pending -> delivered -> read; replies may also become superseded.
@@ -152,9 +266,7 @@ pub fn is_goal_deadline(subscription: &NotificationSubscription) -> bool {
 /// Canonical identity for one goal deadline occurrence. Registrations and the
 /// scheduler share this key so a new goal revision cannot shadow an existing
 /// goal merely because its deadline happens to be the same.
-pub fn goal_deadline_key(
-    subscription: &NotificationSubscription,
-) -> Option<(String, String, i64)> {
+pub fn goal_deadline_key(subscription: &NotificationSubscription) -> Option<(String, String, i64)> {
     if !is_goal_deadline(subscription) {
         return None;
     }
@@ -179,139 +291,7 @@ pub fn goal_deadline_key(
     ))
 }
 
-/// Durable, project-level scheduling signals.  The sets contain identifiers
-/// only; task, bug, and mailbox truth remains in their respective stores and
-/// is materialized when the master reads its briefing.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct MasterWakeAccumulator {
-    pub generation: u64,
-    pub goal_due: bool,
-    #[serde(default)]
-    pub idle_workers: Vec<String>,
-    #[serde(default)]
-    pub unresponsive_workers: Vec<String>,
-    #[serde(default)]
-    pub blocked_or_timed_out_tasks: Vec<String>,
-    #[serde(default)]
-    pub completed_or_freed_tasks: Vec<String>,
-    #[serde(default)]
-    pub highest_bug_revision: Option<u64>,
-    #[serde(default)]
-    pub active_goal_revision: Option<u64>,
-    pub ready_authorized_work: bool,
-    pub scheduling_decision_revision: u64,
-    pub first_pending_ms: i64,
-    pub last_updated_ms: i64,
-    #[serde(default)]
-    pub wake_hold: Option<WakeHold>,
-    #[serde(default = "default_delivery_state")]
-    pub delivery_state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct WakeHold {
-    pub reason: String,
-    pub held_by: String,
-    pub held_ms: i64,
-    pub until_ms: i64,
-}
-
-fn default_delivery_state() -> String {
-    "clean".into()
-}
-
-impl MasterWakeAccumulator {
-    fn add_unique(items: &mut Vec<String>, value: String) -> bool {
-        if items.contains(&value) {
-            return false;
-        }
-        items.push(value);
-        items.sort();
-        true
-    }
-
-    fn note_signal(&mut self, signal: &MasterWakeSignal, created_ms: i64) {
-        let changed = match signal {
-            MasterWakeSignal::GoalDue { revision } => {
-                let changed = !self.goal_due
-                    || self
-                        .active_goal_revision
-                        .is_none_or(|current| *revision > current);
-                self.goal_due = true;
-                if changed {
-                    self.active_goal_revision = Some(*revision);
-                }
-                changed
-            }
-            MasterWakeSignal::WorkerIdle { worker_id }
-            | MasterWakeSignal::MasterIdle { worker_id } => {
-                let added = Self::add_unique(&mut self.idle_workers, worker_id.clone());
-                let recovered = self
-                    .unresponsive_workers
-                    .iter()
-                    .position(|id| id == worker_id)
-                    .map(|index| self.unresponsive_workers.remove(index))
-                    .is_some();
-                added || recovered
-            }
-            MasterWakeSignal::WorkerUnresponsive { worker_id } => {
-                Self::add_unique(&mut self.unresponsive_workers, worker_id.clone())
-            }
-            MasterWakeSignal::WorkerRecovered { worker_id }
-            | MasterWakeSignal::WorkerWorking { worker_id } => {
-                let idle_removed = self.idle_workers.iter().position(|id| id == worker_id);
-                if let Some(index) = idle_removed {
-                    self.idle_workers.remove(index);
-                }
-                let unresponsive_removed =
-                    self.unresponsive_workers.iter().position(|id| id == worker_id);
-                if let Some(index) = unresponsive_removed {
-                    self.unresponsive_workers.remove(index);
-                }
-                idle_removed.is_some() || unresponsive_removed.is_some()
-            }
-            MasterWakeSignal::TaskBlocked { task_id } => {
-                Self::add_unique(&mut self.blocked_or_timed_out_tasks, task_id.clone())
-            }
-            MasterWakeSignal::TaskFreed { task_id } => {
-                Self::add_unique(&mut self.completed_or_freed_tasks, task_id.clone())
-            }
-            MasterWakeSignal::SubagentStatus { subagent_id } => {
-                Self::add_unique(&mut self.idle_workers, format!("subagent:{subagent_id}"))
-            }
-            MasterWakeSignal::SubagentWorking { subagent_id } => {
-                let id = format!("subagent:{subagent_id}");
-                self.idle_workers
-                    .iter()
-                    .position(|existing| existing == &id)
-                    .map(|index| self.idle_workers.remove(index))
-                    .is_some()
-            }
-        };
-        if changed {
-            if self.generation == 0 {
-                self.generation = 1;
-                self.first_pending_ms = created_ms;
-            }
-            self.last_updated_ms = created_ms;
-            self.delivery_state = "pending".into();
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum MasterWakeSignal {
-    GoalDue { revision: u64 },
-    WorkerIdle { worker_id: String },
-    MasterIdle { worker_id: String },
-    WorkerUnresponsive { worker_id: String },
-    WorkerRecovered { worker_id: String },
-    WorkerWorking { worker_id: String },
-    TaskBlocked { task_id: String },
-    TaskFreed { task_id: String },
-    SubagentStatus { subagent_id: String },
-    SubagentWorking { subagent_id: String },
-}
+pub use super::notification_state::{MasterWakeAccumulator, MasterWakeSignal};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRec {
@@ -511,6 +491,23 @@ pub enum Event {
     MigrationUpdated {
         migration: MigrationRecord,
     },
+    ReducerCheckpoint {
+        sequence: u64,
+        revision: u64,
+    },
+    CommandStarted {
+        command_id: String,
+        operation_id: String,
+    },
+    CommandRecorded {
+        command_id: String,
+        receipt: CommandReceipt,
+    },
+    CommandCompleted {
+        command_id: String,
+        operation_id: String,
+        receipt: CommandReceipt,
+    },
     #[serde(alias = "RootAssigned")]
     MasterAssigned {
         worker_id: String,
@@ -518,10 +515,26 @@ pub enum Event {
         approval: Option<String>,
         assigned_ms: i64,
     },
+    WorktreeBound {
+        binding: WorktreeBinding,
+    },
+    GlobalProjectRegistered {
+        registration: super::global_state::ProjectRegistration,
+    },
+    GlobalRuntimeBound {
+        binding: super::global_state::RuntimeBinding,
+    },
 }
 
 #[derive(Default)]
 pub struct State {
+    /// Monotonic in-memory reducer revision and journal sequence.  These are
+    /// not business payload and are advanced only by the resident writer.
+    pub revision: u64,
+    pub sequence: u64,
+    /// A failed journal write makes the in-memory reducer unsafe to mutate.
+    /// Keep the exact first failure so admission can fail closed.
+    pub journal_poison: Option<String>,
     pub master_wake: MasterWakeAccumulator,
     pub keepalives: HashMap<String, super::keepalive::Record>,
     pub subagents: HashMap<String, crate::subagent::Record>,
@@ -535,13 +548,61 @@ pub struct State {
     pub notification_subscriptions: HashMap<String, NotificationSubscription>,
     pub wake_bindings: HashMap<String, String>,
     pub migration: Option<MigrationRecord>,
+    /// Legacy journal projection kept for wire/replay compatibility.  Typed
+    /// command idempotency is owned by `global.command_receipts`; this map is
+    /// updated from the same committed event and is never consulted first.
+    pub command_receipts: HashMap<String, CommandReceipt>,
+    /// Keep the legacy event shape when compacting an old journal receipt.
+    /// Modern command transactions retain their Started/Completed framing.
+    legacy_command_ids: HashSet<String>,
+    pub global: super::global_state::GlobalState,
     pub master_worker_id: Option<String>,
     pub master_assigned_by: Option<String>,
     pub master_approval: Option<String>,
     pub master_assigned_ms: Option<i64>,
+    pub worktree_bindings: HashMap<String, WorktreeBinding>,
 }
 
 impl State {
+    /// Keep the typed projection on the daemon journal's version axis.  The
+    /// resident reducer is the only owner of these counters; the nested
+    /// global state mirrors them for typed CAS and receipts.
+    pub(crate) fn sync_global_version(&mut self) {
+        self.global.set_counters(self.sequence, self.revision);
+    }
+
+    pub(crate) fn advance_version(&mut self) -> Result<(), String> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| "sequence counter overflow".to_string())?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "revision counter overflow".to_string())?;
+        self.sequence = sequence;
+        self.revision = revision;
+        self.sync_global_version();
+        Ok(())
+    }
+
+    pub(crate) fn set_checkpoint_version(
+        &mut self,
+        sequence: u64,
+        revision: u64,
+    ) -> Result<(), String> {
+        if sequence < self.sequence || revision < self.revision {
+            return Err(format!(
+                "reducer checkpoint regresses version: current ({}, {}), observed ({sequence}, {revision})",
+                self.sequence, self.revision
+            ));
+        }
+        self.sequence = sequence;
+        self.revision = revision;
+        self.sync_global_version();
+        Ok(())
+    }
+
     fn consume_notification(&mut self, subscription_id: &str, consumed_ms: Option<i64>) {
         let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id) else {
             return;
@@ -586,10 +647,23 @@ impl State {
         }
     }
 
+    /// Apply one event for legacy callers.  The journal writer uses
+    /// [`Self::apply_checked`] so a global reducer rejection is returned to
+    /// the command boundary instead of being mistaken for success.
     pub fn apply(&mut self, ev: &Event) {
+        if let Err(error) = self.apply_checked(ev) {
+            self.journal_poison.get_or_insert(error);
+        }
+    }
+
+    pub fn apply_checked(&mut self, ev: &Event) -> Result<(), String> {
         match ev {
             Event::MasterWakeSignal { signal, at_ms } => {
-                self.master_wake.note_signal(signal, *at_ms);
+                super::notification_state::accumulate_master_wake(
+                    &mut self.master_wake,
+                    signal,
+                    *at_ms,
+                );
             }
             Event::KeepaliveUpdated { worker_id, record } => {
                 self.keepalives.insert(worker_id.clone(), record.clone());
@@ -689,16 +763,12 @@ impl State {
                 }
                 if ids.iter().any(|id| {
                     self.wake_bindings.contains_key(id)
-                        && self
-                            .msgs
-                            .get(id)
-                            .is_some_and(|message| {
-                                message.from == "collab-server"
-                                    && self.master_worker_id.as_deref()
-                                        == Some(message.to.as_str())
-                            })
+                        && self.msgs.get(id).is_some_and(|message| {
+                            message.from == "collab-server"
+                                && self.master_worker_id.as_deref() == Some(message.to.as_str())
+                        })
                 }) {
-                    self.master_wake.delivery_state = "notified_unconsumed".into();
+                    super::notification_state::mark_master_wake_delivered(&mut self.master_wake);
                 }
             }
             Event::Acked { ids } => {
@@ -791,6 +861,26 @@ impl State {
             Event::MigrationUpdated { migration } => {
                 self.migration = Some(migration.clone());
             }
+            Event::ReducerCheckpoint { .. } => {}
+            Event::CommandStarted { .. } => {}
+            Event::CommandRecorded {
+                command_id,
+                receipt,
+            } => {
+                self.project_command_receipt(command_id, receipt)?;
+                self.legacy_command_ids.insert(command_id.clone());
+                self.command_receipts
+                    .insert(command_id.clone(), receipt.clone());
+            }
+            Event::CommandCompleted {
+                command_id,
+                operation_id: _,
+                receipt,
+            } => {
+                self.project_command_receipt(command_id, receipt)?;
+                self.command_receipts
+                    .insert(command_id.clone(), receipt.clone());
+            }
             Event::MasterAssigned {
                 worker_id,
                 assigned_by,
@@ -802,7 +892,54 @@ impl State {
                 self.master_approval = approval.clone();
                 self.master_assigned_ms = Some(*assigned_ms);
             }
+            Event::WorktreeBound { binding } => {
+                self.worktree_bindings
+                    .insert(binding.binding_id.clone(), binding.clone());
+            }
+            Event::GlobalProjectRegistered { registration } => {
+                self.apply_global_event(&GlobalEvent::ProjectRegistered {
+                    registration: registration.clone(),
+                })?;
+            }
+            Event::GlobalRuntimeBound { binding } => {
+                self.apply_global_event(&GlobalEvent::RuntimeBound {
+                    binding: binding.clone(),
+                })?;
+            }
         }
+        Ok(())
+    }
+
+    fn project_command_receipt(
+        &mut self,
+        command_id: &str,
+        receipt: &CommandReceipt,
+    ) -> Result<(), String> {
+        let command_id = crate::identity::CommandId::new(command_id.to_owned())
+            .map_err(|error| format!("global command receipt has invalid command id: {error}"))?;
+        let operation_id = crate::identity::OperationId::new(receipt.operation_id.clone())
+            .map_err(|error| format!("global command receipt has invalid operation id: {error}"))?;
+        self.global
+            .record_command_projection(super::global_state::CommandReceipt {
+                command_id,
+                operation_id,
+                epoch: self.global.epoch,
+                sequence: receipt.sequence,
+                revision: receipt.revision,
+                outcome: receipt.outcome.clone(),
+            })
+            .map_err(|error| format!("global command receipt rejected: {error}"))
+    }
+
+    pub fn apply_global_event(&mut self, event: &GlobalEvent) -> Result<(), String> {
+        let mut next = self.global.clone();
+        event
+            .clone()
+            .apply(&mut next)
+            .map_err(|error| format!("global reducer rejected event: {error}"))?;
+        next.set_counters(self.sequence, self.revision);
+        self.global = next;
+        Ok(())
     }
 
     pub fn drop_message(&mut self, id: &str) {
@@ -820,15 +957,21 @@ impl State {
         }
         let mut workers: Vec<_> = self.workers.values().cloned().collect();
         workers.sort_by(|a, b| a.id.cmp(&b.id));
-        events.extend(workers.into_iter().map(|worker| Event::Registered { worker }));
+        events.extend(
+            workers
+                .into_iter()
+                .map(|worker| Event::Registered { worker }),
+        );
         let mut keepalives: Vec<_> = self.keepalives.iter().collect();
         keepalives.sort_by(|a, b| a.0.cmp(b.0));
-        events.extend(keepalives.into_iter().map(|(worker_id, record)| {
-            Event::KeepaliveUpdated {
-                worker_id: worker_id.clone(),
-                record: record.clone(),
-            }
-        }));
+        events.extend(
+            keepalives
+                .into_iter()
+                .map(|(worker_id, record)| Event::KeepaliveUpdated {
+                    worker_id: worker_id.clone(),
+                    record: record.clone(),
+                }),
+        );
         let mut subagents: Vec<_> = self.subagents.values().cloned().collect();
         subagents.sort_by(|a, b| a.id.cmp(&b.id));
         events.extend(
@@ -892,6 +1035,26 @@ impl State {
         if let Some(migration) = self.migration.clone() {
             events.push(Event::MigrationUpdated { migration });
         }
+        let mut command_receipts: Vec<_> = self.command_receipts.iter().collect();
+        command_receipts.sort_by(|a, b| a.0.cmp(b.0));
+        for (command_id, receipt) in command_receipts {
+            if self.legacy_command_ids.contains(command_id) {
+                events.push(Event::CommandRecorded {
+                    command_id: command_id.clone(),
+                    receipt: receipt.clone(),
+                });
+            } else {
+                events.push(Event::CommandStarted {
+                    command_id: command_id.clone(),
+                    operation_id: receipt.operation_id.clone(),
+                });
+                events.push(Event::CommandCompleted {
+                    command_id: command_id.clone(),
+                    operation_id: receipt.operation_id.clone(),
+                    receipt: receipt.clone(),
+                });
+            }
+        }
         if let Some(worker_id) = self.master_worker_id.clone() {
             events.push(Event::MasterAssigned {
                 worker_id,
@@ -900,13 +1063,38 @@ impl State {
                 assigned_ms: self.master_assigned_ms.unwrap_or(0),
             });
         }
+        let mut bindings: Vec<_> = self.worktree_bindings.values().cloned().collect();
+        bindings.sort_by(|a, b| a.binding_id.cmp(&b.binding_id));
+        events.extend(
+            bindings
+                .into_iter()
+                .map(|binding| Event::WorktreeBound { binding }),
+        );
+        for (_, project) in &self.global.projects {
+            for registration in project.registrations.values() {
+                events.push(Event::GlobalProjectRegistered {
+                    registration: registration.clone(),
+                });
+            }
+            for binding in project.runtime_bindings.values() {
+                events.push(Event::GlobalRuntimeBound {
+                    binding: binding.clone(),
+                });
+            }
+        }
+        events.push(Event::ReducerCheckpoint {
+            sequence: self.sequence,
+            revision: self.revision,
+        });
         events
     }
 
     pub fn admission_frozen(&self) -> bool {
-        self.migration
-            .as_ref()
-            .is_some_and(|migration| migration.admission_frozen)
+        self.journal_poison.is_some()
+            || self
+                .migration
+                .as_ref()
+                .is_some_and(|migration| migration.admission_frozen)
     }
 
     /// Unread (not yet acked) inbox of a worker, oldest first.
@@ -926,9 +1114,10 @@ impl State {
     }
 
     pub fn scheduler_message_deliverable(&self, message_id: &str) -> bool {
-        !self.scheduler_admissions.values().any(|admission| {
-            admission.message_id == message_id && admission.status != "succeeded"
-        })
+        !self
+            .scheduler_admissions
+            .values()
+            .any(|admission| admission.message_id == message_id && admission.status != "succeeded")
     }
 
     /// True when some other message is a reply to `msg`.
@@ -1173,6 +1362,46 @@ mod tests {
     }
 
     #[test]
+    fn command_receipt_and_worktree_binding_replay_preserve_durable_state() {
+        let mut state = State::default();
+        let receipt = CommandReceipt {
+            operation_id: "operation-1".into(),
+            outcome: serde_json::json!({"accepted": true}),
+            sequence: 4,
+            revision: 4,
+        };
+        let binding = WorktreeBinding {
+            worktree_root: "/project/playground/task".into(),
+            owning_project_scope: "/project".into(),
+            task_id: "task-1".into(),
+            owner_agent_id: "worker-1".into(),
+            binding_id: "binding-task-1".into(),
+            base_commit: "abc123".into(),
+        };
+        let events = [
+            Event::CommandRecorded {
+                command_id: "command-1".into(),
+                receipt: receipt.clone(),
+            },
+            Event::WorktreeBound {
+                binding: binding.clone(),
+            },
+        ];
+        for event in &events {
+            state.apply(event);
+        }
+
+        let replayed = events.iter().fold(State::default(), |mut state, event| {
+            state.apply(event);
+            state
+        });
+        assert_eq!(replayed.command_receipts["command-1"], receipt);
+        assert_eq!(replayed.worktree_bindings["binding-task-1"], binding);
+        assert_eq!(state.command_receipts, replayed.command_receipts);
+        assert_eq!(state.worktree_bindings, replayed.worktree_bindings);
+    }
+
+    #[test]
     fn legacy_role_field_is_ignored_on_replay() {
         let mut st = State::default();
         let event: Event = serde_json::from_str(
@@ -1346,19 +1575,45 @@ mod tests {
         let mut state = State::default();
         state.apply(&Event::NotificationSubscribed {
             subscription: NotificationSubscription {
-                id: "sub-periodic".into(), worker_id: "waiter".into(), event: "deadline".into(),
-                subject: Some("timer".into()), pane: "%7".into(), method: "tmux".into(),
-                trigger_ms: None, trigger_times_ms: Vec::new(), interval_ms: Some(1_000),
-                repeat_count: 3, fired_count: 0, expires_ms: 10_000,
-                status: "armed".into(), created_ms: 1, updated_ms: 1, status_reason: None,
+                id: "sub-periodic".into(),
+                worker_id: "waiter".into(),
+                event: "deadline".into(),
+                subject: Some("timer".into()),
+                pane: "%7".into(),
+                method: "tmux".into(),
+                trigger_ms: None,
+                trigger_times_ms: Vec::new(),
+                interval_ms: Some(1_000),
+                repeat_count: 3,
+                fired_count: 0,
+                expires_ms: 10_000,
+                status: "armed".into(),
+                created_ms: 1,
+                updated_ms: 1,
+                status_reason: None,
             },
         });
         for count in 1..=3 {
-            state.apply(&Event::NotificationConsumed { subscription_id: "sub-periodic".into(), message_id: format!("m{count}"), consumed_ms: count * 1_000 });
-            if count < 3 { assert_eq!(state.notification_subscriptions["sub-periodic"].status, "armed"); }
+            state.apply(&Event::NotificationConsumed {
+                subscription_id: "sub-periodic".into(),
+                message_id: format!("m{count}"),
+                consumed_ms: count * 1_000,
+            });
+            if count < 3 {
+                assert_eq!(
+                    state.notification_subscriptions["sub-periodic"].status,
+                    "armed"
+                );
+            }
         }
-        assert_eq!(state.notification_subscriptions["sub-periodic"].status, "consumed");
-        assert_eq!(state.notification_subscriptions["sub-periodic"].fired_count, 3);
+        assert_eq!(
+            state.notification_subscriptions["sub-periodic"].status,
+            "consumed"
+        );
+        assert_eq!(
+            state.notification_subscriptions["sub-periodic"].fired_count,
+            3
+        );
     }
 
     #[test]

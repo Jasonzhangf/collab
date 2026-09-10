@@ -239,7 +239,17 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
                 required(args, "event")?,
             ]);
             optional_flag(&mut argv, args, "subject", "--subject")?;
-            if let Some(values) = args.get("at_ms").and_then(Value::as_array) { for value in values { argv.extend(["--at-ms".into(), value.as_i64().ok_or("at_ms must contain integers")?.to_string()]); } }
+            if let Some(values) = args.get("at_ms").and_then(Value::as_array) {
+                for value in values {
+                    argv.extend([
+                        "--at-ms".into(),
+                        value
+                            .as_i64()
+                            .ok_or("at_ms must contain integers")?
+                            .to_string(),
+                    ]);
+                }
+            }
             optional_integer_flag(&mut argv, args, "every_ms", "--every-ms")?;
             optional_integer_flag(&mut argv, args, "repeat_count", "--repeat-count")?;
             optional_integer_flag(&mut argv, args, "trigger_ms", "--trigger-ms")?;

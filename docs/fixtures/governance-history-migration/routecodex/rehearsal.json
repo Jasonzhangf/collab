@@ -1,0 +1,97 @@
+{
+  "fixture_version": 1,
+  "project_id": "routecodex",
+  "manifest": "manifest.json",
+  "mode": "no_write",
+  "source_observation": {
+    "captured_at": "2026-09-09T19:54:14Z",
+    "raw_log": "/private/tmp/governance-history-live-refresh-20260909-repair-raw.log",
+    "capture": "capture-03 (journal/events) and capture-11 (mailbox, 2026-09-09T19:56:01Z)",
+    "inputs": [
+      {
+        "source_record_id": ".agent-collab/mailbox",
+        "source_path": "/Users/fanzhang/Documents/github/routecodex/.agent-collab/mailbox",
+        "file_count": 3660,
+        "line_count": 45663,
+        "digest": "sha256:dd56eb28b50f4bbf8dd484ea88ba675cbfe4c98e9306cbe80961b2104bb2a941"
+      },
+      {
+        "source_record_id": ".agent-collab/server/events.jsonl",
+        "source_path": "/Users/fanzhang/Documents/github/routecodex/.agent-collab/server/events.jsonl",
+        "line_count": 26238,
+        "byte_count": 7778263,
+        "digest": "sha256:090b34f2cce9b67aa9345a248bdabcbe153dff9d692a2941a581c11c51bceeab"
+      },
+      {
+        "source_record_id": ".agent-collab/server/journal.jsonl",
+        "source_path": "/Users/fanzhang/Documents/github/routecodex/.agent-collab/server/journal.jsonl",
+        "line_count": 39431,
+        "byte_count": 8608934,
+        "digest": "sha256:9dd93d730fa221aa445ebbc5e79e5c8884ebc877b180ff704bcbe8249c941273"
+      }
+    ]
+  },
+  "expected": {
+    "manifest_mapping_status": "planned",
+    "archive_ref": null,
+    "archive_digest": null,
+    "target_mappings_created": false,
+    "source_mutations": false
+  },
+  "cases": [
+    {
+      "case_id": "dirty-mixed-v3-v4-candidate",
+      "trigger": "the source checkout contains extensive staged and unstaged V3/V4 changes",
+      "expected_mapping_class": "reset",
+      "expected_boundary": "candidate"
+    },
+    {
+      "case_id": "lost-workers-with-active-tasks",
+      "trigger": "23 lost workers retain active task records in the status projection",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "owner"
+    },
+    {
+      "case_id": "preserve-v3-v4-boundary",
+      "trigger": "a copied record crosses the V3 production and V4 design ownership boundary",
+      "expected_mapping_class": "adapt",
+      "expected_boundary": "scope"
+    },
+    {
+      "case_id": "source-digest-drift",
+      "trigger": "the source events projection changes between inspect reads",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "snapshot"
+    },
+    {
+      "case_id": "malformed-middle",
+      "trigger": "a copied JSONL stream contains malformed JSON before its tail",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "schema"
+    },
+    {
+      "case_id": "duplicate-record-id",
+      "trigger": "two copied records claim one source record ID",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "schema"
+    },
+    {
+      "case_id": "missing-owner",
+      "trigger": "an active task has no durable owner relation",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "owner"
+    },
+    {
+      "case_id": "changed-cwd",
+      "trigger": "a task or identity points outside the canonical project cwd",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "scope"
+    },
+    {
+      "case_id": "unknown-outcome",
+      "trigger": "a command result cannot distinguish failure from an ambiguous side effect",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "operation"
+    }
+  ]
+}

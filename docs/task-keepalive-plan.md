@@ -1,21 +1,43 @@
-# Task-bound finite keepalive
+# Task-bound inspect obligation
 
-Scope: Collab task/message journal is the sole owner. Managed sends create an
-assigned task, child registration claims it. No second task list. Existing
-claimed tasks participate; blocked/waiting tasks do not get continuation wakes.
+Scope: the Collab task/message journal is the sole owner. Managed sends create
+an assigned task, child registration claims it, and there is no second task
+list. Existing claimed tasks participate under this task-bound inspect
+obligation; blocked/waiting tasks do not get continuation wakes.
 
-An explicit waiting/idle tmux Agent with unfinished actionable tasks may get
-one grouped activation per 15 minutes, at most three consecutive unconfirmed
-activations. Active sending, a fresh ACK, or positive working observation
-resets the idle timer before exhaustion. Unknown/absent never cause input.
-Exhaustion is durable and requires explicit owner rearm; restart cannot reset
-it. No ACK-to-ACK response, automatic process respawn or task redispatch.
+Wake model:
 
-Policy lives only in ~/.appsdk/config.toml. The third attempt gets its full
-15-minute response window. A late ACK cannot automatically rearm exhaustion.
-Persist reservation before wake; failed/uncertain wakes count toward budget.
-No unbounded pending activation queue. Tests use injected time/probes/sender,
-never production panes or a real 45-minute wait.
+- Only master has long-horizon wake. Workers are not long-horizon wake targets
+  and are not automatically woken from idle.
+- A worker acts on an explicit dispatch, a bounded direct-message lease, or its
+  own open task state. It inspects and progresses owned tasks during its
+  working cycle; this is a task-bound inspect obligation, not a tmux activation
+  schedule, and it does not produce worker tmux input.
+- Explicit `collab sendmessage` is immediate. Idle, progress, delivery, bug,
+  and worker-idle notices are auto-merged by the daemon in the 120-second batch
+  window; they are not repeated as heartbeat storms.
+- On each worker `working` -> `idle` transition, the worker sends one idempotent
+  worker-idle fact to the live master, then stops. Unknown/absent never causes
+  input.
+- Master idle reminders are level-triggered. Within the same master idle
+  episode, each reminder attempt consumes the shared episode-local budget, up
+  to three attempts. An observed `working` change ends that episode; after
+  three consecutive attempts without an observed `working` change, the episode
+  stops. Worker-idle facts do not count toward this budget, and there is no
+  scheduling-turn counter or automatic rearm.
 
-Owner worktree: playground/task-keepalive, base origin/main 23731b8.
-Sequence: red tests -> implementation -> full tests -> isolated tmux -> review.
+Failure and evidence:
+
+- Unknown, timeout, and failure stay explicit; no ACK, fallback, or retry may
+  fabricate success.
+- No ACK-to-ACK response, automatic process respawn, task redispatch, or
+  automatic subagent rearm; an explicit operator rearm remains a separate
+  command.
+- Bugs enter the AppSDK or git-bug backlog with investigation evidence; P0
+  blocks the affected project.
+- Tests use injected time/probes/sender, never production panes.
+
+Legacy note: earlier drafts that described periodic worker activation keepalive
+timers are deprecated and non-authoritative; this file does not restore them.
+
+Policy lives only in `~/.appsdk/config.toml`.

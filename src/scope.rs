@@ -1,6 +1,268 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::identity::{validate_id_for_protocol, AppServerId};
+use serde::{Deserialize, Serialize};
+
+pub const COLLAB_STATE_DIR_ENV: &str = "COLLAB_STATE_DIR";
+pub const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
+pub const HOME_ENV: &str = "HOME";
+pub const COLLAB_SOCKET_PATH_ENV: &str = "COLLAB_SOCKET_PATH";
+pub const COLLAB_HOST_SOCKET_ENV: &str = "COLLAB_HOST_SOCKET";
+pub const COLLAB_LOCK_PATH_ENV: &str = "COLLAB_LOCK_PATH";
+pub const COLLAB_HOST_LOCK_ENV: &str = "COLLAB_HOST_LOCK";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPaths {
+    state_root: PathBuf,
+    socket_path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl HostPaths {
+    pub fn from_state_root(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let state_root = validate_host_path(root.as_ref().to_path_buf(), "host state root")?;
+        Ok(Self {
+            socket_path: state_root.join("server.sock"),
+            lock_path: state_root.join("daemon.lock"),
+            state_root,
+        })
+    }
+
+    pub fn for_state_root(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::from_state_root(root)
+    }
+
+    pub fn resolve_from_env() -> anyhow::Result<Self> {
+        let state_root = if let Some(value) = std::env::var_os(COLLAB_STATE_DIR_ENV) {
+            PathBuf::from(value)
+        } else if let Some(value) = std::env::var_os(XDG_STATE_HOME_ENV) {
+            PathBuf::from(value).join("collab")
+        } else if let Some(value) = std::env::var_os(HOME_ENV) {
+            PathBuf::from(value)
+                .join(".local")
+                .join("state")
+                .join("collab")
+        } else {
+            anyhow::bail!(
+                "collab host state root is unavailable; set ${COLLAB_STATE_DIR_ENV}, ${XDG_STATE_HOME_ENV}, or ${HOME_ENV}"
+            )
+        };
+        let mut paths = Self::from_state_root(state_root)?;
+        apply_endpoint_overrides(
+            &mut paths,
+            first_env_path([COLLAB_SOCKET_PATH_ENV, COLLAB_HOST_SOCKET_ENV])?,
+            first_env_path([COLLAB_LOCK_PATH_ENV, COLLAB_HOST_LOCK_ENV])?,
+        )?;
+        Ok(paths)
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::resolve_from_env()
+    }
+
+    pub fn resolve() -> anyhow::Result<Self> {
+        Self::resolve_from_env()
+    }
+
+    pub fn for_project(_project_root: &Path) -> anyhow::Result<Self> {
+        Self::resolve_from_env()
+    }
+
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    pub fn server_dir(&self) -> PathBuf {
+        self.state_root.clone()
+    }
+
+    pub fn socket_path(&self) -> PathBuf {
+        self.socket_path.clone()
+    }
+
+    pub fn sock_path(&self) -> PathBuf {
+        self.socket_path()
+    }
+
+    pub fn lock_path(&self) -> PathBuf {
+        self.lock_path.clone()
+    }
+
+    pub fn down_path(&self) -> PathBuf {
+        self.state_root.join("DOWN")
+    }
+
+    pub fn events_path(&self) -> PathBuf {
+        self.state_root.join("events.jsonl")
+    }
+
+    pub fn journal_path(&self) -> PathBuf {
+        self.state_root.join("journal.jsonl")
+    }
+
+    pub fn pid_path(&self) -> PathBuf {
+        self.state_root.join("server.pid")
+    }
+
+    pub fn log_path(&self) -> PathBuf {
+        self.state_root.join("log.txt")
+    }
+
+    pub fn ensure_root(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.state_root)
+    }
+}
+
+fn apply_endpoint_overrides(
+    paths: &mut HostPaths,
+    socket_override: Option<PathBuf>,
+    lock_override: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    if let Some(value) = socket_override {
+        let parent = value.parent().ok_or_else(|| {
+            anyhow::anyhow!("host socket path has no parent: {}", value.display())
+        })?;
+        if parent != paths.state_root() {
+            anyhow::bail!(
+                "host socket path must be inside host state root {}: {}",
+                paths.state_root().display(),
+                value.display()
+            );
+        }
+        paths.socket_path = value;
+    }
+    if let Some(value) = lock_override {
+        let expected = paths.state_root().join("daemon.lock");
+        if value != expected {
+            anyhow::bail!(
+                "host lock path must be {} so client and daemon share one lock owner: {}",
+                expected.display(),
+                value.display()
+            );
+        }
+        paths.lock_path = value;
+    }
+    Ok(())
+}
+
+fn first_env_path<const N: usize>(names: [&str; N]) -> anyhow::Result<Option<PathBuf>> {
+    for name in names {
+        if let Some(value) = std::env::var_os(name) {
+            return Ok(Some(validate_host_path(
+                PathBuf::from(value),
+                "host endpoint",
+            )?));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_host_path(path: PathBuf, label: &str) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("{label} must be an absolute path: {}", path.display());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        anyhow::bail!(
+            "{label} must not contain '.' or '..' path components: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectScopeId(String);
+
+impl ProjectScopeId {
+    pub fn new(value: impl Into<String>) -> anyhow::Result<Self> {
+        let value = value.into();
+        if value.is_empty() {
+            anyhow::bail!("project scope id must not be empty");
+        }
+        if value.chars().any(char::is_control) {
+            anyhow::bail!("project scope id must not contain control characters");
+        }
+        if !Path::new(&value).is_absolute() {
+            anyhow::bail!("project scope id must be an absolute path");
+        }
+        Ok(Self(value))
+    }
+
+    fn from_registered_cwd(cwd: &Path) -> anyhow::Result<Self> {
+        let root = normalize_registered_cwd(cwd)?;
+        let value = root.to_str().ok_or_else(|| {
+            anyhow::anyhow!("registered project cwd must be valid UTF-8 for the wire scope")
+        })?;
+        Self::new(value.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        Self::new(self.0.clone()).map(|_| ())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteScope {
+    pub app_scope_id: AppServerId,
+    pub project_scope_id: ProjectScopeId,
+}
+
+impl RouteScope {
+    pub fn for_registered_project(
+        app_scope_id: AppServerId,
+        registered_cwd: &Path,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            app_scope_id,
+            project_scope_id: ProjectScopeId::from_registered_cwd(registered_cwd)?,
+        })
+    }
+
+    pub fn validate_registered_cwd(&self, registered_cwd: &Path) -> anyhow::Result<()> {
+        let normalized = ProjectScopeId::from_registered_cwd(registered_cwd)?;
+        if self.project_scope_id != normalized {
+            anyhow::bail!(
+                "project cwd is outside the registered project scope: {}",
+                registered_cwd.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_id_for_protocol(self.app_scope_id.as_str())?;
+        self.project_scope_id.validate()
+    }
+
+    pub fn validate_same_route(&self, other: &Self) -> anyhow::Result<()> {
+        if self != other {
+            anyhow::bail!("route scope mismatch");
+        }
+        Ok(())
+    }
+}
+
+fn normalize_registered_cwd(cwd: &Path) -> anyhow::Result<PathBuf> {
+    if !cwd.is_absolute() || !cwd.is_dir() {
+        anyhow::bail!(
+            "registered project cwd must be an existing absolute directory: {}",
+            cwd.display()
+        );
+    }
+    Ok(std::fs::canonicalize(cwd)?)
+}
+
 fn validate_project_root(root: PathBuf) -> anyhow::Result<PathBuf> {
     if !root.is_absolute() || !root.is_dir() {
         anyhow::bail!(
@@ -383,7 +645,12 @@ pub struct Scope {
 
 impl Scope {
     pub fn resolve() -> anyhow::Result<Self> {
-        Self::from_project_root(project_root()?)
+        let scope = Self::from_project_root(project_root()?)?;
+        // Resolve and validate the host endpoint while the command still has
+        // a fallible boundary.  The infallible compatibility accessors below
+        // are only used after this check (or by isolated unit fixtures).
+        HostPaths::resolve()?;
+        Ok(scope)
     }
 
     fn from_project_root(root: PathBuf) -> anyhow::Result<Self> {
@@ -397,10 +664,39 @@ impl Scope {
         }
     }
     pub fn server_dir(&self) -> PathBuf {
+        // This remains the project-local reducer/journal directory.  The
+        // daemon socket and lease are exposed separately through host_paths.
         self.root.join(".agent-collab").join("server")
     }
+
+    pub fn host_paths(&self) -> anyhow::Result<HostPaths> {
+        // A few in-process startup fixtures construct a bare `Scope` without
+        // running `collab init`. Keep those fixtures isolated from the real
+        // host endpoint; production scopes always have the project marker and
+        // therefore use the host-wide state root below.
+        #[cfg(test)]
+        if !self.root.join(".agent-collab").is_dir()
+            || self.server_dir().join("daemon.lock").exists()
+        {
+            return HostPaths::from_state_root(self.server_dir());
+        }
+        HostPaths::for_project(&self.root)
+    }
+
+    pub fn host_server_dir(&self) -> PathBuf {
+        self.host_paths()
+            .expect("Scope::resolve validates the host endpoint")
+            .server_dir()
+    }
+
     pub fn sock_path(&self) -> PathBuf {
-        self.server_dir().join("server.sock")
+        self.host_paths()
+            .expect("Scope::resolve validates the host endpoint")
+            .socket_path()
+    }
+
+    pub fn route_scope(&self, app_scope_id: AppServerId) -> anyhow::Result<RouteScope> {
+        RouteScope::for_registered_project(app_scope_id, &self.root)
     }
 }
 
@@ -480,6 +776,95 @@ mod tests {
     }
 
     #[test]
+    fn route_scope_uses_exact_registered_project_cwd() {
+        let parent = test_root("route-scope");
+        let registered = parent.join("registered");
+        let sibling = parent.join("sibling");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let route = RouteScope::for_registered_project(
+            AppServerId::new("appserver-1").unwrap(),
+            &registered,
+        )
+        .unwrap();
+
+        route.validate_registered_cwd(&registered).unwrap();
+        assert!(route.validate_registered_cwd(&sibling).is_err());
+        assert!(route.validate_registered_cwd(&parent).is_err());
+        assert_eq!(
+            route.project_scope_id.as_str(),
+            registered.canonicalize().unwrap().to_string_lossy()
+        );
+        std::fs::remove_dir_all(parent).ok();
+    }
+
+    #[test]
+    fn route_scope_serializes_two_levels_and_does_not_mutate_paths() {
+        let root = test_root("route-serialization");
+        std::fs::create_dir_all(&root).unwrap();
+        let route =
+            RouteScope::for_registered_project(AppServerId::new("appserver-1").unwrap(), &root)
+                .unwrap();
+        let before = route.clone();
+        let encoded = serde_json::to_value(&route).unwrap();
+        assert_eq!(encoded["app_scope_id"], "appserver-1");
+        assert_eq!(
+            encoded["project_scope_id"],
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            serde_json::from_value::<RouteScope>(encoded).unwrap(),
+            route
+        );
+        assert_eq!(route, before);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_registered_cwd_fails_closed_without_scope_collision() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let parent = test_root("non-utf8-route-scope");
+        std::fs::create_dir_all(&parent).unwrap();
+        let first = parent.join(OsString::from_vec(b"project-\xff".to_vec()));
+        let second = parent.join(OsString::from_vec(b"project-\xfe".to_vec()));
+        if std::fs::create_dir(&first).is_err() || std::fs::create_dir(&second).is_err() {
+            std::fs::remove_dir_all(parent).ok();
+            return;
+        }
+
+        assert!(RouteScope::for_registered_project(
+            AppServerId::new("appserver-1").unwrap(),
+            &first
+        )
+        .is_err());
+        assert!(RouteScope::for_registered_project(
+            AppServerId::new("appserver-1").unwrap(),
+            &second
+        )
+        .is_err());
+        std::fs::remove_dir_all(parent).ok();
+    }
+
+    #[test]
+    fn long_registered_cwd_has_a_valid_unbounded_project_scope() {
+        let base = test_root("long-route-scope");
+        let mut root = base.clone();
+        for index in 0..24 {
+            root = root.join(format!("segment-{index:02}-abcdef"));
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let route =
+            RouteScope::for_registered_project(AppServerId::new("appserver-1").unwrap(), &root)
+                .unwrap();
+        assert!(route.project_scope_id.as_str().len() > 256);
+        route.validate_registered_cwd(&root).unwrap();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn sandboxed_tmux_lookup_falls_back_to_initialized_cwd() {
         let cwd = test_root("sandbox-cwd");
         init(&cwd).unwrap();
@@ -491,6 +876,62 @@ mod tests {
         };
         assert_eq!(resolved, cwd);
         std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[test]
+    fn host_endpoint_is_stable_across_project_roots() {
+        let host_root = test_root("host-endpoint").join("state");
+        let first_project = test_root("host-project-one");
+        let second_project = test_root("host-project-two");
+        std::fs::create_dir_all(&first_project).unwrap();
+        std::fs::create_dir_all(&second_project).unwrap();
+
+        let first = HostPaths::for_state_root(&host_root).unwrap();
+        let second = HostPaths::for_state_root(&host_root).unwrap();
+        assert_eq!(first.socket_path(), second.socket_path());
+        assert_eq!(first.lock_path(), second.lock_path());
+        assert_ne!(
+            first.socket_path(),
+            first_project.join(".agent-collab/server/server.sock")
+        );
+        assert_ne!(
+            second.socket_path(),
+            second_project.join(".agent-collab/server/server.sock")
+        );
+
+        std::fs::remove_dir_all(first_project).ok();
+        std::fs::remove_dir_all(second_project).ok();
+        std::fs::remove_dir_all(host_root.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn host_endpoint_rejects_relative_state_roots() {
+        let error = HostPaths::for_state_root("collab-state").unwrap_err();
+        assert!(error.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn host_endpoint_rejects_split_socket_root() {
+        let root = test_root("host-socket-split");
+        let mut paths = HostPaths::for_state_root(&root).unwrap();
+        let error = apply_endpoint_overrides(
+            &mut paths,
+            Some(root.join("nested").join("server.sock")),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("inside host state root"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn host_endpoint_rejects_split_lock_owner() {
+        let root = test_root("host-lock-split");
+        let mut paths = HostPaths::for_state_root(&root).unwrap();
+        let error =
+            apply_endpoint_overrides(&mut paths, None, Some(root.join("other.lock"))).unwrap_err();
+        assert!(error.to_string().contains("one lock owner"));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

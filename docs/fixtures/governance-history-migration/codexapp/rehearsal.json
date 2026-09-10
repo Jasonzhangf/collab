@@ -1,0 +1,80 @@
+{
+  "fixture_version": 1,
+  "project_id": "codexapp",
+  "manifest": "manifest.json",
+  "mode": "no_write",
+  "source_observation": {
+    "captured_at": "2026-09-09T19:54:18Z",
+    "raw_log": "/private/tmp/governance-history-live-refresh-20260909-repair-raw.log",
+    "capture": "capture-03 and capture-09",
+    "inputs": [
+      {
+        "source_record_id": "/Users/fanzhang/.codex-communication/journal.jsonl",
+        "source_path": "/Users/fanzhang/.codex-communication/journal.jsonl",
+        "line_count": 54,
+        "byte_count": 61245,
+        "digest": "sha256:c3d995d870cd45a3887c1f3eddba4e2a214db6b60158f3b037ed4fc826f485a4"
+      },
+      {
+        "source_record_id": "/Users/fanzhang/.codex-communication/sockets/commd.sock",
+        "source_path": "/Users/fanzhang/.codex-communication/sockets/commd.sock",
+        "socket_type": "unix",
+        "listener_observed": false,
+        "error": "connect ECONNREFUSED /Users/fanzhang/.codex-communication/sockets/commd.sock"
+      }
+    ]
+  },
+  "expected": {
+    "manifest_mapping_status": "planned",
+    "archive_ref": null,
+    "archive_digest": null,
+    "target_mappings_created": false,
+    "source_mutations": false,
+    "active_import": false,
+    "operator_disposition": "needs_operator"
+  },
+  "cases": [
+    {
+      "case_id": "endpoint-listener-absent",
+      "trigger": "the external commd socket returns ECONNREFUSED",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "native-endpoint-bootstrap"
+    },
+    {
+      "case_id": "mock-adapter-only",
+      "trigger": "only MockAppServerAdapter fixtures are available",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "native-capability-negotiation"
+    },
+    {
+      "case_id": "active-import-before-bootstrap",
+      "trigger": "an import is attempted before native initialize and capability evidence",
+      "expected_mapping_class": "reset",
+      "expected_boundary": "active-import"
+    },
+    {
+      "case_id": "source-digest-drift",
+      "trigger": "the external journal changes between inspect reads",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "snapshot"
+    },
+    {
+      "case_id": "malformed-middle",
+      "trigger": "a copied JSONL stream contains malformed JSON before its tail",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "schema"
+    },
+    {
+      "case_id": "duplicate-record-id",
+      "trigger": "two copied records claim one source record ID",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "schema"
+    },
+    {
+      "case_id": "unknown-outcome",
+      "trigger": "a transport result cannot distinguish failure from an ambiguous side effect",
+      "expected_mapping_class": "unknown",
+      "expected_boundary": "operation"
+    }
+  ]
+}
