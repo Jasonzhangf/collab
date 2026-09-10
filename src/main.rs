@@ -399,13 +399,6 @@ fn register(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::V
         }
         None => RuntimeIdentity::cli_adapter(&ident.worker_id)?,
     };
-    if context_runtime.appserver_id.as_str() != identity::CLI_APP_SERVER_ID {
-        anyhow::bail!(
-            "CLI identity app scope must be {}; observed {}",
-            identity::CLI_APP_SERVER_ID,
-            context_runtime.appserver_id
-        );
-    }
     let cwd = scope.root.display().to_string();
     let response: serde_json::Value = client::call_with_runtime_identity_at_root(
         &scope.sock_path(),
@@ -420,6 +413,13 @@ fn register(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::V
     )?;
     let runtime =
         identity::runtime_from_registration_receipt(&response, &ident.worker_id, &scope.root)?;
+    if runtime.appserver_id != context_runtime.appserver_id {
+        anyhow::bail!(
+            "registration receipt app scope mismatch: expected {}, observed {}",
+            context_runtime.appserver_id,
+            runtime.appserver_id
+        );
+    }
     identity::persist_runtime(scope, ident, runtime)?;
     Ok(response)
 }
@@ -457,13 +457,6 @@ fn runtime_for_request<'a>(ident: &'a Identity) -> anyhow::Result<&'a RuntimeIde
             "runtime binding agent does not match identity worker: expected {}, observed {}",
             ident.worker_id,
             runtime.agent_id
-        );
-    }
-    if runtime.appserver_id.as_str() != identity::CLI_APP_SERVER_ID {
-        anyhow::bail!(
-            "CLI identity app scope must be {}; observed {}",
-            identity::CLI_APP_SERVER_ID,
-            runtime.appserver_id
         );
     }
     Ok(runtime)
@@ -1270,6 +1263,20 @@ mod tests {
         assert!(error
             .to_string()
             .contains("identity has no registered runtime binding"));
+    }
+
+    #[test]
+    fn runtime_for_request_accepts_a_persisted_tui_binding() {
+        let runtime = RuntimeIdentity {
+            agent_id: identity::AgentId::new("worker-1").unwrap(),
+            runtime_id: identity::RuntimeId::new("runtime-tui").unwrap(),
+            appserver_id: identity::AppServerId::new("tui-default").unwrap(),
+            endpoint_generation: 3,
+            binding_id: identity::BindingId::new("binding-tui").unwrap(),
+            native_thread_id: None,
+        };
+        let identity = identity_with_runtime(Some(runtime.clone()));
+        assert_eq!(runtime_for_request(&identity).unwrap(), &runtime);
     }
 
     #[test]
