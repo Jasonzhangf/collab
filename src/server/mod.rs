@@ -5995,12 +5995,227 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
     }
 }
 
-fn dispatch_with_app_scope(server: &Arc<Server>, req: Req, app_scope: Option<AppServerId>) -> Resp {
+fn subagent_action_mutates(action: &crate::subagent::Action) -> bool {
+    !matches!(
+        action,
+        crate::subagent::Action::List
+            | crate::subagent::Action::Status { .. }
+            | crate::subagent::Action::Snapshot { .. }
+    )
+}
+
+/// Return the authenticated actor for a request that can mutate the resident
+/// reducer.  Read queries intentionally remain compatible with a context that
+/// carries only the project route; the mutation admission below is the single
+/// place that requires the actor's current runtime binding.
+fn wire_mutation_principal(req: &Req) -> Option<(&str, &str)> {
+    match req {
+        Req::Subagent {
+            worker_id,
+            token,
+            command,
+            ..
+        } if subagent_action_mutates(command) => Some((worker_id, token)),
+        Req::Register {
+            worker_id, token, ..
+        }
+        | Req::Send {
+            worker_id: Some(worker_id),
+            token: Some(token),
+            ..
+        }
+        | Req::NotificationSubscribe {
+            worker_id, token, ..
+        }
+        | Req::NotificationUnsubscribe {
+            worker_id, token, ..
+        }
+        | Req::Poll {
+            worker_id, token, ..
+        }
+        | Req::Ack {
+            worker_id, token, ..
+        }
+        | Req::TaskRegister {
+            worker_id, token, ..
+        }
+        | Req::TaskRelocate {
+            worker_id, token, ..
+        }
+        | Req::TaskUpdate {
+            worker_id, token, ..
+        }
+        | Req::TaskAccept {
+            worker_id, token, ..
+        }
+        | Req::TaskClaim {
+            worker_id, token, ..
+        }
+        | Req::TaskWait {
+            worker_id, token, ..
+        }
+        | Req::TaskDeliver {
+            worker_id, token, ..
+        }
+        | Req::TaskReview {
+            worker_id, token, ..
+        }
+        | Req::TaskIntegrated {
+            worker_id, token, ..
+        }
+        | Req::TaskClose {
+            worker_id, token, ..
+        }
+        | Req::TaskDispatch { worker_id, token }
+        | Req::MigrationPlan { worker_id, token }
+        | Req::MigrationApply { worker_id, token }
+        | Req::MigrationVerify { worker_id, token }
+        | Req::MasterPromote {
+            worker_id, token, ..
+        }
+        | Req::MasterDelegate {
+            worker_id, token, ..
+        }
+        | Req::TransferMaster {
+            worker_id, token, ..
+        }
+        | Req::RemoveWorker {
+            worker_id, token, ..
+        }
+        | Req::WorkerClose {
+            worker_id, token, ..
+        } => Some((worker_id, token)),
+        _ => None,
+    }
+}
+
+fn validate_wire_runtime_binding(
+    server: &Server,
+    req: &Req,
+    project_context: &ProjectContext,
+) -> Result<(), String> {
+    if let Req::Register { worker_id, .. } = req {
+        let state = server.state.lock().unwrap();
+        let already_registered = state.workers.contains_key(worker_id)
+            || state.global.projects.values().any(|project| {
+                project
+                    .runtime_bindings
+                    .values()
+                    .any(|binding| binding.agent_id.as_str() == worker_id)
+            });
+        drop(state);
+        if !already_registered {
+            if let Some(runtime) = project_context.runtime_context.as_ref() {
+                let provisional = crate::identity::RuntimeIdentity::cli_adapter(worker_id)
+                    .map_err(|error| format!("PROJECT_CONTEXT_INVALID: {error}"))?;
+                if runtime != &provisional {
+                    return Err(
+                        "RUNTIME_BINDING_REJECTED: first register may carry only the provisional CLI runtime identity"
+                            .into(),
+                    );
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    let Some((worker_id, token)) = wire_mutation_principal(req) else {
+        return Ok(());
+    };
+    let state = server.state.lock().unwrap();
+    project_route_actor(&state, project_context, worker_id, token)
+        .map(|_| ())
+        .map_err(|response| {
+            response.error.unwrap_or_else(|| {
+                "RUNTIME_BINDING_REJECTED: runtime binding admission failed".into()
+            })
+        })
+}
+
+fn project_route_actor(
+    state: &State,
+    context: &ProjectContext,
+    worker_id: &str,
+    token: &str,
+) -> Result<WorkerRec, Resp> {
+    context
+        .validate()
+        .map_err(|error| Resp::err(format!("PROJECT_CONTEXT_INVALID: {error}")))?;
+    let route_scope = RouteScope {
+        app_scope_id: context.app_scope_id.clone(),
+        project_scope_id: context.project_scope.clone(),
+    };
+    let runtime = context.runtime_context.as_ref().ok_or_else(|| {
+        Resp::err(
+            "PROJECT_CONTEXT_REQUIRED: project-scoped mutation requires typed runtime context",
+        )
+    })?;
+    let worker = verify(state, worker_id, token)?;
+    let worker_scope =
+        GlobalState::canonical_project_scope(Path::new(&worker.cwd)).map_err(|error| {
+            Resp::err(format!(
+                "RUNTIME_BINDING_REJECTED: worker cwd is not a project route: {error}"
+            ))
+        })?;
+    if worker_scope != route_scope.project_scope_id {
+        return Err(Resp::err(
+            "RUNTIME_BINDING_REJECTED: worker cwd does not match request project route",
+        ));
+    }
+    let Some(project) = state.global.lookup_project_for_route(&route_scope) else {
+        return Err(Resp::err(
+            "RUNTIME_BINDING_REJECTED: authoritative runtime binding is missing",
+        ));
+    };
+    let mut bindings = project.runtime_bindings.values().filter(|binding| {
+        binding.project_scope == route_scope.project_scope_id
+            && binding.app_scope_id == route_scope.app_scope_id
+            && binding.agent_id.as_str() == worker_id
+    });
+    let Some(binding) = bindings.next() else {
+        return Err(Resp::err(
+            "RUNTIME_BINDING_REJECTED: authoritative runtime binding is missing",
+        ));
+    };
+    if bindings.next().is_some() {
+        return Err(Resp::err(
+            "RUNTIME_BINDING_REJECTED: authoritative runtime binding is ambiguous",
+        ));
+    }
+    if binding.endpoint_generation == 0 {
+        return Err(Resp::err(
+            "RUNTIME_BINDING_REJECTED: authoritative runtime binding has no live endpoint generation",
+        ));
+    }
+    let registered = crate::identity::RuntimeIdentity {
+        agent_id: binding.agent_id.clone(),
+        runtime_id: binding.runtime_id.clone(),
+        appserver_id: binding.app_scope_id.clone(),
+        endpoint_generation: binding.endpoint_generation,
+        binding_id: binding.binding_id.clone(),
+        native_thread_id: binding.native_thread_id.clone(),
+    };
+    registered
+        .validate()
+        .map_err(|error| Resp::err(format!("RUNTIME_BINDING_REJECTED: {error}")))?;
+    crate::identity::validate_binding(&registered, runtime)
+        .map_err(|error| Resp::err(format!("RUNTIME_BINDING_REJECTED: {error}")))?;
+    Ok(worker)
+}
+
+fn dispatch_with_route_context(
+    server: &Arc<Server>,
+    req: Req,
+    project_context: Option<ProjectContext>,
+) -> Resp {
     if mutation_blocked_during_migration(&req) && server.state.lock().unwrap().admission_frozen() {
         return Resp::err(
             "MIGRATION_ADMISSION_FROZEN: only identity rebind, read queries, daemon restart, and migration verify are allowed",
         );
     }
+    let app_scope = project_context
+        .as_ref()
+        .map(|context| context.app_scope_id.clone());
     match req {
         Req::SubagentObserve { id, snapshot_lines } => {
             match crate::subagent::observe(server, id.as_deref(), snapshot_lines) {
@@ -6078,18 +6293,26 @@ fn dispatch_with_app_scope(server: &Arc<Server>, req: Req, app_scope: Option<App
             subject,
             body,
             in_reply_to,
-        } => handle_cross_project_send(
-            server,
-            from,
-            from_project,
-            source_master_assigned_by,
-            source_master_approval,
-            source_master_assigned_ms,
-            to,
-            subject,
-            body,
-            in_reply_to,
-        ),
+        } => {
+            if project_context.is_some() {
+                Resp::err(
+                    "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: cross-project wire requests require independently verified source and target route owners",
+                )
+            } else {
+                handle_cross_project_send(
+                    server,
+                    from,
+                    from_project,
+                    source_master_assigned_by,
+                    source_master_approval,
+                    source_master_assigned_ms,
+                    to,
+                    subject,
+                    body,
+                    in_reply_to,
+                )
+            }
+        }
         Req::NotificationMethods => Resp::data(json!({
             "methods": ["tmux"],
             "events": NOTIFICATION_EVENTS,
@@ -6660,7 +6883,7 @@ fn dispatch_with_app_scope(server: &Arc<Server>, req: Req, app_scope: Option<App
 }
 
 fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
-    dispatch_with_app_scope(server, req, None)
+    dispatch_with_route_context(server, req, None)
 }
 
 fn request_requires_project_context(req: &Req) -> bool {
@@ -6904,7 +7127,8 @@ pub(crate) fn validate_request_context(
             "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: cross-project wire requests require independently verified source and target route owners".into(),
         );
     }
-    validate_wire_route_principals(server, req, &route_scope)
+    validate_wire_route_principals(server, req, &route_scope)?;
+    validate_wire_runtime_binding(server, req, project_context)
 }
 
 /// Admit the explicit CLI host operator route independently of project
@@ -6951,6 +7175,7 @@ fn validate_register_cwd(cwd: &str, expected_root: &Path) -> Result<(), String> 
 #[cfg(test)]
 mod host_route_registry_tests {
     use super::*;
+    use crate::identity::RuntimeIdentity;
 
     static TEST_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -6982,6 +7207,115 @@ mod host_route_registry_tests {
     fn context_with_app(root: &Path, app_scope: &str) -> ProjectContext {
         ProjectContext::for_registered_root_with_app(root, AppServerId::new(app_scope).unwrap())
             .unwrap()
+    }
+
+    fn context_with_runtime(
+        root: &Path,
+        app_scope: &str,
+        runtime: &RuntimeIdentity,
+    ) -> ProjectContext {
+        let mut context = context_with_app(root, app_scope);
+        context.runtime_context = Some(runtime.clone());
+        context
+    }
+
+    fn runtime_for_registered(
+        server: &Server,
+        root: &Path,
+        worker_id: &str,
+        app_scope: &str,
+    ) -> RuntimeIdentity {
+        let project_scope = GlobalState::canonical_project_scope(root).unwrap();
+        let route_scope = RouteScope {
+            app_scope_id: AppServerId::new(app_scope).unwrap(),
+            project_scope_id: project_scope,
+        };
+        let binding = server
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .lookup_binding_for(
+                &route_scope,
+                &BindingId::new(format!("binding-{worker_id}")).unwrap(),
+            )
+            .cloned()
+            .unwrap();
+        crate::identity::RuntimeIdentity {
+            agent_id: binding.agent_id,
+            runtime_id: binding.runtime_id,
+            appserver_id: binding.app_scope_id,
+            endpoint_generation: binding.endpoint_generation,
+            binding_id: binding.binding_id,
+            native_thread_id: binding.native_thread_id,
+        }
+    }
+
+    fn notification_subscribe_request(worker_id: &str, token: &str) -> Req {
+        Req::NotificationSubscribe {
+            worker_id: worker_id.into(),
+            token: token.into(),
+            event: "direct-message".into(),
+            subject: None,
+            trigger_ms: None,
+            trigger_times_ms: Vec::new(),
+            interval_ms: None,
+            repeat_count: 1,
+            ttl_seconds: 60,
+        }
+    }
+
+    type MutationSnapshot = (
+        u64,
+        u64,
+        std::collections::HashMap<String, WorkerRec>,
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+        std::collections::HashMap<String, String>,
+        std::collections::HashMap<String, String>,
+        crate::server::global_state::GlobalState,
+    );
+
+    fn ordered_map_snapshot<T: serde::Serialize>(
+        values: &std::collections::HashMap<String, T>,
+    ) -> Vec<(String, String)> {
+        let mut snapshot = values
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::to_string(value).unwrap()))
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        snapshot
+    }
+
+    fn mutation_snapshot(server: &Server) -> MutationSnapshot {
+        let state = server.state.lock().unwrap();
+        (
+            state.revision,
+            state.sequence,
+            state.workers.clone(),
+            ordered_map_snapshot(&state.msgs),
+            ordered_map_snapshot(&state.notification_subscriptions),
+            state.delivery_modes.clone(),
+            state.wake_bindings.clone(),
+            state.global.clone(),
+        )
+    }
+
+    fn directory_snapshot(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let Some(entries) = std::fs::read_dir(path).ok() else {
+            return Vec::new();
+        };
+        let mut snapshot = entries
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        snapshot
     }
 
     fn context(root: &Path) -> ProjectContext {
@@ -7389,11 +7723,12 @@ mod host_route_registry_tests {
             state.global.grant_master(grant.clone()).unwrap();
             grant
         };
+        let runtime = runtime_for_registered(&server, &root, "wire-worker", "app-wire");
         let before_journal = std::fs::read(&journal_path).unwrap();
         let before_revision = server.state.lock().unwrap().revision;
         let repeated = dispatch_wire(
             server.clone(),
-            Some(context_with_app(&root, "app-wire")),
+            Some(context_with_runtime(&root, "app-wire", &runtime)),
             Req::Register {
                 worker_id: "wire-worker".into(),
                 token: "token-wire-worker".into(),
@@ -7582,14 +7917,326 @@ mod host_route_registry_tests {
     }
 
     #[tokio::test]
+    async fn wire_notification_mutation_requires_runtime_and_read_status_stays_compatible() {
+        let (server, root, journal_path) = test_server();
+        let app = "app-wire";
+        let worker_id = "notification-worker";
+        let token = "token-notification-worker";
+        let registered = dispatch_wire(
+            server.clone(),
+            Some(context_with_app(&root, app)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                pane: Some(format!("%{worker_id}")),
+                cwd: root.display().to_string(),
+            },
+        )
+        .await;
+        assert!(registered.ok, "{registered:?}");
+
+        let mailbox_dir = root.join(".agent-collab/mailbox");
+        let before = mutation_snapshot(&server);
+        let before_journal = std::fs::read(&journal_path).unwrap();
+        let before_mailbox = directory_snapshot(&mailbox_dir);
+        let missing_runtime = dispatch_wire(
+            server.clone(),
+            Some(context_with_app(&root, app)),
+            notification_subscribe_request(worker_id, token),
+        )
+        .await;
+        assert!(!missing_runtime.ok, "{missing_runtime:?}");
+        assert_eq!(
+            missing_runtime.error.as_deref(),
+            Some(
+                "PROJECT_CONTEXT_REQUIRED: project-scoped mutation requires typed runtime context"
+            )
+        );
+        let after = mutation_snapshot(&server);
+        assert_eq!(after, before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        assert_eq!(directory_snapshot(&mailbox_dir), before_mailbox);
+
+        let runtime = runtime_for_registered(&server, &root, worker_id, app);
+        let accepted = dispatch_wire(
+            server.clone(),
+            Some(context_with_runtime(&root, app, &runtime)),
+            notification_subscribe_request(worker_id, token),
+        )
+        .await;
+        assert!(accepted.ok, "{accepted:?}");
+        let subscription_id = accepted.data["subscription"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let status = dispatch_wire(
+            server.clone(),
+            Some(context_with_app(&root, app)),
+            Req::NotificationStatus {
+                worker_id: worker_id.into(),
+                token: token.into(),
+            },
+        )
+        .await;
+        assert!(status.ok, "{status:?}");
+        assert!(status.data["subscriptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|subscription| subscription["id"] == subscription_id));
+
+        let cancelled = dispatch_wire(
+            server.clone(),
+            Some(context_with_runtime(&root, app, &runtime)),
+            Req::NotificationUnsubscribe {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                subscription_id,
+            },
+        )
+        .await;
+        assert!(cancelled.ok, "{cancelled:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wire_notification_mutation_rejects_stale_ambiguous_unbound_and_wrong_routes() {
+        async fn register_worker(
+            app: &str,
+        ) -> (
+            Arc<Server>,
+            PathBuf,
+            PathBuf,
+            RuntimeIdentity,
+            String,
+            String,
+        ) {
+            let (server, root, journal_path) = test_server();
+            let worker_id = "route-worker".to_owned();
+            let token = "token-route-worker".to_owned();
+            let response = dispatch_wire(
+                server.clone(),
+                Some(context_with_app(&root, app)),
+                Req::Register {
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
+                    pane: Some("%route-worker".into()),
+                    cwd: root.display().to_string(),
+                },
+            )
+            .await;
+            assert!(response.ok, "{response:?}");
+            let runtime = runtime_for_registered(&server, &root, &worker_id, app);
+            (server, root, journal_path, runtime, worker_id, token)
+        }
+
+        {
+            let (server, root, journal_path, runtime, worker_id, token) =
+                register_worker("app-stale").await;
+            let mut stale = runtime.clone();
+            stale.endpoint_generation = runtime.endpoint_generation.saturating_sub(1);
+            let before = mutation_snapshot(&server);
+            let journal = std::fs::read(&journal_path).unwrap();
+            let mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+            let rejected = dispatch_wire(
+                server.clone(),
+                Some(context_with_runtime(&root, "app-stale", &stale)),
+                notification_subscribe_request(&worker_id, &token),
+            )
+            .await;
+            assert!(!rejected.ok, "{rejected:?}");
+            assert!(rejected
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("RUNTIME_BINDING_REJECTED:")));
+            let after = mutation_snapshot(&server);
+            assert_eq!(after, before);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+            assert_eq!(
+                directory_snapshot(&root.join(".agent-collab/mailbox")),
+                mailbox
+            );
+
+            server
+                .state
+                .lock()
+                .unwrap()
+                .global
+                .projects
+                .values_mut()
+                .next()
+                .unwrap()
+                .runtime_bindings
+                .get_mut(runtime.binding_id.as_str())
+                .unwrap()
+                .endpoint_generation = 0;
+            let before = mutation_snapshot(&server);
+            let journal = std::fs::read(&journal_path).unwrap();
+            let mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+            let rejected = dispatch_wire(
+                server.clone(),
+                Some(context_with_runtime(&root, "app-stale", &runtime)),
+                notification_subscribe_request(&worker_id, &token),
+            )
+            .await;
+            assert!(!rejected.ok, "{rejected:?}");
+            assert!(rejected
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("RUNTIME_BINDING_REJECTED:")));
+            let after = mutation_snapshot(&server);
+            assert_eq!(after, before);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+            assert_eq!(
+                directory_snapshot(&root.join(".agent-collab/mailbox")),
+                mailbox
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        {
+            let (server, root, journal_path, runtime, worker_id, token) =
+                register_worker("app-ambiguous").await;
+            let scope = GlobalState::canonical_project_scope(&root).unwrap();
+            let app = AppServerId::new("app-ambiguous").unwrap();
+            let ambiguous = RuntimeBinding::new(
+                scope.clone(),
+                app,
+                AgentId::new(worker_id.clone()).unwrap(),
+                RuntimeId::new("runtime-ambiguous").unwrap(),
+                BindingId::new("binding-ambiguous").unwrap(),
+                runtime.endpoint_generation,
+                None,
+            )
+            .unwrap();
+            server
+                .state
+                .lock()
+                .unwrap()
+                .global
+                .projects
+                .get_mut(scope.as_str())
+                .unwrap()
+                .runtime_bindings
+                .insert(ambiguous.binding_id.as_str().into(), ambiguous);
+            let before = mutation_snapshot(&server);
+            let journal = std::fs::read(&journal_path).unwrap();
+            let mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+            let rejected = dispatch_wire(
+                server.clone(),
+                Some(context_with_runtime(&root, "app-ambiguous", &runtime)),
+                notification_subscribe_request(&worker_id, &token),
+            )
+            .await;
+            assert!(!rejected.ok, "{rejected:?}");
+            assert!(rejected
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("RUNTIME_BINDING_REJECTED:")));
+            let after = mutation_snapshot(&server);
+            assert_eq!(after, before);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+            assert_eq!(
+                directory_snapshot(&root.join(".agent-collab/mailbox")),
+                mailbox
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        {
+            let (server, root, journal_path, runtime, worker_id, token) =
+                register_worker("app-unbound").await;
+            let scope = GlobalState::canonical_project_scope(&root).unwrap();
+            server
+                .state
+                .lock()
+                .unwrap()
+                .global
+                .projects
+                .get_mut(scope.as_str())
+                .unwrap()
+                .runtime_bindings
+                .remove(runtime.binding_id.as_str());
+            let before = mutation_snapshot(&server);
+            let journal = std::fs::read(&journal_path).unwrap();
+            let mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+            let rejected = dispatch_wire(
+                server.clone(),
+                Some(context_with_runtime(&root, "app-unbound", &runtime)),
+                notification_subscribe_request(&worker_id, &token),
+            )
+            .await;
+            assert!(!rejected.ok, "{rejected:?}");
+            assert!(rejected
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("PROJECT_ROUTE_NOT_READY/UNSUPPORTED:")));
+            let after = mutation_snapshot(&server);
+            assert_eq!(after, before);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+            assert_eq!(
+                directory_snapshot(&root.join(".agent-collab/mailbox")),
+                mailbox
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        {
+            let (server, root, journal_path, runtime, worker_id, token) =
+                register_worker("app-route").await;
+            let mut wrong_app_runtime = runtime.clone();
+            wrong_app_runtime.appserver_id = AppServerId::new("app-other").unwrap();
+            let wrong_root = root.with_file_name(format!(
+                "{}-other",
+                root.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::create_dir_all(&wrong_root).unwrap();
+            let before = mutation_snapshot(&server);
+            let journal = std::fs::read(&journal_path).unwrap();
+            let mailbox = directory_snapshot(&root.join(".agent-collab/mailbox"));
+            let wrong_app = dispatch_wire(
+                server.clone(),
+                Some(context_with_runtime(&root, "app-other", &wrong_app_runtime)),
+                notification_subscribe_request(&worker_id, &token),
+            )
+            .await;
+            assert!(!wrong_app.ok, "{wrong_app:?}");
+            assert!(wrong_app
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("PROJECT_SCOPE_UNKNOWN:")));
+            let wrong_project = dispatch_wire(
+                server.clone(),
+                Some(context_with_runtime(&wrong_root, "app-route", &runtime)),
+                notification_subscribe_request(&worker_id, &token),
+            )
+            .await;
+            assert!(!wrong_project.ok, "{wrong_project:?}");
+            assert!(wrong_project
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("PROJECT_SCOPE_UNKNOWN:")));
+            let after = mutation_snapshot(&server);
+            assert_eq!(after, before);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+            assert_eq!(
+                directory_snapshot(&root.join(".agent-collab/mailbox")),
+                mailbox
+            );
+            std::fs::remove_dir_all(root).unwrap();
+            std::fs::remove_dir_all(wrong_root).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn authenticated_send_uses_context_app_scope_and_rejects_forged_scope() {
         let (server, root, journal_path) = test_server();
         let app = "app-wire";
-        let context = || context_with_app(&root, app);
         for worker_id in ["sender", "recipient"] {
             let response = dispatch_wire(
                 server.clone(),
-                Some(context()),
+                Some(context_with_app(&root, app)),
                 Req::Register {
                     worker_id: worker_id.into(),
                     token: format!("token-{worker_id}"),
@@ -7600,6 +8247,8 @@ mod host_route_registry_tests {
             .await;
             assert!(response.ok, "{response:?}");
         }
+        let sender_runtime = runtime_for_registered(&server, &root, "sender", app);
+        let context = || context_with_runtime(&root, app, &sender_runtime);
 
         let scope = GlobalState::canonical_project_scope(&root).unwrap();
         let binding_generation = server
@@ -7718,9 +8367,6 @@ async fn dispatch_wire(
     if let Err(error) = validate_request_context(&server, &req, project_context.as_ref()) {
         return Resp::err(error);
     }
-    let app_scope = project_context
-        .as_ref()
-        .map(|context| context.app_scope_id.clone());
     match req {
         Req::Poll {
             worker_id,
@@ -7742,11 +8388,11 @@ async fn dispatch_wire(
                 None => handle_poll_async(server, worker_id, timeout_ms).await,
             }
         }
-        req => {
-            tokio::task::spawn_blocking(move || dispatch_with_app_scope(&server, req, app_scope))
-                .await
-                .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e)))
-        }
+        req => tokio::task::spawn_blocking(move || {
+            dispatch_with_route_context(&server, req, project_context)
+        })
+        .await
+        .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e))),
     }
 }
 

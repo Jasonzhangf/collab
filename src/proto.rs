@@ -99,6 +99,8 @@ pub struct ProjectContext {
     pub app_scope_id: AppServerId,
     pub canonical_root: String,
     pub project_scope: ProjectScopeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_context: Option<RuntimeIdentity>,
 }
 
 impl ProjectContext {
@@ -127,6 +129,7 @@ impl ProjectContext {
             app_scope_id,
             canonical_root: canonical_root.to_owned(),
             project_scope,
+            runtime_context: None,
         })
     }
 
@@ -135,7 +138,9 @@ impl ProjectContext {
         identity: &RuntimeIdentity,
     ) -> anyhow::Result<Self> {
         identity.validate()?;
-        Self::for_registered_root_with_app(root, identity.appserver_id.clone())
+        let mut context = Self::for_registered_root_with_app(root, identity.appserver_id.clone())?;
+        context.runtime_context = Some(identity.clone());
+        Ok(context)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -152,6 +157,12 @@ impl ProjectContext {
         let expected_scope = ProjectScopeId::new(self.canonical_root.clone())?;
         if self.project_scope != expected_scope {
             anyhow::bail!("project context scope does not match its canonical root");
+        }
+        if let Some(runtime) = &self.runtime_context {
+            runtime.validate()?;
+            if runtime.appserver_id != self.app_scope_id {
+                anyhow::bail!("project context runtime app scope does not match context app scope");
+            }
         }
         Ok(())
     }
