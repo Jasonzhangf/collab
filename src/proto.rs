@@ -4,7 +4,7 @@ use crate::identity::{
     validate_binding, BindingId, CommandId, DispatchId, MessageId, OperationId, RuntimeIdentity,
     TurnId,
 };
-use crate::scope::RouteScope;
+use crate::scope::{ProjectScopeId, RouteScope};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandEnvelope {
@@ -86,6 +86,58 @@ impl CommandEnvelope {
         self.scope.validate_same_route(registered_scope)?;
         if self.scope.app_scope_id != registered.appserver_id {
             anyhow::bail!("command app scope does not match actor AppServer identity");
+        }
+        Ok(())
+    }
+}
+
+/// The project identity carried by every project-scoped wire request.  The
+/// root and scope are deliberately both present: the root is the registered
+/// filesystem context, while the scope is the value used by route checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectContext {
+    pub canonical_root: String,
+    pub project_scope: ProjectScopeId,
+}
+
+impl ProjectContext {
+    pub fn for_registered_root(root: &std::path::Path) -> anyhow::Result<Self> {
+        let canonical = std::fs::canonicalize(root)?;
+        let canonical_root = canonical.to_str().ok_or_else(|| {
+            anyhow::anyhow!("registered project root must be valid UTF-8 for the wire context")
+        })?;
+        let project_scope = ProjectScopeId::new(canonical_root.to_owned())?;
+        Ok(Self {
+            canonical_root: canonical_root.to_owned(),
+            project_scope,
+        })
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.canonical_root.is_empty() {
+            anyhow::bail!("project context canonical root must not be empty");
+        }
+        if self.canonical_root.chars().any(char::is_control) {
+            anyhow::bail!("project context canonical root must not contain control characters");
+        }
+        if !std::path::Path::new(&self.canonical_root).is_absolute() {
+            anyhow::bail!("project context canonical root must be an absolute path");
+        }
+        let expected_scope = ProjectScopeId::new(self.canonical_root.clone())?;
+        if self.project_scope != expected_scope {
+            anyhow::bail!("project context scope does not match its canonical root");
+        }
+        Ok(())
+    }
+
+    pub fn validate_registered_root(&self, root: &std::path::Path) -> anyhow::Result<()> {
+        self.validate()?;
+        let expected = Self::for_registered_root(root)?;
+        if self != &expected {
+            anyhow::bail!(
+                "project context does not match registered project root {}",
+                root.display()
+            );
         }
         Ok(())
     }
@@ -353,6 +405,36 @@ pub enum Req {
     },
 }
 
+/// Wire envelope for the resident host daemon.  The request body keeps the
+/// v1 tagged operation shape so existing command names remain compatible;
+/// project context is an additive top-level field.  A missing context is
+/// accepted only for the context-free Ping readiness probe and is rejected by
+/// the server for every project-scoped operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_context: Option<ProjectContext>,
+    #[serde(flatten)]
+    pub request: Req,
+}
+
+impl RequestEnvelope {
+    pub fn new(request: Req, project_context: Option<ProjectContext>) -> Self {
+        Self {
+            project_context,
+            request,
+        }
+    }
+
+    pub fn with_context(request: Req, project_context: ProjectContext) -> Self {
+        Self::new(request, Some(project_context))
+    }
+
+    pub fn into_parts(self) -> (Option<ProjectContext>, Req) {
+        (self.project_context, self.request)
+    }
+}
+
 fn default_delivery_mode() -> String {
     "immediate".into()
 }
@@ -606,6 +688,38 @@ mod tests {
         command
             .validate_for(&registered_identity(), &scope)
             .unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wire_request_carries_canonical_project_context() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-proto-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let context = ProjectContext::for_registered_root(&root).unwrap();
+        let request = RequestEnvelope::new(Req::Ping, Some(context.clone()));
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            encoded["project_context"]["canonical_root"],
+            context.canonical_root
+        );
+        assert_eq!(
+            encoded["project_context"]["project_scope"],
+            context.project_scope.as_str()
+        );
+        assert_eq!(encoded["op"], "Ping");
+        let decoded = serde_json::from_value::<RequestEnvelope>(encoded).unwrap();
+        assert_eq!(decoded.project_context, request.project_context);
+        assert_eq!(
+            serde_json::to_value(decoded.request).unwrap(),
+            serde_json::json!({"op": "Ping"})
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

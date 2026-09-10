@@ -4,6 +4,147 @@ use std::process::Command;
 use crate::identity::{validate_id_for_protocol, AppServerId};
 use serde::{Deserialize, Serialize};
 
+pub const COLLAB_STATE_DIR_ENV: &str = "COLLAB_STATE_DIR";
+pub const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
+pub const HOME_ENV: &str = "HOME";
+pub const COLLAB_SOCKET_PATH_ENV: &str = "COLLAB_SOCKET_PATH";
+pub const COLLAB_HOST_SOCKET_ENV: &str = "COLLAB_HOST_SOCKET";
+pub const COLLAB_LOCK_PATH_ENV: &str = "COLLAB_LOCK_PATH";
+pub const COLLAB_HOST_LOCK_ENV: &str = "COLLAB_HOST_LOCK";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPaths {
+    state_root: PathBuf,
+    socket_path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl HostPaths {
+    pub fn from_state_root(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let state_root = validate_host_path(root.as_ref().to_path_buf(), "host state root")?;
+        Ok(Self {
+            socket_path: state_root.join("server.sock"),
+            lock_path: state_root.join("daemon.lock"),
+            state_root,
+        })
+    }
+
+    pub fn for_state_root(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::from_state_root(root)
+    }
+
+    pub fn resolve_from_env() -> anyhow::Result<Self> {
+        let state_root = if let Some(value) = std::env::var_os(COLLAB_STATE_DIR_ENV) {
+            PathBuf::from(value)
+        } else if let Some(value) = std::env::var_os(XDG_STATE_HOME_ENV) {
+            PathBuf::from(value).join("collab")
+        } else if let Some(value) = std::env::var_os(HOME_ENV) {
+            PathBuf::from(value)
+                .join(".local")
+                .join("state")
+                .join("collab")
+        } else {
+            anyhow::bail!(
+                "collab host state root is unavailable; set ${COLLAB_STATE_DIR_ENV}, ${XDG_STATE_HOME_ENV}, or ${HOME_ENV}"
+            )
+        };
+        let mut paths = Self::from_state_root(state_root)?;
+        if let Some(value) = first_env_path([COLLAB_SOCKET_PATH_ENV, COLLAB_HOST_SOCKET_ENV])? {
+            paths.socket_path = value;
+        }
+        if let Some(value) = first_env_path([COLLAB_LOCK_PATH_ENV, COLLAB_HOST_LOCK_ENV])? {
+            paths.lock_path = value;
+        }
+        Ok(paths)
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::resolve_from_env()
+    }
+
+    pub fn resolve() -> anyhow::Result<Self> {
+        Self::resolve_from_env()
+    }
+
+    pub fn for_project(_project_root: &Path) -> anyhow::Result<Self> {
+        Self::resolve_from_env()
+    }
+
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    pub fn server_dir(&self) -> PathBuf {
+        self.state_root.clone()
+    }
+
+    pub fn socket_path(&self) -> PathBuf {
+        self.socket_path.clone()
+    }
+
+    pub fn sock_path(&self) -> PathBuf {
+        self.socket_path()
+    }
+
+    pub fn lock_path(&self) -> PathBuf {
+        self.lock_path.clone()
+    }
+
+    pub fn down_path(&self) -> PathBuf {
+        self.state_root.join("DOWN")
+    }
+
+    pub fn events_path(&self) -> PathBuf {
+        self.state_root.join("events.jsonl")
+    }
+
+    pub fn journal_path(&self) -> PathBuf {
+        self.state_root.join("journal.jsonl")
+    }
+
+    pub fn pid_path(&self) -> PathBuf {
+        self.state_root.join("server.pid")
+    }
+
+    pub fn log_path(&self) -> PathBuf {
+        self.state_root.join("log.txt")
+    }
+
+    pub fn ensure_root(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.state_root)
+    }
+}
+
+fn first_env_path<const N: usize>(names: [&str; N]) -> anyhow::Result<Option<PathBuf>> {
+    for name in names {
+        if let Some(value) = std::env::var_os(name) {
+            return Ok(Some(validate_host_path(
+                PathBuf::from(value),
+                "host endpoint",
+            )?));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_host_path(path: PathBuf, label: &str) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("{label} must be an absolute path: {}", path.display());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        anyhow::bail!(
+            "{label} must not contain '.' or '..' path components: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ProjectScopeId(String);
@@ -473,7 +614,12 @@ pub struct Scope {
 
 impl Scope {
     pub fn resolve() -> anyhow::Result<Self> {
-        Self::from_project_root(project_root()?)
+        let scope = Self::from_project_root(project_root()?)?;
+        // Resolve and validate the host endpoint while the command still has
+        // a fallible boundary.  The infallible compatibility accessors below
+        // are only used after this check (or by isolated unit fixtures).
+        HostPaths::resolve()?;
+        Ok(scope)
     }
 
     fn from_project_root(root: PathBuf) -> anyhow::Result<Self> {
@@ -487,10 +633,35 @@ impl Scope {
         }
     }
     pub fn server_dir(&self) -> PathBuf {
+        // This remains the project-local reducer/journal directory.  The
+        // daemon socket and lease are exposed separately through host_paths.
         self.root.join(".agent-collab").join("server")
     }
+
+    pub fn host_paths(&self) -> anyhow::Result<HostPaths> {
+        // A few in-process startup fixtures construct a bare `Scope` without
+        // running `collab init`. Keep those fixtures isolated from the real
+        // host endpoint; production scopes always have the project marker and
+        // therefore use the host-wide state root below.
+        #[cfg(test)]
+        if !self.root.join(".agent-collab").is_dir()
+            || self.server_dir().join("daemon.lock").exists()
+        {
+            return HostPaths::from_state_root(self.server_dir());
+        }
+        HostPaths::for_project(&self.root)
+    }
+
+    pub fn host_server_dir(&self) -> PathBuf {
+        self.host_paths()
+            .expect("Scope::resolve validates the host endpoint")
+            .server_dir()
+    }
+
     pub fn sock_path(&self) -> PathBuf {
-        self.server_dir().join("server.sock")
+        self.host_paths()
+            .expect("Scope::resolve validates the host endpoint")
+            .socket_path()
     }
 
     pub fn route_scope(&self, app_scope_id: AppServerId) -> anyhow::Result<RouteScope> {
@@ -674,6 +845,38 @@ mod tests {
         };
         assert_eq!(resolved, cwd);
         std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[test]
+    fn host_endpoint_is_stable_across_project_roots() {
+        let host_root = test_root("host-endpoint").join("state");
+        let first_project = test_root("host-project-one");
+        let second_project = test_root("host-project-two");
+        std::fs::create_dir_all(&first_project).unwrap();
+        std::fs::create_dir_all(&second_project).unwrap();
+
+        let first = HostPaths::for_state_root(&host_root).unwrap();
+        let second = HostPaths::for_state_root(&host_root).unwrap();
+        assert_eq!(first.socket_path(), second.socket_path());
+        assert_eq!(first.lock_path(), second.lock_path());
+        assert_ne!(
+            first.socket_path(),
+            first_project.join(".agent-collab/server/server.sock")
+        );
+        assert_ne!(
+            second.socket_path(),
+            second_project.join(".agent-collab/server/server.sock")
+        );
+
+        std::fs::remove_dir_all(first_project).ok();
+        std::fs::remove_dir_all(second_project).ok();
+        std::fs::remove_dir_all(host_root.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn host_endpoint_rejects_relative_state_roots() {
+        let error = HostPaths::for_state_root("collab-state").unwrap_err();
+        assert!(error.to_string().contains("absolute"));
     }
 
     #[test]

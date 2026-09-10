@@ -1,4 +1,4 @@
-use crate::proto::{Req, Resp};
+use crate::proto::{ProjectContext, Req, RequestEnvelope, Resp};
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -73,8 +73,19 @@ pub fn record_event(sock: &Path, kind: &str, detail: Value) {
 /// never creates a server directory, starts a process, or records a client
 /// event when the socket cannot be reached.
 pub fn call<T: DeserializeOwned>(sock: &Path, req: &Req) -> anyhow::Result<T> {
+    call_with_context(sock, req, infer_project_context())
+}
+
+/// Round-trip one request with an explicit registered project context.  The
+/// context is part of the wire envelope, while the v1 operation keeps its
+/// original tagged shape for compatibility with existing adapters.
+pub fn call_with_context<T: DeserializeOwned>(
+    sock: &Path,
+    req: &Req,
+    project_context: Option<ProjectContext>,
+) -> anyhow::Result<T> {
     let mut stream = connect(sock).map_err(|error| connection_error(sock, error))?;
-    let line = serde_json::to_string(req)?;
+    let line = serde_json::to_string(&RequestEnvelope::new(req.clone(), project_context))?;
     stream.write_all(line.as_bytes()).with_context(|| {
         format!(
             "DAEMON_UNKNOWN: failed to send request to {}",
@@ -126,6 +137,11 @@ pub fn call<T: DeserializeOwned>(sock: &Path, req: &Req) -> anyhow::Result<T> {
             sock.display()
         )
     })
+}
+
+fn infer_project_context() -> Option<ProjectContext> {
+    let root = crate::scope::project_root().ok()?;
+    ProjectContext::for_registered_root(&root).ok()
 }
 
 pub fn daemon_locked(server_dir: &Path) -> bool {

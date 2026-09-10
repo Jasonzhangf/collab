@@ -539,8 +539,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 scope::init(&project_root)?;
             }
             let scope = Scope { root: project_root };
-            std::fs::create_dir_all(scope.server_dir())?;
-            std::fs::remove_file(scope.server_dir().join("DOWN")).ok();
+            let host_server_dir = scope.host_server_dir();
+            std::fs::create_dir_all(&host_server_dir)?;
+            std::fs::remove_file(host_server_dir.join("DOWN")).ok();
             client::record_event(
                 &scope.sock_path(),
                 "daemon_up_requested",
@@ -558,7 +559,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let _: serde_json::Value =
                     client::call(&scope.sock_path(), &Req::Shutdown { operator: true })?;
             }
-            let server_dir = scope.server_dir();
+            let server_dir = scope.host_server_dir();
             std::fs::create_dir_all(&server_dir)?;
             std::fs::write(server_dir.join("DOWN"), b"explicitly stopped\n")?;
             client::record_event(

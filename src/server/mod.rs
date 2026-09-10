@@ -1,3 +1,4 @@
+pub mod global_state;
 pub(crate) mod keepalive;
 pub mod knock;
 pub mod mailbox;
@@ -5,15 +6,12 @@ pub mod notification_contract;
 pub mod notification_state;
 pub mod state;
 pub mod timers;
-pub mod global_state;
 
 pub use global_state::{GlobalState, ProjectRegistration, RuntimeBinding};
 
-use crate::identity::{
-    AgentId, AppServerId, BindingId, CommandId, OperationId, RuntimeId,
-};
-use crate::proto::{CommandEnvelope, Req, Resp, MSG_TYPES};
-use crate::scope::{ProjectScopeId, RouteScope, Scope};
+use crate::identity::{AgentId, AppServerId, BindingId, CommandId, OperationId, RuntimeId};
+use crate::proto::{CommandEnvelope, ProjectContext, Req, RequestEnvelope, Resp, MSG_TYPES};
+use crate::scope::{HostPaths, ProjectScopeId, RouteScope, Scope};
 use crate::server::knock::{
     append_log, knock_or_log, pane_alive, pane_idle, pane_presence, PanePresence,
 };
@@ -52,7 +50,6 @@ const TASK_STATUSES: [&str; 12] = [
     "cancelled",
 ];
 const MAX_WORKTREE_PATH_BYTES: usize = 80;
-const HOST_DAEMON_LOCK_PATH: &str = "/tmp/collab-host.lock";
 
 fn sanitize_identifier(value: &str) -> String {
     value
@@ -342,11 +339,8 @@ impl Server {
             (registration, registered_ms)
         };
         let agent_id = AgentId::new(worker_id.to_string()).map_err(|error| error.to_string())?;
-        let runtime_id = RuntimeId::new(format!(
-            "runtime-{}",
-            sanitize_identifier(pane)
-        ))
-        .map_err(|error| error.to_string())?;
+        let runtime_id = RuntimeId::new(format!("runtime-{}", sanitize_identifier(pane)))
+            .map_err(|error| error.to_string())?;
         let binding = RuntimeBinding::new(
             project_scope.clone(),
             app_scope,
@@ -400,10 +394,9 @@ impl Server {
         &self,
         typed: TypedEnvelope,
     ) -> Result<state::TypedOutcome, notification_contract::JournalError> {
-        typed
-            .envelope
-            .validate()
-            .map_err(|error| notification_contract::JournalError::InvalidCommand(error.to_string()))?;
+        typed.envelope.validate().map_err(|error| {
+            notification_contract::JournalError::InvalidCommand(error.to_string())
+        })?;
         let mut st = self.state.lock().unwrap();
         self.validate_typed_register(&st, &typed)?;
         let mut events = Vec::new();
@@ -495,16 +488,20 @@ impl Server {
             }
         }
         if typed.envelope.actor_binding_id != binding.binding_id {
-            return Err(notification_contract::JournalError::InvalidCommand(format!(
-                "actor binding {} does not match command binding {}",
-                typed.envelope.actor_binding_id, binding.binding_id
-            )));
+            return Err(notification_contract::JournalError::InvalidCommand(
+                format!(
+                    "actor binding {} does not match command binding {}",
+                    typed.envelope.actor_binding_id, binding.binding_id
+                ),
+            ));
         }
         if typed.envelope.endpoint_generation != binding.endpoint_generation {
-            return Err(notification_contract::JournalError::InvalidCommand(format!(
-                "envelope generation {} does not match binding generation {}",
-                typed.envelope.endpoint_generation, binding.endpoint_generation
-            )));
+            return Err(notification_contract::JournalError::InvalidCommand(
+                format!(
+                    "envelope generation {} does not match binding generation {}",
+                    typed.envelope.endpoint_generation, binding.endpoint_generation
+                ),
+            ));
         }
         if typed.envelope.scope != binding.route_scope() {
             return Err(notification_contract::JournalError::InvalidCommand(
@@ -513,9 +510,9 @@ impl Server {
         }
         let mut next = st.global.clone();
         for event in typed.command.global_events() {
-            event
-                .apply(&mut next)
-                .map_err(|error| notification_contract::JournalError::InvalidCommand(error.to_string()))?;
+            event.apply(&mut next).map_err(|error| {
+                notification_contract::JournalError::InvalidCommand(error.to_string())
+            })?;
         }
         next.validate_binding(binding).map_err(|error| {
             notification_contract::JournalError::InvalidCommand(error.to_string())
@@ -550,11 +547,7 @@ impl Server {
     /// Compatibility entry point for callers holding the state lock.
     /// This delegates to the typed reducer and never applies state after a
     /// journal failure.
-    pub(crate) fn try_commit_locked(
-        &self,
-        st: &mut State,
-        evs: &[Event],
-    ) -> Result<(), String> {
+    pub(crate) fn try_commit_locked(&self, st: &mut State, evs: &[Event]) -> Result<(), String> {
         self.commit_locked_checked(st, evs)
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -647,14 +640,14 @@ impl Server {
                 replayed: true,
             });
         }
-        if let Some((existing_command_id, _)) = st
-            .global
-            .command_receipts
-            .iter()
-            .find(|(existing_command_id, receipt)| {
-                *existing_command_id != command_id
-                    && receipt.operation_id.as_str() == operation_id
-            })
+        if let Some((existing_command_id, _)) =
+            st.global
+                .command_receipts
+                .iter()
+                .find(|(existing_command_id, receipt)| {
+                    *existing_command_id != command_id
+                        && receipt.operation_id.as_str() == operation_id
+                })
         {
             return Err(notification_contract::JournalError::InvalidCommand(
                 format!(
@@ -662,12 +655,12 @@ impl Server {
                 ),
             ));
         }
-        if let Some((existing_command_id, _)) = st
-            .command_receipts
-            .iter()
-            .find(|(existing_command_id, receipt)| {
-                *existing_command_id != command_id && receipt.operation_id == operation_id
-            })
+        if let Some((existing_command_id, _)) =
+            st.command_receipts
+                .iter()
+                .find(|(existing_command_id, receipt)| {
+                    *existing_command_id != command_id && receipt.operation_id == operation_id
+                })
         {
             return Err(notification_contract::JournalError::InvalidCommand(
                 format!(
@@ -2562,8 +2555,9 @@ fn register_typed(
         return Resp::err("collab registration requires a live tmux pane");
     };
     let typed = match project_scope {
-        Some(project_scope) => server
-            .typed_register_envelope_for_scope(worker_id, token, pane, project_scope, cwd),
+        Some(project_scope) => {
+            server.typed_register_envelope_for_scope(worker_id, token, pane, project_scope, cwd)
+        }
         None => server.typed_register_envelope(worker_id, token, pane, cwd),
     };
     match typed {
@@ -2689,20 +2683,10 @@ pub(crate) fn handle_register(
         return resp;
     }
     drop(st);
-    register_typed(
-        server,
-        &worker_id,
-        &token,
-        pane.as_deref(),
-        &cwd,
-        None,
-    )
+    register_typed(server, &worker_id, &token, pane.as_deref(), &cwd, None)
 }
 
-fn existing_project_scope(
-    state: &State,
-    worker_id: &str,
-) -> Result<Option<ProjectScopeId>, Resp> {
+fn existing_project_scope(state: &State, worker_id: &str) -> Result<Option<ProjectScopeId>, Resp> {
     let mut found = None;
     for project in state.global.projects.values() {
         for binding in project.runtime_bindings.values() {
@@ -6322,6 +6306,104 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
     }
 }
 
+fn request_requires_project_context(req: &Req) -> bool {
+    !matches!(req, Req::Ping)
+}
+
+/// Validate the route carried by a host-daemon request before the legacy
+/// project reducer sees it.  The first host-routing seam intentionally admits
+/// only the project loaded by this daemon instance; a different canonical
+/// project receives an explicit rejection until a multi-project reducer can
+/// preserve independent journals safely.
+pub(crate) fn validate_request_context(
+    server: &Server,
+    req: &Req,
+    project_context: Option<&ProjectContext>,
+) -> Result<(), String> {
+    let Some(project_context) = project_context else {
+        if request_requires_project_context(req) {
+            return Err(
+                "PROJECT_CONTEXT_REQUIRED: canonical project root and scope are required".into(),
+            );
+        }
+        return Ok(());
+    };
+
+    project_context
+        .validate()
+        .map_err(|error| format!("PROJECT_CONTEXT_INVALID: {error}"))?;
+    let registered_scope = GlobalState::canonical_project_scope(&server.root)
+        .map_err(|error| format!("PROJECT_SCOPE_UNKNOWN: {error}"))?;
+    if project_context.canonical_root != registered_scope.as_str()
+        || project_context.project_scope != registered_scope
+    {
+        return Err(format!(
+            "PROJECT_SCOPE_UNKNOWN: host daemon is bound to {}, request selected {}",
+            registered_scope.as_str(),
+            project_context.canonical_root
+        ));
+    }
+
+    if let Req::Register { cwd, .. } = req {
+        let request_scope = GlobalState::canonical_project_scope(Path::new(cwd))
+            .map_err(|error| format!("PROJECT_SCOPE_INVALID: {error}"))?;
+        if request_scope != registered_scope {
+            return Err(format!(
+                "PROJECT_SCOPE_MISMATCH: register cwd {} is outside {}",
+                cwd,
+                registered_scope.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_wire_request(line: &str) -> Result<(Option<ProjectContext>, Req), String> {
+    match serde_json::from_str::<RequestEnvelope>(line) {
+        Ok(envelope) => Ok(envelope.into_parts()),
+        Err(envelope_error) => serde_json::from_str::<Req>(line)
+            .map(|request| (None, request))
+            .map_err(|request_error| {
+                format!("bad request: {request_error}; wire envelope parse: {envelope_error}")
+            }),
+    }
+}
+
+async fn dispatch_wire(
+    server: Arc<Server>,
+    project_context: Option<ProjectContext>,
+    req: Req,
+) -> Resp {
+    if let Err(error) = validate_request_context(&server, &req, project_context.as_ref()) {
+        return Resp::err(error);
+    }
+    match req {
+        Req::Poll {
+            worker_id,
+            token,
+            timeout_ms,
+        } => {
+            let admission = {
+                let check = server.state.lock().unwrap();
+                if let Err(error) = verify(&check, &worker_id, &token) {
+                    Some(error)
+                } else if check.admission_frozen() {
+                    Some(Resp::err("MIGRATION_ADMISSION_FROZEN: only identity rebind, read queries, daemon restart, and migration verify are allowed"))
+                } else {
+                    None
+                }
+            };
+            match admission {
+                Some(response) => response,
+                None => handle_poll_async(server, worker_id, timeout_ms).await,
+            }
+        }
+        req => tokio::task::spawn_blocking(move || dispatch(&server, req))
+            .await
+            .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e))),
+    }
+}
+
 async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let (reader, mut writer) = stream.into_split();
@@ -6330,37 +6412,10 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
         if line.trim().is_empty() {
             continue;
         }
-        let resp = match serde_json::from_str::<Req>(&line) {
-            Ok(req) => {
+        let resp = match parse_wire_request(&line) {
+            Ok((project_context, req)) => {
                 let activity_req = req.clone();
-                let resp = match req {
-                    Req::Poll {
-                        worker_id,
-                        token,
-                        timeout_ms,
-                    } => {
-                        let admission = {
-                            let check = server.state.lock().unwrap();
-                            if let Err(error) = verify(&check, &worker_id, &token) {
-                                Some(error)
-                            } else if check.admission_frozen() {
-                                Some(Resp::err("MIGRATION_ADMISSION_FROZEN: only identity rebind, read queries, daemon restart, and migration verify are allowed"))
-                            } else {
-                                None
-                            }
-                        };
-                        match admission {
-                            Some(response) => response,
-                            None => handle_poll_async(server.clone(), worker_id, timeout_ms).await,
-                        }
-                    }
-                    req => {
-                        let srv = server.clone();
-                        tokio::task::spawn_blocking(move || dispatch(&srv, req))
-                            .await
-                            .unwrap_or_else(|e| Resp::err(format!("handler join error: {}", e)))
-                    }
-                };
+                let resp = dispatch_wire(server.clone(), project_context, req).await;
                 let _ = record_activity(
                     &server.root,
                     "request",
@@ -6368,8 +6423,8 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
                 );
                 resp
             }
-            Err(e) => {
-                let resp = Resp::err(format!("bad request: {}", e));
+            Err(error) => {
+                let resp = Resp::err(error);
                 let _ =
                     record_activity(&server.root, "protocol_error", json!({"error": resp.error}));
                 resp
@@ -6552,8 +6607,7 @@ fn decode_journal_line(line: &str) -> Result<Vec<Event>, notification_contract::
     Ok(events)
 }
 
-fn acquire_daemon_lock(server_dir: &Path) -> anyhow::Result<std::fs::File> {
-    let lock_path = server_dir.join("daemon.lock");
+fn acquire_daemon_lock(lock_path: &Path, socket_path: &Path) -> anyhow::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -6568,7 +6622,7 @@ fn acquire_daemon_lock(server_dir: &Path) -> anyhow::Result<std::fs::File> {
     match error.raw_os_error() {
         Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => anyhow::bail!(
             "server already running at {}: {}",
-            server_dir.join("server.sock").display(),
+            socket_path.display(),
             error
         ),
         Some(code) if code == libc::EPERM => anyhow::bail!(
@@ -6640,32 +6694,21 @@ fn remove_listener_socket(sock_path: &Path, captured: &std::fs::Metadata) -> any
     Ok(())
 }
 
-fn acquire_host_daemon_lock(lock_path: &Path) -> anyhow::Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(lock_path)?;
-    use std::os::unix::io::AsRawFd;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let flock_error = std::io::Error::last_os_error();
-        anyhow::bail!(
-            "server already running: another Collab daemon holds the host lock at {}: {}",
-            lock_path.display(),
-            flock_error
-        );
-    }
-    Ok(file)
+pub async fn run(scope: Scope) -> anyhow::Result<()> {
+    let host_paths = scope.host_paths()?;
+    run_with_host_paths(scope, host_paths).await
 }
 
-pub async fn run(scope: Scope) -> anyhow::Result<()> {
-    let sock_path = scope.sock_path();
-    let server_dir = scope.server_dir();
-    std::fs::create_dir_all(&server_dir)?;
+async fn run_with_host_paths(scope: Scope, host_paths: HostPaths) -> anyhow::Result<()> {
+    host_paths.ensure_root()?;
+    let sock_path = host_paths.socket_path();
+    let project_server_dir = scope.server_dir();
+    std::fs::create_dir_all(&project_server_dir)?;
 
-    let _host_lock_file = acquire_host_daemon_lock(Path::new(HOST_DAEMON_LOCK_PATH))?;
-    let _lock_file = acquire_daemon_lock(&server_dir)?;
+    // The host lock is the only writable daemon admission gate.  Project
+    // roots still select their own journal/reducer storage, but never another
+    // socket or a second host writer.
+    let _lock_file = acquire_daemon_lock(&host_paths.lock_path(), &sock_path)?;
 
     prepare_socket_path(&sock_path)?;
 
@@ -6673,9 +6716,9 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
     let journal_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(server_dir.join("journal.jsonl"))?;
+        .open(project_server_dir.join("journal.jsonl"))?;
 
-    append_log(&server_dir.join("log.txt"), "server starting");
+    append_log(&host_paths.log_path(), "server starting");
 
     let server = Arc::new(Server {
         config: crate::config::load(&scope.root)?,
@@ -6702,18 +6745,14 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
             ))),
         };
     }
-    std::fs::write(
-        server_dir.join("server.pid"),
-        std::process::id().to_string(),
-    )
-    .map_err(
-        |error| match remove_listener_socket(&sock_path, &socket_metadata) {
+    std::fs::write(host_paths.pid_path(), std::process::id().to_string()).map_err(|error| {
+        match remove_listener_socket(&sock_path, &socket_metadata) {
             Ok(()) => anyhow::Error::new(error),
             Err(cleanup_error) => anyhow::Error::new(error).context(format!(
                 "failed to clean up startup socket: {cleanup_error}"
             )),
-        },
-    )?;
+        }
+    })?;
     let _ = record_activity(
         &scope.root,
         "daemon_start",
@@ -6740,7 +6779,7 @@ pub async fn run(scope: Scope) -> anyhow::Result<()> {
                 let srv = server.clone();
                 tokio::spawn(conn_task(srv, stream));
             }
-            Err(e) => append_log(&server_dir.join("log.txt"), &format!("accept error: {}", e)),
+            Err(e) => append_log(&host_paths.log_path(), &format!("accept error: {}", e)),
         }
     }
 }
@@ -6852,15 +6891,16 @@ mod startup_tests {
     async fn pid_publication_failure_removes_the_owned_socket() {
         let _startup_test_lock = startup_test_lock();
         let root = test_root("pid-failure");
-        let server_dir = root.join(".agent-collab/server");
-        std::fs::create_dir(server_dir.join("server.pid")).expect("occupy pid path");
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        host_paths.ensure_root().unwrap();
+        std::fs::create_dir(host_paths.pid_path()).expect("occupy pid path");
 
-        let error = run(Scope { root: root.clone() })
+        let error = run_with_host_paths(Scope { root: root.clone() }, host_paths.clone())
             .await
             .expect_err("a directory at server.pid must fail startup");
         assert!(error.to_string().contains("directory"), "{error:#}");
         assert!(
-            !server_dir.join("server.sock").exists(),
+            !host_paths.socket_path().exists(),
             "startup failure must remove the socket it just published"
         );
 
@@ -6870,7 +6910,9 @@ mod startup_tests {
     #[test]
     fn cleanup_preserves_a_replacement_socket_path() {
         let root = test_root("replacement");
-        let socket = root.join(".agent-collab/server/server.sock");
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        host_paths.ensure_root().unwrap();
+        let socket = host_paths.socket_path();
         let original = UnixListener::bind(&socket).expect("bind original socket");
         let captured = std::fs::symlink_metadata(&socket).expect("capture socket metadata");
         drop(original);
@@ -6894,21 +6936,25 @@ mod startup_tests {
     async fn retry_after_pid_failure_succeeds_once_the_path_is_fixed() {
         let _startup_test_lock = startup_test_lock();
         let root = test_root("retry");
-        let server_dir = root.join(".agent-collab/server");
-        let pid_path = server_dir.join("server.pid");
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        host_paths.ensure_root().unwrap();
+        let pid_path = host_paths.pid_path();
         std::fs::create_dir(&pid_path).expect("occupy pid path");
-        let first_error = run(Scope { root: root.clone() })
+        let first_error = run_with_host_paths(Scope { root: root.clone() }, host_paths.clone())
             .await
             .expect_err("first startup must fail");
         assert!(first_error.to_string().contains("directory"));
-        assert!(!server_dir.join("server.sock").exists());
+        assert!(!host_paths.socket_path().exists());
         std::fs::remove_dir(&pid_path).expect("remove pid directory");
 
-        let scope = Scope { root: root.clone() };
-        let running = tokio::spawn(run(Scope { root: root.clone() }));
+        let socket = host_paths.socket_path();
+        let running = tokio::spawn(run_with_host_paths(
+            Scope { root: root.clone() },
+            host_paths.clone(),
+        ));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
-            let socket = scope.sock_path();
+            let socket = socket.clone();
             let status = tokio::task::spawn_blocking(move || crate::client::daemon_status(&socket))
                 .await
                 .expect("readiness probe task must complete");
@@ -6917,7 +6963,7 @@ mod startup_tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let socket = scope.sock_path();
+        let socket = socket.clone();
         let status = tokio::task::spawn_blocking(move || crate::client::daemon_status(&socket))
             .await
             .expect("readiness probe task must complete");
