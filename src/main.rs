@@ -9,11 +9,10 @@ mod server;
 mod subagent;
 
 use clap::{Parser, Subcommand};
-use identity::{
-    AgentId, AppServerId, BindingId, CommandId, Identity, OperationId, RuntimeId, RuntimeIdentity,
-};
-use proto::{Req, Resp};
+use identity::{AppServerId, CommandId, Identity, OperationId, RuntimeIdentity};
+use proto::{ProjectContext, Req, Resp};
 use scope::Scope;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -392,9 +391,23 @@ fn out<T: serde::Serialize>(v: &T) {
 }
 
 /// Register an identity with the server (idempotent for the same token).
-fn register(scope: &Scope, ident: &Identity) -> anyhow::Result<serde_json::Value> {
+fn register(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::Value> {
+    let context_runtime = match ident.runtime.as_ref() {
+        Some(runtime) => {
+            runtime.validate()?;
+            runtime.clone()
+        }
+        None => RuntimeIdentity::cli_adapter(&ident.worker_id)?,
+    };
+    if context_runtime.appserver_id.as_str() != identity::CLI_APP_SERVER_ID {
+        anyhow::bail!(
+            "CLI identity app scope must be {}; observed {}",
+            identity::CLI_APP_SERVER_ID,
+            context_runtime.appserver_id
+        );
+    }
     let cwd = scope.root.display().to_string();
-    client::call(
+    let response: serde_json::Value = client::call_with_runtime_identity_at_root(
         &scope.sock_path(),
         &Req::Register {
             worker_id: ident.worker_id.clone(),
@@ -402,32 +415,84 @@ fn register(scope: &Scope, ident: &Identity) -> anyhow::Result<serde_json::Value
             pane: ident.pane.clone(),
             cwd,
         },
-    )
+        &scope.root,
+        &context_runtime,
+    )?;
+    let runtime =
+        identity::runtime_from_registration_receipt(&response, &ident.worker_id, &scope.root)?;
+    identity::persist_runtime(scope, ident, runtime)?;
+    Ok(response)
 }
 
 /// Identity bootstrap used by every command that acts as a worker.
 fn me(scope: &Scope, worker: Option<String>) -> anyhow::Result<Identity> {
     let worker = worker.or_else(|| std::env::var("COLLAB_WORKER").ok());
-    let ident = identity::load_or_create(scope, worker, None)?;
-    let _ = register(scope, &ident)?;
+    let mut ident = identity::load_or_create(scope, worker, None)?;
+    if ident.runtime.is_none() {
+        let _ = register(scope, &mut ident)?;
+    } else {
+        runtime_for_request(&ident)?;
+    }
     Ok(ident)
 }
 
+fn ensure_registration(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::Value> {
+    if ident.runtime.is_none() {
+        register(scope, ident)
+    } else {
+        runtime_for_request(ident)?;
+        Ok(json!({"reused": true}))
+    }
+}
+
+fn runtime_for_request<'a>(ident: &'a Identity) -> anyhow::Result<&'a RuntimeIdentity> {
+    let runtime = ident.runtime.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "identity has no registered runtime binding; register the current peer before making a project request"
+        )
+    })?;
+    runtime.validate()?;
+    if runtime.agent_id.as_str() != ident.worker_id {
+        anyhow::bail!(
+            "runtime binding agent does not match identity worker: expected {}, observed {}",
+            ident.worker_id,
+            runtime.agent_id
+        );
+    }
+    if runtime.appserver_id.as_str() != identity::CLI_APP_SERVER_ID {
+        anyhow::bail!(
+            "CLI identity app scope must be {}; observed {}",
+            identity::CLI_APP_SERVER_ID,
+            runtime.appserver_id
+        );
+    }
+    Ok(runtime)
+}
+
+fn call_project<T: DeserializeOwned>(
+    scope: &Scope,
+    ident: &Identity,
+    request: &Req,
+) -> anyhow::Result<T> {
+    let runtime = runtime_for_request(ident)?;
+    client::call_with_runtime_identity_at_root(&scope.sock_path(), request, &scope.root, runtime)
+}
+
+fn cli_project_context(root: &std::path::Path) -> anyhow::Result<ProjectContext> {
+    ProjectContext::for_registered_root_with_app(
+        root,
+        AppServerId::new(identity::CLI_APP_SERVER_ID)?,
+    )
+}
+
 fn command_envelope(scope: &Scope, ident: &Identity) -> anyhow::Result<proto::CommandEnvelope> {
-    let runtime = ident.runtime.clone().unwrap_or(RuntimeIdentity {
-        agent_id: AgentId::new(&ident.worker_id)?,
-        runtime_id: RuntimeId::new(format!("runtime-{}", ident.worker_id))?,
-        appserver_id: AppServerId::new("appserver-cli")?,
-        endpoint_generation: 0,
-        binding_id: BindingId::new(format!("binding-{}", ident.worker_id))?,
-        native_thread_id: None,
-    });
+    let runtime = runtime_for_request(ident)?;
     let route = scope.route_scope(runtime.appserver_id.clone())?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     Ok(proto::CommandEnvelope::new(
         CommandId::new(format!("command-{}-{nonce}", std::process::id()))?,
         OperationId::new(format!("operation-{}-{nonce}", std::process::id()))?,
-        runtime.binding_id,
+        runtime.binding_id.clone(),
         runtime.endpoint_generation,
         route,
         None,
@@ -465,9 +530,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     _ => None,
                 };
                 if let Some((id, snapshot_lines)) = query {
-                    let value: serde_json::Value = client::call(
+                    let value: serde_json::Value = client::call_with_context(
                         &scope.sock_path(),
                         &Req::SubagentObserve { id, snapshot_lines },
+                        Some(cli_project_context(&scope.root)?),
                     )?;
                     out(&value);
                     return Ok(());
@@ -479,11 +545,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             } else {
                 Default::default()
             };
-            let value: serde_json::Value = client::call(
-                &scope.sock_path(),
+            let value: serde_json::Value = call_project(
+                &scope,
+                &ident,
                 &Req::Subagent {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
                     command,
                     launch_env,
                 },
@@ -512,10 +579,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let scope = Scope { root: project_root };
             let started = !client::alive(&scope.sock_path());
             client::ensure_server(&scope.sock_path())?;
-            let ident = identity::load_or_create(&scope, None, None)?;
-            let registration = register(&scope, &ident)?;
+            let mut ident = identity::load_or_create(&scope, None, None)?;
+            let registration = ensure_registration(&scope, &mut ident)?;
             let task_board: serde_json::Value =
-                client::call(&scope.sock_path(), &Req::TaskStatus { task_id: None })?;
+                call_project(&scope, &ident, &Req::TaskStatus { task_id: None })?;
             out(&json!({
                 "ok": true,
                 "root": scope.root,
@@ -556,8 +623,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Down => {
             let scope = Scope::resolve()?;
             if client::alive(&scope.sock_path()) {
-                let _: serde_json::Value =
-                    client::call(&scope.sock_path(), &Req::Shutdown { operator: true })?;
+                let _: serde_json::Value = client::call_with_context(
+                    &scope.sock_path(),
+                    &Req::Shutdown { operator: true },
+                    Some(cli_project_context(&scope.root)?),
+                )?;
             }
             let server_dir = scope.host_server_dir();
             std::fs::create_dir_all(&server_dir)?;
@@ -615,8 +685,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Status { all } => {
             let scope = Scope::resolve()?;
-            let req = if all { Req::StatusAll } else { Req::Ping };
-            let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
+            let v: serde_json::Value = if all {
+                client::call_with_context(
+                    &scope.sock_path(),
+                    &Req::StatusAll,
+                    Some(cli_project_context(&scope.root)?),
+                )?
+            } else {
+                client::call(&scope.sock_path(), &Req::Ping)?
+            };
             out(&v);
             Ok(())
         }
@@ -624,20 +701,38 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let scope = Scope::resolve()?;
             match cmd {
                 MailboxCmd::Read { all, sort, worker } => {
-                    let ident = if !all && worker.is_none() {
-                        me(&scope, None).ok()
+                    let explicit_worker = worker.is_some();
+                    let actorless = all || explicit_worker;
+                    let mut identity = None;
+                    let worker_id = if actorless {
+                        worker
+                    } else if std::env::var_os("TMUX_PANE").is_none() {
+                        anyhow::bail!(
+                            "collab mailbox read outside tmux requires --all or --worker <id>"
+                        );
                     } else {
-                        None
+                        let ident = me(&scope, None)?;
+                        let worker_id = ident.worker_id.clone();
+                        identity = Some(ident);
+                        Some(worker_id)
                     };
-                    let worker_id = worker.or_else(|| ident.map(|i| i.worker_id));
-                    let v: serde_json::Value = client::call(
-                        &scope.sock_path(),
-                        &Req::MailboxRead {
-                            all,
-                            sort: Some(sort),
-                            worker_id,
-                        },
-                    )?;
+                    let request = Req::MailboxRead {
+                        all,
+                        sort: Some(sort),
+                        worker_id,
+                    };
+                    let v: serde_json::Value = if actorless {
+                        client::call_with_context(
+                            &scope.sock_path(),
+                            &request,
+                            Some(cli_project_context(&scope.root)?),
+                        )?
+                    } else {
+                        let ident = identity
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("mailbox identity was not resolved"))?;
+                        call_project(&scope, ident, &request)?
+                    };
                     out(&v);
                     Ok(())
                 }
@@ -648,43 +743,41 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Who => {
             let scope = Scope::resolve()?;
-            let v: serde_json::Value = client::call(&scope.sock_path(), &Req::Workers)?;
+            let v: serde_json::Value = client::call_with_context(
+                &scope.sock_path(),
+                &Req::Workers,
+                Some(cli_project_context(&scope.root)?),
+            )?;
             out(&v);
             Ok(())
         }
         Cmd::Root { command } | Cmd::Master { command } => {
             let scope = Scope::resolve()?;
+            let ident = me(&scope, None)?;
             let req = match command {
                 MasterCmd::Recover => {
                     anyhow::bail!(
                         "collab master recover is deprecated; use collab master promote or delegate"
                     )
                 }
-                MasterCmd::Promote { approval } => {
-                    let ident = me(&scope, None)?;
-                    Req::MasterPromote {
-                        worker_id: ident.worker_id,
-                        token: ident.token,
-                        approval,
-                    }
-                }
-                MasterCmd::Delegate { target } => {
-                    let ident = me(&scope, None)?;
-                    Req::MasterDelegate {
-                        worker_id: ident.worker_id,
-                        token: ident.token,
-                        target_id: target,
-                    }
-                }
+                MasterCmd::Promote { approval } => Req::MasterPromote {
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
+                    approval,
+                },
+                MasterCmd::Delegate { target } => Req::MasterDelegate {
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
+                    target_id: target,
+                },
                 MasterCmd::Send {
                     project,
                     to,
                     subject,
                     body,
                 } => {
-                    let ident = me(&scope, None)?;
                     let local: serde_json::Value =
-                        client::call(&scope.sock_path(), &Req::MasterStatus)?;
+                        call_project(&scope, &ident, &Req::MasterStatus)?;
                     let Some(master) = local.get("master") else {
                         anyhow::bail!("cross-project send requires this peer to be a live master")
                     };
@@ -702,10 +795,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         anyhow::bail!("target project has no .agent-collab: {}", target.display())
                     }
                     let target_scope = Scope { root: target };
-                    let value: serde_json::Value = client::call(
+                    let value: serde_json::Value = client::call_with_context(
                         &target_scope.sock_path(),
                         &Req::CrossProjectSend {
-                            from: ident.worker_id,
+                            from: ident.worker_id.clone(),
                             from_project: scope.root.display().to_string(),
                             source_master_assigned_by: master
                                 .get("assigned_by")
@@ -725,13 +818,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                             body: body.join(" "),
                             in_reply_to: None,
                         },
+                        Some(cli_project_context(&target_scope.root)?),
                     )?;
                     out(&value);
                     return Ok(());
                 }
                 MasterCmd::Status => Req::MasterStatus,
             };
-            let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
+            let v: serde_json::Value = call_project(&scope, &ident, &req)?;
             out(&v);
             Ok(())
         }
@@ -739,7 +833,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let scope = Scope::resolve()?;
             match cmd {
                 WorkerCmd::Recover => {
-                    let ident = me(&scope, None)?;
+                    let mut ident = identity::load_or_create(&scope, None, None)?;
+                    let _ = register(&scope, &mut ident)?;
                     out(&json!({
                         "recovered": true,
                         "worker_id": ident.worker_id,
@@ -751,8 +846,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     Ok(())
                 }
                 WorkerCmd::Status { id } => {
+                    let ident = me(&scope, None)?;
                     let v: serde_json::Value =
-                        client::call(&scope.sock_path(), &Req::WorkerStatus { worker_id: id })?;
+                        call_project(&scope, &ident, &Req::WorkerStatus { worker_id: id })?;
                     out(&v);
                     Ok(())
                 }
@@ -762,11 +858,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     kill_session,
                 } => {
                     let ident = me(&scope, None)?;
-                    let v: serde_json::Value = client::call(
-                        &scope.sock_path(),
+                    let v: serde_json::Value = call_project(
+                        &scope,
+                        &ident,
                         &Req::WorkerClose {
-                            worker_id: ident.worker_id,
-                            token: ident.token,
+                            worker_id: ident.worker_id.clone(),
+                            token: ident.token.clone(),
                             target_id: id,
                             reason,
                             kill_session,
@@ -795,8 +892,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Whoami { worker, pane } => {
             let scope = Scope::resolve()?;
-            let ident = identity::load_or_create(&scope, worker, pane)?;
-            let registration = register(&scope, &ident)?;
+            let mut ident = identity::load_or_create(&scope, worker, pane)?;
+            let registration = ensure_registration(&scope, &mut ident)?;
             let mut response = serde_json::to_value(&ident)?;
             response["role_brief"] = registration["role_brief"].clone();
             out(&response);
@@ -824,12 +921,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::bail!("empty message body");
             }
             let command = command_envelope(&scope, &ident)?;
-            let v: serde_json::Value = client::call(
-                &scope.sock_path(),
+            let v: serde_json::Value = call_project(
+                &scope,
+                &ident,
                 &Req::Send {
                     from: ident.worker_id.clone(),
-                    worker_id: Some(ident.worker_id),
-                    token: Some(ident.token),
+                    worker_id: Some(ident.worker_id.clone()),
+                    token: Some(ident.token.clone()),
                     command: Some(command),
                     to,
                     mtype: r#type,
@@ -844,6 +942,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Notify { cmd } => {
             let scope = Scope::resolve()?;
+            let ident = me(&scope, None)?;
             let request = match cmd {
                 NotifyCmd::Methods => Req::NotificationMethods,
                 NotifyCmd::Subscribe {
@@ -854,48 +953,40 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     repeat_count,
                     trigger_ms,
                     ttl_seconds,
-                } => {
-                    let ident = me(&scope, None)?;
-                    Req::NotificationSubscribe {
-                        worker_id: ident.worker_id,
-                        token: ident.token,
-                        event,
-                        subject,
-                        trigger_ms,
-                        trigger_times_ms: at_ms,
-                        interval_ms: every_ms,
-                        repeat_count,
-                        ttl_seconds,
-                    }
-                }
-                NotifyCmd::Status => {
-                    let ident = me(&scope, None)?;
-                    Req::NotificationStatus {
-                        worker_id: ident.worker_id,
-                        token: ident.token,
-                    }
-                }
-                NotifyCmd::Unsubscribe { subscription_id } => {
-                    let ident = me(&scope, None)?;
-                    Req::NotificationUnsubscribe {
-                        worker_id: ident.worker_id,
-                        token: ident.token,
-                        subscription_id,
-                    }
-                }
+                } => Req::NotificationSubscribe {
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
+                    event,
+                    subject,
+                    trigger_ms,
+                    trigger_times_ms: at_ms,
+                    interval_ms: every_ms,
+                    repeat_count,
+                    ttl_seconds,
+                },
+                NotifyCmd::Status => Req::NotificationStatus {
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
+                },
+                NotifyCmd::Unsubscribe { subscription_id } => Req::NotificationUnsubscribe {
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
+                    subscription_id,
+                },
             };
-            let value: serde_json::Value = client::call(&scope.sock_path(), &request)?;
+            let value: serde_json::Value = call_project(&scope, &ident, &request)?;
             out(&value);
             Ok(())
         }
         Cmd::Recv { timeout, worker } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;
-            let v: serde_json::Value = client::call(
-                &scope.sock_path(),
+            let v: serde_json::Value = call_project(
+                &scope,
+                &ident,
                 &Req::Poll {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
                     timeout_ms: timeout.saturating_mul(1000),
                 },
             )?;
@@ -905,11 +996,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Inbox { worker } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;
-            let v: serde_json::Value = client::call(
-                &scope.sock_path(),
+            let v: serde_json::Value = call_project(
+                &scope,
+                &ident,
                 &Req::Inbox {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
                 },
             )?;
             out(&v);
@@ -918,11 +1010,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Context { worker } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;
-            let v: serde_json::Value = client::call(
-                &scope.sock_path(),
+            let v: serde_json::Value = call_project(
+                &scope,
+                &ident,
                 &Req::Context {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
                 },
             )?;
             out(&v);
@@ -934,11 +1027,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;
-            let v: serde_json::Value = client::call(
-                &scope.sock_path(),
+            let v: serde_json::Value = call_project(
+                &scope,
+                &ident,
                 &Req::Ack {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: ident.worker_id.clone(),
+                    token: ident.token.clone(),
                     ids,
                 },
             )?;
@@ -947,14 +1041,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Msg { msg_id } => {
             let scope = Scope::resolve()?;
-            let v: serde_json::Value =
-                client::call(&scope.sock_path(), &Req::MsgStatus { msg_id })?;
+            let ident = me(&scope, None)?;
+            let v: serde_json::Value = call_project(&scope, &ident, &Req::MsgStatus { msg_id })?;
             out(&v);
             Ok(())
         }
         Cmd::Task { cmd } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, None)?;
+            let worker_id = ident.worker_id.clone();
+            let token = ident.token.clone();
             let req = match cmd {
                 TaskCmd::Register {
                     id,
@@ -967,8 +1063,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     next,
                     goal,
                 } => Req::TaskRegister {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                     owner,
                     feature_id: feature,
@@ -980,15 +1076,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     goal_prompt: goal,
                 },
                 TaskCmd::Update { id, status, next } => Req::TaskUpdate {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                     status,
                     next_step: next,
                 },
                 TaskCmd::Accept { id } => Req::TaskAccept {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                 },
                 TaskCmd::Relocate {
@@ -997,21 +1093,21 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     branch,
                     base_commit,
                 } => Req::TaskRelocate {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                     worktree_path: worktree,
                     branch,
                     base_commit,
                 },
                 TaskCmd::Claim { id } => Req::TaskClaim {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                 },
                 TaskCmd::Wait { id, blocking_task } => Req::TaskWait {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                     blocking_task_id: blocking_task,
                 },
@@ -1020,8 +1116,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     evidence,
                     worktree,
                 } => Req::TaskDeliver {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                     evidence: Some(evidence),
                     worktree: Some(worktree),
@@ -1032,8 +1128,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     rework,
                     evidence,
                 } => Req::TaskReview {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                     accept,
                     rework,
@@ -1044,58 +1140,60 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     commit,
                     evidence,
                 } => Req::TaskIntegrated {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                     commit,
                     evidence,
                 },
                 TaskCmd::Block { id, next } => Req::TaskUpdate {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                     status: Some("blocked".into()),
                     next_step: next,
                 },
                 TaskCmd::Close { id, force, reason } => Req::TaskClose {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                     task_id: id,
                     force,
                     reason,
                 },
                 TaskCmd::Dispatch => Req::TaskDispatch {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                 },
                 TaskCmd::Status { id } => Req::TaskStatus { task_id: id },
             };
-            let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
+            let v: serde_json::Value = call_project(&scope, &ident, &req)?;
             out(&v);
             Ok(())
         }
         Cmd::Migrate { cmd } => {
             let scope = Scope::resolve()?;
             let ident = me(&scope, None)?;
+            let worker_id = ident.worker_id.clone();
+            let token = ident.token.clone();
             let req = match cmd {
                 MigrateCmd::Inspect => Req::MigrationInspect {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                 },
                 MigrateCmd::Plan => Req::MigrationPlan {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                 },
                 MigrateCmd::Apply => Req::MigrationApply {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                 },
                 MigrateCmd::Verify => Req::MigrationVerify {
-                    worker_id: ident.worker_id,
-                    token: ident.token,
+                    worker_id: worker_id.clone(),
+                    token: token.clone(),
                 },
             };
-            let v: serde_json::Value = client::call(&scope.sock_path(), &req)?;
+            let v: serde_json::Value = call_project(&scope, &ident, &req)?;
             out(&v);
             Ok(())
         }
@@ -1137,3 +1235,89 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
 // keep Resp referenced so the type stays part of the public surface for tests
 #[allow(dead_code)]
 fn _unused(_r: Resp) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "collab-main-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn identity_with_runtime(runtime: Option<RuntimeIdentity>) -> Identity {
+        Identity {
+            worker_id: "worker-1".into(),
+            token: "token-1".into(),
+            pane: None,
+            session: None,
+            runtime,
+        }
+    }
+
+    #[test]
+    fn runtime_for_request_rejects_an_unregistered_identity() {
+        let identity = identity_with_runtime(None);
+        let error = runtime_for_request(&identity).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("identity has no registered runtime binding"));
+    }
+
+    #[test]
+    fn cli_project_context_uses_the_cli_app_and_exact_root() {
+        let root = test_root("project-context");
+        let context = cli_project_context(&root).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        assert_eq!(context.app_scope_id.as_str(), identity::CLI_APP_SERVER_ID);
+        assert_eq!(context.canonical_root, canonical.to_string_lossy());
+        assert_eq!(context.project_scope.as_str(), canonical.to_string_lossy());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ensure_registration_reuses_a_valid_runtime_without_rebinding() {
+        let root = test_root("registration-reuse");
+        let runtime = RuntimeIdentity::cli_adapter("worker-1").unwrap();
+        let mut identity = identity_with_runtime(Some(runtime));
+        let before = serde_json::to_value(&identity).unwrap();
+        let response = ensure_registration(&Scope { root: root.clone() }, &mut identity).unwrap();
+        assert_eq!(response, json!({"reused": true}));
+        assert_eq!(serde_json::to_value(&identity).unwrap(), before);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn command_envelope_uses_the_registered_binding_and_generation() {
+        let root = test_root("command-envelope");
+        let runtime = RuntimeIdentity {
+            agent_id: identity::AgentId::new("worker-1").unwrap(),
+            runtime_id: identity::RuntimeId::new("runtime-live").unwrap(),
+            appserver_id: identity::AppServerId::new(identity::CLI_APP_SERVER_ID).unwrap(),
+            endpoint_generation: 9,
+            binding_id: identity::BindingId::new("binding-live").unwrap(),
+            native_thread_id: None,
+        };
+        let identity = identity_with_runtime(Some(runtime));
+        let envelope = command_envelope(&Scope { root: root.clone() }, &identity).unwrap();
+        assert_eq!(envelope.actor_binding_id.as_str(), "binding-live");
+        assert_eq!(envelope.endpoint_generation, 9);
+        assert_eq!(
+            envelope.scope.app_scope_id.as_str(),
+            identity::CLI_APP_SERVER_ID
+        );
+        assert_eq!(
+            envelope.scope.project_scope_id.as_str(),
+            root.canonicalize().unwrap().to_string_lossy()
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+}

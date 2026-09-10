@@ -1,8 +1,9 @@
 use crate::scope::Scope;
+use anyhow::Context;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -60,6 +61,12 @@ pub(crate) fn validate_id_for_protocol(value: &str) -> anyhow::Result<()> {
     validate_id(value)
 }
 
+/// The stable AppServer route owned by the CLI adapter.  A first registration
+/// has no persisted runtime binding yet, so it may use this contract only to
+/// construct the request context.  The registration receipt remains the sole
+/// source of the current runtime binding afterwards.
+pub const CLI_APP_SERVER_ID: &str = "appserver-cli";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeIdentity {
     pub agent_id: AgentId,
@@ -72,6 +79,23 @@ pub struct RuntimeIdentity {
 }
 
 impl RuntimeIdentity {
+    /// Construct the only provisional identity permitted before registration.
+    /// Its binding and generation are never treated as a registered runtime;
+    /// they exist solely so the first Register request can carry a validated
+    /// app/project context.
+    pub fn cli_adapter(worker_id: &str) -> anyhow::Result<Self> {
+        let identity = Self {
+            agent_id: AgentId::new(worker_id.to_owned())?,
+            runtime_id: RuntimeId::new(format!("runtime-{worker_id}"))?,
+            appserver_id: AppServerId::new(CLI_APP_SERVER_ID)?,
+            endpoint_generation: 0,
+            binding_id: BindingId::new(format!("binding-{worker_id}"))?,
+            native_thread_id: None,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_id(self.agent_id.as_str())?;
         validate_id(self.runtime_id.as_str())?;
@@ -82,6 +106,87 @@ impl RuntimeIdentity {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistrationBinding {
+    project_scope: String,
+    app_scope_id: AppServerId,
+    agent_id: AgentId,
+    runtime_id: RuntimeId,
+    binding_id: BindingId,
+    endpoint_generation: u64,
+    #[serde(default)]
+    native_thread_id: Option<NativeThreadId>,
+}
+
+/// Recover the current runtime identity from the typed Register response.
+///
+/// The daemon may include a human-readable runtime channel beside the typed
+/// command.  That channel is deliberately ignored: only
+/// `typed.command.binding` contains the runtime/binding fields that authorize
+/// later commands.  The project root, worker and CLI app route are checked
+/// before the identity can be persisted.
+pub fn runtime_from_registration_receipt(
+    receipt: &serde_json::Value,
+    expected_worker_id: &str,
+    expected_root: &Path,
+) -> anyhow::Result<RuntimeIdentity> {
+    if receipt.get("typed").and_then(serde_json::Value::as_bool) != Some(true) {
+        anyhow::bail!("registration receipt is missing typed=true");
+    }
+    let worker_id = receipt
+        .get("worker_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("registration receipt is missing worker_id"))?;
+    if worker_id != expected_worker_id {
+        anyhow::bail!(
+            "registration receipt worker_id mismatch: expected {expected_worker_id}, observed {worker_id}"
+        );
+    }
+
+    let binding_value = receipt
+        .get("command")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|command| command.get("binding"))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("registration receipt is missing typed command.binding"))?;
+    let binding: RegistrationBinding = serde_json::from_value(binding_value)
+        .context("registration receipt command.binding has an invalid typed shape")?;
+
+    let canonical_root = std::fs::canonicalize(expected_root)?;
+    let canonical_root = canonical_root.to_str().ok_or_else(|| {
+        anyhow::anyhow!("registered project root must be valid UTF-8 for the wire context")
+    })?;
+    if binding.project_scope != canonical_root {
+        anyhow::bail!(
+            "registration receipt project scope mismatch: expected {canonical_root}, observed {}",
+            binding.project_scope
+        );
+    }
+    if binding.app_scope_id.as_str() != CLI_APP_SERVER_ID {
+        anyhow::bail!(
+            "registration receipt app scope mismatch: expected {CLI_APP_SERVER_ID}, observed {}",
+            binding.app_scope_id
+        );
+    }
+
+    let runtime = RuntimeIdentity {
+        agent_id: binding.agent_id,
+        runtime_id: binding.runtime_id,
+        appserver_id: binding.app_scope_id,
+        endpoint_generation: binding.endpoint_generation,
+        binding_id: binding.binding_id,
+        native_thread_id: binding.native_thread_id,
+    };
+    runtime.validate()?;
+    if runtime.agent_id.as_str() != expected_worker_id {
+        anyhow::bail!(
+            "registration receipt binding agent mismatch: expected {expected_worker_id}, observed {}",
+            runtime.agent_id
+        );
+    }
+    Ok(runtime)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +349,45 @@ fn persist_identity(scope: &Scope, ident: &Identity) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Update the live endpoint from an explicit pane/session binding.  A changed
+/// endpoint is a new runtime registration boundary; the old typed binding must
+/// not be reused for a later command envelope.
+fn refresh_endpoint(ident: &mut Identity, pane: &str, session: Option<&str>) -> bool {
+    let changed = ident.pane.as_deref() != Some(pane)
+        || session.is_some_and(|session| ident.session.as_deref() != Some(session));
+    ident.pane = Some(pane.to_owned());
+    if let Some(session) = session {
+        ident.session = Some(session.to_owned());
+    }
+    if changed {
+        ident.runtime = None;
+    }
+    changed
+}
+
+/// Persist a runtime binding recovered from a successful typed registration.
+/// Update the in-memory identity only after every mirrored identity file has
+/// been written successfully.
+pub fn persist_runtime(
+    scope: &Scope,
+    ident: &mut Identity,
+    runtime: RuntimeIdentity,
+) -> anyhow::Result<()> {
+    runtime.validate()?;
+    if runtime.agent_id.as_str() != ident.worker_id {
+        anyhow::bail!(
+            "runtime binding agent does not match identity worker: expected {}, observed {}",
+            ident.worker_id,
+            runtime.agent_id
+        );
+    }
+    let mut updated = ident.clone();
+    updated.runtime = Some(runtime);
+    persist_identity(scope, &updated)?;
+    *ident = updated;
+    Ok(())
+}
+
 fn read_identity(path: &std::path::Path) -> anyhow::Result<Option<Identity>> {
     if !path.exists() {
         return Ok(None);
@@ -288,18 +432,14 @@ pub fn provision(
     if worker_id.is_empty() || session.is_empty() {
         anyhow::bail!("collab identity requires a session name");
     }
-    let ident = read_identity(&identity_path(scope, worker_id))?.unwrap_or_else(|| Identity {
+    let mut ident = read_identity(&identity_path(scope, worker_id))?.unwrap_or_else(|| Identity {
         worker_id: worker_id.into(),
         token: hex(16),
         pane: Some(pane.into()),
         session: Some(session.into()),
         runtime: None,
     });
-    let ident = Identity {
-        pane: Some(pane.into()),
-        session: Some(session.into()),
-        ..ident
-    };
+    refresh_endpoint(&mut ident, pane, Some(session));
     persist_identity(scope, &ident)?;
     Ok(ident)
 }
@@ -317,28 +457,24 @@ pub fn load_or_create(
         .filter(|pane| pane.starts_with('%'))
         .ok_or_else(|| anyhow::anyhow!("collab identity requires a live tmux pane"))?;
     let requested = worker_id.or_else(|| std::env::var("COLLAB_WORKER").ok());
-    if let Some(ident) = read_identity(&pane_identity_path(scope, &pane))? {
-        return Ok(Identity {
-            pane: Some(pane),
-            ..ident
-        });
+    if let Some(mut ident) = read_identity(&pane_identity_path(scope, &pane))? {
+        if refresh_endpoint(&mut ident, &pane, None) {
+            persist_identity(scope, &ident)?;
+        }
+        return Ok(ident);
     }
     if let Some(worker_id) = requested.clone() {
-        if let Some(ident) = read_identity(&identity_path(scope, &worker_id))? {
-            return Ok(Identity {
-                pane: Some(pane),
-                ..ident
-            });
+        if let Some(mut ident) = read_identity(&identity_path(scope, &worker_id))? {
+            if refresh_endpoint(&mut ident, &pane, None) {
+                persist_identity(scope, &ident)?;
+            }
+            return Ok(ident);
         }
     }
     let session = tmux_session(&pane)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve tmux session for pane {}", pane))?;
-    if let Some(ident) = read_identity(&session_identity_path(scope, &session))? {
-        let ident = Identity {
-            pane: Some(pane),
-            session: Some(session),
-            ..ident
-        };
+    if let Some(mut ident) = read_identity(&session_identity_path(scope, &session))? {
+        refresh_endpoint(&mut ident, &pane, Some(&session));
         persist_identity(scope, &ident)?;
         return Ok(ident);
     }
@@ -400,6 +536,62 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn endpoint_rebind_clears_runtime_and_updates_current_mirrors() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-identity-rebind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
+        let scope = Scope { root: root.clone() };
+
+        let mut registered = provision(&scope, "agent-1", "%743", "session-1").unwrap();
+        let runtime = runtime_identity(7, "binding-7");
+        persist_runtime(&scope, &mut registered, runtime.clone()).unwrap();
+
+        let same_endpoint =
+            load_or_create(&scope, Some("agent-1".into()), Some("%743".into())).unwrap();
+        assert_eq!(same_endpoint.runtime, Some(runtime));
+
+        let rebound = load_or_create(&scope, Some("agent-1".into()), Some("%744".into())).unwrap();
+        assert_eq!(rebound.pane.as_deref(), Some("%744"));
+        assert_eq!(rebound.session.as_deref(), Some("session-1"));
+        assert_eq!(rebound.runtime, None);
+
+        for path in [
+            identity_path(&scope, "agent-1"),
+            session_identity_path(&scope, "session-1"),
+            pane_identity_path(&scope, "%744"),
+        ] {
+            let mirror = read_identity(&path).unwrap().unwrap();
+            assert_eq!(mirror.worker_id, rebound.worker_id);
+            assert_eq!(mirror.token, rebound.token);
+            assert_eq!(mirror.pane, rebound.pane);
+            assert_eq!(mirror.session, rebound.session);
+            assert_eq!(mirror.runtime, None);
+        }
+
+        let mut session_rebound = rebound;
+        let session_runtime = runtime_identity(8, "binding-8");
+        persist_runtime(&scope, &mut session_rebound, session_runtime).unwrap();
+        let session_changed = provision(&scope, "agent-1", "%744", "session-2").unwrap();
+        assert_eq!(session_changed.runtime, None);
+        assert_eq!(session_changed.session.as_deref(), Some("session-2"));
+        assert_eq!(
+            read_identity(&session_identity_path(&scope, "session-2"))
+                .unwrap()
+                .unwrap()
+                .runtime,
+            None
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
     fn runtime_identity(generation: u64, binding: &str) -> RuntimeIdentity {
         RuntimeIdentity {
             agent_id: AgentId::new("agent-1").unwrap(),
@@ -430,6 +622,108 @@ mod tests {
             serde_json::from_value::<RuntimeIdentity>(encoded).unwrap(),
             identity
         );
+    }
+
+    #[test]
+    fn cli_adapter_identity_has_one_stable_app_scope() {
+        let first = RuntimeIdentity::cli_adapter("worker-1").unwrap();
+        let second = RuntimeIdentity::cli_adapter("worker-1").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.appserver_id.as_str(), CLI_APP_SERVER_ID);
+        assert_eq!(first.endpoint_generation, 0);
+    }
+
+    #[test]
+    fn registration_receipt_recovers_typed_command_binding() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-registration-receipt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let receipt = serde_json::json!({
+            "typed": true,
+            "worker_id": "worker-1",
+            "runtime": "untrusted-channel-label",
+            "command": {
+                "cmd": "RegisterWorker",
+                "binding": {
+                    "project_scope": canonical_root.to_str().unwrap(),
+                    "app_scope_id": CLI_APP_SERVER_ID,
+                    "agent_id": "worker-1",
+                    "runtime_id": "runtime-pane-1",
+                    "binding_id": "binding-1",
+                    "endpoint_generation": 4,
+                    "native_thread_id": "thread-1"
+                }
+            }
+        });
+
+        let runtime = runtime_from_registration_receipt(&receipt, "worker-1", &root).unwrap();
+        assert_eq!(runtime.agent_id.as_str(), "worker-1");
+        assert_eq!(runtime.runtime_id.as_str(), "runtime-pane-1");
+        assert_eq!(runtime.appserver_id.as_str(), CLI_APP_SERVER_ID);
+        assert_eq!(runtime.endpoint_generation, 4);
+        assert_eq!(runtime.binding_id.as_str(), "binding-1");
+        assert_eq!(
+            runtime.native_thread_id.as_ref().unwrap().as_str(),
+            "thread-1"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn registration_receipt_rejects_missing_runtime_binding() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-registration-missing-binding-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let error = runtime_from_registration_receipt(
+            &serde_json::json!({"typed": true, "worker_id": "worker-1"}),
+            "worker-1",
+            &root,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("typed command.binding"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn persist_runtime_updates_all_identity_state_after_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-persist-runtime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
+        let scope = Scope { root: root.clone() };
+        let mut identity = Identity {
+            worker_id: "agent-1".into(),
+            token: "token-1".into(),
+            pane: None,
+            session: None,
+            runtime: None,
+        };
+        let runtime = runtime_identity(7, "binding-7");
+        persist_runtime(&scope, &mut identity, runtime.clone()).unwrap();
+        assert_eq!(identity.runtime, Some(runtime.clone()));
+        let persisted = read_identity(&identity_path(&scope, "agent-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runtime, Some(runtime));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

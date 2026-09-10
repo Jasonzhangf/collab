@@ -599,6 +599,32 @@ impl GlobalState {
         self.projects.get(project_scope.as_str())
     }
 
+    /// Register one `(app_scope_id, project_scope_id)` route.  The route is
+    /// the typed key used by future server routing; registration creation
+    /// remains the only operation that creates a project entry.
+    pub fn register_project_for_route(
+        &mut self,
+        route_scope: &RouteScope,
+        registered_at_ms: i64,
+    ) -> Result<StateVersion, StateError> {
+        validate_route_scope(route_scope)?;
+        let registration = ProjectRegistration::with_registered_at(
+            route_scope.project_scope_id.clone(),
+            route_scope.app_scope_id.clone(),
+            registered_at_ms,
+        )?;
+        self.register_project(registration)
+    }
+
+    /// Look up a project only when the requested AppServer is registered for
+    /// that project.  This prevents a known project from being treated as a
+    /// valid route for an unknown AppServer scope.
+    pub fn lookup_project_for_route(&self, route_scope: &RouteScope) -> Option<&ProjectState> {
+        validate_route_scope(route_scope).ok()?;
+        self.lookup_registration(&route_scope.project_scope_id, &route_scope.app_scope_id)
+            .and_then(|_| self.lookup_project(&route_scope.project_scope_id))
+    }
+
     pub fn lookup_registration(
         &self,
         project_scope: &ProjectScopeId,
@@ -631,9 +657,22 @@ impl GlobalState {
         route_scope: &RouteScope,
         binding_id: &BindingId,
     ) -> Option<&RuntimeBinding> {
-        self.lookup_project(&route_scope.project_scope_id)
+        self.lookup_project_for_route(route_scope)
             .and_then(|project| project.lookup_binding(binding_id))
             .filter(|binding| binding.app_scope_id == route_scope.app_scope_id)
+    }
+
+    pub fn lookup_master_grant_for(
+        &self,
+        route_scope: &RouteScope,
+        binding_id: &BindingId,
+    ) -> Option<&MasterGrant> {
+        self.lookup_project_for_route(route_scope)
+            .and_then(|project| project.lookup_master_grant(binding_id))
+            .filter(|grant| {
+                grant.project_scope == route_scope.project_scope_id
+                    && grant.app_scope_id == route_scope.app_scope_id
+            })
     }
 
     pub fn lookup_master_grant(
@@ -655,10 +694,7 @@ impl GlobalState {
     /// host-wide map owns command idempotency.  Consequently the receipt's
     /// coordinates are validated as durable values but do not have to be
     /// bounded by this reducer's independent version counters.
-    pub fn record_command_projection(
-        &mut self,
-        receipt: CommandReceipt,
-    ) -> Result<(), StateError> {
+    pub fn record_command_projection(&mut self, receipt: CommandReceipt) -> Result<(), StateError> {
         receipt.validate()?;
         if receipt.epoch != self.epoch {
             return Err(StateError::Invariant(format!(
@@ -945,6 +981,15 @@ impl GlobalState {
             .map_or(PeerRole::Peer, |_| PeerRole::Master)
     }
 
+    pub fn role_for_route(&self, route_scope: &RouteScope, binding_id: &BindingId) -> PeerRole {
+        let Some(binding) = self.lookup_binding_for(route_scope, binding_id) else {
+            return PeerRole::Peer;
+        };
+        self.lookup_master_grant_for(route_scope, binding_id)
+            .filter(|grant| grant.endpoint_generation == binding.endpoint_generation)
+            .map_or(PeerRole::Peer, |_| PeerRole::Master)
+    }
+
     pub fn record_command(
         &mut self,
         command_id: CommandId,
@@ -1083,6 +1128,11 @@ fn validate_project_scope(scope: &ProjectScopeId) -> Result<(), StateError> {
         .map(|_| ())
 }
 
+fn validate_route_scope(scope: &RouteScope) -> Result<(), StateError> {
+    validate_app_scope(&scope.app_scope_id)?;
+    validate_project_scope(&scope.project_scope_id)
+}
+
 fn validate_app_scope(scope: &AppServerId) -> Result<(), StateError> {
     AppServerId::new(scope.as_str().to_owned())
         .map_err(|error| StateError::invalid("app scope", error.to_string()))
@@ -1215,6 +1265,84 @@ mod tests {
     }
 
     #[test]
+    fn route_registration_is_idempotent_and_conflicts_keep_the_original() {
+        let scope = project_scope();
+        let route = RouteScope {
+            app_scope_id: app_scope("app-one"),
+            project_scope_id: scope.clone(),
+        };
+        let mut state = GlobalState::default();
+        let first = state
+            .register_project_for_route(&route, 11)
+            .expect("first route registration");
+        let replay = state
+            .register_project_for_route(&route, 11)
+            .expect("identical route registration is idempotent");
+        assert_eq!(replay, first);
+        assert_eq!(state.projects.len(), 1);
+
+        let conflict = state.register_project_for_route(&route, 12);
+        assert!(matches!(
+            conflict,
+            Err(StateError::RegistrationConflict {
+                project_scope,
+                app_scope_id
+            }) if project_scope == scope.as_str() && app_scope_id == "app-one"
+        ));
+        assert_eq!(
+            state
+                .lookup_registration(&scope, &route.app_scope_id)
+                .unwrap()
+                .registered_at_ms,
+            11
+        );
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn route_lookup_rejects_unknown_project_or_app_scope() {
+        let scope = project_scope();
+        let unknown_project =
+            ProjectScopeId::new(format!("{}/unknown", scope.as_str())).expect("scope");
+        let known_route = RouteScope {
+            app_scope_id: app_scope("app-one"),
+            project_scope_id: scope.clone(),
+        };
+        let unknown_app_route = RouteScope {
+            app_scope_id: app_scope("app-unknown"),
+            project_scope_id: scope.clone(),
+        };
+        let unknown_project_route = RouteScope {
+            app_scope_id: app_scope("app-one"),
+            project_scope_id: unknown_project.clone(),
+        };
+        let mut state = GlobalState::default();
+        state
+            .register_project_for_route(&known_route, 1)
+            .expect("known route registration");
+
+        assert!(state.lookup_project_for_route(&unknown_app_route).is_none());
+        assert!(state
+            .lookup_project_for_route(&unknown_project_route)
+            .is_none());
+        let binding = binding(
+            &unknown_project,
+            "app-one",
+            "agent-one",
+            "runtime-one",
+            "binding-one",
+            1,
+        );
+        let before = state.version();
+        assert!(matches!(
+            state.bind_runtime(binding),
+            Err(StateError::ProjectNotRegistered(_))
+        ));
+        assert_eq!(state.version(), before);
+        state.validate().unwrap();
+    }
+
+    #[test]
     fn same_project_different_app_scopes_keep_separate_registrations_and_bindings() {
         let scope = project_scope();
         let mut state = GlobalState::default();
@@ -1322,6 +1450,93 @@ mod tests {
         );
         state.validate_binding(&first).unwrap();
         state.validate_binding(&second).unwrap();
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn master_grants_are_isolated_by_project_route_and_generation() {
+        let first_scope = project_scope();
+        let second_scope = ProjectScopeId::new(format!("{}/second", first_scope.as_str()))
+            .expect("second project scope");
+        let first_route = RouteScope {
+            app_scope_id: app_scope("app-one"),
+            project_scope_id: first_scope.clone(),
+        };
+        let second_route = RouteScope {
+            app_scope_id: app_scope("app-one"),
+            project_scope_id: second_scope.clone(),
+        };
+        let mut state = GlobalState::default();
+        state.register_project_for_route(&first_route, 1).unwrap();
+        state.register_project_for_route(&second_route, 2).unwrap();
+        let first_binding = binding(
+            &first_scope,
+            "app-one",
+            "agent-one",
+            "runtime-one",
+            "shared-binding",
+            3,
+        );
+        let second_binding = binding(
+            &second_scope,
+            "app-one",
+            "agent-two",
+            "runtime-two",
+            "shared-binding",
+            4,
+        );
+        state.bind_runtime(first_binding.clone()).unwrap();
+        state.bind_runtime(second_binding.clone()).unwrap();
+        state
+            .grant_master(grant(
+                &first_scope,
+                "app-one",
+                "agent-one",
+                "shared-binding",
+                3,
+            ))
+            .unwrap();
+        state
+            .grant_master(grant(
+                &second_scope,
+                "app-one",
+                "agent-two",
+                "shared-binding",
+                4,
+            ))
+            .unwrap();
+
+        let shared_id = BindingId::new("shared-binding").unwrap();
+        assert_eq!(
+            state
+                .lookup_master_grant_for(&first_route, &shared_id)
+                .unwrap()
+                .project_scope,
+            first_scope
+        );
+        assert_eq!(
+            state
+                .lookup_master_grant_for(&second_route, &shared_id)
+                .unwrap()
+                .project_scope,
+            second_scope
+        );
+        assert_eq!(
+            state.role_for_route(&first_route, &shared_id),
+            PeerRole::Master
+        );
+        assert_eq!(
+            state.role_for_route(&second_route, &shared_id),
+            PeerRole::Master
+        );
+        let wrong_route = RouteScope {
+            app_scope_id: app_scope("app-unknown"),
+            project_scope_id: first_scope,
+        };
+        assert_eq!(
+            state.role_for_route(&wrong_route, &shared_id),
+            PeerRole::Peer
+        );
         state.validate().unwrap();
     }
 
