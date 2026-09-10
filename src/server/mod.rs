@@ -34,6 +34,67 @@ use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
+/// The resident v1 daemon owns one project reducer/journal.  Keep that
+/// ownership explicit at the host boundary instead of treating the process
+/// root as an implicit fallback for every valid project context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostRouteOwner {
+    ResidentProject { root: PathBuf, journal: PathBuf },
+    RegisteredNotReady { root: PathBuf },
+}
+
+#[derive(Debug, Clone, Default)]
+struct HostRouteRegistry {
+    routes: std::collections::BTreeMap<String, HostRouteOwner>,
+}
+
+impl HostRouteRegistry {
+    fn for_server(server: &Server) -> Result<Self, String> {
+        let resident_scope = GlobalState::canonical_project_scope(&server.root)
+            .map_err(|error| format!("PROJECT_SCOPE_UNKNOWN: {error}"))?;
+        let resident_root = PathBuf::from(resident_scope.as_str());
+        let resident_journal = server
+            .root
+            .join(".agent-collab")
+            .join("server")
+            .join("journal.jsonl");
+        let mut routes = std::collections::BTreeMap::new();
+        routes.insert(
+            resident_scope.as_str().to_owned(),
+            HostRouteOwner::ResidentProject {
+                root: resident_root,
+                journal: resident_journal,
+            },
+        );
+
+        // GlobalState is the only durable registration index available to the
+        // v1 resident process.  A registered project without a resident
+        // reducer remains visible as a route, but cannot be sent to this
+        // project's State/journal until multi-project migration is complete.
+        let st = server.state.lock().unwrap();
+        for project in st.global.projects.values() {
+            if project.registrations.is_empty() {
+                continue;
+            }
+            let scope = project.project_scope.as_str().to_owned();
+            if scope == resident_scope.as_str() {
+                continue;
+            }
+            routes.insert(
+                scope,
+                HostRouteOwner::RegisteredNotReady {
+                    root: PathBuf::from(project.project_scope.as_str()),
+                },
+            );
+        }
+        Ok(Self { routes })
+    }
+
+    fn lookup(&self, context: &ProjectContext) -> Option<&HostRouteOwner> {
+        self.routes.get(context.project_scope.as_str())
+    }
+}
+
 const MAX_POLL_MS: u64 = 3_600_000;
 const TASK_STATUSES: [&str; 12] = [
     "assigned",
@@ -6336,30 +6397,192 @@ pub(crate) fn validate_request_context(
     project_context
         .validate()
         .map_err(|error| format!("PROJECT_CONTEXT_INVALID: {error}"))?;
-    let registered_scope = GlobalState::canonical_project_scope(&server.root)
-        .map_err(|error| format!("PROJECT_SCOPE_UNKNOWN: {error}"))?;
-    if project_context.canonical_root != registered_scope.as_str()
-        || project_context.project_scope != registered_scope
-    {
-        return Err(format!(
-            "PROJECT_SCOPE_UNKNOWN: host daemon is bound to {}, request selected {}",
-            registered_scope.as_str(),
+    let registry = HostRouteRegistry::for_server(server)?;
+    match registry.lookup(project_context) {
+        Some(HostRouteOwner::ResidentProject { root, .. }) => {
+            if project_context.canonical_root != root.to_string_lossy() {
+                return Err(format!(
+                    "PROJECT_SCOPE_MISMATCH: route root {} does not match context {}",
+                    root.display(),
+                    project_context.canonical_root
+                ));
+            }
+            if let Req::Register { cwd, .. } = req {
+                let request_scope = GlobalState::canonical_project_scope(Path::new(cwd))
+                    .map_err(|error| format!("PROJECT_SCOPE_INVALID: {error}"))?;
+                if request_scope.as_str() != root.to_string_lossy() {
+                    return Err(format!(
+                        "PROJECT_SCOPE_MISMATCH: register cwd {} is outside {}",
+                        cwd,
+                        root.display()
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Some(HostRouteOwner::RegisteredNotReady { root }) => Err(format!(
+            "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: project route {} is registered but has no migrated reducer/journal owner",
+            root.display()
+        )),
+        None => Err(format!(
+            "PROJECT_SCOPE_UNKNOWN: no host route is registered for {}",
             project_context.canonical_root
-        ));
+        )),
+    }
+}
+
+#[cfg(test)]
+mod host_route_registry_tests {
+    use super::*;
+
+    static TEST_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn test_server() -> (Arc<Server>, PathBuf, PathBuf) {
+        let id = TEST_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("collab-host-route-{id}-{}", std::process::id()));
+        let server_dir = root.join(".agent-collab").join("server");
+        std::fs::create_dir_all(&server_dir).unwrap();
+        let journal_path = server_dir.join("journal.jsonl");
+        let journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        let server = Arc::new(Server {
+            config: crate::config::Config::default(),
+            root: root.clone(),
+            state: Mutex::new(State::default()),
+            journal: Mutex::new(journal),
+            pane_alive_check: |_| PanePresence::Present,
+            pane_owner_check: |_, _| Ok(true),
+            pane_state_check: |_| crate::server::knock::AgentState::Working,
+            mailbox_notify: Notify::new(),
+        });
+        (server, root, journal_path)
     }
 
-    if let Req::Register { cwd, .. } = req {
-        let request_scope = GlobalState::canonical_project_scope(Path::new(cwd))
-            .map_err(|error| format!("PROJECT_SCOPE_INVALID: {error}"))?;
-        if request_scope != registered_scope {
-            return Err(format!(
-                "PROJECT_SCOPE_MISMATCH: register cwd {} is outside {}",
-                cwd,
-                registered_scope.as_str()
-            ));
-        }
+    fn context(root: &Path) -> ProjectContext {
+        ProjectContext::for_registered_root(root).unwrap()
     }
-    Ok(())
+
+    fn register_known_project(server: &Server, root: &Path) {
+        let scope = GlobalState::canonical_project_scope(root).unwrap();
+        let app = AppServerId::new("tui-default").unwrap();
+        let registration = ProjectRegistration::new(scope, app).unwrap();
+        server
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .register_project(registration)
+            .unwrap();
+    }
+
+    #[test]
+    fn raw_ping_keeps_context_free_readiness() {
+        let (server, root, _) = test_server();
+        assert!(validate_request_context(&server, &Req::Ping, None).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unknown_project_route_fails_closed() {
+        let (server, root, _) = test_server();
+        let other_root = root.with_file_name(format!(
+            "{}-other",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&other_root).unwrap();
+        let error = validate_request_context(&server, &Req::StatusAll, Some(&context(&other_root)))
+            .unwrap_err();
+        assert!(error.starts_with("PROJECT_SCOPE_UNKNOWN:"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[test]
+    fn registered_project_without_migrated_reducer_is_explicitly_not_ready() {
+        let (server, root, _) = test_server();
+        let other_root = root.with_file_name(format!(
+            "{}-other",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&other_root).unwrap();
+        register_known_project(&server, &other_root);
+        let error = validate_request_context(&server, &Req::StatusAll, Some(&context(&other_root)))
+            .unwrap_err();
+        assert!(
+            error.starts_with("PROJECT_ROUTE_NOT_READY/UNSUPPORTED:"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[test]
+    fn context_scope_spoof_is_rejected_before_route_lookup() {
+        let (server, root, _) = test_server();
+        let other_root = root.with_file_name(format!(
+            "{}-other",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&other_root).unwrap();
+        let mut spoofed = context(&other_root);
+        spoofed.project_scope = context(&root).project_scope;
+        let error = validate_request_context(&server, &Req::StatusAll, Some(&spoofed)).unwrap_err();
+        assert!(error.starts_with("PROJECT_CONTEXT_INVALID:"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn not_ready_route_does_not_mutate_state_or_primary_journal() {
+        let (server, root, journal_path) = test_server();
+        let other_root = root.with_file_name(format!(
+            "{}-other",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&other_root).unwrap();
+        register_known_project(&server, &other_root);
+        let before_journal = std::fs::read(&journal_path).unwrap();
+        let before_revision = server.state.lock().unwrap().revision;
+        let response =
+            dispatch_wire(server.clone(), Some(context(&other_root)), Req::StatusAll).await;
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .unwrap()
+            .starts_with("PROJECT_ROUTE_NOT_READY/UNSUPPORTED:"));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
+        assert_eq!(server.state.lock().unwrap().revision, before_revision);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[test]
+    fn repeated_registry_builds_do_not_duplicate_or_replace_route_owner() {
+        let (server, root, _) = test_server();
+        let other_root = root.with_file_name(format!(
+            "{}-other",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&other_root).unwrap();
+        register_known_project(&server, &other_root);
+        let first = HostRouteRegistry::for_server(&server).unwrap();
+        let second = HostRouteRegistry::for_server(&server).unwrap();
+        assert_eq!(first.routes, second.routes);
+        assert!(matches!(
+            first.lookup(&context(&root)),
+            Some(HostRouteOwner::ResidentProject { .. })
+        ));
+        assert!(matches!(
+            first.lookup(&context(&other_root)),
+            Some(HostRouteOwner::RegisteredNotReady { .. })
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
+    }
 }
 
 fn parse_wire_request(line: &str) -> Result<(Option<ProjectContext>, Req), String> {
