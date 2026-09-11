@@ -15,10 +15,13 @@ pub fn tick(server: &Arc<Server>) {
 }
 
 fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
+    tick_with_idle_at(server, now_ms(), _can_receive);
+}
+
+fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str) -> bool) {
     if server.state.lock().unwrap().admission_frozen() {
         return;
     }
-    let now = now_ms();
     let checks: Vec<(String, String, String, Option<String>)> = {
         let state = server.state.lock().unwrap();
         state
@@ -369,6 +372,12 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
                 (message.state == "pending"
                     && !unknown_sub_ids.contains(subscription_id)
                     && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
+                    && !super::mailbox::is_explicit_delivery_mode(&state, message)
+                    && super::mailbox::automatic_retry_eligible(
+                        message,
+                        server.config.notifications.delay_ms(&subscription.event),
+                        now,
+                    )
                     && subscription.status == "armed"
                     && subscription.expires_ms > now)
                     .then(|| (message_id.clone(), subscription_id.clone()))
@@ -376,13 +385,14 @@ fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
             .collect()
     };
     for (message_id, subscription_id) in candidates {
-        super::attempt_notification_with(
+        super::attempt_notification_with_at(
             server,
             &message_id,
             &subscription_id,
             &|pane| (server.pane_state_check)(pane) == super::knock::AgentState::Waiting,
             &|pane, text| super::knock_or_log(&server.log_path(), pane, text),
             &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
+            now,
         );
     }
 }
@@ -524,11 +534,12 @@ mod tests {
         )
     }
 
-    fn bind_message_with_id(
+    fn bind_message_with_type(
         server: &Server,
         worker_id: &str,
         subscription_id: &str,
         message_id: &str,
+        message_type: &str,
     ) -> String {
         server.commit(&[
             Event::Sent {
@@ -536,7 +547,7 @@ mod tests {
                     id: message_id.to_string(),
                     from: "peer".into(),
                     to: worker_id.into(),
-                    mtype: "notify".into(),
+                    mtype: message_type.into(),
                     subject: Some("released:held".into()),
                     body: "RESOURCE_RELEASED task=held".into(),
                     in_reply_to: None,
@@ -552,6 +563,15 @@ mod tests {
             },
         ]);
         message_id.to_string()
+    }
+
+    fn bind_message_with_id(
+        server: &Server,
+        worker_id: &str,
+        subscription_id: &str,
+        message_id: &str,
+    ) -> String {
+        bind_message_with_type(server, worker_id, subscription_id, message_id, "notify")
     }
 
     fn working_task(server: &Server, worker_id: &str) {
@@ -982,42 +1002,240 @@ mod tests {
     }
 
     #[test]
-    fn repeated_timer_ticks_wait_for_batch_window_and_attempt_once() {
-        let (server, root) = test_server();
+    fn automatic_retry_uses_bound_event_policy_window() {
+        let (mut server, root) = test_server();
+        Arc::get_mut(&mut server)
+            .unwrap()
+            .config
+            .notifications
+            .batch_window_seconds = 7;
         register(&server, "owner");
-        let sub = subscribe(&server, "owner", "direct-message", None, None);
-        let id = bind_message(&server, "owner", &sub);
-        server
-            .state
-            .lock()
-            .unwrap()
-            .msgs
-            .get_mut(&id)
-            .unwrap()
-            .created_ms = now_ms();
-
-        for _ in 0..4 {
-            tick_with_idle(&server, &|_| true);
+        let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
+        let message_id = bind_message(&server, "owner", &subscription_id);
+        let base = now_ms();
+        let delay_ms = server.config.notifications.delay_ms("direct-message");
+        {
+            let mut state = server.state.lock().unwrap();
+            state
+                .notification_subscriptions
+                .get_mut(&subscription_id)
+                .unwrap()
+                .expires_ms = base + 300_000;
+            state.msgs.get_mut(&message_id).unwrap().created_ms = base - delay_ms - 1;
         }
-        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 0);
 
-        server
-            .state
-            .lock()
-            .unwrap()
-            .msgs
-            .get_mut(&id)
-            .unwrap()
-            .created_ms -= super::super::mailbox::AUTOMATIC_BATCH_WINDOW_MS + 1;
-        tick_with_idle(&server, &|_| true);
-        for _ in 0..4 {
-            tick_with_idle(&server, &|_| true);
-        }
+        assert_eq!(delay_ms, 7_000);
+        assert!(!super::super::attempt_notification_with_at(
+            &server,
+            &message_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| false,
+            &|_, _| Ok(true),
+            base,
+        ));
         assert_eq!(
-            server.state.lock().unwrap().msgs[&id].wake_attempt_count,
-            MAX_WAKE_ATTEMPTS
+            server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
+            1
+        );
+
+        tick_with_idle_at(&server, base + delay_ms - 1, &|_| true);
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
+            1,
+            "the bound direct-message window has not elapsed"
+        );
+        {
+            let state = server.state.lock().unwrap();
+            assert!(!super::super::mailbox::automatic_retry_eligible(
+                &state.msgs[&message_id],
+                delay_ms,
+                base + delay_ms - 1
+            ));
+            assert!(super::super::mailbox::automatic_retry_eligible(
+                &state.msgs[&message_id],
+                delay_ms,
+                base + delay_ms
+            ));
+        }
+
+        tick_with_idle_at(&server, base + delay_ms, &|_| true);
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
+            1,
+            "the lifetime attempt cap remains in force at the event-policy boundary"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn immediate_event_policy_is_not_delayed_by_the_batch_window() {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let subscription_id = subscribe(&server, "owner", "deadline", Some("due"), None);
+        let message_id = bind_message(&server, "owner", &subscription_id);
+        let base = now_ms();
+        let delay_ms = server.config.notifications.delay_ms("deadline");
+        assert_eq!(delay_ms, 0);
+        {
+            let mut state = server.state.lock().unwrap();
+            state
+                .notification_subscriptions
+                .get_mut(&subscription_id)
+                .unwrap()
+                .expires_ms = base + 300_000;
+            state.msgs.get_mut(&message_id).unwrap().created_ms = base - 1;
+        }
+        assert!(!super::super::attempt_notification_with_at(
+            &server,
+            &message_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| false,
+            &|_, _| Ok(true),
+            base,
+        ));
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
+            1
+        );
+
+        {
+            let state = server.state.lock().unwrap();
+            assert!(super::super::mailbox::automatic_retry_eligible(
+                &state.msgs[&message_id],
+                delay_ms,
+                base + 1
+            ));
+        }
+        tick_with_idle_at(&server, base + 1, &|_| true);
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
+            1,
+            "the lifetime attempt cap remains in force for immediate events"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn failed_explicit_message_is_not_automatically_replayed(message_type: &str) {
+        let (server, root) = test_server();
+        register(&server, "owner");
+        let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
+        let message_id = bind_message_with_type(
+            &server,
+            "owner",
+            &subscription_id,
+            &format!("explicit-{message_type}"),
+            message_type,
+        );
+        let base = now_ms();
+        {
+            let mut state = server.state.lock().unwrap();
+            state
+                .notification_subscriptions
+                .get_mut(&subscription_id)
+                .unwrap()
+                .expires_ms = base + 300_000;
+        }
+        server.commit(&[Event::DeliveryMode {
+            msg_id: message_id.clone(),
+            mode: "explicit-notification".into(),
+        }]);
+
+        {
+            let state = server.state.lock().unwrap();
+            assert!(super::super::mailbox::is_explicit_delivery_mode(
+                &state,
+                &state.msgs[&message_id]
+            ));
+        }
+        assert!(!super::super::attempt_notification_with_at(
+            &server,
+            &message_id,
+            &subscription_id,
+            &|_| true,
+            &|_, _| false,
+            &|_, _| Ok(true),
+            base,
+        ));
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
+            1
+        );
+
+        tick_with_idle_at(&server, base + 120_000, &|_| true);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs[&message_id].state, "pending");
+        assert_eq!(state.msgs[&message_id].wake_attempt_count, 1);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_explicit_peer_notification_is_not_automatically_replayed() {
+        failed_explicit_message_is_not_automatically_replayed("notify");
+    }
+
+    #[test]
+    fn failed_explicit_request_is_not_automatically_replayed() {
+        failed_explicit_message_is_not_automatically_replayed("request");
+    }
+
+    #[test]
+    fn failed_explicit_reply_is_not_automatically_replayed() {
+        failed_explicit_message_is_not_automatically_replayed("reply");
+    }
+
+    #[test]
+    fn explicit_typed_messages_are_isolated_from_immediate_system_batches() {
+        for message_type in ["request", "reply"] {
+            let (server, root) = test_server();
+            register(&server, "owner");
+            let direct_subscription = subscribe(&server, "owner", "direct-message", None, None);
+            let deadline_subscription = subscribe(&server, "owner", "deadline", Some("due"), None);
+            let explicit_id = bind_message_with_type(
+                &server,
+                "owner",
+                &direct_subscription,
+                &format!("explicit-{message_type}"),
+                message_type,
+            );
+            let automatic_id = bind_message_with_type(
+                &server,
+                "owner",
+                &deadline_subscription,
+                "automatic-deadline",
+                "notification",
+            );
+            server.commit(&[Event::DeliveryMode {
+                msg_id: explicit_id.clone(),
+                mode: "explicit-notification".into(),
+            }]);
+
+            let delivered = std::cell::RefCell::new(Vec::new());
+            assert!(super::super::attempt_notification_with_at(
+                &server,
+                &explicit_id,
+                &direct_subscription,
+                &|_| true,
+                &|_, text| {
+                    delivered.borrow_mut().push(text.to_string());
+                    true
+                },
+                &|_, _| Ok(true),
+                now_ms(),
+            ));
+
+            let state = server.state.lock().unwrap();
+            assert_eq!(state.msgs[&explicit_id].state, "delivered");
+            assert_eq!(state.msgs[&automatic_id].state, "pending");
+            assert_eq!(state.msgs[&automatic_id].wake_attempt_count, 0);
+            drop(state);
+            let text = delivered.borrow().join("\n");
+            assert!(text.contains(&explicit_id));
+            assert!(!text.contains(&automatic_id));
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
