@@ -8,10 +8,13 @@ use std::sync::Arc;
 /// Server-side scheduler for finite subscriptions and bounded waits. It never
 /// creates task continuations or infers that ordinary work needs a wake.
 pub fn tick(server: &Arc<Server>) {
-    let now = now_ms();
+    tick_at(server, now_ms());
+}
+
+fn tick_at(server: &Arc<Server>, now: i64) {
     super::keepalive::tick_at(server, now);
     super::purge_expired_storage(server, now);
-    tick_with_idle(server, &|_| true);
+    tick_with_idle_at(server, now, &|_| true);
 }
 
 fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
@@ -1089,6 +1092,55 @@ mod tests {
             server.state.lock().unwrap().msgs[&message_id].last_wake_attempt_ms,
             tick_at
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_tick_reuses_timestamp_for_expiry_and_retry() {
+        let (mut server, root) = test_server();
+        Arc::get_mut(&mut server).unwrap().config.keepalive.enabled = false;
+        register(&server, "owner");
+        let expired_subscription = subscribe(&server, "owner", "deadline", Some("expired"), None);
+        let retry_subscription = subscribe(&server, "owner", "direct-message", None, None);
+        let message_id = bind_message(&server, "owner", &retry_subscription);
+        let scheduler_now = now_ms();
+        let retry_delay_ms = server.config.notifications.delay_ms("direct-message");
+        {
+            let mut state = server.state.lock().unwrap();
+            let expired = state
+                .notification_subscriptions
+                .get_mut(&expired_subscription)
+                .unwrap();
+            expired.expires_ms = scheduler_now;
+            expired.updated_ms = scheduler_now - 1;
+            let retry = state
+                .notification_subscriptions
+                .get_mut(&retry_subscription)
+                .unwrap();
+            retry.expires_ms = scheduler_now + 60_000;
+            retry.updated_ms = scheduler_now - 1;
+            let message = state.msgs.get_mut(&message_id).unwrap();
+            message.created_ms = scheduler_now - retry_delay_ms;
+            message.last_wake_attempt_ms = 0;
+        }
+
+        tick_at(&server, scheduler_now);
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.notification_subscriptions[&expired_subscription].status,
+            "expired"
+        );
+        assert_eq!(
+            state.notification_subscriptions[&expired_subscription].updated_ms, scheduler_now,
+            "subscription expiry must use the scheduler timestamp"
+        );
+        assert_eq!(state.msgs[&message_id].wake_attempt_count, 1);
+        assert_eq!(
+            state.msgs[&message_id].last_wake_attempt_ms, scheduler_now,
+            "automatic retry reservation must use the scheduler timestamp"
+        );
+        drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
 
