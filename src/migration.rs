@@ -6,8 +6,14 @@
 //! archive, adapt, reset, or stop for operator input without replaying a
 //! source journal while it is being inspected.
 
+#[allow(unused_imports)]
+pub use crate::server::global_state::{
+    MigrationIdentityRebindReceipt, MigrationReceiptSet, MigrationRuntimeRebindReceipt,
+    MigrationWriterReceipt,
+};
 use crate::server::state::Event;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -17,7 +23,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// The disposition of a source record in a future migration transaction.
-#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MappingClass {
     /// The record has enough immutable identity and lifecycle evidence to be
     /// referenced directly.  Direct does not authorize active replay.
@@ -38,7 +45,8 @@ pub enum MappingClass {
 /// separate from `MappingClass`: the classifier describes what was observed,
 /// while the controller decides whether the source may be replayed, adapted,
 /// preserved only as evidence, or rebuilt in a new epoch.
-#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceDisposition {
     DirectReplay,
     AdaptReconcile,
@@ -68,7 +76,8 @@ impl SourceDisposition {
 
 /// Project admission is a project-level gate and must not be inferred from a
 /// single source record or confused with the migration transaction phase.
-#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProjectAdmission {
     Verified,
     ResetRequired,
@@ -85,6 +94,1002 @@ impl ProjectAdmission {
             Self::Aborted => "aborted",
         }
     }
+}
+
+/// Durable lifecycle states for the migration transaction boundary.
+///
+/// These values describe the transaction owned by this module.  They are
+/// deliberately separate from the legacy `MigrationRecord::phase` string so
+/// that an old `verified` row cannot be mistaken for a verified target epoch.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationPhase {
+    Planned,
+    SnapshotCaptured,
+    ReplayVerified,
+    Rebound,
+    Applied,
+    Verified,
+    ResetRequired,
+    NeedsOperator,
+    Aborted,
+}
+
+impl MigrationPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::SnapshotCaptured => "snapshot_captured",
+            Self::ReplayVerified => "replay_verified",
+            Self::Rebound => "rebound",
+            Self::Applied => "applied",
+            Self::Verified => "verified",
+            Self::ResetRequired => "reset_required",
+            Self::NeedsOperator => "needs_operator",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+/// Typed failures at the migration transaction boundary.
+///
+/// The variants intentionally retain the first failed field/boundary.  A
+/// caller can expose the error to an operator without converting an unknown
+/// or reset-required source into a successful apply.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum MigrationContractError {
+    Missing(&'static str),
+    Invalid {
+        field: &'static str,
+        reason: String,
+    },
+    DigestMismatch {
+        field: &'static str,
+        expected: String,
+        observed: String,
+    },
+    EpochMismatch {
+        field: &'static str,
+        expected: u64,
+        observed: u64,
+    },
+    RevisionMismatch {
+        field: &'static str,
+        expected: u64,
+        observed: u64,
+    },
+    AdmissionBlocked {
+        admission: ProjectAdmission,
+    },
+    PrefixBlocked {
+        line: Option<usize>,
+        exact_error: String,
+    },
+    ReceiptRejected {
+        reason: String,
+    },
+}
+
+impl MigrationContractError {
+    fn missing(field: &'static str) -> Self {
+        Self::Missing(field)
+    }
+
+    fn invalid(field: &'static str, reason: impl Into<String>) -> Self {
+        Self::Invalid {
+            field,
+            reason: reason.into(),
+        }
+    }
+
+    fn digest_mismatch(
+        field: &'static str,
+        expected: impl Into<String>,
+        observed: impl Into<String>,
+    ) -> Self {
+        Self::DigestMismatch {
+            field,
+            expected: expected.into(),
+            observed: observed.into(),
+        }
+    }
+}
+
+impl fmt::Display for MigrationContractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(field) => write!(f, "MIGRATION_CONTRACT_MISSING:{field}"),
+            Self::Invalid { field, reason } => {
+                write!(f, "MIGRATION_CONTRACT_INVALID:{field}:{reason}")
+            }
+            Self::DigestMismatch {
+                field,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "MIGRATION_DIGEST_MISMATCH:{field}:expected={expected}:observed={observed}"
+            ),
+            Self::EpochMismatch {
+                field,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "MIGRATION_EPOCH_MISMATCH:{field}:expected={expected}:observed={observed}"
+            ),
+            Self::RevisionMismatch {
+                field,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "MIGRATION_REVISION_MISMATCH:{field}:expected={expected}:observed={observed}"
+            ),
+            Self::AdmissionBlocked { admission } => {
+                write!(f, "MIGRATION_APPLY_REJECTED:{}", admission.as_str())
+            }
+            Self::PrefixBlocked { line, exact_error } => {
+                write!(f, "MIGRATION_PREFIX_BLOCKED:line={line:?}:{exact_error}")
+            }
+            Self::ReceiptRejected { reason } => {
+                write!(f, "MIGRATION_RECEIPT_REJECTED:{reason}")
+            }
+        }
+    }
+}
+
+impl Error for MigrationContractError {}
+
+/// An immutable source/archive snapshot receipt.
+///
+/// This value does not write an archive.  It binds the source digest and the
+/// archive digest to the same migration, while allowing the archive to contain
+/// the source stream plus the immutable migration evidence collected around
+/// it.  The owner that creates the archive must separately prove that both
+/// referenced byte streams are immutable.  `verify_source_digest` is the
+/// read-side check used before any target operation.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImmutableSnapshot {
+    pub migration_id: String,
+    pub source_project_id: String,
+    pub source_epoch: Option<u64>,
+    pub source_digest: String,
+    pub archive_ref: String,
+    pub archive_digest: String,
+    pub captured_revision: u64,
+}
+
+impl ImmutableSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        migration_id: impl Into<String>,
+        source_project_id: impl Into<String>,
+        source_digest: impl Into<String>,
+        archive_ref: impl Into<String>,
+        archive_digest: impl Into<String>,
+        captured_revision: u64,
+    ) -> Result<Self, MigrationContractError> {
+        let snapshot = Self {
+            migration_id: migration_id.into(),
+            source_project_id: source_project_id.into(),
+            source_epoch: None,
+            source_digest: source_digest.into(),
+            archive_ref: archive_ref.into(),
+            archive_digest: archive_digest.into(),
+            captured_revision,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn with_source_epoch(mut self, source_epoch: Option<u64>) -> Self {
+        self.source_epoch = source_epoch;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), MigrationContractError> {
+        validate_contract_identifier("migration_id", &self.migration_id)?;
+        validate_contract_identifier("source_project_id", &self.source_project_id)?;
+        validate_contract_identifier("source_digest", &self.source_digest)?;
+        validate_contract_reference("archive_ref", &self.archive_ref)?;
+        validate_contract_identifier("archive_digest", &self.archive_digest)?;
+        if let Some(source_epoch) = self.source_epoch {
+            if source_epoch == 0 {
+                return Err(MigrationContractError::invalid(
+                    "source_epoch",
+                    "must be non-zero when present",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn verify_source_digest(&self, observed: &str) -> Result<(), MigrationContractError> {
+        self.validate()?;
+        if self.source_digest == observed {
+            Ok(())
+        } else {
+            Err(MigrationContractError::digest_mismatch(
+                "source_digest",
+                self.source_digest.clone(),
+                observed,
+            ))
+        }
+    }
+}
+
+/// Compatibility name used by migration manifests and archive owners.
+pub type SnapshotReceipt = ImmutableSnapshot;
+
+/// Target epoch allocation and the source revision it is fenced against.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetEpoch {
+    pub source_epoch: Option<u64>,
+    pub target_epoch: u64,
+    pub expected_active_revision: u64,
+}
+
+impl TargetEpoch {
+    pub fn new(
+        source_epoch: Option<u64>,
+        target_epoch: u64,
+        expected_active_revision: u64,
+    ) -> Result<Self, MigrationContractError> {
+        let epoch = Self {
+            source_epoch,
+            target_epoch,
+            expected_active_revision,
+        };
+        epoch.validate()?;
+        Ok(epoch)
+    }
+
+    pub fn validate(&self) -> Result<(), MigrationContractError> {
+        if let Some(source_epoch) = self.source_epoch {
+            if source_epoch == 0 {
+                return Err(MigrationContractError::invalid(
+                    "source_epoch",
+                    "must be non-zero when present",
+                ));
+            }
+        }
+        if self.target_epoch == 0 {
+            return Err(MigrationContractError::invalid(
+                "target_epoch",
+                "must be non-zero",
+            ));
+        }
+        if self.source_epoch == Some(self.target_epoch) {
+            return Err(MigrationContractError::invalid(
+                "source_epoch",
+                "must differ from target_epoch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(
+        &self,
+        active_epoch: u64,
+        active_revision: u64,
+    ) -> Result<(), MigrationContractError> {
+        self.validate()?;
+        if let Some(source_epoch) = self.source_epoch {
+            if source_epoch != active_epoch {
+                return Err(MigrationContractError::EpochMismatch {
+                    field: "source_epoch",
+                    expected: source_epoch,
+                    observed: active_epoch,
+                });
+            }
+        }
+        if self.target_epoch <= active_epoch {
+            return Err(MigrationContractError::invalid(
+                "target_epoch",
+                format!(
+                    "must be greater than active_epoch {active_epoch}, observed {}",
+                    self.target_epoch
+                ),
+            ));
+        }
+        if self.expected_active_revision != active_revision {
+            return Err(MigrationContractError::RevisionMismatch {
+                field: "expected_active_revision",
+                expected: self.expected_active_revision,
+                observed: active_revision,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate a transaction after its target epoch is active.  Allocation
+    /// uses [`Self::validate_against`], which requires a strictly newer target;
+    /// apply admission observes the committed target and therefore requires
+    /// equality with the active epoch.
+    pub fn validate_committed_against(
+        &self,
+        active_epoch: u64,
+        active_revision: u64,
+    ) -> Result<(), MigrationContractError> {
+        self.validate()?;
+        if self.target_epoch != active_epoch {
+            return Err(MigrationContractError::EpochMismatch {
+                field: "target_epoch",
+                expected: active_epoch,
+                observed: self.target_epoch,
+            });
+        }
+        if self.expected_active_revision != active_revision {
+            return Err(MigrationContractError::RevisionMismatch {
+                field: "expected_active_revision",
+                expected: self.expected_active_revision,
+                observed: active_revision,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Compatibility name used by callers that call the epoch allocation an
+/// epoch descriptor.
+pub type EpochDescriptor = TargetEpoch;
+
+/// One source record in a verified replay prefix.  Raw bytes remain owned by
+/// the source/archive; only stable identity and digest evidence is carried in
+/// the replay receipt.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedPrefixRecord {
+    pub line_number: usize,
+    pub record_id: String,
+    pub sequence: u64,
+    pub digest: String,
+}
+
+impl VerifiedPrefixRecord {
+    fn validate(&self) -> Result<(), MigrationContractError> {
+        if self.line_number == 0 {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.line_number",
+                "must be non-zero",
+            ));
+        }
+        if self.sequence == 0 {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.sequence",
+                "must be non-zero",
+            ));
+        }
+        validate_contract_identifier("verified_prefix.record_id", &self.record_id)?;
+        validate_contract_identifier("verified_prefix.digest", &self.digest)
+    }
+}
+
+/// Evidence for the only source records eligible for direct replay.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedPrefix {
+    pub source_digest: String,
+    pub prefix_digest: String,
+    pub records: Vec<VerifiedPrefixRecord>,
+    pub complete: bool,
+    pub stop_line: Option<usize>,
+    pub stop_error: Option<String>,
+    /// The exact source bytes covered by `prefix_digest`.  This is an
+    /// in-memory verification witness: it is deliberately omitted from the
+    /// serialized contract so a deserialized prefix must be rebound through
+    /// `verify_against_report` or `verify_against_bytes` before apply.
+    #[serde(skip)]
+    raw_prefix_bytes: Option<Vec<u8>>,
+}
+
+impl VerifiedPrefix {
+    /// Derive a prefix from the existing read-only classifier.  The method
+    /// stops at the first record that is not direct and retains its exact
+    /// error.  It never changes the report or attempts replay.
+    pub fn from_report(report: &InspectionReport) -> Result<Self, MigrationContractError> {
+        let mut records = Vec::new();
+        let mut prefix_bytes = Vec::new();
+        let mut expected_sequence = None;
+        let mut stop_line = None;
+        let mut stop_error = None;
+
+        for record in &report.records {
+            let Some(record_id) = record.record_id.as_ref() else {
+                stop_line = Some(record.line_number);
+                stop_error = record.exact_error.clone();
+                break;
+            };
+            let Some(sequence) = record.sequence else {
+                stop_line = Some(record.line_number);
+                stop_error = record.exact_error.clone();
+                break;
+            };
+            if sequence == 0 {
+                stop_line = Some(record.line_number);
+                stop_error = Some("INVALID_SEQUENCE:0".to_owned());
+                break;
+            }
+            if record.classification != MappingClass::Direct || record.exact_error.is_some() {
+                stop_line = Some(record.line_number);
+                stop_error = record
+                    .exact_error
+                    .clone()
+                    .or_else(|| Some("RECORD_NOT_DIRECT".to_owned()));
+                break;
+            }
+            if let Some(expected) = expected_sequence {
+                if sequence != expected {
+                    stop_line = Some(record.line_number);
+                    stop_error = Some(if sequence > expected {
+                        format!("SEQUENCE_GAP:expected={expected}:observed={sequence}")
+                    } else {
+                        format!("SEQUENCE_NON_MONOTONIC:expected={expected}:observed={sequence}")
+                    });
+                    break;
+                }
+            }
+            expected_sequence = sequence.checked_add(1);
+            if expected_sequence.is_none() {
+                stop_line = Some(record.line_number);
+                stop_error = Some("SEQUENCE_OVERFLOW".to_owned());
+                break;
+            }
+            records.push(VerifiedPrefixRecord {
+                line_number: record.line_number,
+                record_id: record_id.clone(),
+                sequence,
+                digest: record.digest.clone(),
+            });
+            prefix_bytes.extend_from_slice(&record.raw_bytes);
+        }
+
+        if stop_line.is_none() {
+            if let Some(issue) = report.issues.first() {
+                stop_line = issue.line_number;
+                stop_error = Some(issue.exact_error.clone());
+            }
+        }
+
+        let prefix = Self {
+            source_digest: report.source_digest.clone(),
+            prefix_digest: digest_bytes(&prefix_bytes),
+            complete: stop_line.is_none() && stop_error.is_none() && report.issues.is_empty(),
+            records,
+            stop_line,
+            stop_error,
+            raw_prefix_bytes: Some(prefix_bytes),
+        };
+        prefix.validate()?;
+        Ok(prefix)
+    }
+
+    pub fn validate(&self) -> Result<(), MigrationContractError> {
+        validate_contract_identifier("verified_prefix.source_digest", &self.source_digest)?;
+        validate_contract_identifier("verified_prefix.prefix_digest", &self.prefix_digest)?;
+        if self.records.is_empty() {
+            if self.complete {
+                return Err(MigrationContractError::missing("verified_prefix.records"));
+            }
+            if self.stop_error.is_none() {
+                return Err(MigrationContractError::invalid(
+                    "verified_prefix.stop",
+                    "an incomplete empty prefix must retain the exact stop error",
+                ));
+            }
+        }
+        let mut expected_sequence = None;
+        let mut previous_line = None;
+        for record in &self.records {
+            record.validate()?;
+            if let Some(expected) = expected_sequence {
+                if record.sequence != expected {
+                    return Err(MigrationContractError::invalid(
+                        "verified_prefix.records",
+                        format!(
+                            "sequence is not contiguous: expected {expected}, observed {}",
+                            record.sequence
+                        ),
+                    ));
+                }
+            }
+            if let Some(previous) = previous_line {
+                if record.line_number <= previous {
+                    return Err(MigrationContractError::invalid(
+                        "verified_prefix.records",
+                        format!(
+                            "line numbers must increase: previous {previous}, observed {}",
+                            record.line_number
+                        ),
+                    ));
+                }
+            }
+            previous_line = Some(record.line_number);
+            expected_sequence = Some(record.sequence.checked_add(1).ok_or_else(|| {
+                MigrationContractError::invalid("verified_prefix.sequence", "must not overflow")
+            })?);
+        }
+        if self.complete != (self.stop_line.is_none() && self.stop_error.is_none()) {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.complete",
+                "complete must be true only when no stop error exists",
+            ));
+        }
+        if self.stop_line.is_some() && self.stop_error.is_none() {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.stop",
+                "stop_error is required when stop_line is supplied",
+            ));
+        }
+        let Some(raw_prefix_bytes) = self.raw_prefix_bytes.as_deref() else {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.evidence",
+                "must be rebound against the source report or bytes",
+            ));
+        };
+        if digest_bytes(raw_prefix_bytes) != self.prefix_digest {
+            return Err(MigrationContractError::digest_mismatch(
+                "verified_prefix.prefix_digest",
+                digest_bytes(raw_prefix_bytes),
+                self.prefix_digest.clone(),
+            ));
+        }
+        validate_prefix_bytes_against_records(raw_prefix_bytes, &self.records)?;
+        Ok(())
+    }
+
+    /// Rebind serialized or caller-provided prefix metadata to one inspected
+    /// source report.  Every field and every covered line must match the
+    /// report-derived prefix before the in-memory byte witness is installed.
+    pub fn verify_against_report(
+        &mut self,
+        report: &InspectionReport,
+    ) -> Result<(), MigrationContractError> {
+        let expected = Self::from_report(report)?;
+        if self.source_digest != expected.source_digest {
+            return Err(MigrationContractError::digest_mismatch(
+                "verified_prefix.source_digest",
+                expected.source_digest,
+                self.source_digest.clone(),
+            ));
+        }
+        if self.prefix_digest != expected.prefix_digest {
+            return Err(MigrationContractError::digest_mismatch(
+                "verified_prefix.prefix_digest",
+                expected.prefix_digest,
+                self.prefix_digest.clone(),
+            ));
+        }
+        if self.records != expected.records {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.records",
+                "do not match the report-derived direct prefix",
+            ));
+        }
+        if self.complete != expected.complete
+            || self.stop_line != expected.stop_line
+            || self.stop_error != expected.stop_error
+        {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.stop",
+                "does not match the report-derived stop boundary",
+            ));
+        }
+        self.raw_prefix_bytes = expected.raw_prefix_bytes;
+        self.validate()
+    }
+
+    /// Inspect and bind one exact source byte stream.  No filesystem or
+    /// daemon operation is performed; the caller remains the source owner.
+    pub fn verify_against_bytes(
+        &mut self,
+        source_bytes: &[u8],
+    ) -> Result<(), MigrationContractError> {
+        let report = inspect_jsonl(source_bytes);
+        self.verify_against_report(&report)
+    }
+
+    pub fn verify_source_digest(&self, observed: &str) -> Result<(), MigrationContractError> {
+        self.validate()?;
+        if self.source_digest == observed {
+            Ok(())
+        } else {
+            Err(MigrationContractError::digest_mismatch(
+                "verified_prefix.source_digest",
+                self.source_digest.clone(),
+                observed,
+            ))
+        }
+    }
+
+    pub fn last_sequence(&self) -> Option<u64> {
+        self.records.last().map(|record| record.sequence)
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+}
+
+/// Receipt produced by the pure apply gate.  It is evidence of validation,
+/// not a journal commit; callers still need the resident writer to persist it.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationApplyReceipt {
+    pub migration_id: String,
+    pub source_project_id: String,
+    pub target_epoch: u64,
+    pub source_snapshot_digest: String,
+    pub verified_prefix_digest: String,
+    pub writer_operation_id: String,
+}
+
+/// Pure migration transaction gate.  It can be constructed and validated in
+/// a copied fixture; no method here opens a live source, freezes a daemon,
+/// creates an archive, allocates a target sequence, or rebinds a runtime.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationTransaction {
+    pub migration_id: String,
+    pub source_project_id: String,
+    pub project_admission: ProjectAdmission,
+    pub phase: MigrationPhase,
+    pub snapshot: Option<ImmutableSnapshot>,
+    pub target_epoch: Option<TargetEpoch>,
+    pub verified_prefix: Option<VerifiedPrefix>,
+    pub receipts: Option<MigrationReceiptSet>,
+}
+
+impl MigrationTransaction {
+    pub fn new(
+        migration_id: impl Into<String>,
+        source_project_id: impl Into<String>,
+    ) -> Result<Self, MigrationContractError> {
+        let transaction = Self {
+            migration_id: migration_id.into(),
+            source_project_id: source_project_id.into(),
+            project_admission: ProjectAdmission::NeedsOperator,
+            phase: MigrationPhase::Planned,
+            snapshot: None,
+            target_epoch: None,
+            verified_prefix: None,
+            receipts: None,
+        };
+        transaction.validate_identity()?;
+        Ok(transaction)
+    }
+
+    pub fn validate(&self) -> Result<(), MigrationContractError> {
+        self.validate_identity()?;
+        if self.phase == MigrationPhase::ResetRequired
+            && self.project_admission != ProjectAdmission::ResetRequired
+        {
+            return Err(MigrationContractError::invalid(
+                "phase",
+                "reset_required phase must carry reset_required project admission",
+            ));
+        }
+
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            snapshot.validate()?;
+            if snapshot.migration_id != self.migration_id {
+                return Err(MigrationContractError::invalid(
+                    "snapshot.migration_id",
+                    "does not match migration transaction",
+                ));
+            }
+            if snapshot.source_project_id != self.source_project_id {
+                return Err(MigrationContractError::invalid(
+                    "snapshot.source_project_id",
+                    "does not match migration transaction",
+                ));
+            }
+        }
+
+        if let Some(target_epoch) = self.target_epoch.as_ref() {
+            target_epoch.validate()?;
+            if let Some(snapshot) = self.snapshot.as_ref() {
+                if snapshot.source_epoch != target_epoch.source_epoch {
+                    return Err(match (target_epoch.source_epoch, snapshot.source_epoch) {
+                        (Some(expected), observed) => MigrationContractError::EpochMismatch {
+                            field: "target_epoch.source_epoch",
+                            expected,
+                            observed: observed.unwrap_or_default(),
+                        },
+                        (None, Some(observed)) => MigrationContractError::invalid(
+                            "target_epoch.source_epoch",
+                            format!("snapshot source epoch {observed} is not bound to the target"),
+                        ),
+                        (None, None) => MigrationContractError::invalid(
+                            "target_epoch.source_epoch",
+                            "source epoch values differ",
+                        ),
+                    });
+                }
+                if snapshot.source_epoch == Some(target_epoch.target_epoch) {
+                    return Err(MigrationContractError::invalid(
+                        "target_epoch.target_epoch",
+                        "must differ from the snapshot source epoch",
+                    ));
+                }
+            }
+        }
+
+        if let Some(prefix) = self.verified_prefix.as_ref() {
+            prefix.validate()?;
+            if let Some(snapshot) = self.snapshot.as_ref() {
+                if prefix.source_digest != snapshot.source_digest {
+                    return Err(MigrationContractError::digest_mismatch(
+                        "verified_prefix.source_digest",
+                        snapshot.source_digest.clone(),
+                        prefix.source_digest.clone(),
+                    ));
+                }
+            }
+        }
+
+        if let Some(receipts) = self.receipts.as_ref() {
+            let snapshot = self
+                .snapshot
+                .as_ref()
+                .ok_or_else(|| MigrationContractError::missing("snapshot"))?;
+            let target_epoch = self
+                .target_epoch
+                .as_ref()
+                .ok_or_else(|| MigrationContractError::missing("target_epoch"))?;
+            receipts
+                .validate_for(
+                    &self.migration_id,
+                    &self.source_project_id,
+                    &snapshot.source_digest,
+                    target_epoch.target_epoch,
+                )
+                .map_err(|error| MigrationContractError::ReceiptRejected {
+                    reason: error.to_string(),
+                })?;
+            if let Some(writer) = receipts.writer.as_ref() {
+                if writer.source_epoch != snapshot.source_epoch {
+                    return Err(MigrationContractError::invalid(
+                        "receipts.writer.source_epoch",
+                        format!(
+                            "does not match snapshot source epoch {:?}",
+                            snapshot.source_epoch
+                        ),
+                    ));
+                }
+            }
+        }
+
+        match self.phase {
+            MigrationPhase::SnapshotCaptured if self.snapshot.is_none() => {
+                return Err(MigrationContractError::missing("snapshot"));
+            }
+            MigrationPhase::ReplayVerified if self.verified_prefix.is_none() => {
+                return Err(MigrationContractError::missing("verified_prefix"));
+            }
+            MigrationPhase::Rebound if self.receipts.is_none() => {
+                return Err(MigrationContractError::missing("receipts"));
+            }
+            MigrationPhase::Applied | MigrationPhase::Verified => {
+                for (field, present) in [
+                    ("snapshot", self.snapshot.is_some()),
+                    ("target_epoch", self.target_epoch.is_some()),
+                    ("verified_prefix", self.verified_prefix.is_some()),
+                    ("receipts", self.receipts.is_some()),
+                ] {
+                    if !present {
+                        return Err(MigrationContractError::missing(field));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Validate every precondition required before an apply side effect.
+    /// `reset_required`, `needs_operator`, and `aborted` are terminal stops;
+    /// they are rejected before receipt or source validation is attempted.
+    /// Validate every precondition against the currently active epoch and
+    /// revision before an apply side effect is admitted.
+    pub fn validate_for_apply(
+        &self,
+        active_epoch: u64,
+        active_revision: u64,
+    ) -> Result<(), MigrationContractError> {
+        self.validate_identity()?;
+        if self.project_admission != ProjectAdmission::Verified {
+            return Err(MigrationContractError::AdmissionBlocked {
+                admission: self.project_admission,
+            });
+        }
+        self.validate()?;
+        if !matches!(
+            self.phase,
+            MigrationPhase::Rebound | MigrationPhase::Applied | MigrationPhase::Verified
+        ) {
+            return Err(MigrationContractError::invalid(
+                "phase",
+                format!("{} cannot be applied", self.phase.as_str()),
+            ));
+        }
+        for (field, present) in [
+            ("snapshot", self.snapshot.is_some()),
+            ("target_epoch", self.target_epoch.is_some()),
+            ("verified_prefix", self.verified_prefix.is_some()),
+            ("receipts", self.receipts.is_some()),
+        ] {
+            if !present {
+                return Err(MigrationContractError::missing(field));
+            }
+        }
+        self.target_epoch
+            .as_ref()
+            .expect("target epoch presence checked above")
+            .validate_committed_against(active_epoch, active_revision)?;
+        Ok(())
+    }
+
+    /// Return a typed apply receipt without mutating source or target state.
+    /// The active epoch and revision are required so the target cannot be
+    /// reused or moved backward between validation and apply admission.
+    pub fn apply(
+        &self,
+        active_epoch: u64,
+        active_revision: u64,
+    ) -> Result<MigrationApplyReceipt, MigrationContractError> {
+        self.validate_for_apply(active_epoch, active_revision)?;
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| MigrationContractError::missing("snapshot"))?;
+        let target_epoch = self
+            .target_epoch
+            .as_ref()
+            .ok_or_else(|| MigrationContractError::missing("target_epoch"))?;
+        let prefix = self
+            .verified_prefix
+            .as_ref()
+            .ok_or_else(|| MigrationContractError::missing("verified_prefix"))?;
+        if !prefix.complete {
+            return Err(MigrationContractError::PrefixBlocked {
+                line: prefix.stop_line,
+                exact_error: prefix
+                    .stop_error
+                    .clone()
+                    .unwrap_or_else(|| "VERIFIED_PREFIX_INCOMPLETE".to_owned()),
+            });
+        }
+        let receipts = self
+            .receipts
+            .as_ref()
+            .ok_or_else(|| MigrationContractError::missing("receipts"))?;
+        let writer_operation_id = receipts
+            .writer
+            .as_ref()
+            .map(|writer| writer.operation_id.as_str().to_owned())
+            .ok_or_else(|| MigrationContractError::missing("receipts.writer"))?;
+        Ok(MigrationApplyReceipt {
+            migration_id: self.migration_id.clone(),
+            source_project_id: self.source_project_id.clone(),
+            target_epoch: target_epoch.target_epoch,
+            source_snapshot_digest: snapshot.source_digest.clone(),
+            verified_prefix_digest: prefix.prefix_digest.clone(),
+            writer_operation_id,
+        })
+    }
+
+    fn validate_identity(&self) -> Result<(), MigrationContractError> {
+        validate_contract_identifier("migration_id", &self.migration_id)?;
+        validate_contract_identifier("source_project_id", &self.source_project_id)
+    }
+}
+
+fn validate_contract_identifier(
+    field: &'static str,
+    value: &str,
+) -> Result<(), MigrationContractError> {
+    if value.trim().is_empty() {
+        return Err(MigrationContractError::missing(field));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(MigrationContractError::invalid(
+            field,
+            "must not contain whitespace or control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_contract_reference(
+    field: &'static str,
+    value: &str,
+) -> Result<(), MigrationContractError> {
+    if value.trim().is_empty() {
+        return Err(MigrationContractError::missing(field));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(MigrationContractError::invalid(
+            field,
+            "must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Bind a serialized prefix receipt to the exact source bytes that it claims
+/// to cover.  The receipt only carries stable record metadata, so the bytes
+/// must be inspected again before the prefix can pass validation or apply.
+fn validate_prefix_bytes_against_records(
+    raw_prefix_bytes: &[u8],
+    expected_records: &[VerifiedPrefixRecord],
+) -> Result<(), MigrationContractError> {
+    let report = inspect_jsonl(raw_prefix_bytes);
+    if report.records.len() != expected_records.len() {
+        return Err(MigrationContractError::invalid(
+            "verified_prefix.records",
+            format!(
+                "source prefix contains {} records, expected {}",
+                report.records.len(),
+                expected_records.len()
+            ),
+        ));
+    }
+
+    for (expected, observed) in expected_records.iter().zip(&report.records) {
+        if observed.line_number != expected.line_number {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.records.line_number",
+                format!(
+                    "expected {}, observed {}",
+                    expected.line_number, observed.line_number
+                ),
+            ));
+        }
+        if observed.record_id.as_deref() != Some(expected.record_id.as_str()) {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.records.record_id",
+                format!(
+                    "expected {}, observed {:?}",
+                    expected.record_id, observed.record_id
+                ),
+            ));
+        }
+        if observed.sequence != Some(expected.sequence) {
+            return Err(MigrationContractError::invalid(
+                "verified_prefix.records.sequence",
+                format!(
+                    "expected {}, observed {:?}",
+                    expected.sequence, observed.sequence
+                ),
+            ));
+        }
+
+        let observed_digest = digest_bytes(&observed.raw_bytes);
+        if observed_digest != expected.digest {
+            return Err(MigrationContractError::digest_mismatch(
+                "verified_prefix.records.digest",
+                expected.digest.clone(),
+                observed_digest,
+            ));
+        }
+        if observed.classification != MappingClass::Direct || observed.exact_error.is_some() {
+            return Err(MigrationContractError::PrefixBlocked {
+                line: Some(observed.line_number),
+                exact_error: observed
+                    .exact_error
+                    .clone()
+                    .unwrap_or_else(|| "RECORD_NOT_DIRECT".to_owned()),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl MappingClass {
@@ -1803,5 +2808,346 @@ mod tests {
         assert_eq!(report.classification, MappingClass::Adapt);
         assert_eq!(report.records[0].classification, MappingClass::Adapt);
         assert!(report.has_error("LEGACY_BINDING_EVIDENCE_ABSENT"));
+    }
+
+    fn valid_snapshot(report: &InspectionReport) -> ImmutableSnapshot {
+        ImmutableSnapshot::new(
+            "migration-1",
+            "project-1",
+            report.source_digest.clone(),
+            "archive/migration-1",
+            report.source_digest.clone(),
+            0,
+        )
+        .expect("snapshot")
+    }
+
+    fn valid_receipts(source_digest: &str, target_epoch: u64) -> MigrationReceiptSet {
+        use crate::identity::{AgentId, OperationId};
+
+        MigrationReceiptSet {
+            writer: Some(
+                MigrationWriterReceipt::new(
+                    "migration-1",
+                    "project-1",
+                    None,
+                    target_epoch,
+                    source_digest,
+                    AgentId::new("writer-1").unwrap(),
+                    OperationId::new("writer-op-1").unwrap(),
+                    7,
+                    1,
+                    1,
+                )
+                .unwrap(),
+            ),
+            identity_rebinds: Vec::new(),
+            runtime_rebinds: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn verified_prefix_preserves_the_direct_prefix_and_first_stop() {
+        let bytes = format!(
+            "{}{{bad json}}\n{}",
+            direct_line("one", 1),
+            direct_line("two", 2)
+        );
+        let report = inspect_jsonl(bytes.as_bytes());
+        let prefix = VerifiedPrefix::from_report(&report).expect("direct prefix");
+
+        assert_eq!(prefix.records.len(), 1);
+        assert_eq!(prefix.records[0].record_id, "one");
+        assert_eq!(prefix.records[0].sequence, 1);
+        assert_eq!(prefix.stop_line, Some(2));
+        assert!(prefix
+            .stop_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("MALFORMED_JSON_MIDDLE:")));
+        assert!(!prefix.complete);
+        assert_eq!(prefix.source_digest, report.source_digest);
+        assert_eq!(prefix.last_sequence(), Some(1));
+    }
+
+    #[test]
+    fn first_failed_record_preserves_an_empty_prefix_and_exact_stop() {
+        let bytes = b"{bad json}\n";
+        let report = inspect_jsonl(bytes);
+        let prefix = VerifiedPrefix::from_report(&report).expect("empty incomplete prefix");
+
+        assert!(prefix.records.is_empty());
+        assert!(!prefix.complete);
+        assert_eq!(prefix.stop_line, Some(1));
+        assert!(prefix
+            .stop_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("MALFORMED_JSON_TAIL:")));
+
+        let mut transaction = MigrationTransaction::new("migration-1", "project-1").unwrap();
+        transaction.snapshot = Some(valid_snapshot(&report));
+        transaction.target_epoch = Some(TargetEpoch::new(None, 2, 0).unwrap());
+        transaction.verified_prefix = Some(prefix);
+        transaction.receipts = Some(valid_receipts(&report.source_digest, 2));
+        transaction.project_admission = ProjectAdmission::Verified;
+        transaction.phase = MigrationPhase::Rebound;
+
+        assert!(matches!(
+            transaction.apply(2, 0),
+            Err(MigrationContractError::PrefixBlocked {
+                line: Some(1),
+                exact_error,
+            }) if exact_error.starts_with("MALFORMED_JSON_TAIL:")
+        ));
+    }
+
+    #[test]
+    fn serialized_prefix_requires_rebinding_to_exact_source_bytes() {
+        let bytes = direct_line("one", 1).into_bytes();
+        let report = inspect_jsonl(&bytes);
+        let prefix = VerifiedPrefix::from_report(&report).expect("prefix");
+        let serialized = serde_json::to_value(&prefix).expect("prefix serializes");
+        assert!(serialized.get("raw_prefix_bytes").is_none());
+
+        let mut decoded: VerifiedPrefix = serde_json::from_value(serialized).expect("prefix");
+        assert!(matches!(
+            decoded.validate(),
+            Err(MigrationContractError::Invalid {
+                field: "verified_prefix.evidence",
+                ..
+            })
+        ));
+        decoded
+            .verify_against_bytes(&bytes)
+            .expect("exact source bytes rebind the prefix");
+        decoded.validate().expect("rebound prefix validates");
+
+        let mut forged = serde_json::to_value(&prefix).expect("prefix serializes");
+        forged["prefix_digest"] = Value::String(digest_bytes(b"forged"));
+        let mut forged: VerifiedPrefix = serde_json::from_value(forged).expect("forged prefix");
+        assert!(matches!(
+            forged.verify_against_bytes(&bytes),
+            Err(MigrationContractError::DigestMismatch {
+                field: "verified_prefix.prefix_digest",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reset_required_transaction_rejects_apply_before_side_effects() {
+        let report = inspect_jsonl(direct_line("one", 1).as_bytes());
+        let snapshot = valid_snapshot(&report);
+        let prefix = VerifiedPrefix::from_report(&report).expect("prefix");
+        let receipts = valid_receipts(&report.source_digest, 2);
+        let mut transaction = MigrationTransaction::new("migration-1", "project-1").unwrap();
+        transaction.snapshot = Some(snapshot);
+        transaction.target_epoch = Some(TargetEpoch::new(None, 2, 0).unwrap());
+        transaction.verified_prefix = Some(prefix);
+        transaction.receipts = Some(receipts);
+        transaction.project_admission = ProjectAdmission::ResetRequired;
+
+        assert!(matches!(
+            transaction.apply(2, 0),
+            Err(MigrationContractError::AdmissionBlocked {
+                admission: ProjectAdmission::ResetRequired
+            })
+        ));
+    }
+
+    #[test]
+    fn migration_apply_requires_snapshot_epoch_prefix_and_receipts() {
+        let mut transaction = MigrationTransaction::new("migration-1", "project-1").unwrap();
+        transaction.project_admission = ProjectAdmission::Verified;
+        transaction.phase = MigrationPhase::Applied;
+
+        assert!(matches!(
+            transaction.apply(2, 0),
+            Err(MigrationContractError::Missing("snapshot"))
+        ));
+    }
+
+    #[test]
+    fn migration_apply_rejects_an_incomplete_verified_prefix() {
+        let bytes = format!(
+            "{}{{bad json}}\n{}",
+            direct_line("one", 1),
+            direct_line("two", 2)
+        );
+        let report = inspect_jsonl(bytes.as_bytes());
+        let mut transaction = MigrationTransaction::new("migration-1", "project-1").unwrap();
+        transaction.snapshot = Some(valid_snapshot(&report));
+        transaction.target_epoch = Some(TargetEpoch::new(None, 2, 0).unwrap());
+        transaction.verified_prefix = Some(VerifiedPrefix::from_report(&report).unwrap());
+        transaction.receipts = Some(valid_receipts(&report.source_digest, 2));
+        transaction.project_admission = ProjectAdmission::Verified;
+        transaction.phase = MigrationPhase::Rebound;
+
+        assert!(matches!(
+            transaction.apply(2, 0),
+            Err(MigrationContractError::PrefixBlocked {
+                line: Some(2),
+                exact_error,
+            }) if exact_error.starts_with("MALFORMED_JSON_MIDDLE:")
+        ));
+    }
+
+    #[test]
+    fn migration_apply_requires_rebound_phase_and_returns_a_pure_receipt() {
+        let report = inspect_jsonl(direct_line("one", 1).as_bytes());
+        let mut transaction = MigrationTransaction::new("migration-1", "project-1").unwrap();
+        transaction.snapshot = Some(valid_snapshot(&report));
+        transaction.target_epoch = Some(TargetEpoch::new(None, 2, 0).unwrap());
+        transaction.verified_prefix = Some(VerifiedPrefix::from_report(&report).unwrap());
+        transaction.receipts = Some(valid_receipts(&report.source_digest, 2));
+        transaction.project_admission = ProjectAdmission::Verified;
+
+        assert!(matches!(
+            transaction.apply(2, 0),
+            Err(MigrationContractError::Invalid { field: "phase", .. })
+        ));
+
+        transaction.phase = MigrationPhase::Rebound;
+        assert!(matches!(
+            transaction.apply(1, 0),
+            Err(MigrationContractError::EpochMismatch {
+                field: "target_epoch",
+                expected: 1,
+                observed: 2,
+            })
+        ));
+        let receipt = transaction.apply(2, 0).expect("complete rebound applies");
+        assert_eq!(receipt.migration_id, "migration-1");
+        assert_eq!(receipt.source_project_id, "project-1");
+        assert_eq!(receipt.target_epoch, 2);
+        assert_eq!(receipt.source_snapshot_digest, report.source_digest);
+        assert_eq!(receipt.writer_operation_id, "writer-op-1");
+    }
+
+    #[test]
+    fn snapshot_allows_an_independent_archive_digest() {
+        let report = inspect_jsonl(direct_line("one", 1).as_bytes());
+        let mut snapshot = valid_snapshot(&report);
+        snapshot.archive_digest = "sha256:other-archive".into();
+
+        snapshot
+            .validate()
+            .expect("archive has independent evidence digest");
+        snapshot
+            .verify_source_digest(&report.source_digest)
+            .expect("source digest remains bound");
+    }
+
+    #[test]
+    fn source_epoch_zero_is_rejected_and_global_failures_keep_their_error() {
+        let report = inspect_jsonl(direct_line("one", 1).as_bytes());
+        let mut snapshot = valid_snapshot(&report);
+        snapshot.source_epoch = Some(0);
+        assert!(matches!(
+            snapshot.validate(),
+            Err(MigrationContractError::Invalid {
+                field: "source_epoch",
+                ..
+            })
+        ));
+
+        let epoch = TargetEpoch {
+            source_epoch: Some(0),
+            target_epoch: 2,
+            expected_active_revision: 0,
+        };
+        assert!(matches!(
+            epoch.validate(),
+            Err(MigrationContractError::Invalid {
+                field: "source_epoch",
+                ..
+            })
+        ));
+
+        let epoch = TargetEpoch::new(Some(1), 2, 7).unwrap();
+        assert!(matches!(
+            epoch.validate_against(1, 8),
+            Err(MigrationContractError::RevisionMismatch {
+                field: "expected_active_revision",
+                expected: 7,
+                observed: 8,
+            })
+        ));
+
+        let report = inspect_jsonl_with_options(
+            direct_line("one", 1).as_bytes(),
+            &InspectOptions {
+                canonical_project_cwd: Some(PathBuf::from("relative")),
+                ..InspectOptions::default()
+            },
+        );
+        let prefix = VerifiedPrefix::from_report(&report).expect("prefix evidence");
+        assert!(!prefix.complete);
+        assert_eq!(prefix.stop_line, None);
+        assert!(prefix
+            .stop_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("INVALID_CANONICAL_PROJECT_CWD:")));
+        prefix.validate().expect("global stop retains valid shape");
+    }
+
+    #[test]
+    fn target_epoch_requires_strictly_new_active_epoch_when_source_is_unknown() {
+        for active_epoch in [3, 4] {
+            let epoch = TargetEpoch::new(None, 3, 7).unwrap();
+            assert!(matches!(
+                epoch.validate_against(active_epoch, 7),
+                Err(MigrationContractError::Invalid {
+                    field: "target_epoch",
+                    reason,
+                }) if reason.contains("greater than active_epoch")
+            ));
+        }
+
+        let epoch = TargetEpoch::new(None, 4, 7).unwrap();
+        epoch
+            .validate_against(3, 7)
+            .expect("unknown source still advances the active epoch");
+    }
+
+    #[test]
+    fn migration_transaction_binds_snapshot_and_target_source_epochs() {
+        let report = inspect_jsonl(direct_line("one", 1).as_bytes());
+        let snapshot = valid_snapshot(&report).with_source_epoch(Some(3));
+        let mut transaction = MigrationTransaction::new("migration-1", "project-1").unwrap();
+        transaction.snapshot = Some(snapshot);
+        transaction.target_epoch = Some(TargetEpoch::new(None, 4, 0).unwrap());
+
+        assert!(matches!(
+            transaction.validate(),
+            Err(MigrationContractError::Invalid {
+                field: "target_epoch.source_epoch",
+                ..
+            })
+        ));
+
+        transaction.target_epoch = Some(TargetEpoch::new(Some(3), 4, 0).unwrap());
+        assert!(transaction.validate().is_ok());
+    }
+
+    #[test]
+    fn migration_transaction_rejects_prefix_digest_drift() {
+        let report = inspect_jsonl(direct_line("one", 1).as_bytes());
+        let mut snapshot = valid_snapshot(&report);
+        snapshot.source_digest = "sha256:other-source".into();
+        snapshot.archive_digest = snapshot.source_digest.clone();
+        let prefix = VerifiedPrefix::from_report(&report).expect("prefix");
+        let mut transaction = MigrationTransaction::new("migration-1", "project-1").unwrap();
+        transaction.snapshot = Some(snapshot);
+        transaction.target_epoch = Some(TargetEpoch::new(None, 2, 0).unwrap());
+        transaction.verified_prefix = Some(prefix);
+        transaction.receipts = Some(valid_receipts(&report.source_digest, 2));
+
+        assert!(matches!(
+            transaction.validate(),
+            Err(MigrationContractError::DigestMismatch {
+                field: "verified_prefix.source_digest",
+                ..
+            })
+        ));
     }
 }

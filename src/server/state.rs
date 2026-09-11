@@ -98,8 +98,15 @@ pub enum TypedCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "gr")]
 pub enum GlobalEvent {
-    ProjectRegistered { registration: ProjectRegistration },
-    RuntimeBound { binding: RuntimeBinding },
+    ProjectRegistered {
+        registration: ProjectRegistration,
+    },
+    RuntimeBound {
+        binding: RuntimeBinding,
+    },
+    MigrationCommitEvidence {
+        evidence: super::global_state::MigrationCommitEvidence,
+    },
 }
 
 impl GlobalEvent {
@@ -109,6 +116,9 @@ impl GlobalEvent {
                 global.register_project(registration).map(|_| ())
             }
             Self::RuntimeBound { binding } => global.bind_runtime(binding).map(|_| ()),
+            Self::MigrationCommitEvidence { evidence } => {
+                global.record_migration_commit_evidence(evidence)
+            }
         }
     }
 }
@@ -524,6 +534,9 @@ pub enum Event {
     GlobalRuntimeBound {
         binding: super::global_state::RuntimeBinding,
     },
+    GlobalMigrationCommitEvidence {
+        evidence: super::global_state::MigrationCommitEvidence,
+    },
 }
 
 #[derive(Default)]
@@ -906,6 +919,11 @@ impl State {
                     binding: binding.clone(),
                 })?;
             }
+            Event::GlobalMigrationCommitEvidence { evidence } => {
+                self.apply_global_event(&GlobalEvent::MigrationCommitEvidence {
+                    evidence: evidence.clone(),
+                })?;
+            }
         }
         Ok(())
     }
@@ -1082,6 +1100,19 @@ impl State {
                 });
             }
         }
+        let mut migration_commit_evidence: Vec<_> = self
+            .global
+            .migration_commit_evidence
+            .values()
+            .cloned()
+            .collect();
+        migration_commit_evidence
+            .sort_by(|a, b| a.operation_id.as_str().cmp(b.operation_id.as_str()));
+        events.extend(
+            migration_commit_evidence
+                .into_iter()
+                .map(|evidence| Event::GlobalMigrationCommitEvidence { evidence }),
+        );
         events.push(Event::ReducerCheckpoint {
             sequence: self.sequence,
             revision: self.revision,
