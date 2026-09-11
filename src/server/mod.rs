@@ -561,6 +561,11 @@ impl Server {
                 GlobalEvent::RuntimeBound { binding } => {
                     events.push(Event::GlobalRuntimeBound { binding })
                 }
+                GlobalEvent::MigrationCommitEvidence { .. } => {
+                    return Err(notification_contract::JournalError::InvalidCommand(
+                        "migration commit evidence is not part of worker registration".into(),
+                    ))
+                }
             }
         }
         let TypedCommand::RegisterWorker { worker, .. } = &typed.command;
@@ -1212,6 +1217,11 @@ impl Server {
                     }
                 }
             }
+        }
+        if let Err(error) = st.global.validate() {
+            let error = format!("global reducer validation failed: {error}");
+            st.journal_poison.get_or_insert(error.clone());
+            return Err(notification_contract::JournalError::Reducer(error));
         }
         Ok(())
     }
@@ -8963,7 +8973,14 @@ fn apply_replayed_event(st: &mut State, event: &Event, line: usize) -> anyhow::R
     match event {
         Event::ReducerCheckpoint { sequence, revision } => st
             .set_checkpoint_version(*sequence, *revision)
-            .map_err(|error| anyhow::anyhow!("journal replay failed at line {line}: {error}")),
+            .map_err(|error| anyhow::anyhow!("journal replay failed at line {line}: {error}"))
+            .and_then(|_| {
+                st.global.validate().map_err(|error| {
+                    anyhow::anyhow!(
+                        "journal replay failed at line {line}: global state validation: {error}"
+                    )
+                })
+            }),
         _ => st
             .advance_version()
             .map_err(|error| anyhow::anyhow!("journal replay failed at line {line}: {error}")),
@@ -9091,6 +9108,9 @@ fn replay(root: &Path) -> anyhow::Result<State> {
             "journal replay failed: incomplete command {command_id}; completion marker missing"
         );
     }
+    st.global.validate().map_err(|error| {
+        anyhow::anyhow!("journal replay failed: global state validation: {error}")
+    })?;
     if convert_root {
         let mut body = String::new();
         for event in events {
@@ -9416,6 +9436,100 @@ async fn run_with_host_paths(scope: Scope, host_paths: HostPaths) -> anyhow::Res
 #[cfg(test)]
 mod reducer_binding_tests {
     use super::*;
+
+    #[test]
+    fn migration_commit_evidence_survives_journal_replay_and_checkpoint() {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "collab-migration-evidence-replay-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let server_dir = root.join(".agent-collab/server");
+        std::fs::create_dir_all(&server_dir).unwrap();
+        let journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(server_dir.join("journal.jsonl"))
+            .unwrap();
+        let server = Server {
+            config: crate::config::Config::default(),
+            root: root.clone(),
+            state: Mutex::new(State::default()),
+            journal: Mutex::new(journal),
+            pane_alive_check: |_| PanePresence::Present,
+            pane_owner_check: |_, _| Ok(true),
+            pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            mailbox_notify: Notify::new(),
+        };
+        let repeated_events = (0..99)
+            .map(|_| Event::KeepaliveUpdated {
+                worker_id: "worker".into(),
+                record: crate::server::keepalive::Record::default(),
+            })
+            .collect::<Vec<_>>();
+        server.commit_checked(&repeated_events).unwrap();
+
+        let evidence = crate::server::global_state::MigrationCommitEvidence::new(
+            "migration-1",
+            "project-1",
+            1,
+            "sha256:source",
+            OperationId::new("migration-op-1").unwrap(),
+            None,
+            7,
+            100,
+        )
+        .unwrap();
+
+        server
+            .commit_checked(&[Event::GlobalMigrationCommitEvidence {
+                evidence: evidence.clone(),
+            }])
+            .unwrap();
+        let snapshot = server.state.lock().unwrap().snapshot_events();
+        assert!(snapshot.iter().any(|event| {
+            matches!(
+                event,
+                Event::GlobalMigrationCommitEvidence { evidence: observed }
+                    if observed == &evidence
+            )
+        }));
+        assert_eq!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .global
+                .migration_commit_evidence
+                .len(),
+            1
+        );
+
+        let replayed = replay(&root).unwrap();
+        assert_eq!(
+            replayed
+                .global
+                .migration_commit_evidence
+                .get("migration-op-1"),
+            Some(&evidence)
+        );
+        replayed.global.validate().unwrap();
+
+        let mut checkpointed = State::default();
+        for (line, event) in snapshot.iter().enumerate() {
+            apply_replayed_event(&mut checkpointed, event, line + 1).unwrap();
+        }
+        assert_eq!(
+            checkpointed
+                .global
+                .migration_commit_evidence
+                .get("migration-op-1"),
+            Some(&evidence)
+        );
+        checkpointed.global.validate().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn task_register_wires_worktree_binding_and_replays_it() {
