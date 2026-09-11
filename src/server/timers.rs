@@ -1021,49 +1021,33 @@ mod tests {
                 .get_mut(&subscription_id)
                 .unwrap()
                 .expires_ms = base + 300_000;
-            state.msgs.get_mut(&message_id).unwrap().created_ms = base - delay_ms - 1;
+            state.msgs.get_mut(&message_id).unwrap().created_ms = base;
         }
 
         assert_eq!(delay_ms, 7_000);
-        assert!(!super::super::attempt_notification_with_at(
-            &server,
-            &message_id,
-            &subscription_id,
-            &|_| true,
-            &|_, _| false,
-            &|_, _| Ok(true),
-            base,
-        ));
+        let tick_before = base + delay_ms - 1;
+        tick_with_idle_at(&server, tick_before, &|_| true);
         assert_eq!(
             server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
-            1
+            0,
+            "the timer must not reserve before the bound direct-message window"
+        );
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&message_id].last_wake_attempt_ms,
+            0
         );
 
-        tick_with_idle_at(&server, base + delay_ms - 1, &|_| true);
+        let tick_at = base + delay_ms;
+        tick_with_idle_at(&server, tick_at, &|_| true);
         assert_eq!(
             server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
             1,
-            "the bound direct-message window has not elapsed"
+            "the timer must reserve exactly at the bound direct-message window"
         );
-        {
-            let state = server.state.lock().unwrap();
-            assert!(!super::super::mailbox::automatic_retry_eligible(
-                &state.msgs[&message_id],
-                delay_ms,
-                base + delay_ms - 1
-            ));
-            assert!(super::super::mailbox::automatic_retry_eligible(
-                &state.msgs[&message_id],
-                delay_ms,
-                base + delay_ms
-            ));
-        }
-
-        tick_with_idle_at(&server, base + delay_ms, &|_| true);
         assert_eq!(
-            server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
-            1,
-            "the lifetime attempt cap remains in force at the event-policy boundary"
+            server.state.lock().unwrap().msgs[&message_id].last_wake_attempt_ms,
+            tick_at,
+            "the timer reservation must carry the policy-boundary timestamp"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1084,35 +1068,26 @@ mod tests {
                 .get_mut(&subscription_id)
                 .unwrap()
                 .expires_ms = base + 300_000;
-            state.msgs.get_mut(&message_id).unwrap().created_ms = base - 1;
+            state.msgs.get_mut(&message_id).unwrap().created_ms = base;
         }
-        assert!(!super::super::attempt_notification_with_at(
-            &server,
-            &message_id,
-            &subscription_id,
-            &|_| true,
-            &|_, _| false,
-            &|_, _| Ok(true),
-            base,
-        ));
+        let tick_before = base - 1;
+        tick_with_idle_at(&server, tick_before, &|_| true);
         assert_eq!(
             server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
-            1
+            0,
+            "the timer must leave an immediate event unreserved before its message timestamp"
         );
 
-        {
-            let state = server.state.lock().unwrap();
-            assert!(super::super::mailbox::automatic_retry_eligible(
-                &state.msgs[&message_id],
-                delay_ms,
-                base + 1
-            ));
-        }
-        tick_with_idle_at(&server, base + 1, &|_| true);
+        let tick_at = base;
+        tick_with_idle_at(&server, tick_at, &|_| true);
         assert_eq!(
             server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
             1,
-            "the lifetime attempt cap remains in force for immediate events"
+            "the timer must reserve an immediate event without the batch window"
+        );
+        assert_eq!(
+            server.state.lock().unwrap().msgs[&message_id].last_wake_attempt_ms,
+            tick_at
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1129,6 +1104,7 @@ mod tests {
             message_type,
         );
         let base = now_ms();
+        let retry_delay_ms = server.config.notifications.delay_ms("direct-message");
         {
             let mut state = server.state.lock().unwrap();
             state
@@ -1136,6 +1112,7 @@ mod tests {
                 .get_mut(&subscription_id)
                 .unwrap()
                 .expires_ms = base + 300_000;
+            state.msgs.get_mut(&message_id).unwrap().created_ms = base;
         }
         server.commit(&[Event::DeliveryMode {
             msg_id: message_id.clone(),
@@ -1149,6 +1126,20 @@ mod tests {
                 &state.msgs[&message_id]
             ));
         }
+        let timer_at = base + retry_delay_ms;
+        tick_with_idle_at(&server, timer_at, &|_| true);
+        {
+            let state = server.state.lock().unwrap();
+            assert_eq!(state.msgs[&message_id].state, "pending");
+            assert_eq!(
+                state.msgs[&message_id].wake_attempt_count, 0,
+                "eligible timer ticks must exclude explicit {message_type} delivery"
+            );
+            assert_eq!(state.msgs[&message_id].last_wake_attempt_ms, 0);
+        }
+
+        // The explicit operation remains available after the timer exclusion;
+        // its failed attempt is the only reservation recorded for this message.
         assert!(!super::super::attempt_notification_with_at(
             &server,
             &message_id,
@@ -1156,14 +1147,14 @@ mod tests {
             &|_| true,
             &|_, _| false,
             &|_, _| Ok(true),
-            base,
+            timer_at,
         ));
         assert_eq!(
             server.state.lock().unwrap().msgs[&message_id].wake_attempt_count,
             1
         );
 
-        tick_with_idle_at(&server, base + 120_000, &|_| true);
+        tick_with_idle_at(&server, timer_at + retry_delay_ms, &|_| true);
         let state = server.state.lock().unwrap();
         assert_eq!(state.msgs[&message_id].state, "pending");
         assert_eq!(state.msgs[&message_id].wake_attempt_count, 1);
