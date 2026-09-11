@@ -491,6 +491,504 @@ impl CommandReceipt {
     }
 }
 
+/// Authoritative target-state evidence for one committed migration operation.
+/// The evidence is indexed by `operation_id` in [`GlobalState`], so a receipt
+/// can only pass when its coordinates agree with the state-owned commit record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationCommitEvidence {
+    pub migration_id: String,
+    pub source_project_id: String,
+    pub target_epoch: u64,
+    pub source_snapshot_digest: String,
+    pub operation_id: OperationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<BindingId>,
+    pub fencing_token: u64,
+    pub committed_revision: u64,
+}
+
+impl MigrationCommitEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        migration_id: impl Into<String>,
+        source_project_id: impl Into<String>,
+        target_epoch: u64,
+        source_snapshot_digest: impl Into<String>,
+        operation_id: OperationId,
+        binding_id: Option<BindingId>,
+        fencing_token: u64,
+        committed_revision: u64,
+    ) -> Result<Self, StateError> {
+        let evidence = Self {
+            migration_id: migration_id.into(),
+            source_project_id: source_project_id.into(),
+            target_epoch,
+            source_snapshot_digest: source_snapshot_digest.into(),
+            operation_id,
+            binding_id,
+            fencing_token,
+            committed_revision,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    pub fn validate(&self) -> Result<(), StateError> {
+        validate_migration_identifier("migration id", &self.migration_id)?;
+        validate_migration_identifier("source project id", &self.source_project_id)?;
+        validate_migration_identifier("source snapshot digest", &self.source_snapshot_digest)?;
+        validate_operation_id(&self.operation_id)?;
+        if let Some(binding_id) = &self.binding_id {
+            validate_binding_id(binding_id)?;
+        }
+        if self.target_epoch == 0 {
+            return Err(StateError::invalid(
+                "migration target epoch",
+                "must be non-zero",
+            ));
+        }
+        if self.fencing_token == 0 {
+            return Err(StateError::invalid(
+                "migration fencing token",
+                "must be non-zero",
+            ));
+        }
+        if self.committed_revision == 0 {
+            return Err(StateError::invalid(
+                "migration commit revision",
+                "must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Receipt proving that exactly one target writer was admitted for a
+/// migration attempt.  The receipt is control state: it carries no source
+/// payload and does not start or stop a daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationWriterReceipt {
+    pub migration_id: String,
+    pub source_project_id: String,
+    pub source_epoch: Option<u64>,
+    pub target_epoch: u64,
+    pub source_snapshot_digest: String,
+    pub writer_id: AgentId,
+    pub operation_id: OperationId,
+    pub fencing_token: u64,
+    pub writer_count: u32,
+    pub committed_revision: u64,
+}
+
+impl MigrationWriterReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        migration_id: impl Into<String>,
+        source_project_id: impl Into<String>,
+        source_epoch: Option<u64>,
+        target_epoch: u64,
+        source_snapshot_digest: impl Into<String>,
+        writer_id: AgentId,
+        operation_id: OperationId,
+        fencing_token: u64,
+        writer_count: u32,
+        committed_revision: u64,
+    ) -> Result<Self, StateError> {
+        let receipt = Self {
+            migration_id: migration_id.into(),
+            source_project_id: source_project_id.into(),
+            source_epoch,
+            target_epoch,
+            source_snapshot_digest: source_snapshot_digest.into(),
+            writer_id,
+            operation_id,
+            fencing_token,
+            writer_count,
+            committed_revision,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<(), StateError> {
+        validate_migration_identifier("migration id", &self.migration_id)?;
+        validate_migration_identifier("source project id", &self.source_project_id)?;
+        validate_migration_identifier("source snapshot digest", &self.source_snapshot_digest)?;
+        validate_agent_id(&self.writer_id)?;
+        validate_operation_id(&self.operation_id)?;
+        validate_migration_epoch(self.source_epoch, self.target_epoch)?;
+        if self.fencing_token == 0 {
+            return Err(StateError::invalid(
+                "migration fencing token",
+                "must be non-zero",
+            ));
+        }
+        if self.writer_count != 1 {
+            return Err(StateError::invalid(
+                "migration writer count",
+                "exactly one writer is required",
+            ));
+        }
+        if self.committed_revision == 0 {
+            return Err(StateError::invalid(
+                "migration writer revision",
+                "must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Receipt proving that a stable logical identity was rebound to the target
+/// epoch's runtime/binding tuple.  A matching runtime receipt is required
+/// before the tuple can authorize target state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationIdentityRebindReceipt {
+    pub migration_id: String,
+    pub source_project_id: String,
+    pub project_scope: ProjectScopeId,
+    pub source_epoch: Option<u64>,
+    pub target_epoch: u64,
+    pub source_snapshot_digest: String,
+    pub agent_id: AgentId,
+    pub app_scope_id: AppServerId,
+    pub runtime_id: RuntimeId,
+    pub binding_id: BindingId,
+    pub endpoint_generation: u64,
+    pub operation_id: OperationId,
+    pub fencing_token: u64,
+    pub committed_revision: u64,
+}
+
+impl MigrationIdentityRebindReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        migration_id: impl Into<String>,
+        source_project_id: impl Into<String>,
+        project_scope: ProjectScopeId,
+        source_epoch: Option<u64>,
+        target_epoch: u64,
+        source_snapshot_digest: impl Into<String>,
+        agent_id: AgentId,
+        app_scope_id: AppServerId,
+        runtime_id: RuntimeId,
+        binding_id: BindingId,
+        endpoint_generation: u64,
+        operation_id: OperationId,
+        fencing_token: u64,
+        committed_revision: u64,
+    ) -> Result<Self, StateError> {
+        let receipt = Self {
+            migration_id: migration_id.into(),
+            source_project_id: source_project_id.into(),
+            project_scope,
+            source_epoch,
+            target_epoch,
+            source_snapshot_digest: source_snapshot_digest.into(),
+            agent_id,
+            app_scope_id,
+            runtime_id,
+            binding_id,
+            endpoint_generation,
+            operation_id,
+            fencing_token,
+            committed_revision,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<(), StateError> {
+        validate_migration_receipt_identity(
+            &self.migration_id,
+            &self.source_project_id,
+            &self.project_scope,
+            self.source_epoch,
+            self.target_epoch,
+            &self.source_snapshot_digest,
+            &self.agent_id,
+            &self.app_scope_id,
+            &self.runtime_id,
+            &self.binding_id,
+            self.endpoint_generation,
+            &self.operation_id,
+            self.fencing_token,
+            self.committed_revision,
+        )
+    }
+}
+
+/// Receipt proving that the native/runtime endpoint was rebound and committed
+/// under the migration writer fence.  Its identity tuple must match an
+/// `MigrationIdentityRebindReceipt` exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationRuntimeRebindReceipt {
+    pub migration_id: String,
+    pub source_project_id: String,
+    pub project_scope: ProjectScopeId,
+    pub source_epoch: Option<u64>,
+    pub target_epoch: u64,
+    pub source_snapshot_digest: String,
+    pub agent_id: AgentId,
+    pub app_scope_id: AppServerId,
+    pub runtime_id: RuntimeId,
+    pub binding_id: BindingId,
+    pub endpoint_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_thread_id: Option<NativeThreadId>,
+    pub operation_id: OperationId,
+    pub fencing_token: u64,
+    pub committed_revision: u64,
+}
+
+impl MigrationRuntimeRebindReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        migration_id: impl Into<String>,
+        source_project_id: impl Into<String>,
+        project_scope: ProjectScopeId,
+        source_epoch: Option<u64>,
+        target_epoch: u64,
+        source_snapshot_digest: impl Into<String>,
+        agent_id: AgentId,
+        app_scope_id: AppServerId,
+        runtime_id: RuntimeId,
+        binding_id: BindingId,
+        endpoint_generation: u64,
+        native_thread_id: Option<NativeThreadId>,
+        operation_id: OperationId,
+        fencing_token: u64,
+        committed_revision: u64,
+    ) -> Result<Self, StateError> {
+        let receipt = Self {
+            migration_id: migration_id.into(),
+            source_project_id: source_project_id.into(),
+            project_scope,
+            source_epoch,
+            target_epoch,
+            source_snapshot_digest: source_snapshot_digest.into(),
+            agent_id,
+            app_scope_id,
+            runtime_id,
+            binding_id,
+            endpoint_generation,
+            native_thread_id,
+            operation_id,
+            fencing_token,
+            committed_revision,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<(), StateError> {
+        validate_migration_receipt_identity(
+            &self.migration_id,
+            &self.source_project_id,
+            &self.project_scope,
+            self.source_epoch,
+            self.target_epoch,
+            &self.source_snapshot_digest,
+            &self.agent_id,
+            &self.app_scope_id,
+            &self.runtime_id,
+            &self.binding_id,
+            self.endpoint_generation,
+            &self.operation_id,
+            self.fencing_token,
+            self.committed_revision,
+        )?;
+        if let Some(native_thread_id) = &self.native_thread_id {
+            validate_native_thread_id(native_thread_id)?;
+        }
+        Ok(())
+    }
+}
+
+/// The receipt graph required by the migration apply gate.  The optional
+/// writer is intentional: a missing writer remains a typed validation error,
+/// rather than being represented by an invented default writer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationReceiptSet {
+    pub writer: Option<MigrationWriterReceipt>,
+    #[serde(default)]
+    pub identity_rebinds: Vec<MigrationIdentityRebindReceipt>,
+    #[serde(default)]
+    pub runtime_rebinds: Vec<MigrationRuntimeRebindReceipt>,
+}
+
+impl MigrationReceiptSet {
+    pub fn validate(&self) -> Result<(), StateError> {
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| StateError::invalid("migration writer receipt", "is required"))?;
+        self.validate_for(
+            &writer.migration_id,
+            &writer.source_project_id,
+            &writer.source_snapshot_digest,
+            writer.target_epoch,
+        )
+    }
+
+    pub fn validate_for(
+        &self,
+        migration_id: &str,
+        source_project_id: &str,
+        source_snapshot_digest: &str,
+        target_epoch: u64,
+    ) -> Result<(), StateError> {
+        validate_migration_identifier("migration id", migration_id)?;
+        validate_migration_identifier("source project id", source_project_id)?;
+        validate_migration_identifier("source snapshot digest", source_snapshot_digest)?;
+        if target_epoch == 0 {
+            return Err(StateError::invalid(
+                "migration target epoch",
+                "must be non-zero",
+            ));
+        }
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| StateError::invalid("migration writer receipt", "is required"))?;
+        writer.validate()?;
+        validate_migration_context(
+            "writer",
+            &writer.migration_id,
+            &writer.source_project_id,
+            &writer.source_snapshot_digest,
+            writer.target_epoch,
+            migration_id,
+            source_project_id,
+            source_snapshot_digest,
+            target_epoch,
+        )?;
+
+        if self.identity_rebinds.len() != self.runtime_rebinds.len() {
+            return Err(StateError::Invariant(format!(
+                "migration identity/runtime receipt count mismatch: {} != {}",
+                self.identity_rebinds.len(),
+                self.runtime_rebinds.len()
+            )));
+        }
+
+        let mut operations = BTreeSet::new();
+        if !operations.insert(writer.operation_id.as_str().to_owned()) {
+            return Err(StateError::Invariant(format!(
+                "migration operation {} is recorded more than once",
+                writer.operation_id
+            )));
+        }
+
+        for receipt in &self.identity_rebinds {
+            receipt.validate()?;
+            validate_migration_context(
+                "identity rebind",
+                &receipt.migration_id,
+                &receipt.source_project_id,
+                &receipt.source_snapshot_digest,
+                receipt.target_epoch,
+                migration_id,
+                source_project_id,
+                source_snapshot_digest,
+                target_epoch,
+            )?;
+            if receipt.fencing_token != writer.fencing_token {
+                return Err(StateError::Invariant(format!(
+                    "identity rebind {} uses a different fencing token",
+                    receipt.operation_id
+                )));
+            }
+            if receipt.source_epoch != writer.source_epoch {
+                return Err(StateError::Invariant(format!(
+                    "identity rebind {} uses a different source epoch",
+                    receipt.operation_id
+                )));
+            }
+            if !operations.insert(receipt.operation_id.as_str().to_owned()) {
+                return Err(StateError::Invariant(format!(
+                    "migration operation {} is recorded more than once",
+                    receipt.operation_id
+                )));
+            }
+        }
+
+        for receipt in &self.runtime_rebinds {
+            receipt.validate()?;
+            validate_migration_context(
+                "runtime rebind",
+                &receipt.migration_id,
+                &receipt.source_project_id,
+                &receipt.source_snapshot_digest,
+                receipt.target_epoch,
+                migration_id,
+                source_project_id,
+                source_snapshot_digest,
+                target_epoch,
+            )?;
+            if receipt.fencing_token != writer.fencing_token {
+                return Err(StateError::Invariant(format!(
+                    "runtime rebind {} uses a different fencing token",
+                    receipt.operation_id
+                )));
+            }
+            if receipt.source_epoch != writer.source_epoch {
+                return Err(StateError::Invariant(format!(
+                    "runtime rebind {} uses a different source epoch",
+                    receipt.operation_id
+                )));
+            }
+            if !operations.insert(receipt.operation_id.as_str().to_owned()) {
+                return Err(StateError::Invariant(format!(
+                    "migration operation {} is recorded more than once",
+                    receipt.operation_id
+                )));
+            }
+        }
+
+        for identity in &self.identity_rebinds {
+            let matches = self.runtime_rebinds.iter().filter(|runtime| {
+                runtime.project_scope == identity.project_scope
+                    && runtime.app_scope_id == identity.app_scope_id
+                    && runtime.agent_id == identity.agent_id
+                    && runtime.runtime_id == identity.runtime_id
+                    && runtime.binding_id == identity.binding_id
+                    && runtime.endpoint_generation == identity.endpoint_generation
+                    && runtime.fencing_token == identity.fencing_token
+            });
+            if matches.count() != 1 {
+                return Err(StateError::Invariant(format!(
+                    "identity rebind {} has no unique matching runtime receipt",
+                    identity.operation_id
+                )));
+            }
+        }
+        for runtime in &self.runtime_rebinds {
+            let matches = self.identity_rebinds.iter().filter(|identity| {
+                identity.project_scope == runtime.project_scope
+                    && identity.app_scope_id == runtime.app_scope_id
+                    && identity.agent_id == runtime.agent_id
+                    && identity.runtime_id == runtime.runtime_id
+                    && identity.binding_id == runtime.binding_id
+                    && identity.endpoint_generation == runtime.endpoint_generation
+                    && identity.fencing_token == runtime.fencing_token
+            });
+            if matches.count() != 1 {
+                return Err(StateError::Invariant(format!(
+                    "runtime rebind {} has no unique matching identity receipt",
+                    runtime.operation_id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One host-wide reducer state.  Project state is nested under a canonical
 /// project-scope key; AppServer registrations are nested under each project.
 /// Command IDs are host-wide so retries cannot be rebound across projects.
@@ -503,6 +1001,8 @@ pub struct GlobalState {
     pub projects: BTreeMap<String, ProjectState>,
     #[serde(default)]
     pub command_receipts: BTreeMap<String, CommandReceipt>,
+    #[serde(default)]
+    pub migration_commit_evidence: BTreeMap<String, MigrationCommitEvidence>,
 }
 
 impl Default for GlobalState {
@@ -522,6 +1022,7 @@ impl GlobalState {
             revision: 0,
             projects: BTreeMap::new(),
             command_receipts: BTreeMap::new(),
+            migration_commit_evidence: BTreeMap::new(),
         })
     }
 
@@ -572,6 +1073,232 @@ impl GlobalState {
                 return Err(StateError::Invariant(format!(
                     "operation {} is recorded more than once",
                     receipt.operation_id
+                )));
+            }
+        }
+        for (operation_key, evidence) in &self.migration_commit_evidence {
+            evidence.validate()?;
+            if operation_key != evidence.operation_id.as_str() {
+                return Err(StateError::Invariant(format!(
+                    "migration commit evidence key {operation_key} does not match operation {}",
+                    evidence.operation_id
+                )));
+            }
+            if evidence.target_epoch != self.epoch {
+                return Err(StateError::Invariant(format!(
+                    "migration commit evidence {} belongs to target epoch {}, expected {}",
+                    evidence.operation_id, evidence.target_epoch, self.epoch
+                )));
+            }
+            if evidence.committed_revision > self.revision {
+                return Err(StateError::Invariant(format!(
+                    "migration commit evidence {} revision {} exceeds global revision {}",
+                    evidence.operation_id, evidence.committed_revision, self.revision
+                )));
+            }
+            if !operations.insert(evidence.operation_id.as_str().to_owned()) {
+                return Err(StateError::Invariant(format!(
+                    "operation {} is recorded more than once",
+                    evidence.operation_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the target-side receipt graph against this projected global
+    /// state.  This is intentionally read-only: epoch allocation and runtime
+    /// rebind operations remain owned by the resident journal writer.
+    pub fn validate_migration_receipts(
+        &self,
+        receipts: &MigrationReceiptSet,
+    ) -> Result<(), StateError> {
+        self.validate()?;
+        let writer = receipts
+            .writer
+            .as_ref()
+            .ok_or_else(|| StateError::invalid("migration writer receipt", "is required"))?;
+        receipts.validate_for(
+            &writer.migration_id,
+            &writer.source_project_id,
+            &writer.source_snapshot_digest,
+            self.epoch,
+        )?;
+
+        let mut receipt_operation_ids = BTreeSet::new();
+        self.validate_migration_commit_evidence(
+            "writer",
+            &writer.migration_id,
+            &writer.source_project_id,
+            &writer.source_snapshot_digest,
+            writer.target_epoch,
+            &writer.operation_id,
+            None,
+            writer.fencing_token,
+            writer.committed_revision,
+        )?;
+        receipt_operation_ids.insert(writer.operation_id.as_str().to_owned());
+
+        for receipt in &receipts.identity_rebinds {
+            self.validate_migration_commit_evidence(
+                "identity rebind",
+                &receipt.migration_id,
+                &receipt.source_project_id,
+                &receipt.source_snapshot_digest,
+                receipt.target_epoch,
+                &receipt.operation_id,
+                Some(&receipt.binding_id),
+                receipt.fencing_token,
+                receipt.committed_revision,
+            )?;
+            receipt_operation_ids.insert(receipt.operation_id.as_str().to_owned());
+        }
+        for receipt in &receipts.runtime_rebinds {
+            self.validate_migration_commit_evidence(
+                "runtime rebind",
+                &receipt.migration_id,
+                &receipt.source_project_id,
+                &receipt.source_snapshot_digest,
+                receipt.target_epoch,
+                &receipt.operation_id,
+                Some(&receipt.binding_id),
+                receipt.fencing_token,
+                receipt.committed_revision,
+            )?;
+            receipt_operation_ids.insert(receipt.operation_id.as_str().to_owned());
+        }
+
+        for evidence in self.migration_commit_evidence.values() {
+            if evidence.migration_id == writer.migration_id
+                && evidence.source_project_id == writer.source_project_id
+                && evidence.source_snapshot_digest == writer.source_snapshot_digest
+                && evidence.target_epoch == writer.target_epoch
+                && !receipt_operation_ids.contains(evidence.operation_id.as_str())
+            {
+                return Err(StateError::Invariant(format!(
+                    "migration commit evidence {} is not paired with a receipt",
+                    evidence.operation_id
+                )));
+            }
+        }
+
+        let expected_bindings: Vec<&RuntimeBinding> = self
+            .projects
+            .values()
+            .flat_map(|project| project.runtime_bindings.values())
+            .collect();
+        if expected_bindings.len() != receipts.runtime_rebinds.len() {
+            return Err(StateError::Invariant(format!(
+                "runtime rebind receipt count {} does not match target binding count {}",
+                receipts.runtime_rebinds.len(),
+                expected_bindings.len()
+            )));
+        }
+
+        for binding in expected_bindings {
+            let Some(receipt) = receipts.runtime_rebinds.iter().find(|receipt| {
+                receipt.project_scope == binding.project_scope
+                    && receipt.app_scope_id == binding.app_scope_id
+                    && receipt.agent_id == binding.agent_id
+                    && receipt.runtime_id == binding.runtime_id
+                    && receipt.binding_id == binding.binding_id
+                    && receipt.endpoint_generation == binding.endpoint_generation
+                    && receipt.native_thread_id == binding.native_thread_id
+            }) else {
+                return Err(StateError::Invariant(format!(
+                    "target runtime binding {} has no matching migration receipt",
+                    binding.binding_id
+                )));
+            };
+
+            let route_scope = binding.route_scope();
+            if self
+                .lookup_binding_for(&route_scope, &receipt.binding_id)
+                .is_none()
+            {
+                return Err(StateError::Invariant(format!(
+                    "migration receipt {} is not bound to a registered route",
+                    receipt.operation_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_migration_commit_evidence(
+        &self,
+        kind: &str,
+        migration_id: &str,
+        source_project_id: &str,
+        source_snapshot_digest: &str,
+        target_epoch: u64,
+        operation_id: &OperationId,
+        binding_id: Option<&BindingId>,
+        fencing_token: u64,
+        committed_revision: u64,
+    ) -> Result<(), StateError> {
+        let Some(evidence) = self.migration_commit_evidence.get(operation_id.as_str()) else {
+            return Err(StateError::Invariant(format!(
+                "{kind} receipt {} has no authoritative migration commit evidence",
+                operation_id
+            )));
+        };
+
+        if evidence.migration_id != migration_id {
+            return Err(StateError::Invariant(format!(
+                "{kind} receipt {} evidence belongs to migration {}, expected {}",
+                operation_id, evidence.migration_id, migration_id
+            )));
+        }
+        if evidence.source_project_id != source_project_id {
+            return Err(StateError::Invariant(format!(
+                "{kind} receipt {} evidence belongs to source project {}, expected {}",
+                operation_id, evidence.source_project_id, source_project_id
+            )));
+        }
+        if evidence.source_snapshot_digest != source_snapshot_digest {
+            return Err(StateError::Invariant(format!(
+                "{kind} receipt {} evidence belongs to source digest {}, expected {}",
+                operation_id, evidence.source_snapshot_digest, source_snapshot_digest
+            )));
+        }
+        if evidence.target_epoch != target_epoch {
+            return Err(StateError::Invariant(format!(
+                "{kind} receipt {} evidence belongs to target epoch {}, expected {}",
+                operation_id, evidence.target_epoch, target_epoch
+            )));
+        }
+        if evidence.fencing_token != fencing_token {
+            return Err(StateError::Invariant(format!(
+                "{kind} receipt {} evidence uses fencing token {}, expected {}",
+                operation_id, evidence.fencing_token, fencing_token
+            )));
+        }
+        if evidence.committed_revision != committed_revision {
+            return Err(StateError::Invariant(format!(
+                "{kind} receipt {} evidence uses committed revision {}, expected {}",
+                operation_id, evidence.committed_revision, committed_revision
+            )));
+        }
+        match (evidence.binding_id.as_ref(), binding_id) {
+            (None, None) => {}
+            (Some(observed), Some(expected)) if observed == expected => {}
+            (None, Some(expected)) => {
+                return Err(StateError::Invariant(format!(
+                    "{kind} receipt {} evidence has no binding, expected {}",
+                    operation_id, expected
+                )));
+            }
+            (Some(observed), None) => {
+                return Err(StateError::Invariant(format!(
+                    "{kind} receipt {} evidence is bound to {}, writer evidence must be unbound",
+                    operation_id, observed
+                )));
+            }
+            (Some(observed), Some(expected)) => {
+                return Err(StateError::Invariant(format!(
+                    "{kind} receipt {} evidence is bound to {}, expected {}",
+                    operation_id, observed, expected
                 )));
             }
         }
@@ -730,6 +1457,46 @@ impl GlobalState {
         }
         self.command_receipts
             .insert(receipt.command_id.as_str().to_owned(), receipt);
+        Ok(())
+    }
+
+    /// Install one migration commit evidence record already committed by the
+    /// resident journal.  The outer reducer owns the event and version
+    /// ordering, so this projection deliberately does not bump or validate
+    /// the independent global counters until the caller synchronizes them.
+    pub fn record_migration_commit_evidence(
+        &mut self,
+        evidence: MigrationCommitEvidence,
+    ) -> Result<(), StateError> {
+        evidence.validate()?;
+        if evidence.target_epoch != self.epoch {
+            return Err(StateError::Invariant(format!(
+                "migration commit evidence {} belongs to target epoch {}, expected {}",
+                evidence.operation_id, evidence.target_epoch, self.epoch
+            )));
+        }
+        let operation_key = evidence.operation_id.as_str().to_owned();
+        if let Some(existing) = self.migration_commit_evidence.get(&operation_key) {
+            if existing == &evidence {
+                return Ok(());
+            }
+            return Err(StateError::ReceiptConflict(format!(
+                "migration operation {} was already projected with different commit evidence",
+                evidence.operation_id
+            )));
+        }
+        if let Some(existing) = self
+            .command_receipts
+            .values()
+            .find(|current| current.operation_id == evidence.operation_id)
+        {
+            return Err(StateError::OperationIdReuse {
+                operation_id: evidence.operation_id.as_str().to_owned(),
+                existing_command: existing.command_id.as_str().to_owned(),
+            });
+        }
+        self.migration_commit_evidence
+            .insert(operation_key, evidence);
         Ok(())
     }
 
@@ -1184,6 +1951,134 @@ fn validate_non_empty_text(field: &'static str, value: &str) -> Result<(), State
             field,
             "must not contain control characters",
         ));
+    }
+    Ok(())
+}
+
+fn validate_migration_identifier(field: &'static str, value: &str) -> Result<(), StateError> {
+    if value.trim().is_empty() {
+        return Err(StateError::invalid(field, "must not be empty"));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(StateError::invalid(
+            field,
+            "must not contain whitespace or control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_migration_epoch(
+    source_epoch: Option<u64>,
+    target_epoch: u64,
+) -> Result<(), StateError> {
+    if source_epoch == Some(0) {
+        return Err(StateError::invalid(
+            "migration source epoch",
+            "must be non-zero when present",
+        ));
+    }
+    if target_epoch == 0 {
+        return Err(StateError::invalid(
+            "migration target epoch",
+            "must be non-zero",
+        ));
+    }
+    if source_epoch == Some(target_epoch) {
+        return Err(StateError::invalid(
+            "migration source epoch",
+            "must differ from target epoch",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_migration_receipt_identity(
+    migration_id: &str,
+    source_project_id: &str,
+    project_scope: &ProjectScopeId,
+    source_epoch: Option<u64>,
+    target_epoch: u64,
+    source_snapshot_digest: &str,
+    agent_id: &AgentId,
+    app_scope_id: &AppServerId,
+    runtime_id: &RuntimeId,
+    binding_id: &BindingId,
+    endpoint_generation: u64,
+    operation_id: &OperationId,
+    fencing_token: u64,
+    committed_revision: u64,
+) -> Result<(), StateError> {
+    validate_migration_identifier("migration id", migration_id)?;
+    validate_migration_identifier("source project id", source_project_id)?;
+    validate_project_scope(project_scope)?;
+    validate_migration_identifier("source snapshot digest", source_snapshot_digest)?;
+    validate_migration_epoch(source_epoch, target_epoch)?;
+    validate_agent_id(agent_id)?;
+    validate_app_scope(app_scope_id)?;
+    validate_runtime_id(runtime_id)?;
+    validate_binding_id(binding_id)?;
+    validate_operation_id(operation_id)?;
+    if endpoint_generation == 0 {
+        return Err(StateError::invalid(
+            "migration endpoint generation",
+            "must be non-zero",
+        ));
+    }
+    if fencing_token == 0 {
+        return Err(StateError::invalid(
+            "migration fencing token",
+            "must be non-zero",
+        ));
+    }
+    if committed_revision == 0 {
+        return Err(StateError::invalid(
+            "migration receipt revision",
+            "must be non-zero",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_migration_context(
+    kind: &str,
+    observed_migration_id: &str,
+    observed_source_project_id: &str,
+    observed_source_snapshot_digest: &str,
+    observed_target_epoch: u64,
+    migration_id: &str,
+    source_project_id: &str,
+    source_snapshot_digest: &str,
+    target_epoch: u64,
+) -> Result<(), StateError> {
+    if observed_migration_id != migration_id {
+        return Err(StateError::Invariant(format!(
+            "{kind} receipt belongs to migration {}, expected {}",
+            observed_migration_id, migration_id
+        )));
+    }
+    if observed_source_project_id != source_project_id {
+        return Err(StateError::Invariant(format!(
+            "{kind} receipt belongs to source project {}, expected {}",
+            observed_source_project_id, source_project_id
+        )));
+    }
+    if observed_source_snapshot_digest != source_snapshot_digest {
+        return Err(StateError::Invariant(format!(
+            "{kind} receipt belongs to source digest {}, expected {}",
+            observed_source_snapshot_digest, source_snapshot_digest
+        )));
+    }
+    if observed_target_epoch != target_epoch {
+        return Err(StateError::Invariant(format!(
+            "{kind} receipt belongs to target epoch {}, expected {}",
+            observed_target_epoch, target_epoch
+        )));
     }
     Ok(())
 }
@@ -1779,5 +2674,387 @@ mod tests {
             Err(StateError::CommandIdReuse { .. })
         ));
         state.validate().unwrap();
+    }
+
+    fn migration_writer(target_epoch: u64) -> MigrationWriterReceipt {
+        MigrationWriterReceipt::new(
+            "migration-1",
+            "project-1",
+            None,
+            target_epoch,
+            "sha256:source",
+            AgentId::new("writer-1").unwrap(),
+            OperationId::new("writer-op-1").unwrap(),
+            7,
+            1,
+            1,
+        )
+        .expect("migration writer receipt")
+    }
+
+    fn migration_commit(
+        operation_id: &str,
+        binding_id: Option<&str>,
+        committed_revision: u64,
+    ) -> MigrationCommitEvidence {
+        MigrationCommitEvidence::new(
+            "migration-1",
+            "project-1",
+            2,
+            "sha256:source",
+            OperationId::new(operation_id).expect("operation id"),
+            binding_id.map(|value| BindingId::new(value).expect("binding id")),
+            7,
+            committed_revision,
+        )
+        .expect("migration commit evidence")
+    }
+
+    #[test]
+    fn migration_receipt_set_requires_one_writer_and_unique_rebind_pairs() {
+        let missing = MigrationReceiptSet::default();
+        assert!(matches!(
+            missing.validate(),
+            Err(StateError::Invalid {
+                field: "migration writer receipt",
+                ..
+            })
+        ));
+
+        let mut writer = migration_writer(2);
+        writer.writer_count = 2;
+        assert!(writer.validate().is_err());
+
+        let mut receipts = MigrationReceiptSet {
+            writer: Some(migration_writer(2)),
+            ..MigrationReceiptSet::default()
+        };
+        let scope = project_scope();
+        let identity = MigrationIdentityRebindReceipt::new(
+            "migration-1",
+            "project-1",
+            scope.clone(),
+            None,
+            2,
+            "sha256:source",
+            AgentId::new("agent-1").unwrap(),
+            app_scope("app-one"),
+            RuntimeId::new("runtime-one").unwrap(),
+            BindingId::new("binding-one").unwrap(),
+            1,
+            OperationId::new("identity-op-1").unwrap(),
+            7,
+            2,
+        )
+        .unwrap();
+        let runtime = MigrationRuntimeRebindReceipt::new(
+            "migration-1",
+            "project-1",
+            scope,
+            None,
+            2,
+            "sha256:source",
+            AgentId::new("agent-other").unwrap(),
+            app_scope("app-one"),
+            RuntimeId::new("runtime-one").unwrap(),
+            BindingId::new("binding-one").unwrap(),
+            1,
+            None,
+            OperationId::new("runtime-op-1").unwrap(),
+            7,
+            3,
+        )
+        .unwrap();
+        receipts.identity_rebinds.push(identity);
+        receipts.runtime_rebinds.push(runtime);
+        assert!(matches!(
+            receipts.validate(),
+            Err(StateError::Invariant(reason)) if reason.contains("matching runtime receipt")
+        ));
+    }
+
+    #[test]
+    fn global_state_checks_migration_runtime_receipts_against_target_bindings() {
+        let scope = project_scope();
+        let mut state = GlobalState::new(2).unwrap();
+        state
+            .register_project(registration(&scope, "app-one"))
+            .unwrap();
+        state
+            .bind_runtime(binding(
+                &scope,
+                "app-one",
+                "agent-one",
+                "runtime-one",
+                "binding-one",
+                1,
+            ))
+            .unwrap();
+
+        let mut receipts = MigrationReceiptSet {
+            writer: Some(migration_writer(2)),
+            ..MigrationReceiptSet::default()
+        };
+        receipts.identity_rebinds.push(
+            MigrationIdentityRebindReceipt::new(
+                "migration-1",
+                "project-1",
+                scope.clone(),
+                None,
+                2,
+                "sha256:source",
+                AgentId::new("agent-one").unwrap(),
+                app_scope("app-one"),
+                RuntimeId::new("runtime-one").unwrap(),
+                BindingId::new("binding-one").unwrap(),
+                1,
+                OperationId::new("identity-op-1").unwrap(),
+                7,
+                2,
+            )
+            .unwrap(),
+        );
+        receipts.runtime_rebinds.push(
+            MigrationRuntimeRebindReceipt::new(
+                "migration-1",
+                "project-1",
+                scope,
+                None,
+                2,
+                "sha256:source",
+                AgentId::new("agent-one").unwrap(),
+                app_scope("app-one"),
+                RuntimeId::new("runtime-one").unwrap(),
+                BindingId::new("binding-one").unwrap(),
+                1,
+                None,
+                OperationId::new("runtime-op-1").unwrap(),
+                7,
+                3,
+            )
+            .unwrap(),
+        );
+        state.set_counters(3, 3);
+        state.migration_commit_evidence.insert(
+            "writer-op-1".into(),
+            migration_commit("writer-op-1", None, 1),
+        );
+        state.migration_commit_evidence.insert(
+            "identity-op-1".into(),
+            migration_commit("identity-op-1", Some("binding-one"), 2),
+        );
+        state.migration_commit_evidence.insert(
+            "runtime-op-1".into(),
+            migration_commit("runtime-op-1", Some("binding-one"), 3),
+        );
+        state.validate_migration_receipts(&receipts).unwrap();
+
+        let runtime_evidence = state
+            .migration_commit_evidence
+            .remove("runtime-op-1")
+            .expect("runtime commit evidence");
+        assert!(matches!(
+            state.validate_migration_receipts(&receipts),
+            Err(StateError::Invariant(reason))
+                if reason.contains("has no authoritative migration commit evidence")
+        ));
+        state
+            .migration_commit_evidence
+            .insert("runtime-op-1".into(), runtime_evidence);
+
+        state
+            .migration_commit_evidence
+            .get_mut("runtime-op-1")
+            .expect("runtime commit evidence")
+            .committed_revision = 4;
+        assert!(matches!(
+            state.validate_migration_receipts(&receipts),
+            Err(StateError::Invariant(reason)) if reason.contains("exceeds global revision")
+        ));
+        state
+            .migration_commit_evidence
+            .get_mut("runtime-op-1")
+            .expect("runtime commit evidence")
+            .committed_revision = 3;
+
+        state
+            .migration_commit_evidence
+            .get_mut("runtime-op-1")
+            .expect("runtime commit evidence")
+            .fencing_token = 8;
+        assert!(matches!(
+            state.validate_migration_receipts(&receipts),
+            Err(StateError::Invariant(reason)) if reason.contains("evidence uses fencing token")
+        ));
+        state
+            .migration_commit_evidence
+            .get_mut("runtime-op-1")
+            .expect("runtime commit evidence")
+            .fencing_token = 7;
+
+        receipts.runtime_rebinds[0].native_thread_id =
+            Some(NativeThreadId::new("native-thread-one").expect("native thread id"));
+        assert!(matches!(
+            state.validate_migration_receipts(&receipts),
+            Err(StateError::Invariant(reason)) if reason.contains("no matching migration receipt")
+        ));
+        receipts.runtime_rebinds[0].native_thread_id = None;
+
+        receipts.identity_rebinds[0].endpoint_generation = 2;
+        receipts.runtime_rebinds[0].endpoint_generation = 2;
+        assert!(matches!(
+            state.validate_migration_receipts(&receipts),
+            Err(StateError::Invariant(reason)) if reason.contains("no matching migration receipt")
+        ));
+    }
+
+    #[test]
+    fn migration_receipts_require_one_source_epoch_and_a_symmetric_pairing() {
+        assert!(MigrationWriterReceipt::new(
+            "migration-1",
+            "project-1",
+            Some(0),
+            2,
+            "sha256:source",
+            AgentId::new("writer-1").unwrap(),
+            OperationId::new("writer-op-1").unwrap(),
+            7,
+            1,
+            1,
+        )
+        .is_err());
+
+        let scope = project_scope();
+        let identity = MigrationIdentityRebindReceipt::new(
+            "migration-1",
+            "project-1",
+            scope.clone(),
+            None,
+            2,
+            "sha256:source",
+            AgentId::new("agent-one").unwrap(),
+            app_scope("app-one"),
+            RuntimeId::new("runtime-one").unwrap(),
+            BindingId::new("binding-one").unwrap(),
+            1,
+            OperationId::new("identity-op-1").unwrap(),
+            7,
+            2,
+        )
+        .unwrap();
+        let duplicate_identity = MigrationIdentityRebindReceipt::new(
+            "migration-1",
+            "project-1",
+            scope.clone(),
+            None,
+            2,
+            "sha256:source",
+            AgentId::new("agent-one").unwrap(),
+            app_scope("app-one"),
+            RuntimeId::new("runtime-one").unwrap(),
+            BindingId::new("binding-one").unwrap(),
+            1,
+            OperationId::new("identity-op-2").unwrap(),
+            7,
+            3,
+        )
+        .unwrap();
+        let runtime = MigrationRuntimeRebindReceipt::new(
+            "migration-1",
+            "project-1",
+            scope.clone(),
+            None,
+            2,
+            "sha256:source",
+            AgentId::new("agent-one").unwrap(),
+            app_scope("app-one"),
+            RuntimeId::new("runtime-one").unwrap(),
+            BindingId::new("binding-one").unwrap(),
+            1,
+            None,
+            OperationId::new("runtime-op-1").unwrap(),
+            7,
+            4,
+        )
+        .unwrap();
+        let unmatched_runtime = MigrationRuntimeRebindReceipt::new(
+            "migration-1",
+            "project-1",
+            scope,
+            None,
+            2,
+            "sha256:source",
+            AgentId::new("agent-two").unwrap(),
+            app_scope("app-one"),
+            RuntimeId::new("runtime-two").unwrap(),
+            BindingId::new("binding-two").unwrap(),
+            1,
+            None,
+            OperationId::new("runtime-op-2").unwrap(),
+            7,
+            5,
+        )
+        .unwrap();
+        let receipts = MigrationReceiptSet {
+            writer: Some(migration_writer(2)),
+            identity_rebinds: vec![identity, duplicate_identity],
+            runtime_rebinds: vec![runtime, unmatched_runtime],
+        };
+
+        assert!(matches!(
+            receipts.validate(),
+            Err(StateError::Invariant(reason))
+                if reason.contains("no unique matching identity receipt")
+        ));
+    }
+
+    #[test]
+    fn migration_receipts_reject_a_rebind_with_a_different_source_epoch() {
+        let scope = project_scope();
+        let identity = MigrationIdentityRebindReceipt::new(
+            "migration-1",
+            "project-1",
+            scope.clone(),
+            Some(1),
+            2,
+            "sha256:source",
+            AgentId::new("agent-one").unwrap(),
+            app_scope("app-one"),
+            RuntimeId::new("runtime-one").unwrap(),
+            BindingId::new("binding-one").unwrap(),
+            1,
+            OperationId::new("identity-op-1").unwrap(),
+            7,
+            2,
+        )
+        .unwrap();
+        let runtime = MigrationRuntimeRebindReceipt::new(
+            "migration-1",
+            "project-1",
+            scope,
+            Some(1),
+            2,
+            "sha256:source",
+            AgentId::new("agent-one").unwrap(),
+            app_scope("app-one"),
+            RuntimeId::new("runtime-one").unwrap(),
+            BindingId::new("binding-one").unwrap(),
+            1,
+            None,
+            OperationId::new("runtime-op-1").unwrap(),
+            7,
+            3,
+        )
+        .unwrap();
+        let receipts = MigrationReceiptSet {
+            writer: Some(migration_writer(2)),
+            identity_rebinds: vec![identity],
+            runtime_rebinds: vec![runtime],
+        };
+
+        assert!(matches!(
+            receipts.validate(),
+            Err(StateError::Invariant(reason)) if reason.contains("different source epoch")
+        ));
     }
 }
