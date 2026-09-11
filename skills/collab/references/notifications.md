@@ -49,13 +49,18 @@ collab notify unsubscribe <subscription-id>
   storms and terminal pollution, push knocks pause when unacknowledged notifications
   reach `max_unacked` (default 3, range 1-5). Run `collab ack <id>` or `collab ack --all`
   to resume push delivery. Messages remain safely buffered in the durable mailbox.
-- First pending daemon message starts a fixed 120-second window. At dispatch, include
-  eligible unsent messages for the recipient, capped at 3 previews per batch knock.
-  Excess messages remain in the inbox with `[+N more pending in inbox]`. When unacked
+- The bound subscription event policy supplies the automatic retry window: the
+  default `direct-message` batch window is 120 seconds, while an event configured
+  as `immediate` has a zero retry delay. At dispatch, include eligible unsent
+  messages for the recipient, capped at 3 previews per batch knock. Excess
+  messages remain in the inbox with `[+N more pending in inbox]`. When unacked
   notifications reach the throttle cap, the batch preview appends an
-  `[ACK REQUIRED: ...]` notice. Combine previews into one line with one final Enter;
-  at most one batch attempt per recipient per 120-second window. Reserve attempts before sending;
-  failed, absent, unknown, or uncertain delivery does not cause later automatic replay.
+  `[ACK REQUIRED: ...]` notice. Combine previews into one line with one final
+  Enter; reserve attempts before sending. Failed, absent, unknown, or uncertain
+  ordinary delivery remains pending; automatic eligibility still respects the
+  bound event window and the lifetime attempt cap. Explicit notification
+  delivery is never an automatic timer candidate; a later explicit operation
+  must be used when its first delivery failed.
 - P0 urgency is explicit: only a typed goal/deadline interrupt is marked P0. A blocked
   task, wait-timeout, or scheduling blocker is P1 operational work and must not be
   reclassified as a P0 interrupt by subject text alone.
