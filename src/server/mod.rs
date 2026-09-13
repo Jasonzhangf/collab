@@ -1520,7 +1520,39 @@ impl ProjectRuntimeManager {
             }
         }
 
-        for record in load_host_route_records(&route_journal)? {
+        let route_records = load_host_route_records(&route_journal)?;
+        // A route record is only usable when its storage path has one owner.
+        // The host resident reducer is an owner even when it has no entry in
+        // routes.jsonl; otherwise replay could admit a second reducer on the
+        // resident journal.
+        for record in &route_records {
+            let key = (record.app_scope_id.clone(), record.project_scope.clone());
+            let storage_root = PathBuf::from(&record.storage_root);
+            if (storage_root == host.root || storage_root == host.storage_root)
+                && !routes.get(&key).is_some_and(|route| {
+                    route
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| Arc::ptr_eq(runtime, &host))
+                })
+            {
+                return Err(format!(
+                    "HOST_ROUTE_REPLAY_FAILED: runtime storage root {} is already owned by resident host",
+                    record.storage_root
+                ));
+            }
+            if let Some((owner_key, _)) = routes
+                .iter()
+                .find(|(owner_key, route)| *owner_key != &key && route.storage_root == storage_root)
+            {
+                return Err(format!(
+                    "HOST_ROUTE_REPLAY_FAILED: runtime storage root {} is already owned by route ({}, {})",
+                    record.storage_root, owner_key.0, owner_key.1
+                ));
+            }
+        }
+
+        for record in route_records {
             let (key, root, storage_root) = validate_host_route_record(&record)?;
             if key.1 == host_root.as_str()
                 && routes.get(&key).is_some_and(|route| {
@@ -1763,6 +1795,25 @@ impl ProjectRuntimeManager {
             });
     }
 
+    fn storage_owner(&self, storage_root: &Path, records: &[HostRouteRecord]) -> Option<String> {
+        if self.host.root == storage_root || self.host.storage_root == storage_root {
+            return Some("resident host".into());
+        }
+        if let Some((key, _)) = self
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, route)| route.storage_root == storage_root)
+        {
+            return Some(format!("route ({}, {})", key.0, key.1));
+        }
+        records
+            .iter()
+            .find(|record| record.storage_root == storage_root.to_string_lossy())
+            .map(|record| format!("route ({}, {})", record.app_scope_id, record.project_scope))
+    }
+
     fn append_route_record(
         &self,
         context: &ProjectContext,
@@ -1804,13 +1855,10 @@ impl ProjectRuntimeManager {
                 record.app_scope_id, record.project_scope
             ));
         }
-        if let Some(existing) = existing_records
-            .iter()
-            .find(|existing| existing.storage_root == record.storage_root)
-        {
+        if let Some(owner) = self.storage_owner(storage_root, &existing_records) {
             return Err(format!(
-                "HOST_ROUTE_DURABILITY_FAILED: runtime storage root {} is already owned by route ({}, {})",
-                record.storage_root, existing.app_scope_id, existing.project_scope
+                "HOST_ROUTE_DURABILITY_FAILED: runtime storage root {} is already owned by {}",
+                record.storage_root, owner
             ));
         }
         if !existing.is_empty() && !existing.ends_with(b"\n") {
@@ -9938,6 +9986,88 @@ mod host_route_registry_tests {
         drop(manager);
         std::fs::remove_dir_all(host_root).unwrap();
         std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resident_storage_collision_rejects_register_before_route_publish() {
+        let (mut server, host_root, _) = test_server();
+        let resident_storage_root = host_root.with_file_name(format!(
+            "{}-resident-storage",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        let resident_server_dir = resident_storage_root.join(".agent-collab/server");
+        std::fs::create_dir_all(&resident_server_dir).unwrap();
+        let resident_storage_root = resident_storage_root.canonicalize().unwrap();
+        let resident_journal_path = resident_server_dir.join("journal.jsonl");
+        let resident_journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&resident_journal_path)
+            .unwrap();
+        {
+            let host = Arc::get_mut(&mut server).unwrap();
+            host.storage_root = resident_storage_root.clone();
+            host.journal_path = resident_journal_path;
+            host.journal = Mutex::new(resident_journal);
+        }
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        std::fs::write(&route_journal, b"").unwrap();
+        let before_collision = std::fs::read(&route_journal).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+
+        // First establish the resident route. Its reducer owns the storage
+        // root even though that ownership is not represented in routes.jsonl.
+        let resident_context = context_with_app(&host_root, "resident-app");
+        let (_runtime, resident_response) = manager.dispatch_sync(
+            Some(resident_context.clone()),
+            Req::Register {
+                worker_id: "resident-worker".into(),
+                token: "token-resident-worker".into(),
+                pane: Some("%resident-worker".into()),
+                cwd: host_root.display().to_string(),
+            },
+        );
+        assert!(resident_response.ok, "{resident_response:?}");
+
+        // A second project whose storage root equals the resident reducer's
+        // root must fail before a route record or second reducer is created.
+        let collision_context = context_with_app(&resident_storage_root, "collision-app");
+        let (_runtime, collision_response) = manager.dispatch_sync(
+            Some(collision_context.clone()),
+            Req::Register {
+                worker_id: "resident-collision-worker".into(),
+                token: "token-resident-collision".into(),
+                pane: Some("%resident-collision-worker".into()),
+                cwd: resident_storage_root.display().to_string(),
+            },
+        );
+        assert!(!collision_response.ok, "{collision_response:?}");
+        assert!(
+            collision_response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("owned by resident host")),
+            "{collision_response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+        assert!(!manager
+            .routes
+            .lock()
+            .unwrap()
+            .contains_key(&ProjectRuntimeManager::route_key(&collision_context)));
+
+        // The resident route remains the only owner and is still queryable.
+        let (_runtime, status_response) =
+            manager.dispatch_sync(Some(resident_context), Req::StatusAll);
+        assert!(status_response.ok, "{status_response:?}");
+        assert_eq!(status_response.data["workers"][0]["id"], "resident-worker");
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        drop(manager);
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(resident_storage_root).unwrap();
     }
 
     #[tokio::test]
