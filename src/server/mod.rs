@@ -1555,6 +1555,37 @@ fn storage_roots_equal(left: &Path, right: &Path) -> Result<bool, String> {
     Ok(storage_owner_path(left)? == storage_owner_path(right)?)
 }
 
+fn validate_runtime_storage_root(
+    root: &Path,
+    storage_root: &Path,
+    error_prefix: &str,
+) -> Result<PathBuf, String> {
+    if !storage_root.is_absolute() {
+        return Err(format!(
+            "{error_prefix}: runtime storage root must be absolute"
+        ));
+    }
+    let root_owner = storage_owner_path(root)
+        .map_err(|error| format!("{error_prefix}: resolve project storage owner: {error}"))?;
+    let storage_owner = storage_owner_path(storage_root)
+        .map_err(|error| format!("{error_prefix}: resolve runtime storage owner: {error}"))?;
+    if storage_owner == root_owner {
+        return Ok(root_owner);
+    }
+    let expected_parent = root_owner
+        .join(".agent-collab")
+        .join("server")
+        .join("runtimes");
+    if !storage_owner.starts_with(&expected_parent) {
+        return Err(format!(
+            "{error_prefix}: runtime storage root {} resolves outside project runtime storage {}",
+            storage_root.display(),
+            expected_parent.display()
+        ));
+    }
+    Ok(storage_owner)
+}
+
 fn validate_route_owner_table(
     host: &Arc<Server>,
     routes: &std::collections::BTreeMap<RouteKey, RuntimeRoute>,
@@ -1822,18 +1853,11 @@ impl ProjectRuntimeManager {
                 root.display()
             ));
         }
-        let storage_root = if storage_root == root {
-            root.clone()
-        } else {
-            let expected_parent = root.join(".agent-collab").join("server").join("runtimes");
-            if !storage_root.starts_with(&expected_parent) {
-                return Err(format!(
-                    "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: runtime storage {} is outside project runtime storage",
-                    storage_root.display()
-                ));
-            }
-            storage_root.to_path_buf()
-        };
+        let storage_root = validate_runtime_storage_root(
+            &root,
+            storage_root,
+            "PROJECT_ROUTE_NOT_READY/UNSUPPORTED",
+        )?;
         let server_dir = storage_root.join(".agent-collab").join("server");
         std::fs::create_dir_all(&server_dir).map_err(|error| {
             format!("PROJECT_ROUTE_NOT_READY/UNSUPPORTED: create runtime storage: {error}")
@@ -1961,6 +1985,12 @@ impl ProjectRuntimeManager {
         context: &ProjectContext,
         storage_root: &Path,
     ) -> Result<(), String> {
+        let project_root = Path::new(&context.canonical_root);
+        let storage_root = validate_runtime_storage_root(
+            project_root,
+            storage_root,
+            "HOST_ROUTE_DURABILITY_FAILED",
+        )?;
         let record = HostRouteRecord {
             version: 1,
             op: "register".into(),
@@ -1998,7 +2028,7 @@ impl ProjectRuntimeManager {
             ));
         }
         if let Some(owner) = self
-            .storage_owner(storage_root, &existing_records)
+            .storage_owner(&storage_root, &existing_records)
             .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?
         {
             return Err(format!(
@@ -2294,16 +2324,8 @@ fn validate_host_route_record(
         );
     }
     let storage_root = PathBuf::from(&record.storage_root);
-    if !storage_root.is_absolute() {
-        return Err("HOST_ROUTE_REPLAY_FAILED: runtime storage root must be absolute".into());
-    }
-    if storage_root != root && !storage_root.starts_with(root.join(".agent-collab/server/runtimes"))
-    {
-        return Err(
-            "HOST_ROUTE_REPLAY_FAILED: runtime storage root is outside project runtime storage"
-                .into(),
-        );
-    }
+    let storage_root =
+        validate_runtime_storage_root(&root, &storage_root, "HOST_ROUTE_REPLAY_FAILED")?;
     Ok((
         (
             app_scope.as_str().to_owned(),
@@ -10850,12 +10872,172 @@ mod host_route_registry_tests {
 
     #[cfg(unix)]
     #[test]
+    fn storage_owner_identity_resolves_dangling_symlink_with_missing_target() {
+        use std::os::unix::fs::symlink;
+
+        let (_server, root, _) = test_server();
+        let missing_parent = root.join("missing-parent");
+        let dangling_parent = root.join("dangling-parent");
+        symlink(&missing_parent, &dangling_parent).unwrap();
+
+        let target_path = missing_parent.join("future").join("journal");
+        let dangling_path = dangling_parent.join("future").join("journal");
+        assert_eq!(
+            storage_owner_path(&target_path).unwrap(),
+            storage_owner_path(&dangling_path).unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_storage_symlink_escape_rejects_register_before_journal_write() {
+        use std::os::unix::fs::symlink;
+
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-runtime-escape",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server/runtimes")).unwrap();
+        let external_root = host_root.with_file_name(format!(
+            "{}-runtime-escape-target",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&external_root).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let seed_context = context_with_app(&project_root, "runtime-seed");
+        let (_, seed_response) = manager.dispatch_sync(
+            Some(seed_context),
+            Req::Register {
+                worker_id: "runtime-seed-worker".into(),
+                token: "token-runtime-seed-worker".into(),
+                pane: Some("%runtime-seed-worker".into()),
+                cwd: project_root.display().to_string(),
+            },
+        );
+        assert!(seed_response.ok, "{seed_response:?}");
+
+        let escape_context = context_with_app(&project_root, "runtime-escape");
+        let escape_storage_root = app_scope_storage_path(&canonical_project_root, "runtime-escape");
+        symlink(&external_root, &escape_storage_root).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let before_route_journal = std::fs::read(&route_journal).unwrap();
+        let (_, escape_response) = manager.dispatch_sync(
+            Some(escape_context.clone()),
+            Req::Register {
+                worker_id: "runtime-escape-worker".into(),
+                token: "token-runtime-escape-worker".into(),
+                pane: Some("%runtime-escape-worker".into()),
+                cwd: project_root.display().to_string(),
+            },
+        );
+
+        assert!(!escape_response.ok, "{escape_response:?}");
+        assert!(
+            escape_response.error.as_deref().is_some_and(|error| {
+                error.starts_with("HOST_ROUTE_DURABILITY_FAILED:")
+                    && error.contains("resolves outside project runtime storage")
+            }),
+            "{escape_response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_route_journal);
+        assert!(!manager
+            .routes
+            .lock()
+            .unwrap()
+            .contains_key(&ProjectRuntimeManager::route_key(&escape_context)));
+        assert!(!external_root
+            .join(".agent-collab/server/journal.jsonl")
+            .exists());
+
+        let build_error = match manager.build_runtime(&project_root, &escape_storage_root) {
+            Ok(_) => panic!("runtime storage symlink escape must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            build_error.starts_with("PROJECT_ROUTE_NOT_READY/UNSUPPORTED:")
+                && build_error.contains("resolves outside project runtime storage"),
+            "{build_error}"
+        );
+        assert!(!external_root
+            .join(".agent-collab/server/journal.jsonl")
+            .exists());
+
+        drop(manager);
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_storage_symlink_escape_rejects_replay_before_runtime_creation() {
+        use std::os::unix::fs::symlink;
+
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-replay-runtime-escape",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server/runtimes")).unwrap();
+        let external_root = host_root.with_file_name(format!(
+            "{}-replay-runtime-escape-target",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&external_root).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let storage_root = app_scope_storage_path(&canonical_project_root, "replay-escape");
+        symlink(&external_root, &storage_root).unwrap();
+        let project_scope = GlobalState::canonical_project_scope(&canonical_project_root).unwrap();
+        let record = HostRouteRecord {
+            version: 1,
+            op: "register".into(),
+            app_scope_id: "replay-escape".into(),
+            project_scope: project_scope.as_str().into(),
+            canonical_root: project_scope.as_str().into(),
+            storage_root: storage_root.to_string_lossy().into_owned(),
+            registered_ms: 1,
+        };
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::write(
+            &route_journal,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let replay_error = match ProjectRuntimeManager::new(server, &host_paths) {
+            Ok(_) => panic!("runtime storage symlink escape must fail during replay"),
+            Err(error) => error,
+        };
+        assert!(
+            replay_error.starts_with("HOST_ROUTE_REPLAY_FAILED:")
+                && replay_error.contains("resolves outside project runtime storage"),
+            "{replay_error}"
+        );
+        assert!(!external_root
+            .join(".agent-collab/server/journal.jsonl")
+            .exists());
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dangling_symlink_storage_owner_rejects_alias_route_before_journal_write() {
         use std::os::unix::fs::symlink;
 
         let (server, root, _) = test_server();
-        let real_parent = root.join("real-parent");
-        let alias_parent = root.join("alias-parent");
+        let runtimes = root.join(".agent-collab/server/runtimes");
+        let real_parent = runtimes.join("real-parent");
+        let alias_parent = runtimes.join("alias-parent");
         std::fs::create_dir_all(&real_parent).unwrap();
         symlink(&real_parent, &alias_parent).unwrap();
 
@@ -10875,12 +11057,7 @@ mod host_route_registry_tests {
             },
         );
 
-        let external_root = root.with_file_name(format!(
-            "{}-dangling-alias",
-            root.file_name().unwrap().to_string_lossy()
-        ));
-        std::fs::create_dir_all(&external_root).unwrap();
-        let context = context_with_app(&external_root, "dangling-alias-app");
+        let context = context_with_app(&root, "dangling-alias-app");
         let before_route_journal = std::fs::read(&route_journal).unwrap();
         let error = manager
             .append_route_record(&context, &aliased_storage_root)
@@ -10898,14 +11075,13 @@ mod host_route_registry_tests {
         );
         assert!(!manager.routes.lock().unwrap().contains_key(&(
             "dangling-alias-app".into(),
-            GlobalState::canonical_project_scope(&external_root)
+            GlobalState::canonical_project_scope(&root)
                 .unwrap()
                 .as_str()
                 .into(),
         )));
 
         std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_dir_all(external_root).unwrap();
     }
 
     #[cfg(unix)]
