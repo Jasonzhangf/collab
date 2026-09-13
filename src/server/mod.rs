@@ -1484,12 +1484,49 @@ struct ProjectRuntimeManager {
     runtime_init_gates: Mutex<std::collections::BTreeMap<RouteKey, Arc<Mutex<()>>>>,
 }
 
-fn storage_owner_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+fn storage_owner_path(path: &Path) -> Result<PathBuf, String> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut missing_suffix = Vec::new();
+            let mut current = path.to_path_buf();
+            loop {
+                let Some(name) = current.file_name() else {
+                    return Err(format!(
+                        "storage owner path has no resolvable ancestor: {}",
+                        path.display()
+                    ));
+                };
+                missing_suffix.push(name.to_os_string());
+                let parent = current
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                match std::fs::canonicalize(parent) {
+                    Ok(mut resolved) => {
+                        for component in missing_suffix.iter().rev() {
+                            resolved.push(component);
+                        }
+                        return Ok(resolved);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        current = parent.to_path_buf();
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "storage owner path ancestor {}: {error}",
+                            parent.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Err(error) => Err(format!("storage owner path {}: {error}", path.display())),
+    }
 }
 
-fn storage_roots_equal(left: &Path, right: &Path) -> bool {
-    left == right || storage_owner_path(left) == storage_owner_path(right)
+fn storage_roots_equal(left: &Path, right: &Path) -> Result<bool, String> {
+    Ok(storage_owner_path(left)? == storage_owner_path(right)?)
 }
 
 fn validate_route_owner_table(
@@ -1498,11 +1535,13 @@ fn validate_route_owner_table(
 ) -> Result<(), String> {
     let mut owners = std::collections::BTreeMap::<PathBuf, (String, bool)>::new();
     owners.insert(
-        storage_owner_path(&host.root),
+        storage_owner_path(&host.root)
+            .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?,
         ("resident host".into(), true),
     );
     owners.insert(
-        storage_owner_path(&host.storage_root),
+        storage_owner_path(&host.storage_root)
+            .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?,
         ("resident host".into(), true),
     );
 
@@ -1512,7 +1551,8 @@ fn validate_route_owner_table(
             .runtime
             .as_ref()
             .is_some_and(|runtime| Arc::ptr_eq(runtime, host));
-        let route_storage_root = storage_owner_path(&route.storage_root);
+        let route_storage_root = storage_owner_path(&route.storage_root)
+            .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?;
         if let Some((owner, is_host)) = owners.get(&route_storage_root) {
             if is_resident_runtime && *is_host {
                 continue;
@@ -1573,7 +1613,9 @@ impl ProjectRuntimeManager {
             let key = (record.app_scope_id.clone(), record.project_scope.clone());
             let storage_root = PathBuf::from(&record.storage_root);
             if (storage_roots_equal(&storage_root, &host.root)
-                || storage_roots_equal(&storage_root, &host.storage_root))
+                .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?
+                || storage_roots_equal(&storage_root, &host.storage_root)
+                    .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?)
                 && !routes.get(&key).is_some_and(|route| {
                     route
                         .runtime
@@ -1586,9 +1628,17 @@ impl ProjectRuntimeManager {
                     record.storage_root
                 ));
             }
-            if let Some((owner_key, _)) = routes.iter().find(|(owner_key, route)| {
-                *owner_key != &key && storage_roots_equal(&route.storage_root, &storage_root)
-            }) {
+            let mut owner_key = None;
+            for (candidate_key, route) in &routes {
+                if candidate_key != &key
+                    && storage_roots_equal(&route.storage_root, &storage_root)
+                        .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?
+                {
+                    owner_key = Some(candidate_key.clone());
+                    break;
+                }
+            }
+            if let Some(owner_key) = owner_key {
                 return Err(format!(
                     "HOST_ROUTE_REPLAY_FAILED: runtime storage root {} is already owned by route ({}, {})",
                     record.storage_root, owner_key.0, owner_key.1
@@ -1845,25 +1895,39 @@ impl ProjectRuntimeManager {
             });
     }
 
-    fn storage_owner(&self, storage_root: &Path, records: &[HostRouteRecord]) -> Option<String> {
-        if storage_roots_equal(&self.host.root, storage_root)
-            || storage_roots_equal(&self.host.storage_root, storage_root)
+    fn storage_owner(
+        &self,
+        storage_root: &Path,
+        records: &[HostRouteRecord],
+    ) -> Result<Option<String>, String> {
+        if storage_roots_equal(&self.host.root, storage_root)?
+            || storage_roots_equal(&self.host.storage_root, storage_root)?
         {
-            return Some("resident host".into());
+            return Ok(Some("resident host".into()));
         }
-        if let Some((key, _)) = self
-            .routes
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, route)| storage_roots_equal(&route.storage_root, storage_root))
-        {
-            return Some(format!("route ({}, {})", key.0, key.1));
+        let route_owner = {
+            let routes = self.routes.lock().unwrap();
+            let mut owner = None;
+            for (key, route) in routes.iter() {
+                if storage_roots_equal(&route.storage_root, storage_root)? {
+                    owner = Some(format!("route ({}, {})", key.0, key.1));
+                    break;
+                }
+            }
+            owner
+        };
+        if route_owner.is_some() {
+            return Ok(route_owner);
         }
-        records
-            .iter()
-            .find(|record| storage_roots_equal(Path::new(&record.storage_root), storage_root))
-            .map(|record| format!("route ({}, {})", record.app_scope_id, record.project_scope))
+        for record in records {
+            if storage_roots_equal(Path::new(&record.storage_root), storage_root)? {
+                return Ok(Some(format!(
+                    "route ({}, {})",
+                    record.app_scope_id, record.project_scope
+                )));
+            }
+        }
+        Ok(None)
     }
 
     fn append_route_record(
@@ -1907,7 +1971,10 @@ impl ProjectRuntimeManager {
                 record.app_scope_id, record.project_scope
             ));
         }
-        if let Some(owner) = self.storage_owner(storage_root, &existing_records) {
+        if let Some(owner) = self
+            .storage_owner(storage_root, &existing_records)
+            .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?
+        {
             return Err(format!(
                 "HOST_ROUTE_DURABILITY_FAILED: runtime storage root {} is already owned by {}",
                 record.storage_root, owner
@@ -10732,6 +10799,93 @@ mod host_route_registry_tests {
         assert!(!root.join(".agent-collab/server/runtimes").exists());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_owner_identity_resolves_symlinked_parent_with_missing_tail() {
+        use std::os::unix::fs::symlink;
+
+        let (_server, root, _) = test_server();
+        let real_parent = root.join("real-parent");
+        let alias_parent = root.join("alias-parent");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &alias_parent).unwrap();
+
+        let real_future_path = real_parent.join("future").join("journal");
+        let aliased_future_path = alias_parent.join("future").join("journal");
+        assert_eq!(
+            storage_owner_path(&real_future_path).unwrap(),
+            storage_owner_path(&aliased_future_path).unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_owner_permission_error_rejects_register_without_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut server, root, _) = test_server();
+        let blocked_parent = root.with_file_name(format!(
+            "{}-blocked-owner",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&blocked_parent).unwrap();
+        let blocked_storage = blocked_parent.join("future-storage");
+        {
+            let host = Arc::get_mut(&mut server).unwrap();
+            host.storage_root = blocked_storage;
+        }
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let external_root = root.with_file_name(format!(
+            "{}-permission-external",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(external_root.join(".agent-collab/server")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        std::fs::write(&route_journal, b"").unwrap();
+        let before_route_journal = std::fs::read(&route_journal).unwrap();
+
+        std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let context = context_with_app(&external_root, "permission-external-app");
+        let (_runtime, response) = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: "permission-external-worker".into(),
+                token: "token-permission-external".into(),
+                pane: Some("%permission-external-worker".into()),
+                cwd: external_root.display().to_string(),
+            },
+        );
+        std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!response.ok, "{response:?}");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("HOST_ROUTE_DURABILITY_FAILED:")
+                    && error.contains("Permission denied")),
+            "{response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_route_journal);
+        assert!(!manager
+            .routes
+            .lock()
+            .unwrap()
+            .contains_key(&ProjectRuntimeManager::route_key(&context)));
+        assert!(!external_root
+            .join(".agent-collab/server/journal.jsonl")
+            .exists());
+
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+        std::fs::remove_dir_all(blocked_parent).unwrap();
     }
 
     #[tokio::test]
