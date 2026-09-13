@@ -9081,6 +9081,548 @@ mod host_route_registry_tests {
     }
 
     #[tokio::test]
+    async fn manager_routes_project_queries_mutations_and_poll_to_one_runtime() {
+        let (server, root, _) = test_server();
+        let project_root = root.with_file_name(format!(
+            "{}-route-aware",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        let app_scope = "route-aware-app";
+        let sender_id = "route-aware-sender";
+        let recipient_id = "route-aware-recipient";
+        let sender_token = "token-route-aware-sender";
+        let recipient_token = "token-route-aware-recipient";
+        let context = context_with_app(&project_root, app_scope);
+
+        let (sender_runtime, sender_registration) = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: sender_id.into(),
+                token: sender_token.into(),
+                pane: Some(format!("%{sender_id}")),
+                cwd: project_root.display().to_string(),
+            },
+        );
+        assert!(sender_registration.ok, "{sender_registration:?}");
+        let (recipient_runtime, recipient_registration) = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+                pane: Some(format!("%{recipient_id}")),
+                cwd: project_root.display().to_string(),
+            },
+        );
+        assert!(recipient_registration.ok, "{recipient_registration:?}");
+        assert!(Arc::ptr_eq(&sender_runtime, &recipient_runtime));
+        assert!(!Arc::ptr_eq(&sender_runtime, &manager.host));
+
+        let sender_identity =
+            runtime_for_registered(&sender_runtime, &project_root, sender_id, app_scope);
+        let recipient_identity =
+            runtime_for_registered(&recipient_runtime, &project_root, recipient_id, app_scope);
+        let sender_context = context_with_runtime(&project_root, app_scope, &sender_identity);
+        let recipient_context = context_with_runtime(&project_root, app_scope, &recipient_identity);
+
+        let (_, status) = manager.dispatch_sync(Some(sender_context.clone()), Req::StatusAll);
+        assert!(status.ok, "{status:?}");
+        assert_eq!(status.data["summary"]["workers"], 2);
+        let worker_ids = status.data["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|worker| worker["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            worker_ids,
+            std::collections::BTreeSet::from([sender_id, recipient_id])
+        );
+
+        let (_, workers) = manager.dispatch_sync(Some(recipient_context.clone()), Req::Workers);
+        assert!(workers.ok, "{workers:?}");
+        assert_eq!(workers.data["count"], 2);
+
+        let (_, task_registration) = manager.dispatch_sync(
+            Some(sender_context.clone()),
+            Req::TaskRegister {
+                worker_id: sender_id.into(),
+                token: sender_token.into(),
+                task_id: "route-aware-task".into(),
+                owner: None,
+                feature_id: Some("route-aware-feature".into()),
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: "p1".into(),
+                next_step: Some("verify route-aware task".into()),
+                goal_prompt: None,
+            },
+        );
+        assert!(task_registration.ok, "{task_registration:?}");
+        let (_, task_status) = manager.dispatch_sync(
+            Some(recipient_context.clone()),
+            Req::TaskStatus {
+                task_id: Some("route-aware-task".into()),
+            },
+        );
+        assert!(task_status.ok, "{task_status:?}");
+        assert_eq!(task_status.data["id"], "route-aware-task");
+        assert_eq!(task_status.data["owner"], sender_id);
+
+        let (_, subscription) = manager.dispatch_sync(
+            Some(recipient_context.clone()),
+            notification_subscribe_request(recipient_id, recipient_token),
+        );
+        assert!(subscription.ok, "{subscription:?}");
+        assert_eq!(subscription.data["subscription"]["worker_id"], recipient_id);
+
+        let scope = GlobalState::canonical_project_scope(&project_root).unwrap();
+        let sender_command = CommandEnvelope::new(
+            CommandId::new("route-aware-send-command").unwrap(),
+            OperationId::new("route-aware-send-operation").unwrap(),
+            sender_identity.binding_id.clone(),
+            sender_identity.endpoint_generation,
+            RouteScope {
+                app_scope_id: AppServerId::new(app_scope).unwrap(),
+                project_scope_id: scope,
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        let (_, sent) = manager.dispatch_sync(
+            Some(sender_context),
+            Req::Send {
+                from: sender_id.into(),
+                worker_id: Some(sender_id.into()),
+                token: Some(sender_token.into()),
+                command: Some(sender_command),
+                to: recipient_id.into(),
+                mtype: "notify".into(),
+                subject: Some("route-aware message".into()),
+                body: "message must stay in the selected runtime".into(),
+                in_reply_to: None,
+                delivery: "immediate".into(),
+            },
+        );
+        assert!(sent.ok, "{sent:?}");
+        let sent_id = sent.data["msg_id"].as_str().unwrap().to_owned();
+
+        let (_, polled) = dispatch_wire_routed(
+            manager,
+            Some(recipient_context),
+            Req::Poll {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+                timeout_ms: 0,
+            },
+        )
+        .await;
+        assert!(polled.ok, "{polled:?}");
+        assert_eq!(polled.data["count"], 1);
+        assert_eq!(polled.data["messages"][0]["id"], sent_id);
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_isolates_app_and_project_routes_and_replays_each_runtime() {
+        let (server, host_root, host_journal) = test_server();
+        let project_a = host_root.with_file_name(format!(
+            "{}-project-a",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        let project_b = host_root.with_file_name(format!(
+            "{}-project-b",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        for project_root in [&project_a, &project_b] {
+            std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        }
+        let canonical_project_a = project_a.canonicalize().unwrap();
+        let canonical_project_b = project_b.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+
+        let register = |context: ProjectContext, worker_id: &str, token: &str| {
+            let (runtime, response) = manager.dispatch_sync(
+                Some(context),
+                Req::Register {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    pane: Some(format!("%{worker_id}")),
+                    cwd: if worker_id == "app-a-worker" || worker_id == "app-b-worker" {
+                        project_a.display().to_string()
+                    } else {
+                        project_b.display().to_string()
+                    },
+                },
+            );
+            assert!(response.ok, "registration {worker_id}: {response:?}");
+            runtime
+        };
+
+        // The same project may have two appserver routes. Each route gets a
+        // distinct reducer/storage namespace, so app A cannot observe app B.
+        let app_a_context = context_with_app(&project_a, "app-a");
+        let app_b_context = context_with_app(&project_a, "app-b");
+        let project_b_context = context_with_app(&project_b, "app-a");
+        let app_a_runtime = register(app_a_context.clone(), "app-a-worker", "token-app-a");
+        let app_b_runtime = register(app_b_context.clone(), "app-b-worker", "token-app-b");
+        let project_b_runtime = register(
+            project_b_context.clone(),
+            "project-b-worker",
+            "token-project-b",
+        );
+        assert!(!Arc::ptr_eq(&app_a_runtime, &app_b_runtime));
+        assert!(!Arc::ptr_eq(&app_a_runtime, &project_b_runtime));
+        assert!(!Arc::ptr_eq(&app_b_runtime, &project_b_runtime));
+        assert_ne!(app_a_runtime.storage_root, app_b_runtime.storage_root);
+        assert_ne!(app_a_runtime.storage_root, project_b_runtime.storage_root);
+        assert_ne!(app_b_runtime.storage_root, project_b_runtime.storage_root);
+        assert!(
+            app_a_runtime.storage_root.starts_with(&canonical_project_a),
+            "app-a storage {} is outside project {}",
+            app_a_runtime.storage_root.display(),
+            canonical_project_a.display()
+        );
+        assert!(app_b_runtime
+            .storage_root
+            .starts_with(canonical_project_a.join(".agent-collab/server/runtimes")));
+        assert!(project_b_runtime
+            .storage_root
+            .starts_with(&canonical_project_b));
+
+        let app_a_identity =
+            runtime_for_registered(&app_a_runtime, &project_a, "app-a-worker", "app-a");
+        let app_b_identity =
+            runtime_for_registered(&app_b_runtime, &project_a, "app-b-worker", "app-b");
+        let project_b_identity =
+            runtime_for_registered(&project_b_runtime, &project_b, "project-b-worker", "app-a");
+        let app_a_runtime_context = context_with_runtime(&project_a, "app-a", &app_a_identity);
+        let app_b_runtime_context = context_with_runtime(&project_a, "app-b", &app_b_identity);
+        let project_b_runtime_context =
+            context_with_runtime(&project_b, "app-a", &project_b_identity);
+
+        for (context, runtime, worker_id) in [
+            (
+                app_a_runtime_context.clone(),
+                app_a_runtime.clone(),
+                "app-a-worker",
+            ),
+            (
+                app_b_runtime_context.clone(),
+                app_b_runtime.clone(),
+                "app-b-worker",
+            ),
+            (
+                project_b_runtime_context.clone(),
+                project_b_runtime.clone(),
+                "project-b-worker",
+            ),
+        ] {
+            let (selected, response) = manager.dispatch_sync(Some(context), Req::StatusAll);
+            assert!(response.ok, "{worker_id} status: {response:?}");
+            assert!(Arc::ptr_eq(&selected, &runtime));
+            assert_eq!(response.data["summary"]["workers"], 1);
+            assert_eq!(response.data["workers"][0]["id"], worker_id);
+        }
+
+        let mut subscription_ids = Vec::new();
+        for (context, worker_id, token) in [
+            (app_a_runtime_context.clone(), "app-a-worker", "token-app-a"),
+            (app_b_runtime_context.clone(), "app-b-worker", "token-app-b"),
+            (
+                project_b_runtime_context.clone(),
+                "project-b-worker",
+                "token-project-b",
+            ),
+        ] {
+            let (_, response) = manager.dispatch_sync(
+                Some(context.clone()),
+                Req::TaskRegister {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    task_id: "same-task-id".into(),
+                    owner: None,
+                    feature_id: Some(format!("feature-{worker_id}")),
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p1".into(),
+                    next_step: Some(format!("verify {worker_id}")),
+                    goal_prompt: None,
+                },
+            );
+            assert!(response.ok, "{worker_id} task register: {response:?}");
+            let (_, response) = manager.dispatch_sync(
+                Some(context.clone()),
+                notification_subscribe_request(worker_id, token),
+            );
+            assert!(response.ok, "{worker_id} subscription: {response:?}");
+            subscription_ids.push(
+                response.data["subscription"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+
+        let send_command =
+            |identity: &RuntimeIdentity, project_root: &Path, app_scope: &str, suffix: &str| {
+                CommandEnvelope::new(
+                    CommandId::new(format!("route-isolation-command-{suffix}")).unwrap(),
+                    OperationId::new(format!("route-isolation-operation-{suffix}")).unwrap(),
+                    identity.binding_id.clone(),
+                    identity.endpoint_generation,
+                    RouteScope {
+                        app_scope_id: AppServerId::new(app_scope).unwrap(),
+                        project_scope_id: GlobalState::canonical_project_scope(project_root)
+                            .unwrap(),
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+        let sends = [
+            (
+                app_a_runtime_context.clone(),
+                app_a_identity.clone(),
+                "app-a-worker",
+                "token-app-a",
+                &project_a,
+                "app-a",
+                "app-a",
+            ),
+            (
+                app_b_runtime_context.clone(),
+                app_b_identity.clone(),
+                "app-b-worker",
+                "token-app-b",
+                &project_a,
+                "app-b",
+                "app-b",
+            ),
+            (
+                project_b_runtime_context.clone(),
+                project_b_identity.clone(),
+                "project-b-worker",
+                "token-project-b",
+                &project_b,
+                "app-a",
+                "project-b",
+            ),
+        ];
+        let mut message_ids = Vec::new();
+        for (context, identity, worker_id, token, project_root, app_scope, suffix) in sends {
+            let (_, response) = manager.dispatch_sync(
+                Some(context.clone()),
+                Req::Send {
+                    from: worker_id.into(),
+                    worker_id: Some(worker_id.into()),
+                    token: Some(token.into()),
+                    command: Some(send_command(&identity, project_root, app_scope, suffix)),
+                    to: worker_id.into(),
+                    mtype: "notify".into(),
+                    subject: Some(format!("isolated message {suffix}")),
+                    body: format!("body for {suffix}"),
+                    in_reply_to: None,
+                    delivery: "immediate".into(),
+                },
+            );
+            assert!(response.ok, "{worker_id} send: {response:?}");
+            message_ids.push(response.data["msg_id"].as_str().unwrap().to_owned());
+        }
+
+        // A recipient in another app/project route is absent from this
+        // reducer, so cross-route send cannot silently fall back to a resident
+        // or neighboring runtime.
+        let cross_route_send = manager.dispatch_sync(
+            Some(app_a_runtime_context.clone()),
+            Req::Send {
+                from: "app-a-worker".into(),
+                worker_id: Some("app-a-worker".into()),
+                token: Some("token-app-a".into()),
+                command: Some(send_command(
+                    &app_a_identity,
+                    &project_a,
+                    "app-a",
+                    "cross-route",
+                )),
+                to: "app-b-worker".into(),
+                mtype: "notify".into(),
+                subject: Some("must stay isolated".into()),
+                body: "cross-route delivery must fail closed".into(),
+                in_reply_to: None,
+                delivery: "immediate".into(),
+            },
+        );
+        assert!(!cross_route_send.1.ok, "{:?}", cross_route_send.1);
+        assert!(cross_route_send
+            .1
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("recipient app-b-worker not registered")));
+
+        for (context, worker_id, token, message_id, suffix) in [
+            (
+                app_a_runtime_context.clone(),
+                "app-a-worker",
+                "token-app-a",
+                message_ids[0].clone(),
+                "app-a",
+            ),
+            (
+                app_b_runtime_context.clone(),
+                "app-b-worker",
+                "token-app-b",
+                message_ids[1].clone(),
+                "app-b",
+            ),
+            (
+                project_b_runtime_context.clone(),
+                "project-b-worker",
+                "token-project-b",
+                message_ids[2].clone(),
+                "project-b",
+            ),
+        ] {
+            let (_, polled) = dispatch_wire_routed(
+                manager.clone(),
+                Some(context.clone()),
+                Req::Poll {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    timeout_ms: 0,
+                },
+            )
+            .await;
+            assert!(polled.ok, "{suffix} poll: {polled:?}");
+            assert_eq!(polled.data["count"], 1);
+            assert_eq!(polled.data["messages"][0]["id"], message_id);
+            assert!(polled.data["messages"][0]["body"]
+                .as_str()
+                .unwrap()
+                .contains(suffix));
+        }
+
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let route_records = load_host_route_records(&route_journal).unwrap();
+        assert_eq!(route_records.len(), 3);
+        let route_keys = route_records
+            .iter()
+            .map(|record| (record.app_scope_id.clone(), record.project_scope.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(route_keys.len(), 3);
+        assert!(std::fs::read(&host_journal).unwrap().is_empty());
+        assert!(std::fs::read(&app_a_runtime.journal_path)
+            .unwrap()
+            .windows(b"app-a-worker".len())
+            .any(|window| window == b"app-a-worker"));
+        assert!(std::fs::read(&app_b_runtime.journal_path)
+            .unwrap()
+            .windows(b"app-b-worker".len())
+            .any(|window| window == b"app-b-worker"));
+        assert!(std::fs::read(&project_b_runtime.journal_path)
+            .unwrap()
+            .windows(b"project-b-worker".len())
+            .any(|window| window == b"project-b-worker"));
+
+        drop(app_a_runtime);
+        drop(app_b_runtime);
+        drop(project_b_runtime);
+        drop(manager);
+        let replayed_manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        assert_eq!(replayed_manager.runtimes().len(), 4);
+
+        for (context, worker_id, message_id, subscription_id, suffix) in [
+            (
+                app_a_runtime_context,
+                "app-a-worker",
+                message_ids[0].clone(),
+                subscription_ids[0].clone(),
+                "app-a",
+            ),
+            (
+                app_b_runtime_context,
+                "app-b-worker",
+                message_ids[1].clone(),
+                subscription_ids[1].clone(),
+                "app-b",
+            ),
+            (
+                project_b_runtime_context,
+                "project-b-worker",
+                message_ids[2].clone(),
+                subscription_ids[2].clone(),
+                "project-b",
+            ),
+        ] {
+            let (selected, status) =
+                replayed_manager.dispatch_sync(Some(context.clone()), Req::StatusAll);
+            assert!(status.ok, "{suffix} replay status: {status:?}");
+            assert_eq!(status.data["summary"]["workers"], 1);
+            assert_eq!(status.data["workers"][0]["id"], worker_id);
+            assert_eq!(status.data["summary"]["tasks"], 1);
+            assert!(Arc::ptr_eq(
+                &selected,
+                &replayed_manager.select_runtime(&context).unwrap()
+            ));
+
+            let (_, task_status) = replayed_manager.dispatch_sync(
+                Some(context.clone()),
+                Req::TaskStatus {
+                    task_id: Some("same-task-id".into()),
+                },
+            );
+            assert!(task_status.ok, "{suffix} replay task: {task_status:?}");
+            assert_eq!(task_status.data["owner"], worker_id);
+
+            let (_, message_status) = replayed_manager
+                .dispatch_sync(Some(context.clone()), Req::MsgStatus { msg_id: message_id });
+            assert!(
+                message_status.ok,
+                "{suffix} replay message: {message_status:?}"
+            );
+            assert_eq!(message_status.data["to"], worker_id);
+
+            let (_, notification_status) = replayed_manager.dispatch_sync(
+                Some(context),
+                Req::NotificationStatus {
+                    worker_id: worker_id.into(),
+                    token: match worker_id {
+                        "app-a-worker" => "token-app-a",
+                        "app-b-worker" => "token-app-b",
+                        "project-b-worker" => "token-project-b",
+                        _ => unreachable!(),
+                    }
+                    .into(),
+                },
+            );
+            assert!(
+                notification_status.ok,
+                "{suffix} replay subscription: {notification_status:?}"
+            );
+            assert!(notification_status.data["subscriptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|subscription| subscription["id"] == subscription_id));
+        }
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_a).unwrap();
+        std::fs::remove_dir_all(project_b).unwrap();
+    }
+
+    #[tokio::test]
     async fn empty_registry_admits_only_exact_cli_host_operator_shutdown() {
         let (server, root, journal_path) = test_server();
         let resident_context = context_with_app(&root, crate::identity::CLI_APP_SERVER_ID);
