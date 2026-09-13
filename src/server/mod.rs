@@ -9922,6 +9922,210 @@ mod host_route_registry_tests {
     }
 
     #[tokio::test]
+    async fn nonresident_route_replays_full_query_mutation_and_notification_surface() {
+        let (server, host_root, host_journal) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-full-replay-surface",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let app_scope = "full-replay-app";
+        let sender_id = "full-replay-sender";
+        let recipient_id = "full-replay-recipient";
+        let sender_token = "token-full-replay-sender";
+        let recipient_token = "token-full-replay-recipient";
+
+        let (sender_runtime, sender_registration) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, app_scope)),
+            Req::Register {
+                worker_id: sender_id.into(),
+                token: sender_token.into(),
+                pane: Some(format!("%{sender_id}")),
+                cwd: project_root.display().to_string(),
+            },
+        );
+        assert!(sender_registration.ok, "{sender_registration:?}");
+        let (recipient_runtime, recipient_registration) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, app_scope)),
+            Req::Register {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+                pane: Some(format!("%{recipient_id}")),
+                cwd: project_root.display().to_string(),
+            },
+        );
+        assert!(recipient_registration.ok, "{recipient_registration:?}");
+        assert!(Arc::ptr_eq(&sender_runtime, &recipient_runtime));
+        assert!(!Arc::ptr_eq(&sender_runtime, &server));
+
+        let sender_identity =
+            runtime_for_registered(&sender_runtime, &project_root, sender_id, app_scope);
+        let recipient_identity =
+            runtime_for_registered(&recipient_runtime, &project_root, recipient_id, app_scope);
+        let sender_context = context_with_runtime(&project_root, app_scope, &sender_identity);
+        let recipient_context = context_with_runtime(&project_root, app_scope, &recipient_identity);
+
+        let (_, task_registration) = manager.dispatch_sync(
+            Some(sender_context.clone()),
+            Req::TaskRegister {
+                worker_id: sender_id.into(),
+                token: sender_token.into(),
+                task_id: "full-replay-task".into(),
+                owner: None,
+                feature_id: Some("full-replay-feature".into()),
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: "p1".into(),
+                next_step: Some("continue after runtime replay".into()),
+                goal_prompt: None,
+            },
+        );
+        assert!(task_registration.ok, "{task_registration:?}");
+        let (_, subscription) = manager.dispatch_sync(
+            Some(recipient_context.clone()),
+            notification_subscribe_request(recipient_id, recipient_token),
+        );
+        assert!(subscription.ok, "{subscription:?}");
+
+        let send_command = |suffix: &str| {
+            CommandEnvelope::new(
+                CommandId::new(format!("full-replay-command-{suffix}")).unwrap(),
+                OperationId::new(format!("full-replay-operation-{suffix}")).unwrap(),
+                sender_identity.binding_id.clone(),
+                sender_identity.endpoint_generation,
+                RouteScope {
+                    app_scope_id: AppServerId::new(app_scope).unwrap(),
+                    project_scope_id: GlobalState::canonical_project_scope(&project_root).unwrap(),
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let (_, first_send) = manager.dispatch_sync(
+            Some(sender_context.clone()),
+            Req::Send {
+                from: sender_id.into(),
+                worker_id: Some(sender_id.into()),
+                token: Some(sender_token.into()),
+                command: Some(send_command("before-replay")),
+                to: recipient_id.into(),
+                mtype: "notify".into(),
+                subject: Some("full replay before".into()),
+                body: "message retained across runtime replay".into(),
+                in_reply_to: None,
+                delivery: "immediate".into(),
+            },
+        );
+        assert!(first_send.ok, "{first_send:?}");
+        let first_message_id = first_send.data["msg_id"].as_str().unwrap().to_owned();
+        let runtime_storage = sender_runtime.storage_root.clone();
+        let runtime_journal = sender_runtime.journal_path.clone();
+        let mailbox_path = runtime_storage
+            .join(".agent-collab/mailbox")
+            .join(format!("recipient-{recipient_id}.jsonl"));
+        assert!(mailbox_path.exists());
+        assert!(std::fs::read(&mailbox_path)
+            .unwrap()
+            .windows(first_message_id.len())
+            .any(|window| window == first_message_id.as_bytes()));
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let route_journal_before_replay = std::fs::read(&route_journal).unwrap();
+        assert!(std::fs::read(&host_journal).unwrap().is_empty());
+
+        drop(sender_runtime);
+        drop(recipient_runtime);
+        drop(manager);
+        let replayed_manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        let replayed_runtime = replayed_manager.select_runtime(&sender_context).unwrap();
+        assert_eq!(replayed_runtime.storage_root, runtime_storage);
+        assert_eq!(replayed_runtime.journal_path, runtime_journal);
+        assert!(!Arc::ptr_eq(&replayed_runtime, &replayed_manager.host));
+
+        let (selected, status) =
+            replayed_manager.dispatch_sync(Some(sender_context.clone()), Req::StatusAll);
+        assert!(status.ok, "{status:?}");
+        assert!(Arc::ptr_eq(&selected, &replayed_runtime));
+        assert_eq!(status.data["summary"]["workers"], 2);
+        let (_, workers) =
+            replayed_manager.dispatch_sync(Some(recipient_context.clone()), Req::Workers);
+        assert!(workers.ok, "{workers:?}");
+        assert_eq!(workers.data["count"], 2);
+        let (_, task_status) = replayed_manager.dispatch_sync(
+            Some(sender_context.clone()),
+            Req::TaskStatus {
+                task_id: Some("full-replay-task".into()),
+            },
+        );
+        assert!(task_status.ok, "{task_status:?}");
+        assert_eq!(task_status.data["owner"], sender_id);
+        let (_, notification_status) = replayed_manager.dispatch_sync(
+            Some(recipient_context.clone()),
+            Req::NotificationStatus {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+            },
+        );
+        assert!(notification_status.ok, "{notification_status:?}");
+        assert!(!notification_status.data["subscriptions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let (_, second_send) = replayed_manager.dispatch_sync(
+            Some(sender_context),
+            Req::Send {
+                from: sender_id.into(),
+                worker_id: Some(sender_id.into()),
+                token: Some(sender_token.into()),
+                command: Some(send_command("after-replay")),
+                to: recipient_id.into(),
+                mtype: "notify".into(),
+                subject: Some("full replay after".into()),
+                body: "message sent by the replayed runtime".into(),
+                in_reply_to: None,
+                delivery: "immediate".into(),
+            },
+        );
+        assert!(second_send.ok, "{second_send:?}");
+        let second_message_id = second_send.data["msg_id"].as_str().unwrap().to_owned();
+        let (_, polled) = dispatch_wire_routed(
+            replayed_manager.clone(),
+            Some(recipient_context),
+            Req::Poll {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+                timeout_ms: 0,
+            },
+        )
+        .await;
+        assert!(polled.ok, "{polled:?}");
+        let polled_ids = polled.data["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(polled_ids.contains(first_message_id.as_str()));
+        assert!(polled_ids.contains(second_message_id.as_str()));
+        assert_eq!(
+            std::fs::read(&route_journal).unwrap(),
+            route_journal_before_replay
+        );
+        assert!(std::fs::read(&mailbox_path)
+            .unwrap()
+            .windows(second_message_id.len())
+            .any(|window| window == second_message_id.as_bytes()));
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn manager_app_scope_storage_encoding_is_collision_free_and_replayed() {
         let (server, host_root, _) = test_server();
         let project_root = host_root.with_file_name(format!(
