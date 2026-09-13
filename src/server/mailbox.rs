@@ -1134,6 +1134,8 @@ mod tests {
             crate::server::Server {
                 config: crate::config::Config::default(),
                 root: root.clone(),
+                storage_root: root.clone(),
+                journal_path: root.join(".agent-collab/server/journal.jsonl"),
                 state: Mutex::new(crate::server::state::State::default()),
                 journal: Mutex::new(journal),
                 pane_alive_check: |_| crate::server::knock::PanePresence::Present,

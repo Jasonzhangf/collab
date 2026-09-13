@@ -21,6 +21,8 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
         Server {
             config: crate::config::Config::default(),
             root: root.clone(),
+            storage_root: root.clone(),
+            journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
             pane_alive_check: |_| PanePresence::Present,
@@ -1501,6 +1503,8 @@ fn replayed_command_is_idempotent_and_operation_conflict_fails_closed() {
         Server {
             config: crate::config::Config::default(),
             root: root.clone(),
+            storage_root: root.clone(),
+            journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(super::replay(&root).unwrap()),
             journal: Mutex::new(journal),
             pane_alive_check: |_| PanePresence::Present,
