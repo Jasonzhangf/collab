@@ -1804,6 +1804,15 @@ impl ProjectRuntimeManager {
                 record.app_scope_id, record.project_scope
             ));
         }
+        if let Some(existing) = existing_records
+            .iter()
+            .find(|existing| existing.storage_root == record.storage_root)
+        {
+            return Err(format!(
+                "HOST_ROUTE_DURABILITY_FAILED: runtime storage root {} is already owned by route ({}, {})",
+                record.storage_root, existing.app_scope_id, existing.project_scope
+            ));
+        }
         if !existing.is_empty() && !existing.ends_with(b"\n") {
             return Err(
                 "HOST_ROUTE_DURABILITY_FAILED: route journal must end with a newline".into(),
@@ -9842,6 +9851,169 @@ mod host_route_registry_tests {
             ));
         }
 
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prospective_storage_collision_rejects_register_before_route_publish() {
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-prospective-collision",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        let legacy_app_scope = "v1-3-616263";
+        let candidate_app_scope = "abc";
+        let legacy_storage_root = canonical_project_root
+            .join(".agent-collab/server/runtimes")
+            .join(legacy_app_scope);
+        assert_eq!(
+            legacy_storage_root,
+            app_scope_storage_path(&canonical_project_root, candidate_app_scope)
+        );
+        let project_scope = GlobalState::canonical_project_scope(&canonical_project_root).unwrap();
+        let legacy_record = HostRouteRecord {
+            version: 1,
+            op: "register".into(),
+            app_scope_id: legacy_app_scope.into(),
+            project_scope: project_scope.as_str().into(),
+            canonical_root: project_scope.as_str().into(),
+            storage_root: legacy_storage_root.to_string_lossy().into_owned(),
+            registered_ms: 1,
+        };
+        let legacy_line = serde_json::to_string(&legacy_record).unwrap();
+        std::fs::write(&route_journal, format!("{legacy_line}\n")).unwrap();
+        let before_collision = std::fs::read(&route_journal).unwrap();
+
+        // The existing record uses the old lossy path convention. Startup
+        // must replay it, while a new encoded route must be rejected before
+        // the host route journal is replaced.
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let (_runtime, collision_response) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, candidate_app_scope)),
+            Req::Register {
+                worker_id: "prospective-collision-worker".into(),
+                token: "token-prospective-collision".into(),
+                pane: Some("%prospective-collision-worker".into()),
+                cwd: project_root.display().to_string(),
+            },
+        );
+        assert!(!collision_response.ok, "{collision_response:?}");
+        assert!(
+            collision_response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("runtime storage root")),
+            "{collision_response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        // The rejected prospective route must not poison the old route that
+        // was successfully replayed from the durable journal.
+        let legacy_context = context_with_app(&project_root, legacy_app_scope);
+        let (_runtime, registration_response) = manager.dispatch_sync(
+            Some(legacy_context.clone()),
+            Req::Register {
+                worker_id: "legacy-replayed-worker".into(),
+                token: "token-legacy-replayed".into(),
+                pane: Some("%legacy-replayed-worker".into()),
+                cwd: project_root.display().to_string(),
+            },
+        );
+        assert!(registration_response.ok, "{registration_response:?}");
+        let (_runtime, status_response) =
+            manager.dispatch_sync(Some(legacy_context), Req::StatusAll);
+        assert!(status_response.ok, "{status_response:?}");
+        assert_eq!(
+            status_response.data["workers"][0]["id"],
+            "legacy-replayed-worker"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        drop(manager);
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prospective_nested_project_collision_rejects_register_before_route_publish() {
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-nested-collision",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+
+        let (seed_runtime, seed_response) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, "seed")),
+            Req::Register {
+                worker_id: "nested-seed-worker".into(),
+                token: "token-nested-seed".into(),
+                pane: Some("%nested-seed-worker".into()),
+                cwd: project_root.display().to_string(),
+            },
+        );
+        assert!(seed_response.ok, "{seed_response:?}");
+        let (app_runtime, app_response) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, "app/a")),
+            Req::Register {
+                worker_id: "nested-app-worker".into(),
+                token: "token-nested-app".into(),
+                pane: Some("%nested-app-worker".into()),
+                cwd: project_root.display().to_string(),
+            },
+        );
+        assert!(app_response.ok, "{app_response:?}");
+        assert!(!Arc::ptr_eq(&seed_runtime, &app_runtime));
+
+        let nested_root = app_scope_storage_path(&canonical_project_root, "app/a");
+        assert_eq!(app_runtime.root, canonical_project_root);
+        assert_eq!(app_runtime.storage_root, nested_root);
+        std::fs::create_dir_all(nested_root.join(".agent-collab/server")).unwrap();
+
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let before_collision = std::fs::read(&route_journal).unwrap();
+        let (_runtime, collision_response) = manager.dispatch_sync(
+            Some(context_with_app(&nested_root, "nested-app")),
+            Req::Register {
+                worker_id: "nested-collision-worker".into(),
+                token: "token-nested-collision".into(),
+                pane: Some("%nested-collision-worker".into()),
+                cwd: nested_root.display().to_string(),
+            },
+        );
+        assert!(!collision_response.ok, "{collision_response:?}");
+        assert!(
+            collision_response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("runtime storage root")),
+            "{collision_response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        // The existing app/a route remains routable after the prospective
+        // nested project was rejected, and its route journal entry is intact.
+        let (_runtime, status_response) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, "app/a")),
+            Req::StatusAll,
+        );
+        assert!(status_response.ok, "{status_response:?}");
+        assert_eq!(
+            status_response.data["workers"][0]["id"],
+            "nested-app-worker"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        drop(manager);
         std::fs::remove_dir_all(host_root).unwrap();
         std::fs::remove_dir_all(project_root).unwrap();
     }
