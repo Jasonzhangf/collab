@@ -1491,6 +1491,32 @@ fn storage_owner_path(path: &Path) -> Result<PathBuf, String> {
             let mut missing_suffix = Vec::new();
             let mut current = path.to_path_buf();
             loop {
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        let target = std::fs::read_link(&current).map_err(|error| {
+                            format!("storage owner symlink {}: {error}", current.display())
+                        })?;
+                        let target = if target.is_absolute() {
+                            target
+                        } else {
+                            current
+                                .parent()
+                                .filter(|parent| !parent.as_os_str().is_empty())
+                                .unwrap_or_else(|| Path::new("."))
+                                .join(target)
+                        };
+                        let mut resolved = storage_owner_path(&target)?;
+                        for component in missing_suffix.iter().rev() {
+                            resolved.push(component);
+                        }
+                        return Ok(resolved);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("storage owner path {}: {error}", current.display()));
+                    }
+                }
                 let Some(name) = current.file_name() else {
                     return Err(format!(
                         "storage owner path has no resolvable ancestor: {}",
@@ -10820,6 +10846,66 @@ mod host_route_registry_tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_storage_owner_rejects_alias_route_before_journal_write() {
+        use std::os::unix::fs::symlink;
+
+        let (server, root, _) = test_server();
+        let real_parent = root.join("real-parent");
+        let alias_parent = root.join("alias-parent");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &alias_parent).unwrap();
+
+        let real_storage_root = real_parent.join("future");
+        let aliased_storage_root = alias_parent.join("future");
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        std::fs::write(&route_journal, b"").unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        manager.routes.lock().unwrap().insert(
+            ("existing-app".into(), "/existing-project".into()),
+            RuntimeRoute {
+                root: root.clone(),
+                storage_root: real_storage_root,
+                runtime: None,
+            },
+        );
+
+        let external_root = root.with_file_name(format!(
+            "{}-dangling-alias",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&external_root).unwrap();
+        let context = context_with_app(&external_root, "dangling-alias-app");
+        let before_route_journal = std::fs::read(&route_journal).unwrap();
+        let error = manager
+            .append_route_record(&context, &aliased_storage_root)
+            .unwrap_err();
+
+        assert!(
+            error.starts_with("HOST_ROUTE_DURABILITY_FAILED:")
+                && error.contains("already owned by route (existing-app, /existing-project)"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&route_journal).unwrap(),
+            before_route_journal,
+            "an alias collision must be rejected before route journal publication"
+        );
+        assert!(!manager.routes.lock().unwrap().contains_key(&(
+            "dangling-alias-app".into(),
+            GlobalState::canonical_project_scope(&external_root)
+                .unwrap()
+                .as_str()
+                .into(),
+        )));
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
     }
 
     #[cfg(unix)]
