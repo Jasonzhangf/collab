@@ -1484,6 +1484,50 @@ struct ProjectRuntimeManager {
     runtime_init_gates: Mutex<std::collections::BTreeMap<RouteKey, Arc<Mutex<()>>>>,
 }
 
+fn storage_owner_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn storage_roots_equal(left: &Path, right: &Path) -> bool {
+    left == right || storage_owner_path(left) == storage_owner_path(right)
+}
+
+fn validate_route_owner_table(
+    host: &Arc<Server>,
+    routes: &std::collections::BTreeMap<RouteKey, RuntimeRoute>,
+) -> Result<(), String> {
+    let mut owners = std::collections::BTreeMap::<PathBuf, (String, bool)>::new();
+    owners.insert(
+        storage_owner_path(&host.root),
+        ("resident host".into(), true),
+    );
+    owners.insert(
+        storage_owner_path(&host.storage_root),
+        ("resident host".into(), true),
+    );
+
+    for (key, route) in routes {
+        let route_owner = format!("route ({}, {})", key.0, key.1);
+        let is_resident_runtime = route
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| Arc::ptr_eq(runtime, host));
+        let route_storage_root = storage_owner_path(&route.storage_root);
+        if let Some((owner, is_host)) = owners.get(&route_storage_root) {
+            if is_resident_runtime && *is_host {
+                continue;
+            }
+            return Err(format!(
+                "HOST_ROUTE_REPLAY_FAILED: runtime storage root {} is already owned by {}",
+                route.storage_root.display(),
+                owner
+            ));
+        }
+        owners.insert(route_storage_root, (route_owner, is_resident_runtime));
+    }
+    Ok(())
+}
+
 impl ProjectRuntimeManager {
     fn new(host: Arc<Server>, host_paths: &crate::scope::HostPaths) -> Result<Arc<Self>, String> {
         let host_root = GlobalState::canonical_project_scope(&host.root)
@@ -1528,7 +1572,8 @@ impl ProjectRuntimeManager {
         for record in &route_records {
             let key = (record.app_scope_id.clone(), record.project_scope.clone());
             let storage_root = PathBuf::from(&record.storage_root);
-            if (storage_root == host.root || storage_root == host.storage_root)
+            if (storage_roots_equal(&storage_root, &host.root)
+                || storage_roots_equal(&storage_root, &host.storage_root))
                 && !routes.get(&key).is_some_and(|route| {
                     route
                         .runtime
@@ -1541,10 +1586,9 @@ impl ProjectRuntimeManager {
                     record.storage_root
                 ));
             }
-            if let Some((owner_key, _)) = routes
-                .iter()
-                .find(|(owner_key, route)| *owner_key != &key && route.storage_root == storage_root)
-            {
+            if let Some((owner_key, _)) = routes.iter().find(|(owner_key, route)| {
+                *owner_key != &key && storage_roots_equal(&route.storage_root, &storage_root)
+            }) {
                 return Err(format!(
                     "HOST_ROUTE_REPLAY_FAILED: runtime storage root {} is already owned by route ({}, {})",
                     record.storage_root, owner_key.0, owner_key.1
@@ -1573,6 +1617,12 @@ impl ProjectRuntimeManager {
                 },
             );
         }
+
+        // Legacy registrations may be present in GlobalState while the host
+        // route journal is empty. Validate the merged table before replay can
+        // open any pending runtime; a pending legacy alias of the resident
+        // storage must fail closed instead of creating a second reducer.
+        validate_route_owner_table(&host, &routes)?;
 
         let manager = Arc::new(Self {
             host,
@@ -1796,7 +1846,9 @@ impl ProjectRuntimeManager {
     }
 
     fn storage_owner(&self, storage_root: &Path, records: &[HostRouteRecord]) -> Option<String> {
-        if self.host.root == storage_root || self.host.storage_root == storage_root {
+        if storage_roots_equal(&self.host.root, storage_root)
+            || storage_roots_equal(&self.host.storage_root, storage_root)
+        {
             return Some("resident host".into());
         }
         if let Some((key, _)) = self
@@ -1804,13 +1856,13 @@ impl ProjectRuntimeManager {
             .lock()
             .unwrap()
             .iter()
-            .find(|(_, route)| route.storage_root == storage_root)
+            .find(|(_, route)| storage_roots_equal(&route.storage_root, storage_root))
         {
             return Some(format!("route ({}, {})", key.0, key.1));
         }
         records
             .iter()
-            .find(|record| record.storage_root == storage_root.to_string_lossy())
+            .find(|record| storage_roots_equal(Path::new(&record.storage_root), storage_root))
             .map(|record| format!("route ({}, {})", record.app_scope_id, record.project_scope))
     }
 
@@ -10638,6 +10690,46 @@ mod host_route_registry_tests {
             error.starts_with("PROJECT_ROUTE_NOT_READY/UNSUPPORTED:"),
             "{error}"
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_multiple_app_routes_fail_replay_before_opening_a_second_reducer() {
+        let (server, root, journal_path) = test_server();
+        register_known_project_with_app(&server, &root, "app-a");
+        assert!(
+            handle_register_with_app_scope(
+                &server,
+                "legacy-resident".into(),
+                "token-legacy-resident".into(),
+                Some("%legacy-resident".into()),
+                root.display().to_string(),
+                Some(AppServerId::new("app-a").unwrap()),
+            )
+            .ok
+        );
+        register_known_project_with_app(&server, &root, "app-b");
+
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        std::fs::write(&route_journal, b"").unwrap();
+        let before_route_journal = std::fs::read(&route_journal).unwrap();
+        let before_resident_journal = std::fs::read(&journal_path).unwrap();
+
+        let error = match ProjectRuntimeManager::new(server.clone(), &host_paths) {
+            Ok(_) => panic!("legacy pending route must not open a second reducer"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("HOST_ROUTE_REPLAY_FAILED:"), "{error}");
+        assert!(error.contains("resident host"), "{error}");
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_route_journal);
+        assert_eq!(
+            std::fs::read(&journal_path).unwrap(),
+            before_resident_journal
+        );
+        assert!(!root.join(".agent-collab/server/runtimes").exists());
 
         std::fs::remove_dir_all(root).unwrap();
     }
