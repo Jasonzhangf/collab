@@ -189,6 +189,33 @@ fn sanitize_identifier(value: &str) -> String {
         .collect()
 }
 
+/// Encode an app scope into filesystem components without lossy sanitizing.
+/// AppServerId deliberately accepts any control-free UTF-8 string, so replacing
+/// path punctuation with `_` is not injective (`app/a` and `app:a` would
+/// collide). Hex encodes the original bytes and fixed-size chunks keep every
+/// component below common filesystem name limits even at the 256-byte ID cap.
+fn app_scope_storage_path(root: &Path, app_scope: &str) -> PathBuf {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    const CHUNK_BYTES: usize = 96;
+    let bytes = app_scope.as_bytes();
+    let mut path = root.join(".agent-collab").join("server").join("runtimes");
+    for (index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
+        let prefix = if index == 0 {
+            format!("v1-{}-", bytes.len())
+        } else {
+            String::new()
+        };
+        let mut component = String::with_capacity(prefix.len() + chunk.len() * 2);
+        component.push_str(&prefix);
+        for byte in chunk {
+            component.push(HEX[(byte >> 4) as usize] as char);
+            component.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        path.push(component);
+    }
+    path
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) enum CommandJournalFault {
@@ -1454,6 +1481,7 @@ struct ProjectRuntimeManager {
     routes: Mutex<std::collections::BTreeMap<RouteKey, RuntimeRoute>>,
     project_locks: Mutex<std::collections::BTreeMap<PathBuf, std::fs::File>>,
     register_gate: Mutex<()>,
+    runtime_init_gates: Mutex<std::collections::BTreeMap<RouteKey, Arc<Mutex<()>>>>,
 }
 
 impl ProjectRuntimeManager {
@@ -1521,6 +1549,7 @@ impl ProjectRuntimeManager {
             routes: Mutex::new(routes),
             project_locks: Mutex::new(std::collections::BTreeMap::new()),
             register_gate: Mutex::new(()),
+            runtime_init_gates: Mutex::new(std::collections::BTreeMap::new()),
         });
 
         // Replay every durable route at startup.  A broken external runtime
@@ -1535,9 +1564,7 @@ impl ProjectRuntimeManager {
             .map(|(key, route)| (key.clone(), route.root.clone(), route.storage_root.clone()))
             .collect::<Vec<_>>();
         for (key, root, storage_root) in pending {
-            if let Ok((runtime, project_lock)) = manager.build_runtime(&root, &storage_root) {
-                manager.install_runtime(&key, runtime, project_lock);
-            }
+            let _ = manager.ensure_runtime(&key, &root, &storage_root);
         }
         Ok(manager)
     }
@@ -1583,13 +1610,44 @@ impl ProjectRuntimeManager {
 
     fn storage_root_for_new(&self, root: &Path, app_scope: &str) -> PathBuf {
         if self.has_project_route(root.to_string_lossy().as_ref()) {
-            root.join(".agent-collab")
-                .join("server")
-                .join("runtimes")
-                .join(sanitize_identifier(app_scope))
+            app_scope_storage_path(root, app_scope)
         } else {
             root.to_path_buf()
         }
+    }
+
+    fn runtime_init_gate(&self, key: &RouteKey) -> Arc<Mutex<()>> {
+        self.runtime_init_gates
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Open and install a pending route exactly once. The double-check after
+    /// acquiring the per-route gate is required because Poll and blocking
+    /// requests can select the same durable pending route concurrently.
+    fn ensure_runtime(
+        &self,
+        key: &RouteKey,
+        root: &Path,
+        storage_root: &Path,
+    ) -> Result<Arc<Server>, String> {
+        let gate = self.runtime_init_gate(key);
+        let _guard = gate.lock().unwrap();
+        if let Some(runtime) = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(key)
+            .and_then(|route| route.runtime.clone())
+        {
+            return Ok(runtime);
+        }
+        let (runtime, project_lock) = self.build_runtime(root, storage_root)?;
+        self.install_runtime(key, runtime.clone(), project_lock);
+        Ok(runtime)
     }
 
     fn build_runtime(
@@ -1822,9 +1880,7 @@ impl ProjectRuntimeManager {
             }
             (route.root.clone(), route.storage_root.clone())
         };
-        let (runtime, project_lock) = self.build_runtime(&pending.0, &pending.1)?;
-        self.install_runtime(&key, runtime.clone(), project_lock);
-        Ok(runtime)
+        self.ensure_runtime(&key, &pending.0, &pending.1)
     }
 
     fn dispatch_sync(
@@ -1876,15 +1932,10 @@ impl ProjectRuntimeManager {
             .get(&key)
             .map(|route| (route.root.clone(), route.storage_root.clone()));
         if let Some((root, storage_root)) = pending_route {
-            let (runtime, project_lock) = match self.build_runtime(&root, &storage_root) {
-                Ok(value) => value,
+            let runtime = match self.ensure_runtime(&key, &root, &storage_root) {
+                Ok(runtime) => runtime,
                 Err(error) => return (self.host.clone(), Resp::err(error)),
             };
-            // The route metadata is already durable. Keep the successfully
-            // opened reducer installed even when this particular request is
-            // rejected; otherwise the next request would open a second
-            // writer for the same project journal.
-            self.install_runtime(&key, runtime.clone(), project_lock);
             let response =
                 if let Err(error) = validate_request_context(&runtime, &req, Some(&context)) {
                     Resp::err(error)
@@ -1934,11 +1985,10 @@ impl ProjectRuntimeManager {
             return (self.host.clone(), Resp::err(error));
         }
         self.install_pending_route(&key, &context_root, &storage_root);
-        let (runtime, project_lock) = match self.build_runtime(&context_root, &storage_root) {
-            Ok(value) => value,
+        let runtime = match self.ensure_runtime(&key, &context_root, &storage_root) {
+            Ok(runtime) => runtime,
             Err(error) => return (self.host.clone(), Resp::err(error)),
         };
-        self.install_runtime(&key, runtime.clone(), project_lock);
         let response = if let Err(error) = validate_request_context(&runtime, &req, Some(&context))
         {
             Resp::err(error)
@@ -1967,6 +2017,7 @@ fn load_host_route_records(path: &Path) -> Result<Vec<HostRouteRecord>, String> 
     }
     let mut records = Vec::new();
     let mut seen_keys = std::collections::BTreeMap::<RouteKey, usize>::new();
+    let mut seen_storage_roots = std::collections::BTreeMap::<String, (RouteKey, usize)>::new();
     for (index, chunk) in content.split_inclusive('\n').enumerate() {
         let line = chunk
             .strip_suffix('\n')
@@ -1991,6 +2042,20 @@ fn load_host_route_records(path: &Path) -> Result<Vec<HostRouteRecord>, String> 
         if let Some(previous_line) = seen_keys.insert(key.clone(), index + 1) {
             return Err(format!(
                 "HOST_ROUTE_REPLAY_FAILED: duplicate route key ({}, {}) at lines {} and {}",
+                key.0,
+                key.1,
+                previous_line,
+                index + 1
+            ));
+        }
+        if let Some((previous_key, previous_line)) =
+            seen_storage_roots.insert(record.storage_root.clone(), (key.clone(), index + 1))
+        {
+            return Err(format!(
+                "HOST_ROUTE_REPLAY_FAILED: duplicate runtime storage root {} for routes ({}, {}) and ({}, {}) at lines {} and {}",
+                record.storage_root,
+                previous_key.0,
+                previous_key.1,
                 key.0,
                 key.1,
                 previous_line,
@@ -8951,6 +9016,16 @@ mod host_route_registry_tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].app_scope_id, "route-app");
 
+        let mut colliding_record = record.clone();
+        colliding_record.app_scope_id = "route-app-other".into();
+        let colliding_line = serde_json::to_string(&colliding_record).unwrap();
+        std::fs::write(&route_journal, format!("{line}\n{colliding_line}\n")).unwrap();
+        let duplicate_storage = load_host_route_records(&route_journal).unwrap_err();
+        assert!(
+            duplicate_storage.contains("duplicate runtime storage root"),
+            "{duplicate_storage}"
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -9089,7 +9164,7 @@ mod host_route_registry_tests {
         ));
         std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
         let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
-        let manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
         let app_scope = "route-aware-app";
         let sender_id = "route-aware-sender";
         let recipient_id = "route-aware-recipient";
@@ -9269,9 +9344,9 @@ mod host_route_registry_tests {
 
         // The same project may have two appserver routes. Each route gets a
         // distinct reducer/storage namespace, so app A cannot observe app B.
-        let app_a_context = context_with_app(&project_a, "app-a");
-        let app_b_context = context_with_app(&project_a, "app-b");
-        let project_b_context = context_with_app(&project_b, "app-a");
+        let app_a_context = context_with_app(&project_a, "app/a");
+        let app_b_context = context_with_app(&project_a, "app:a");
+        let project_b_context = context_with_app(&project_b, "app/a");
         let app_a_runtime = register(app_a_context.clone(), "app-a-worker", "token-app-a");
         let app_b_runtime = register(app_b_context.clone(), "app-b-worker", "token-app-b");
         let project_b_runtime = register(
@@ -9299,15 +9374,15 @@ mod host_route_registry_tests {
             .starts_with(&canonical_project_b));
 
         let app_a_identity =
-            runtime_for_registered(&app_a_runtime, &project_a, "app-a-worker", "app-a");
+            runtime_for_registered(&app_a_runtime, &project_a, "app-a-worker", "app/a");
         let app_b_identity =
-            runtime_for_registered(&app_b_runtime, &project_a, "app-b-worker", "app-b");
+            runtime_for_registered(&app_b_runtime, &project_a, "app-b-worker", "app:a");
         let project_b_identity =
-            runtime_for_registered(&project_b_runtime, &project_b, "project-b-worker", "app-a");
-        let app_a_runtime_context = context_with_runtime(&project_a, "app-a", &app_a_identity);
-        let app_b_runtime_context = context_with_runtime(&project_a, "app-b", &app_b_identity);
+            runtime_for_registered(&project_b_runtime, &project_b, "project-b-worker", "app/a");
+        let app_a_runtime_context = context_with_runtime(&project_a, "app/a", &app_a_identity);
+        let app_b_runtime_context = context_with_runtime(&project_a, "app:a", &app_b_identity);
         let project_b_runtime_context =
-            context_with_runtime(&project_b, "app-a", &project_b_identity);
+            context_with_runtime(&project_b, "app/a", &project_b_identity);
 
         for (context, runtime, worker_id) in [
             (
@@ -9398,7 +9473,7 @@ mod host_route_registry_tests {
                 "app-a-worker",
                 "token-app-a",
                 &project_a,
-                "app-a",
+                "app/a",
                 "app-a",
             ),
             (
@@ -9407,7 +9482,7 @@ mod host_route_registry_tests {
                 "app-b-worker",
                 "token-app-b",
                 &project_a,
-                "app-b",
+                "app:a",
                 "app-b",
             ),
             (
@@ -9416,7 +9491,7 @@ mod host_route_registry_tests {
                 "project-b-worker",
                 "token-project-b",
                 &project_b,
-                "app-a",
+                "app/a",
                 "project-b",
             ),
         ];
@@ -9453,7 +9528,7 @@ mod host_route_registry_tests {
                 command: Some(send_command(
                     &app_a_identity,
                     &project_a,
-                    "app-a",
+                    "app/a",
                     "cross-route",
                 )),
                 to: "app-b-worker".into(),
@@ -9620,6 +9695,196 @@ mod host_route_registry_tests {
         std::fs::remove_dir_all(host_root).unwrap();
         std::fs::remove_dir_all(project_a).unwrap();
         std::fs::remove_dir_all(project_b).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_app_scope_storage_encoding_is_collision_free_and_replayed() {
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-encoded-scope",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+
+        let register = |context: ProjectContext, worker_id: &str, token: &str| {
+            let (runtime, response) = manager.dispatch_sync(
+                Some(context),
+                Req::Register {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    pane: Some(format!("%{worker_id}")),
+                    cwd: project_root.display().to_string(),
+                },
+            );
+            assert!(response.ok, "registration {worker_id}: {response:?}");
+            runtime
+        };
+        // A first route owns the project's legacy storage root. The two
+        // colliding sanitized forms are deliberately later routes, where the
+        // encoded namespace is selected.
+        let seed_runtime = register(
+            context_with_app(&project_root, "seed"),
+            "encoded-seed-worker",
+            "token-encoded-seed",
+        );
+        let slash_runtime = register(
+            context_with_app(&project_root, "app/a"),
+            "encoded-slash-worker",
+            "token-encoded-slash",
+        );
+        let colon_runtime = register(
+            context_with_app(&project_root, "app:a"),
+            "encoded-colon-worker",
+            "token-encoded-colon",
+        );
+        let slash_storage = app_scope_storage_path(&canonical_project_root, "app/a");
+        let colon_storage = app_scope_storage_path(&canonical_project_root, "app:a");
+        assert_ne!(slash_storage, colon_storage);
+        assert_eq!(slash_runtime.storage_root, slash_storage);
+        assert_eq!(colon_runtime.storage_root, colon_storage);
+        assert!(!Arc::ptr_eq(&slash_runtime, &colon_runtime));
+
+        let routes = [
+            (
+                context_with_runtime(
+                    &project_root,
+                    "seed",
+                    &runtime_for_registered(
+                        &seed_runtime,
+                        &project_root,
+                        "encoded-seed-worker",
+                        "seed",
+                    ),
+                ),
+                "encoded-seed-worker",
+                "token-encoded-seed",
+            ),
+            (
+                context_with_runtime(
+                    &project_root,
+                    "app/a",
+                    &runtime_for_registered(
+                        &slash_runtime,
+                        &project_root,
+                        "encoded-slash-worker",
+                        "app/a",
+                    ),
+                ),
+                "encoded-slash-worker",
+                "token-encoded-slash",
+            ),
+            (
+                context_with_runtime(
+                    &project_root,
+                    "app:a",
+                    &runtime_for_registered(
+                        &colon_runtime,
+                        &project_root,
+                        "encoded-colon-worker",
+                        "app:a",
+                    ),
+                ),
+                "encoded-colon-worker",
+                "token-encoded-colon",
+            ),
+        ];
+        for (context, worker_id, token) in &routes {
+            let (_selected, status) = manager.dispatch_sync(Some(context.clone()), Req::StatusAll);
+            assert!(status.ok, "{worker_id} status: {status:?}");
+            assert_eq!(status.data["summary"]["workers"], 1);
+            assert_eq!(status.data["workers"][0]["id"], *worker_id);
+            let (_, task) = manager.dispatch_sync(
+                Some(context.clone()),
+                Req::TaskRegister {
+                    worker_id: (*worker_id).into(),
+                    token: (*token).into(),
+                    task_id: "encoded-scope-task".into(),
+                    owner: None,
+                    feature_id: Some(format!("feature-{worker_id}")),
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p1".into(),
+                    next_step: Some("verify encoded scope replay".into()),
+                    goal_prompt: None,
+                },
+            );
+            assert!(task.ok, "{worker_id} task: {task:?}");
+        }
+
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let route_records = load_host_route_records(&route_journal).unwrap();
+        assert_eq!(route_records.len(), 3);
+        let storage_roots = route_records
+            .iter()
+            .map(|record| record.storage_root.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(storage_roots.len(), 3);
+
+        drop(seed_runtime);
+        drop(slash_runtime);
+        drop(colon_runtime);
+        drop(manager);
+        let replayed_manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        for (context, worker_id, _token) in routes {
+            let (selected, status) =
+                replayed_manager.dispatch_sync(Some(context.clone()), Req::StatusAll);
+            assert!(status.ok, "{worker_id} replay status: {status:?}");
+            assert_eq!(status.data["summary"]["workers"], 1);
+            assert_eq!(status.data["workers"][0]["id"], worker_id);
+            assert_eq!(status.data["summary"]["tasks"], 1);
+            assert!(Arc::ptr_eq(
+                &selected,
+                &replayed_manager.select_runtime(&context).unwrap()
+            ));
+        }
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_runtime_initialization_is_one_arc_under_concurrent_dispatch() {
+        let (server, root, _) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        let context = context_with_app(&root, "pending-concurrent");
+        let key = ProjectRuntimeManager::route_key(&context);
+        let canonical_root = root.canonicalize().unwrap();
+        manager.install_pending_route(&key, &canonical_root, &canonical_root);
+
+        let first_manager = manager.clone();
+        let first_context = context.clone();
+        let second_manager = manager.clone();
+        let second_context = context.clone();
+        let (first, second) = tokio::join!(
+            tokio::task::spawn_blocking(move || first_manager.select_runtime(&first_context)),
+            tokio::task::spawn_blocking(move || second_manager.select_runtime(&second_context)),
+        );
+        let first = first.unwrap().unwrap();
+        let second = second.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let installed = manager
+            .routes
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|route| route.runtime.clone())
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &installed));
+        assert_eq!(manager.runtimes().len(), 2);
+        assert_eq!(
+            first.journal_path,
+            canonical_root.join(".agent-collab/server/journal.jsonl")
+        );
+
+        drop(first);
+        drop(second);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
