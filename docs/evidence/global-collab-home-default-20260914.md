@@ -15,8 +15,9 @@ deleted or reset.
 - `cargo fmt -- --check`: pass.
 - `cargo build --release`: pass.
 - `scope::tests`: pass, including the new
-  `default_host_endpoint_uses_dot_collab_in_home`, which asserts
-  `HostPaths::resolve_from_env().state_root() == HOME/.collab`.
+  `default_host_endpoint_uses_dot_collab_in_home`, which asserts that
+  `resolve_state_root(Some(""), Some(""), Some(HOME))` falls through to
+  `HOME/.collab`.
 - `server::startup_tests`: 6 passed / 0 failed.
 
 ## Default-path resolution
@@ -70,8 +71,9 @@ process cwd rather than an inherited pane:
 STATE=$(mktemp -d /tmp/collab-clean-proof-XXXXXX)
 A=$(mktemp -d /tmp/collab-clean-a-XXXXXX)
 B=$(mktemp -d /tmp/collab-clean-b-XXXXXX)
+COLLAB_BIN="$PWD/target/release/collab"
 run() { env -u TMUX -u TMUX_PANE COLLAB_STATE_DIR="$STATE" \
-        target/release/collab "$@"; }
+        "$COLLAB_BIN" "$@"; }
 
 cd "$A"; run up        # {"ok":true,"server":"$STATE/server.sock","started":true}
 cd "$A"; run status    # {"messages":0,"tasks":0,"workers":0}
