@@ -34,20 +34,11 @@ impl HostPaths {
     }
 
     pub fn resolve_from_env() -> anyhow::Result<Self> {
-        let state_root = if let Some(value) = std::env::var_os(COLLAB_STATE_DIR_ENV) {
-            PathBuf::from(value)
-        } else if let Some(value) = std::env::var_os(XDG_STATE_HOME_ENV) {
-            PathBuf::from(value).join("collab")
-        } else if let Some(value) = std::env::var_os(HOME_ENV) {
-            PathBuf::from(value)
-                .join(".local")
-                .join("state")
-                .join("collab")
-        } else {
-            anyhow::bail!(
-                "collab host state root is unavailable; set ${COLLAB_STATE_DIR_ENV}, ${XDG_STATE_HOME_ENV}, or ${HOME_ENV}"
-            )
-        };
+        let state_root = resolve_state_root(
+            std::env::var_os(COLLAB_STATE_DIR_ENV),
+            std::env::var_os(XDG_STATE_HOME_ENV),
+            std::env::var_os(HOME_ENV),
+        )?;
         let mut paths = Self::from_state_root(state_root)?;
         apply_endpoint_overrides(
             &mut paths,
@@ -148,7 +139,7 @@ fn apply_endpoint_overrides(
 
 fn first_env_path<const N: usize>(names: [&str; N]) -> anyhow::Result<Option<PathBuf>> {
     for name in names {
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = nonempty_env(name) {
             return Ok(Some(validate_host_path(
                 PathBuf::from(value),
                 "host endpoint",
@@ -156,6 +147,29 @@ fn first_env_path<const N: usize>(names: [&str; N]) -> anyhow::Result<Option<Pat
         }
     }
     Ok(None)
+}
+
+fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn resolve_state_root(
+    state_dir: Option<std::ffi::OsString>,
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(value) = state_dir.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value));
+    }
+    if let Some(value) = xdg_state_home.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value).join("collab"));
+    }
+    if let Some(value) = home.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value).join(".collab"));
+    }
+    anyhow::bail!(
+        "collab host state root is unavailable; set ${COLLAB_STATE_DIR_ENV}, ${XDG_STATE_HOME_ENV}, or ${HOME_ENV}"
+    )
 }
 
 fn validate_host_path(path: PathBuf, label: &str) -> anyhow::Result<PathBuf> {
@@ -908,6 +922,20 @@ mod tests {
     fn host_endpoint_rejects_relative_state_roots() {
         let error = HostPaths::for_state_root("collab-state").unwrap_err();
         assert!(error.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn default_host_endpoint_uses_dot_collab_in_home() {
+        let home = test_root("host-home-default");
+        std::fs::create_dir_all(&home).unwrap();
+        let state_root = resolve_state_root(
+            Some("".into()),
+            Some("".into()),
+            Some(home.clone().into_os_string()),
+        )
+        .unwrap();
+        assert_eq!(state_root, home.join(".collab"));
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
