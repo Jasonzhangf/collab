@@ -2776,8 +2776,49 @@ fn cross_project_send_requires_master_endpoints_on_both_sides() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn register_appserver(server: &mut Server, id: &str, thread_id: &str) -> Resp {
+    use crate::identity::AppServerId;
+    use crate::proto::AppServerCandidate;
+
+    let app_scope = AppServerId::new("appserver-test").unwrap();
+    let candidate = AppServerCandidate {
+        endpoint: format!("unix:///tmp/collab-appserver-{id}.sock"),
+        namespace: "codex_tui".into(),
+        thread_id: thread_id.into(),
+    };
+    let candidate_for_closure = candidate.clone();
+    let checked = {
+        let expected = thread_id.to_owned();
+        move |candidate: &AppServerCandidate| {
+            assert_eq!(candidate.thread_id, expected);
+            Ok(SelectedTransport {
+                kind: TransportKind::AppServer,
+                endpoint: Some(candidate.endpoint.clone()),
+                namespace: Some(candidate.namespace.clone()),
+                thread_id: Some(candidate.thread_id.clone()),
+                pane: None,
+                capabilities: vec!["send_message".into()],
+                self_check: "test App Server candidate".into(),
+            })
+        }
+    };
+    server.appserver_candidate_check = Arc::new(checked);
+    handle_register_with_app_scope(
+        server,
+        id.into(),
+        format!("token-{id}"),
+        None,
+        server.root.display().to_string(),
+        Some(app_scope),
+        Some(TransportCandidates {
+            appserver: Some(candidate_for_closure),
+            tmux: None,
+        }),
+    )
+}
+
 #[test]
-fn master_promotion_requires_live_tmux_pane() {
+fn master_promotion_requires_live_transport() {
     fn none_alive(_: &str) -> PanePresence {
         PanePresence::Missing
     }
@@ -2791,7 +2832,27 @@ fn master_promotion_requires_live_tmux_pane() {
         "user approved peer-a as collab master".into(),
     );
     assert!(!denied.ok);
-    assert!(denied.error.unwrap().contains("live tmux pane"));
+    assert!(denied.error.unwrap().contains("live registered transport"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_promotion_allows_verified_appserver_without_tmux() {
+    let (mut server, root) = test_server();
+    let registered = register_appserver(&mut server, "peer-appserver", "thread-appserver");
+    assert!(registered.ok, "{registered:?}");
+    assert_eq!(registered.data["transport_selected"]["kind"], "appserver");
+    let promoted = super::handle_master_promote(
+        &server,
+        "peer-appserver".into(),
+        "token-peer-appserver".into(),
+        "user approved peer-appserver as appserver master".into(),
+    );
+    assert!(promoted.ok, "{}", promoted.error.unwrap_or_default());
+    assert_eq!(
+        server.state.lock().unwrap().master_worker_id.as_deref(),
+        Some("peer-appserver")
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -6076,6 +6137,28 @@ fn worker_status_query_exposes_liveness_identity_and_notification_pressure() {
     assert_eq!(w["status"], "waiting");
     assert_eq!(w["unacked_notifications"], 0);
     assert_eq!(w["notifications_paused"], false);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_status_query_exposes_appserver_liveness_without_tmux() {
+    let (mut server, root) = test_server();
+    assert!(
+        register_appserver(&mut server, "status-appserver", "thread-status-appserver").ok,
+        "appserver registration failed"
+    );
+    let resp = dispatch(&Arc::new(server), Req::WorkerStatus { worker_id: None });
+    assert!(resp.ok);
+    let workers = resp.data["workers"].as_array().unwrap();
+    assert_eq!(workers.len(), 1);
+    let w = &workers[0];
+    assert_eq!(w["id"], "status-appserver");
+    assert_eq!(w["transport"]["kind"], "appserver");
+    assert_eq!(w["transport"]["thread_id"], "thread-status-appserver");
+    assert_eq!(w["endpoint_live"], true);
+    assert_eq!(w["identity_valid"], true);
+    assert_eq!(w["agent_state"], "waiting");
+    assert_eq!(w["status"], "waiting");
     std::fs::remove_dir_all(root).unwrap();
 }
 

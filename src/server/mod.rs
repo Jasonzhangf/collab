@@ -3838,7 +3838,17 @@ fn migration_issues(server: &Server, state: &State) -> Vec<String> {
                     worker.id
                 )),
             },
-            _ => issues.push(format!("worker {} is not bound to tmux", worker.id)),
+            _ => match worker_identity_presence(server, worker) {
+                PanePresence::Present => {}
+                PanePresence::Missing => issues.push(format!(
+                    "worker {} has no live server-verified transport",
+                    worker.id
+                )),
+                PanePresence::Unknown => issues.push(format!(
+                    "worker {} transport liveness is unknown",
+                    worker.id
+                )),
+            },
         }
     }
     for task in state.tasks.values() {
@@ -4669,9 +4679,9 @@ pub(crate) fn live_master_id(
     match worker_identity_presence(server, worker) {
         PanePresence::Present => Ok(Some(worker.id.clone())),
         PanePresence::Missing => Ok(None),
-        PanePresence::Unknown => {
-            Err("master identity is unknown; defer authority changes until pane probes succeed")
-        }
+        PanePresence::Unknown => Err(
+            "master identity is unknown; defer authority changes until transport probes succeed",
+        ),
     }
 }
 
@@ -5334,9 +5344,11 @@ fn handle_master_promote(
     }
     match worker_identity_presence(server, &worker) {
         PanePresence::Present => {}
-        PanePresence::Missing => return Resp::err("master promotion requires a live tmux pane"),
+        PanePresence::Missing => {
+            return Resp::err("master promotion requires a live registered transport")
+        }
         PanePresence::Unknown => return Resp::err(
-            "promotion candidate identity is unknown; defer promotion until pane probes succeed",
+            "promotion candidate identity is unknown; defer promotion until transport probes succeed",
         ),
     }
     server.commit_locked(
@@ -5371,11 +5383,11 @@ fn handle_master_delegate(
     match worker_identity_presence(server, target) {
         PanePresence::Present => {}
         PanePresence::Missing => {
-            return Resp::err("master delegation requires a live target tmux pane")
+            return Resp::err("master delegation requires a live target transport")
         }
         PanePresence::Unknown => {
             return Resp::err(
-                "delegation target identity is unknown; defer delegation until pane probes succeed",
+                "delegation target identity is unknown; defer delegation until transport probes succeed",
             )
         }
     }
@@ -5767,8 +5779,8 @@ pub(crate) fn handle_send_with_task(
     let Some(recipient) = st.workers.get(&to) else {
         return Resp::err(format!("recipient {} not registered", to));
     };
-    if runtime_for_pane(recipient.pane.as_deref()).is_none() {
-        return Resp::err("recipient has no valid tmux pane");
+    if worker_identity_presence(server, recipient) == PanePresence::Missing {
+        return Resp::err("recipient has no live server-verified transport");
     }
     if let Some(ref rid) = in_reply_to {
         if !st.msgs.contains_key(rid) {
@@ -6362,15 +6374,12 @@ fn handle_task_update(
 
 fn stale_worker_views(
     st: &State,
-    presence: &dyn Fn(&str) -> PanePresence,
+    presence: &dyn Fn(&WorkerRec) -> PanePresence,
 ) -> Vec<serde_json::Value> {
     st.workers
         .values()
         .filter(|worker| {
-            worker
-                .pane
-                .as_deref()
-                .is_some_and(|pane| presence(pane) == PanePresence::Missing)
+            presence(worker) == PanePresence::Missing
         })
         .map(|worker| {
             let active_tasks: Vec<String> = st
@@ -6382,6 +6391,7 @@ fn stale_worker_views(
             json!({
                 "worker": worker.id,
                 "pane": worker.pane,
+                "transport_kind": worker.transport.as_ref().map(|transport| transport.kind.as_str()),
                 "active_tasks": active_tasks,
                 "action": "peer owns cleanup; daemon operator may inspect during migration"
             })
@@ -6827,14 +6837,12 @@ fn handle_task_close(
             Ok(master) => master,
             Err(error) => return Resp::err(error),
         };
-        let owner_identity_live = st
-            .workers
-            .get(&task.owner)
-            .and_then(|owner| owner.pane.as_deref())
-            .is_some_and(|pane| {
-                (server.pane_alive_check)(pane) != PanePresence::Missing
-                    && (server.pane_owner_check)(&task.owner, pane) != Ok(false)
-            });
+        let owner_identity_live = st.workers.get(&task.owner).is_some_and(|owner| {
+            !matches!(
+                worker_identity_presence(server, owner),
+                PanePresence::Missing
+            )
+        });
         let authorized = live_master.as_deref() == Some(worker_id.as_str())
             || (live_master.is_none() && (task.owner == worker_id || !owner_identity_live));
         if !authorized {
@@ -6863,7 +6871,9 @@ fn handle_task_close(
                     "reason": receipt.manual_reason,
                     "receipt_id": receipt.id,
                     "superseded_pending_keepalives": [],
-                    "stale_workers": stale_worker_views(&st, &server.pane_alive_check),
+                    "stale_workers": stale_worker_views(&st, &|worker| {
+                        worker_identity_presence(server, worker)
+                    }),
                     "idempotent": true,
                     "next_action": "lifecycle complete; keepalives for this task owner stopped",
                 }));
@@ -6924,7 +6934,8 @@ fn handle_task_close(
             }
         }
         server.commit_locked(&mut st, &events);
-        let stale_workers = stale_worker_views(&st, &server.pane_alive_check);
+        let stale_workers =
+            stale_worker_views(&st, &|worker| worker_identity_presence(server, worker));
         drop(st);
         return Resp::data(json!({
             "task": closed.id,
@@ -7081,7 +7092,7 @@ fn handle_task_close(
         server.commit_locked(&mut st, &events);
     }
 
-    let stale_workers = stale_worker_views(&st, &server.pane_alive_check);
+    let stale_workers = stale_worker_views(&st, &|worker| worker_identity_presence(server, worker));
     drop(st);
     for (message_id, subscription_id) in subscribed_notifications {
         attempt_notification(server, &message_id, &subscription_id);
@@ -7172,9 +7183,27 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         })
         .collect();
     let managed = is_managed_subagent(&st, &worker_id);
+    let presence = worker_identity_presence(server, worker);
+    let transport = worker.transport.as_ref().map(|transport| {
+        json!({
+            "kind": transport.kind.as_str(),
+            "endpoint": transport.endpoint,
+            "namespace": transport.namespace,
+            "thread_id": transport.thread_id,
+            "pane": transport.pane,
+            "self_check": transport.self_check,
+        })
+    });
     Resp::data(json!({
-        "identity": {"worker_id": worker.id, "kind": "peer", "pane": worker.pane},
+        "identity": {"worker_id": worker.id, "kind": "peer", "pane": worker.pane, "transport": transport},
         "liveness": {
+            "live": presence == PanePresence::Present,
+            "presence": match presence {
+                PanePresence::Present => "present",
+                PanePresence::Missing => "missing",
+                PanePresence::Unknown => "unknown",
+            },
+            "transport_kind": worker.transport.as_ref().map(|transport| transport.kind.as_str()),
             "pane_alive": worker.pane.as_deref().is_some_and(pane_alive),
             "pane_idle": worker.pane.as_deref().is_some_and(pane_idle),
         },
@@ -7190,7 +7219,7 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
             "must_obey_master": managed,
             "may_decline_master_invite": !managed,
         },
-        "truth": "server journal and mailbox; tmux is wake-only",
+        "truth": "server journal and mailbox; selected transport is wake-only",
     }))
 }
 
@@ -7399,29 +7428,40 @@ fn worker_status_summary_with_maps(
     let active = tasks
         .values()
         .find(|task| task.owner == w.id && !matches!(task.status.as_str(), "closed" | "cancelled"));
-    let pane = w.pane.as_deref();
-    let presence = pane
-        .map(server.pane_alive_check)
-        .unwrap_or(PanePresence::Missing);
+    let presence = worker_identity_presence(server, w);
     let endpoint_live = presence == PanePresence::Present;
-    let ownership = if endpoint_live {
-        pane.map(|p| (server.pane_owner_check)(&w.id, p))
+    let is_appserver = w
+        .transport
+        .as_ref()
+        .is_some_and(|transport| transport.kind == TransportKind::AppServer);
+    let (ownership, identity_valid, agent_state) = if is_appserver {
+        let ownership = endpoint_live.then_some(Ok(true));
+        let identity_valid = endpoint_live;
+        let agent_state = if endpoint_live { "waiting" } else { "absent" };
+        (ownership, identity_valid, agent_state)
     } else {
-        None
-    };
-    let identity_valid = endpoint_live && ownership == Some(Ok(true));
-    let agent_state = if endpoint_live && identity_valid {
-        pane.map(|p| match (server.pane_state_check)(p) {
-            crate::server::knock::AgentState::Waiting => "waiting",
-            crate::server::knock::AgentState::Working => "working",
-            crate::server::knock::AgentState::Absent => "absent",
-            crate::server::knock::AgentState::Unknown => "unknown",
-        })
-        .unwrap_or("absent")
-    } else if presence == PanePresence::Unknown || (endpoint_live && ownership == Some(Err(()))) {
-        "unknown"
-    } else {
-        "absent"
+        let pane = w.pane.as_deref();
+        let ownership = if endpoint_live {
+            pane.map(|p| (server.pane_owner_check)(&w.id, p))
+        } else {
+            None
+        };
+        let identity_valid = endpoint_live && ownership == Some(Ok(true));
+        let agent_state = if endpoint_live && identity_valid {
+            pane.map(|p| match (server.pane_state_check)(p) {
+                crate::server::knock::AgentState::Waiting => "waiting",
+                crate::server::knock::AgentState::Working => "working",
+                crate::server::knock::AgentState::Absent => "absent",
+                crate::server::knock::AgentState::Unknown => "unknown",
+            })
+            .unwrap_or("absent")
+        } else if presence == PanePresence::Unknown || (endpoint_live && ownership == Some(Err(())))
+        {
+            "unknown"
+        } else {
+            "absent"
+        };
+        (ownership, identity_valid, agent_state)
     };
     let unacked_notifications = msgs
         .values()
@@ -7449,9 +7489,9 @@ fn worker_status_summary_with_maps(
     let diagnostic = if status == "unknown" {
         None
     } else if status == "lost" {
-        Some("pane dead or not found; clean up task or restart pane")
+        Some("registered transport is not live; verify App Server route or tmux pane")
     } else if status == "identity-mismatch" {
-        Some("pane re-bound or owned by different process; verify pane ownership")
+        Some("selected transport is not live or owned by a different identity; verify route")
     } else if suspected_offline {
         Some("unresponsive; run snapshot: collab subagent snapshot <id> --lines 40")
     } else {
@@ -7460,6 +7500,14 @@ fn worker_status_summary_with_maps(
     json!({
         "id": w.id,
         "pane": w.pane,
+        "transport": w.transport.as_ref().map(|transport| json!({
+            "kind": transport.kind.as_str(),
+            "endpoint": transport.endpoint,
+            "namespace": transport.namespace,
+            "thread_id": transport.thread_id,
+            "pane": transport.pane,
+            "self_check": transport.self_check,
+        })),
         "status": status,
         "presence": match presence {
             PanePresence::Present => "present",

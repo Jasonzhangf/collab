@@ -525,7 +525,8 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
   daemon restart restores it only while the registered tmux session still
   matches the peer identity. A shorter explicit lease cannot suppress it.
 - AppServer is preferred for live notification when server self-check passes;
-  tmux remains the fallback wake channel and carries one bounded preview.
+  tmux is an optional adapter and carries one bounded preview only when the
+  server selects and proves it.
 - Server state, journal, and mailbox are durable truth; a failed wake cannot
   roll back state or fabricate success.
 - The runtime is part of the worker identity boundary, not a task preference.
@@ -535,7 +536,7 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
 - Every registered identity is an equal `peer`; there is no inferred master
   from first registration. Codex root is not Collab master.
 - `collab init` and peer registration never create a master. A master exists
-  only when a registered peer has a live tmux pane and was assigned by
+  only when a registered peer has a live server-verified transport and was assigned by
   user-approved self-promotion or live-master delegation. A recorded identity
   with a dead pane is not a live master.
 - If a live master exists, other peers cannot promote; only that master may
