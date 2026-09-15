@@ -559,44 +559,30 @@ pub fn load_or_create(
 
 /// Load or create the identity used by `collab init`. Initialization binds to
 /// the process cwd and never depends on tmux: an advertised pane is only
-/// offered as a capability candidate when it is actually live, and the server
-/// still assigns the channel with App Server preferred.
-pub fn load_or_create_for_init(
-    scope: &Scope,
-    appserver_available: bool,
-) -> anyhow::Result<Identity> {
-    load_or_create_for_init_with(
-        scope,
-        appserver_available,
-        std::env::var("TMUX_PANE").ok(),
-        None,
-        |pane| tmux_session(pane).is_some(),
-    )
+/// offered as a capability candidate when it is actually live. The server
+/// remains the sole owner of channel assignment, so init always re-registers
+/// instead of reusing a persisted binding.
+pub fn load_or_create_for_init(scope: &Scope) -> anyhow::Result<Identity> {
+    load_or_create_for_init_with(scope, std::env::var("TMUX_PANE").ok(), |pane| {
+        tmux_session(pane).is_some()
+    })
 }
 
 fn load_or_create_for_init_with<F>(
     scope: &Scope,
-    appserver_available: bool,
     tmux_pane: Option<String>,
-    requested_worker: Option<String>,
     pane_is_live: F,
 ) -> anyhow::Result<Identity>
 where
     F: FnOnce(&str) -> bool,
 {
-    let live_pane = init_pane_candidate(tmux_pane, appserver_available, pane_is_live);
-    let mut ident = load_or_create_resolved(scope, requested_worker, live_pane.clone(), false)?;
-    if !persisted_binding_matches_current_candidates(
-        &ident,
-        appserver_available,
-        live_pane.as_deref(),
-    ) {
-        // A persisted binding may only be reused when it matches a currently
-        // verified candidate: App Server when a thread is available, or the
-        // exact live pane. A stale/dead pane or a now-available App Server
-        // must not silently keep the old channel. Preserve the worker identity
-        // and token, clear only the endpoint binding, and let registration
-        // re-run with the server still choosing the channel.
+    let live_pane = init_pane_candidate(tmux_pane, pane_is_live);
+    let mut ident = load_or_create_resolved(scope, None, live_pane, false)?;
+    if ident.runtime.is_some() || ident.transport.is_some() {
+        // A persisted binding may describe a channel the server has not
+        // re-admitted in this environment. Preserve the worker identity and
+        // token, clear the binding, and let registration run the server-owned
+        // self-check and channel selection again.
         ident.runtime = None;
         ident.transport = None;
         persist_identity(scope, &ident)?;
@@ -604,38 +590,14 @@ where
     Ok(ident)
 }
 
-/// Init reuses a persisted endpoint only when it is one of the candidates the
-/// server could admit right now. App Server is preferred; tmux is accepted
-/// only for the exact pane proven live in this run.
-fn persisted_binding_matches_current_candidates(
-    ident: &Identity,
-    appserver_available: bool,
-    live_pane: Option<&str>,
-) -> bool {
-    match ident.transport.as_ref().map(|transport| &transport.kind) {
-        Some(TransportKind::AppServer) => appserver_available,
-        Some(TransportKind::Tmux) => {
-            !appserver_available && live_pane.is_some() && ident.pane.as_deref() == live_pane
-        }
-        None => true,
-    }
-}
-
-/// App Server outranks tmux, so a pane is never probed when an App Server
-/// thread is available. Otherwise a pane is a candidate only when it is
-/// advertised and resolves live; a stale or missing pane is ignored rather
-/// than blocking initialization.
-fn init_pane_candidate<F>(
-    tmux_pane: Option<String>,
-    appserver_available: bool,
-    pane_is_live: F,
-) -> Option<String>
+/// A pane is a candidate only when it is advertised and resolves live. A
+/// stale or missing pane is ignored rather than blocking initialization.
+/// App Server priority is enforced by the server, which owns channel
+/// assignment, so the worker still offers every candidate it can verify.
+fn init_pane_candidate<F>(tmux_pane: Option<String>, pane_is_live: F) -> Option<String>
 where
     F: FnOnce(&str) -> bool,
 {
-    if appserver_available {
-        return None;
-    }
     let pane = tmux_pane.filter(|pane| pane.starts_with('%'))?;
     pane_is_live(&pane).then_some(pane)
 }
@@ -1029,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn init_prefers_appserver_over_an_advertised_tmux_pane() {
+    fn init_clears_a_persisted_binding_so_the_server_reassigns_the_channel() {
         let root = std::env::temp_dir().join(format!(
             "collab-init-priority-{}-{}",
             std::process::id(),
@@ -1060,14 +1022,9 @@ mod tests {
         )
         .unwrap();
 
-        let resolved = load_or_create_for_init_with(
-            &scope,
-            true,
-            Some("%743".into()),
-            Some("codex-thread-1".into()),
-            |_| panic!("tmux must not be probed when App Server is available"),
-        )
-        .unwrap();
+        let resolved =
+            load_or_create_for_init_with(&scope, Some("%743".into()), |pane| pane == "%743")
+                .unwrap();
         assert_eq!(resolved.worker_id, "codex-thread-1");
         assert_eq!(resolved.token, ident.token);
         assert_eq!(resolved.runtime, None);
@@ -1076,70 +1033,25 @@ mod tests {
     }
 
     #[test]
-    fn init_uses_a_live_tmux_pane_when_appserver_is_unavailable() {
-        let selected = init_pane_candidate(Some("%7".into()), false, |pane| pane == "%7");
+    fn init_uses_a_live_tmux_pane() {
+        let selected = init_pane_candidate(Some("%7".into()), |pane| pane == "%7");
         assert_eq!(selected.as_deref(), Some("%7"));
     }
 
     #[test]
-    fn init_ignores_a_stale_tmux_pane_without_appserver() {
-        let selected = init_pane_candidate(Some("%7".into()), false, |_| false);
+    fn init_ignores_a_stale_tmux_pane() {
+        let selected = init_pane_candidate(Some("%7".into()), |_| false);
         assert_eq!(selected, None);
     }
 
     #[test]
-    fn init_does_not_probe_tmux_when_appserver_is_available() {
-        let selected = init_pane_candidate(Some("%7".into()), true, |_| {
-            panic!("tmux must not be probed when App Server is available")
-        });
-        assert_eq!(selected, None);
-    }
-
-    #[test]
-    fn init_clears_a_persisted_tmux_binding_when_the_pane_is_stale() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-init-stale-pane-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
-        let scope = Scope { root: root.clone() };
-        let mut ident = provision(&scope, "codex-thread-2", "%743", "session-1").unwrap();
-        persist_registration(
-            &scope,
-            &mut ident,
-            RuntimeIdentity {
-                native_thread_id: None,
-                ..runtime_identity(5, "binding-tmux-stale")
-            },
-            SelectedTransport {
-                kind: TransportKind::Tmux,
-                endpoint: None,
-                namespace: None,
-                thread_id: None,
-                pane: Some("%743".into()),
-                capabilities: vec!["send_message_to_thread".into()],
-                self_check: "ok".into(),
-            },
-        )
-        .unwrap();
-
-        let resolved = load_or_create_for_init_with(
-            &scope,
-            false,
-            Some("%743".into()),
-            Some("codex-thread-2".into()),
-            |_| false,
-        )
-        .unwrap();
-        assert_eq!(resolved.worker_id, "codex-thread-2");
-        assert_eq!(resolved.token, ident.token);
-        assert_eq!(resolved.runtime, None);
-        assert_eq!(resolved.transport, None);
-        std::fs::remove_dir_all(root).ok();
+    fn init_offers_every_verifiable_candidate_to_the_server() {
+        // The worker offers every candidate it can verify; the server owns
+        // channel assignment and App Server priority. Suppressing the tmux
+        // candidate here would strand init when the advertised App Server is
+        // rejected by the server self-check.
+        let selected = init_pane_candidate(Some("%7".into()), |pane| pane == "%7");
+        assert_eq!(selected.as_deref(), Some("%7"));
     }
 
     #[test]
