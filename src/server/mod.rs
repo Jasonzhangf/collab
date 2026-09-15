@@ -1902,6 +1902,8 @@ impl ProjectRuntimeManager {
             pane_alive_check: self.host.pane_alive_check,
             pane_owner_check: self.host.pane_owner_check,
             pane_state_check: self.host.pane_state_check,
+            appserver_candidate_check: self.host.appserver_candidate_check.clone(),
+            appserver_notification_sink: self.host.appserver_notification_sink.clone(),
             mailbox_notify: Notify::new(),
         });
         restore_registered_peer_default_leases(&runtime);
@@ -2115,6 +2117,127 @@ impl ProjectRuntimeManager {
         self.ensure_runtime(&key, &pending.0, &pending.1)
     }
 
+    fn verify_cross_project_source(
+        &self,
+        from: &str,
+        from_project: &str,
+        assigned_by: &str,
+        approval: Option<&str>,
+        assigned_ms: i64,
+    ) -> Result<(), String> {
+        let source_root = std::fs::canonicalize(from_project).map_err(|error| {
+            format!("CROSS_PROJECT_SOURCE_REJECTED: canonicalize source project: {error}")
+        })?;
+        if !source_root.join(".agent-collab").is_dir() {
+            return Err(format!(
+                "CROSS_PROJECT_SOURCE_REJECTED: source project {} is not initialized for Collab",
+                source_root.display()
+            ));
+        }
+        let source_scope = GlobalState::canonical_project_scope(&source_root)
+            .map_err(|error| format!("CROSS_PROJECT_SOURCE_REJECTED: {error}"))?;
+        let pending = self
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((_, project_scope), _)| project_scope == source_scope.as_str())
+            .map(|(key, route)| (key.clone(), route.root.clone(), route.storage_root.clone()))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Err(format!(
+                "CROSS_PROJECT_SOURCE_REJECTED: no registered source route for {}",
+                source_scope.as_str()
+            ));
+        }
+
+        let mut matches = Vec::new();
+        for (key, root, storage_root) in pending {
+            let runtime = self
+                .ensure_runtime(&key, &root, &storage_root)
+                .map_err(|error| format!("CROSS_PROJECT_SOURCE_REJECTED: {error}"))?;
+            let state = runtime.state.lock().unwrap();
+            let live_master = match live_master_id(&runtime, &state) {
+                Ok(master) => master,
+                Err(error) => {
+                    return Err(format!("CROSS_PROJECT_SOURCE_REJECTED: {error}"));
+                }
+            };
+            if live_master.as_deref() != Some(from) {
+                continue;
+            }
+            if state.master_assigned_by.as_deref() != Some(assigned_by)
+                || state.master_approval.as_deref() != approval
+                || state.master_assigned_ms != Some(assigned_ms)
+            {
+                return Err(
+                    "CROSS_PROJECT_SOURCE_REJECTED: source master assignment evidence does not match the source reducer"
+                        .into(),
+                );
+            }
+            matches.push(key);
+        }
+
+        match matches.len() {
+            1 => Ok(()),
+            0 => Err(
+                "CROSS_PROJECT_SOURCE_REJECTED: sender is not the live master of the source project"
+                    .into(),
+            ),
+            _ => Err(
+                "CROSS_PROJECT_SOURCE_REJECTED: source master route is ambiguous; use one registered source app scope"
+                    .into(),
+            ),
+        }
+    }
+
+    fn dispatch_cross_project_send(
+        &self,
+        target_context: &ProjectContext,
+        req: Req,
+    ) -> (Arc<Server>, Resp) {
+        let Req::CrossProjectSend {
+            from,
+            from_project,
+            source_master_assigned_by,
+            source_master_approval,
+            source_master_assigned_ms,
+            to,
+            subject,
+            body,
+            in_reply_to,
+        } = req
+        else {
+            unreachable!("cross-project dispatch requires CrossProjectSend");
+        };
+        let target = match self.select_runtime(target_context) {
+            Ok(runtime) => runtime,
+            Err(error) => return (self.host.clone(), Resp::err(error)),
+        };
+        if let Err(error) = self.verify_cross_project_source(
+            &from,
+            &from_project,
+            &source_master_assigned_by,
+            source_master_approval.as_deref(),
+            source_master_assigned_ms,
+        ) {
+            return (target, Resp::err(error));
+        }
+        let response = handle_cross_project_send(
+            &target,
+            from,
+            from_project,
+            source_master_assigned_by,
+            source_master_approval,
+            source_master_assigned_ms,
+            to,
+            subject,
+            body,
+            in_reply_to,
+        );
+        (target, response)
+    }
+
     fn dispatch_sync(
         &self,
         project_context: Option<ProjectContext>,
@@ -2141,6 +2264,9 @@ impl ProjectRuntimeManager {
         let key = Self::route_key(&context);
         let is_register = matches!(req, Req::Register { .. });
         let _register_guard = is_register.then(|| self.register_gate.lock().unwrap());
+        if matches!(req, Req::CrossProjectSend { .. }) {
+            return self.dispatch_cross_project_send(&context, req);
+        }
 
         if let Some((runtime, _)) = self.routes.lock().unwrap().get(&key).and_then(|route| {
             route
@@ -9301,6 +9427,7 @@ mod host_route_registry_tests {
                 token: "token-atomic-register-worker".into(),
                 pane: Some("%atomic-register-worker".into()),
                 cwd: external_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(!response.1.ok, "{:?}", response.1);
@@ -9345,6 +9472,7 @@ mod host_route_registry_tests {
                 token: "token-manager-external-worker".into(),
                 pane: Some("%manager-external-worker".into()),
                 cwd: external_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(response.ok, "{response:?}");
@@ -9403,6 +9531,7 @@ mod host_route_registry_tests {
                 token: sender_token.into(),
                 pane: Some(format!("%{sender_id}")),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(sender_registration.ok, "{sender_registration:?}");
@@ -9413,6 +9542,7 @@ mod host_route_registry_tests {
                 token: recipient_token.into(),
                 pane: Some(format!("%{recipient_id}")),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(recipient_registration.ok, "{recipient_registration:?}");
@@ -9560,6 +9690,7 @@ mod host_route_registry_tests {
                     } else {
                         project_b.display().to_string()
                     },
+                    candidates: None,
                 },
             );
             assert!(response.ok, "registration {worker_id}: {response:?}");
@@ -9922,6 +10053,190 @@ mod host_route_registry_tests {
     }
 
     #[tokio::test]
+    async fn manager_cross_project_appserver_masters_send_and_reject_forged_source_evidence() {
+        let (mut server, host_root, _) = test_server();
+        with_appserver_check(&mut server, |candidate| Ok(verified_appserver(candidate)));
+        with_appserver_notification_sink(&mut server, |_, _, _| Ok(json!({"queued": true})));
+
+        let project_a = host_root.with_file_name(format!(
+            "{}-cross-project-a",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        let project_b = host_root.with_file_name(format!(
+            "{}-cross-project-b",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        for project_root in [&project_a, &project_b] {
+            std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        }
+        let project_a = project_a.canonicalize().unwrap();
+        let project_b = project_b.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+
+        let app_a = "cross-project-app-a";
+        let app_b = "cross-project-app-b";
+        let master_a = "cross-project-master-a";
+        let master_b = "cross-project-master-b";
+        let token_a = "token-cross-project-master-a";
+        let token_b = "token-cross-project-master-b";
+        let appserver_candidate = |thread_id: &str| AppServerCandidate {
+            endpoint: format!("unix:///tmp/collab-{thread_id}.sock"),
+            namespace: "codex_app".into(),
+            thread_id: thread_id.into(),
+        };
+
+        let (source_runtime, source_registration) = manager.dispatch_sync(
+            Some(context_with_app(&project_a, app_a)),
+            Req::Register {
+                worker_id: master_a.into(),
+                token: token_a.into(),
+                pane: None,
+                cwd: project_a.display().to_string(),
+                candidates: Some(TransportCandidates {
+                    appserver: Some(appserver_candidate("thread-a")),
+                    tmux: None,
+                }),
+            },
+        );
+        assert!(source_registration.ok, "{source_registration:?}");
+        assert_eq!(
+            source_registration.data["transport_selected"]["kind"],
+            "appserver"
+        );
+        assert!(source_registration.data["transport_selected"]["pane"].is_null());
+
+        let (target_runtime, target_registration) = manager.dispatch_sync(
+            Some(context_with_app(&project_b, app_b)),
+            Req::Register {
+                worker_id: master_b.into(),
+                token: token_b.into(),
+                pane: None,
+                cwd: project_b.display().to_string(),
+                candidates: Some(TransportCandidates {
+                    appserver: Some(appserver_candidate("thread-b")),
+                    tmux: None,
+                }),
+            },
+        );
+        assert!(target_registration.ok, "{target_registration:?}");
+        assert_eq!(
+            target_registration.data["transport_selected"]["kind"],
+            "appserver"
+        );
+        assert!(target_registration.data["transport_selected"]["pane"].is_null());
+
+        let source_identity = runtime_for_registered(&source_runtime, &project_a, master_a, app_a);
+        let target_identity = runtime_for_registered(&target_runtime, &project_b, master_b, app_b);
+        let source_context = context_with_runtime(&project_a, app_a, &source_identity);
+        let target_context = context_with_runtime(&project_b, app_b, &target_identity);
+
+        for (context, worker_id, token, approval) in [
+            (
+                source_context.clone(),
+                master_a,
+                token_a,
+                "user approved cross-project-master-a as collab master",
+            ),
+            (
+                target_context.clone(),
+                master_b,
+                token_b,
+                "user approved cross-project-master-b as collab master",
+            ),
+        ] {
+            let (_, promoted) = manager.dispatch_sync(
+                Some(context),
+                Req::MasterPromote {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    approval: approval.into(),
+                },
+            );
+            assert!(promoted.ok, "{worker_id} promotion: {promoted:?}");
+        }
+
+        let (assigned_by, approval, assigned_ms) = {
+            let state = source_runtime.state.lock().unwrap();
+            (
+                state.master_assigned_by.clone().unwrap(),
+                state.master_approval.clone(),
+                state.master_assigned_ms.unwrap(),
+            )
+        };
+        let cross_project_send = |assigned_ms: i64| Req::CrossProjectSend {
+            from: master_a.into(),
+            from_project: project_a.display().to_string(),
+            source_master_assigned_by: assigned_by.clone(),
+            source_master_approval: approval.clone(),
+            source_master_assigned_ms: assigned_ms,
+            to: master_b.into(),
+            subject: "cross-project appserver route".into(),
+            body: "durable cross-project message".into(),
+            in_reply_to: None,
+        };
+
+        let (selected, delivered) = manager.dispatch_sync(
+            Some(target_context.clone()),
+            cross_project_send(assigned_ms),
+        );
+        assert!(Arc::ptr_eq(&selected, &target_runtime));
+        assert!(delivered.ok, "{delivered:?}");
+        assert_eq!(delivered.data["durable"], true);
+        assert_eq!(delivered.data["cross_project"], true);
+        assert_eq!(delivered.data["source_master"], master_a);
+        assert_eq!(delivered.data["target_master"], master_b);
+        let message_id = delivered.data["msg_id"].as_str().unwrap().to_owned();
+        assert!(target_runtime
+            .state
+            .lock()
+            .unwrap()
+            .msgs
+            .contains_key(&message_id));
+
+        let (_, received) = dispatch_wire_routed(
+            manager.clone(),
+            Some(target_context.clone()),
+            Req::Poll {
+                worker_id: master_b.into(),
+                token: token_b.into(),
+                timeout_ms: 0,
+            },
+        )
+        .await;
+        assert!(received.ok, "{received:?}");
+        assert_eq!(received.data["count"], 1);
+        assert_eq!(received.data["messages"][0]["id"], message_id);
+        assert_eq!(received.data["messages"][0]["to"], master_b);
+
+        let target_journal_before = std::fs::read(&target_runtime.journal_path).unwrap();
+        let target_message_count = target_runtime.state.lock().unwrap().msgs.len();
+        let (_, forged) =
+            manager.dispatch_sync(Some(target_context), cross_project_send(assigned_ms + 1));
+        assert!(!forged.ok, "{forged:?}");
+        assert!(forged
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("CROSS_PROJECT_SOURCE_REJECTED:")));
+        assert!(!forged
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("PROJECT_ROUTE_NOT_READY")));
+        assert_eq!(
+            std::fs::read(&target_runtime.journal_path).unwrap(),
+            target_journal_before
+        );
+        assert_eq!(
+            target_runtime.state.lock().unwrap().msgs.len(),
+            target_message_count
+        );
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_a).unwrap();
+        std::fs::remove_dir_all(project_b).unwrap();
+    }
+
+    #[tokio::test]
     async fn nonresident_route_replays_full_query_mutation_and_notification_surface() {
         let (server, host_root, host_journal) = test_server();
         let project_root = host_root.with_file_name(format!(
@@ -9944,6 +10259,7 @@ mod host_route_registry_tests {
                 token: sender_token.into(),
                 pane: Some(format!("%{sender_id}")),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(sender_registration.ok, "{sender_registration:?}");
@@ -9954,6 +10270,7 @@ mod host_route_registry_tests {
                 token: recipient_token.into(),
                 pane: Some(format!("%{recipient_id}")),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(recipient_registration.ok, "{recipient_registration:?}");
@@ -10145,6 +10462,7 @@ mod host_route_registry_tests {
                     token: token.into(),
                     pane: Some(format!("%{worker_id}")),
                     cwd: project_root.display().to_string(),
+                    candidates: None,
                 },
             );
             assert!(response.ok, "registration {worker_id}: {response:?}");
@@ -10320,6 +10638,7 @@ mod host_route_registry_tests {
                 token: "token-prospective-collision".into(),
                 pane: Some("%prospective-collision-worker".into()),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(!collision_response.ok, "{collision_response:?}");
@@ -10342,6 +10661,7 @@ mod host_route_registry_tests {
                 token: "token-legacy-replayed".into(),
                 pane: Some("%legacy-replayed-worker".into()),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(registration_response.ok, "{registration_response:?}");
@@ -10398,6 +10718,7 @@ mod host_route_registry_tests {
                 token: "token-resident-worker".into(),
                 pane: Some("%resident-worker".into()),
                 cwd: host_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(resident_response.ok, "{resident_response:?}");
@@ -10412,6 +10733,7 @@ mod host_route_registry_tests {
                 token: "token-resident-collision".into(),
                 pane: Some("%resident-collision-worker".into()),
                 cwd: resident_storage_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(!collision_response.ok, "{collision_response:?}");
@@ -10460,6 +10782,7 @@ mod host_route_registry_tests {
                 token: "token-nested-seed".into(),
                 pane: Some("%nested-seed-worker".into()),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(seed_response.ok, "{seed_response:?}");
@@ -10470,6 +10793,7 @@ mod host_route_registry_tests {
                 token: "token-nested-app".into(),
                 pane: Some("%nested-app-worker".into()),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(app_response.ok, "{app_response:?}");
@@ -10489,6 +10813,7 @@ mod host_route_registry_tests {
                 token: "token-nested-collision".into(),
                 pane: Some("%nested-collision-worker".into()),
                 cwd: nested_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(!collision_response.ok, "{collision_response:?}");
@@ -10636,6 +10961,7 @@ mod host_route_registry_tests {
                 token: "token-routecodex-master".into(),
                 pane: Some("%routecodex-master".into()),
                 cwd: external_root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -10673,6 +10999,7 @@ mod host_route_registry_tests {
                 token: "token-routecodex-master".into(),
                 pane: Some("%routecodex-master".into()),
                 cwd: external_root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -10714,6 +11041,7 @@ mod host_route_registry_tests {
                 token: "token-uninitialized-worker".into(),
                 pane: Some("%uninitialized-worker".into()),
                 cwd: external_root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -10748,6 +11076,7 @@ mod host_route_registry_tests {
                 token: "token-wrong-cwd-worker".into(),
                 pane: Some("%wrong-cwd-worker".into()),
                 cwd: child_root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -11025,6 +11354,7 @@ mod host_route_registry_tests {
                 Some("%legacy-resident".into()),
                 root.display().to_string(),
                 Some(AppServerId::new("app-a").unwrap()),
+                None,
             )
             .ok
         );
@@ -11121,6 +11451,7 @@ mod host_route_registry_tests {
                 token: "token-runtime-seed-worker".into(),
                 pane: Some("%runtime-seed-worker".into()),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
         assert!(seed_response.ok, "{seed_response:?}");
@@ -11137,6 +11468,7 @@ mod host_route_registry_tests {
                 token: "token-runtime-escape-worker".into(),
                 pane: Some("%runtime-escape-worker".into()),
                 cwd: project_root.display().to_string(),
+                candidates: None,
             },
         );
 
@@ -11325,6 +11657,7 @@ mod host_route_registry_tests {
                 token: "token-permission-external".into(),
                 pane: Some("%permission-external-worker".into()),
                 cwd: external_root.display().to_string(),
+                candidates: None,
             },
         );
         std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
