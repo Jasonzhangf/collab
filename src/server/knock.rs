@@ -37,6 +37,12 @@ pub fn pane_presence(pane: &str) -> PanePresence {
     pane_presence_with(pane, &PANE_ALIVE_CACHE, &tmux_output)
 }
 
+pub fn invalidate_pane_presence_cache() {
+    let mut cache = PANE_ALIVE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    cache.at = None;
+    cache.panes = None;
+}
+
 pub(super) fn tmux_output(args: &[&str]) -> std::io::Result<std::process::Output> {
     Command::new("tmux").args(args).output()
 }
