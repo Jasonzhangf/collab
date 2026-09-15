@@ -219,12 +219,7 @@ fn footer(screen: &str) -> String {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RuntimeKind {
-    Cursor,
     Codex,
-}
-
-fn in_cursor_tui(screen: &str) -> bool {
-    screen.contains("Run Everything")
 }
 
 fn composer_ask_codex(screen: &str) -> bool {
@@ -232,9 +227,6 @@ fn composer_ask_codex(screen: &str) -> bool {
 }
 
 fn tui_guess(screen: &str) -> Option<(RuntimeKind, u8)> {
-    if in_cursor_tui(screen) {
-        return Some((RuntimeKind::Cursor, 100));
-    }
     if composer_ask_codex(screen) {
         return Some((RuntimeKind::Codex, 100));
     }
@@ -279,34 +271,6 @@ fn wait_child(child: &mut std::process::Child, timeout: std::time::Duration) -> 
     }
 }
 
-fn cursor_status_ok() -> bool {
-    let Some(agent) = bin_on_path("agent") else {
-        return false;
-    };
-    let mut command = Command::new(agent);
-    command
-        .args(["status", "--format", "json"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    if !wait_child(&mut child, std::time::Duration::from_secs(5)) {
-        return false;
-    }
-    let mut text = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
-        return false;
-    };
-    value.get("loggedIn") == Some(&serde_json::json!(true))
-        || value.get("isAuthenticated") == Some(&serde_json::json!(true))
-        || value.get("status").and_then(|status| status.as_str()) == Some("authenticated")
-}
-
 fn codex_status_ok() -> bool {
     let Some(codex) = bin_on_path("codex") else {
         return false;
@@ -334,14 +298,11 @@ fn codex_status_ok() -> bool {
 }
 
 struct StatusCache {
-    cursor: Option<(std::time::Instant, bool)>,
     codex: Option<(std::time::Instant, bool)>,
 }
 
-static STATUS_CACHE: std::sync::Mutex<StatusCache> = std::sync::Mutex::new(StatusCache {
-    cursor: None,
-    codex: None,
-});
+static STATUS_CACHE: std::sync::Mutex<StatusCache> =
+    std::sync::Mutex::new(StatusCache { codex: None });
 const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn official_status(kind: RuntimeKind) -> bool {
@@ -350,10 +311,7 @@ fn official_status(kind: RuntimeKind) -> bool {
         let cache = STATUS_CACHE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let slot = match kind {
-            RuntimeKind::Cursor => cache.cursor,
-            RuntimeKind::Codex => cache.codex,
-        };
+        let slot = cache.codex;
         if let Some((at, ok)) = slot {
             if now.saturating_duration_since(at) < STATUS_TTL {
                 return ok;
@@ -361,14 +319,12 @@ fn official_status(kind: RuntimeKind) -> bool {
         }
     }
     let ok = match kind {
-        RuntimeKind::Cursor => cursor_status_ok(),
         RuntimeKind::Codex => codex_status_ok(),
     };
     let mut cache = STATUS_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     match kind {
-        RuntimeKind::Cursor => cache.cursor = Some((now, ok)),
         RuntimeKind::Codex => cache.codex = Some((now, ok)),
     }
     ok
@@ -383,10 +339,10 @@ fn in_agent_with(
     if matches!(command, "codex" | "composer" | "claude" | "agy" | "dsh") {
         return true;
     }
-    if !matches!(command, "node" | "agent" | "cursor-agent") {
+    if !matches!(command, "node") {
         return false;
     }
-    if in_cursor_tui(screen) || in_codex_tui(screen) || has_spinner(title) {
+    if in_codex_tui(screen) || has_spinner(title) {
         return true;
     }
     match tui_guess(screen) {
@@ -416,25 +372,9 @@ fn agent_state_from_with(
     }
 }
 
-/// Cursor CLI swallows Enter that shares a PTY read with a bracketed-paste
-/// terminator. Codex needs the opposite: `paste-buffer -p` then `C-m` in the
-/// same tmux queue, or the paste lands without a submit.
-const SUBMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Codex needs `paste-buffer -p` then `C-m` in the same tmux queue, or the
+/// paste lands without a submit.
 static KNOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SubmitKind {
-    BracketedPaste,
-    Literal,
-}
-
-fn submit_kind(command: &str, screen: &str) -> SubmitKind {
-    if in_cursor_tui(screen) || matches!(command, "agent" | "cursor-agent") {
-        SubmitKind::Literal
-    } else {
-        SubmitKind::BracketedPaste
-    }
-}
 
 fn paste_args<'a>(pane: &'a str, text: &'a str, buffer: &'a str) -> Vec<&'a str> {
     vec![
@@ -459,18 +399,6 @@ fn paste_submit_args<'a>(pane: &'a str, text: &'a str, buffer: &'a str) -> Vec<&
     args
 }
 
-fn literal_args<'a>(pane: &'a str, text: &'a str) -> Vec<&'a str> {
-    vec!["send-keys", "-t", pane, "-l", "--", text]
-}
-
-fn submit_args(pane: &str) -> [&str; 4] {
-    ["send-keys", "-t", pane, "C-m"]
-}
-
-fn steer_followup(kind: SubmitKind, working: bool) -> bool {
-    kind == SubmitKind::Literal && working
-}
-
 fn tmux(args: &[&str], what: &str, pane: &str) -> anyhow::Result<()> {
     let sent = Command::new("tmux").args(args).status()?;
     if !sent.success() {
@@ -479,33 +407,17 @@ fn tmux(args: &[&str], what: &str, pane: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn knock_kind(pane: &str, text: &str, kind: SubmitKind, working: bool) -> anyhow::Result<()> {
+fn knock_kind(pane: &str, text: &str) -> anyhow::Result<()> {
     let _lock = KNOCK_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match kind {
-        SubmitKind::Literal => {
-            tmux(&literal_args(pane, text), "literal", pane)?;
-            std::thread::sleep(SUBMIT_SETTLE);
-            tmux(&submit_args(pane), "submit", pane)?;
-            if steer_followup(kind, working) {
-                // Cursor queues a busy follow-up on the first Enter. A later
-                // empty Enter injects it as steering instead of a next turn.
-                std::thread::sleep(SUBMIT_SETTLE);
-                tmux(&submit_args(pane), "steer", pane)?;
-            }
-            Ok(())
-        }
-        SubmitKind::BracketedPaste => {
-            let sequence = WAKE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let buffer = format!("collab-wake-{}-{sequence}", std::process::id());
-            tmux(
-                &paste_submit_args(pane, text, &buffer),
-                "paste-submit",
-                pane,
-            )
-        }
-    }
+    let sequence = WAKE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let buffer = format!("collab-wake-{}-{sequence}", std::process::id());
+    tmux(
+        &paste_submit_args(pane, text, &buffer),
+        "paste-submit",
+        pane,
+    )
 }
 
 pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
@@ -516,17 +428,14 @@ pub fn knock(pane: &str, text: &str) -> anyhow::Result<()> {
     if !matches!(state, AgentState::Waiting | AgentState::Working) {
         anyhow::bail!("pane {} is not a known agent (state: {:?})", pane, state);
     }
-    let (command, _, screen) =
-        pane_view(pane).map_err(|error| anyhow::anyhow!("pane {pane} view failed: {error:?}"))?;
-    let kind = submit_kind(&command, &screen);
-    knock_kind(pane, text, kind, state == AgentState::Working)
+    knock_kind(pane, text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_state_from, agent_state_from_with, literal_args, paste_args, paste_submit_args,
-        steer_followup, submit_kind, AgentState, RuntimeKind, SubmitKind,
+        agent_state_from, agent_state_from_with, paste_args, paste_submit_args, AgentState,
+        RuntimeKind,
     };
 
     fn output(text: &[u8]) -> std::io::Result<std::process::Output> {
@@ -743,34 +652,10 @@ setInterval(() => {}, 1 << 30);
             hex.contains("0d"),
             "Codex-style paste-submit must include Enter: {text}"
         );
-        super::knock_kind(
-            &pane,
-            "COLLAB_NOTIFY cursor [literal]",
-            super::SubmitKind::Literal,
-            false,
-        )
-        .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let capture = Command::new("tmux")
-            .args(["capture-pane", "-p", "-J", "-t", &pane])
-            .output()
-            .unwrap();
-        let text = String::from_utf8(capture.stdout).unwrap();
-        let chunks: Vec<_> = text.lines().filter_map(|l| l.strip_prefix("RX:")).collect();
-        assert!(
-            chunks
-                .iter()
-                .any(|c| c.contains("6c69746572616c") && !c.contains("0d")),
-            "cursor literal payload must not include Enter: {text}"
-        );
-        assert!(
-            chunks.iter().any(|c| *c == "0d"),
-            "cursor submit is a later Enter of its own: {text}"
-        );
     }
 
     #[test]
-    fn wake_splits_paste_or_literal_from_submit() {
+    fn wake_splits_paste_from_submit() {
         assert_eq!(
             &paste_args("%7", "COLLAB_NOTIFY message", "collab-wake-test")[..],
             &[
@@ -788,10 +673,6 @@ setInterval(() => {}, 1 << 30);
                 "%7"
             ][..]
         );
-        assert_eq!(
-            &literal_args("%7", "COLLAB_NOTIFY message")[..],
-            &["send-keys", "-t", "%7", "-l", "--", "COLLAB_NOTIFY message"][..]
-        );
         let paste_submit = paste_submit_args("%7", "COLLAB_NOTIFY message", "collab-wake-test");
         assert!(paste_submit
             .windows(4)
@@ -805,33 +686,6 @@ setInterval(() => {}, 1 << 30);
         assert!(
             !paste_submit.iter().any(|a| a.contains("sleep")),
             "Codex Enter must share the paste queue, not a delayed process: {paste_submit:?}"
-        );
-        assert_eq!(
-            submit_kind(
-                "node",
-                "  Cursor Grok 4.6 High Fast · 54.5%\n  /tmp/project · main\n"
-            ),
-            SubmitKind::BracketedPaste
-        );
-        assert_eq!(submit_kind("agent", ""), SubmitKind::Literal);
-        assert!(steer_followup(SubmitKind::Literal, true));
-        assert!(!steer_followup(SubmitKind::Literal, false));
-        assert!(!steer_followup(SubmitKind::BracketedPaste, true));
-        assert_eq!(submit_kind("codex", ""), SubmitKind::BracketedPaste);
-        assert_eq!(
-            submit_kind("node", "  Auto · 10.3%                                                  Run Everything\n  /tmp/zterm ·\n  codex/branch\n"),
-            SubmitKind::Literal
-        );
-        assert_eq!(
-            submit_kind(
-                "node",
-                "› Ask Codex to do anything\n  gpt-5.6-luna high · /Volumes/extension/code/zterm\n"
-            ),
-            SubmitKind::BracketedPaste
-        );
-        assert_eq!(
-            submit_kind("node", "  gpt-5.6-luna high · /tmp/project\n"),
-            SubmitKind::BracketedPaste
         );
     }
 
@@ -854,58 +708,6 @@ setInterval(() => {}, 1 << 30);
         assert_eq!(
             agent_state_from("codex", "⠋ collab", ""),
             AgentState::Working
-        );
-        assert_eq!(
-            agent_state_from("node", "Cursor Agent", ""),
-            AgentState::Unknown
-        );
-        assert_eq!(
-            agent_state_from(
-                "node",
-                "Word Counter",
-                "  Cursor Grok 4.6 High Fast · 54.5%\n"
-            ),
-            AgentState::Unknown
-        );
-        assert_eq!(
-            agent_state_from("node", "Word Counter", "  Run Everything\n"),
-            AgentState::Waiting
-        );
-        assert_eq!(
-            agent_state_from("node", "Word Counter", "  /tmp/cursor-cli-cap · main\n"),
-            AgentState::Unknown
-        );
-        assert_eq!(
-            agent_state_from(
-                "node",
-                "Word Counter",
-                "  Cursor Grok 4.6 High Fast · 54.5%\n  /tmp/cursor-cli-cap · main\n"
-            ),
-            AgentState::Unknown
-        );
-        assert_eq!(
-            agent_state_from(
-                "node",
-                "Word Counter",
-                " ⠘⠆ Working\n  Cursor Grok 4.6 High Fast · 54.5% · 2 files edited          Run Everything\n"
-            ),
-            AgentState::Working
-        );
-        assert_eq!(
-            agent_state_from(
-                "node",
-                "Word Counter",
-                "  → Add a follow-up\n  Cursor Grok 4.6 High Fast · 54.5% · 2 files edited          Run Everything\n"
-            ),
-            AgentState::Waiting
-        );
-        assert_eq!(
-            agent_state_from(
-                "node",
-                "AppSDK Subagent Ready",
-                "  → Add a follow-up\n  Auto · 10.3%                                                  Run Everything\n  /Volumes/extension/code/zterm ·\n"
-            ),
-            AgentState::Waiting
         );
         assert_eq!(
             agent_state_from(
@@ -940,15 +742,6 @@ setInterval(() => {}, 1 << 30);
                 |_| false
             ),
             AgentState::Unknown
-        );
-        assert_eq!(
-            agent_state_from_with(
-                "node",
-                "Word Counter",
-                "  Run Everything\n  gpt-5.6-luna high · /tmp/zterm\n",
-                |_| panic!("Run Everything is already Cursor")
-            ),
-            AgentState::Waiting
         );
     }
 }

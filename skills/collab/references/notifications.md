@@ -65,9 +65,8 @@ collab notify unsubscribe <subscription-id>
   task, wait-timeout, or scheduling blocker is P1 operational work and must not be
   reclassified as a P0 interrupt by subject text alone.
 - One safe preview contains notification ID, abbreviated subject, and one-line
-  original body. Control characters are escaped. Cursor delivery is two tmux
-  processes: literal payload, then `C-m` after 250ms, so bracketed paste cannot
-  swallow Enter. Codex keeps `paste-buffer -p` and `C-m` in one tmux queue so
+  original body. Control characters are escaped. Codex keeps `paste-buffer -p`
+  and `C-m` in one tmux queue so
   the paste is submitted. Dual tmux sessions must prove both mailbox and pane Enter.
 - Full subject/body remains in the mailbox without a matching subscription.
   This outcome is not a sender-selected `mailbox-only` mode.

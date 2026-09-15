@@ -1139,6 +1139,8 @@ mod tests {
                 pane_alive_check: |_| crate::server::knock::PanePresence::Present,
                 pane_owner_check: |_, _| Ok(true),
                 pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+                appserver_candidate_check: crate::server::default_appserver_candidate_check(),
+                appserver_notification_sink: crate::server::default_appserver_notification_sink(),
                 mailbox_notify: tokio::sync::Notify::new(),
             },
             root,

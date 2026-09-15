@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use super::global_state::{GlobalState, ProjectRegistration, RuntimeBinding, StateError};
-use crate::proto::CommandEnvelope;
+use crate::proto::{CommandEnvelope, SelectedTransport, TransportKind};
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -45,8 +45,8 @@ pub struct MigrationRecord {
     pub updated_ms: i64,
 }
 
-/// Runtime is encoded in the registered pane handle. tmux is the only live
-/// notification channel.
+/// Runtime is encoded in the registered pane handle. The server chooses the
+/// App Server binding first and falls back to tmux when self-check fails.
 pub fn runtime_for_pane(pane: Option<&str>) -> Option<&'static str> {
     let pane = pane?;
     if pane.starts_with('%') {
@@ -63,6 +63,16 @@ pub struct WorkerRec {
     pub pane: Option<String>,
     pub cwd: String,
     pub registered_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<SelectedTransport>,
+}
+
+impl WorkerRec {
+    pub fn transport_kind(&self) -> Option<TransportKind> {
+        self.transport
+            .as_ref()
+            .map(|transport| transport.kind.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,7 +230,7 @@ impl NotificationSubscription {
         self.worker_id == worker_id
             && self.event == event
             && self.subject.as_deref() == subject
-            && self.method == "tmux"
+            && matches!(self.method.as_str(), "appserver" | "tmux")
             && self.status == "armed"
             && self.expires_ms > now
     }

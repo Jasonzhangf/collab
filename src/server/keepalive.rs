@@ -547,7 +547,7 @@ mod tests {
                     last_message: None,
                     error: None,
                     probe_failures: Vec::new(),
-                    runtime: Some("cursor".into()),
+                    runtime: Some("codex".into()),
                 },
             },
             Event::TaskCreated {
@@ -669,7 +669,7 @@ mod tests {
                 last_message: None,
                 error: None,
                 probe_failures: Vec::new(),
-                runtime: Some("cursor".into()),
+                runtime: Some("codex".into()),
             },
         }]);
 
@@ -1035,7 +1035,7 @@ mod tests {
                             last_message: None,
                             error: None,
                             probe_failures: Vec::new(),
-                            runtime: Some("cursor".into()),
+                            runtime: Some("codex".into()),
                         },
                     },
                     Event::TaskCreated {
@@ -1173,7 +1173,7 @@ mod tests {
                     last_message: None,
                     error: None,
                     probe_failures: Vec::new(),
-                    runtime: Some("cursor".into()),
+                    runtime: Some("codex".into()),
                 },
             },
             Event::TaskCreated {

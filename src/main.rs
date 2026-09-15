@@ -407,12 +407,17 @@ fn register(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::V
             token: ident.token.clone(),
             pane: ident.pane.clone(),
             cwd,
+            candidates: Some(proto::TransportCandidates {
+                appserver: crate::client::adapters::candidate_from_env()
+                    .map_err(anyhow::Error::msg)?,
+                tmux: ident.pane.clone().map(|pane| proto::TmuxCandidate { pane }),
+            }),
         },
         &scope.root,
         &context_runtime,
     )?;
-    let runtime =
-        identity::runtime_from_registration_receipt(&response, &ident.worker_id, &scope.root)?;
+    let (runtime, transport) =
+        identity::registration_from_receipt(&response, &ident.worker_id, &scope.root)?;
     if runtime.appserver_id != context_runtime.appserver_id {
         anyhow::bail!(
             "registration receipt app scope mismatch: expected {}, observed {}",
@@ -420,7 +425,7 @@ fn register(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::V
             runtime.appserver_id
         );
     }
-    identity::persist_runtime(scope, ident, runtime)?;
+    identity::persist_registration(scope, ident, runtime, transport)?;
     Ok(response)
 }
 
@@ -428,7 +433,7 @@ fn register(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::V
 fn me(scope: &Scope, worker: Option<String>) -> anyhow::Result<Identity> {
     let worker = worker.or_else(|| std::env::var("COLLAB_WORKER").ok());
     let mut ident = identity::load_or_create(scope, worker, None)?;
-    if ident.runtime.is_none() {
+    if ident.runtime.is_none() || ident.transport.is_none() {
         let _ = register(scope, &mut ident)?;
     } else {
         runtime_for_request(&ident)?;
@@ -437,7 +442,7 @@ fn me(scope: &Scope, worker: Option<String>) -> anyhow::Result<Identity> {
 }
 
 fn ensure_registration(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::Value> {
-    if ident.runtime.is_none() {
+    if ident.runtime.is_none() || ident.transport.is_none() {
         register(scope, ident)
     } else {
         runtime_for_request(ident)?;
@@ -553,12 +558,6 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Init => {
             let project_root = scope::project_root()?;
-            let in_tmux = std::env::var_os("TMUX_PANE").is_some();
-            if !in_tmux {
-                anyhow::bail!(
-                    "NOTIFICATION_CHANNEL_NONE: collab init requires a live tmux pane for peer registration; no push notifications are available here. Independent work can continue. Check subagent status (includes parent mailbox) yourself; use subagent snapshot explicitly for screen diagnostics. No subscription was created."
-                );
-            }
             if project_root.ancestors().skip(1).any(|ancestor| {
                 ancestor
                     .file_name()
@@ -581,6 +580,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 "root": scope.root,
                 "worker_id": ident.worker_id,
                 "identity_kind": "peer",
+                "transport_selected": ident.transport,
                 "daemon_started": started,
                 "role_brief": registration["role_brief"],
                 "task_board": task_board["tasks"],
@@ -1232,6 +1232,7 @@ fn _unused(_r: Resp) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{SelectedTransport, TransportKind};
 
     fn test_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1253,6 +1254,7 @@ mod tests {
             pane: None,
             session: None,
             runtime,
+            transport: None,
         }
     }
 
@@ -1295,6 +1297,15 @@ mod tests {
         let root = test_root("registration-reuse");
         let runtime = RuntimeIdentity::cli_adapter("worker-1").unwrap();
         let mut identity = identity_with_runtime(Some(runtime));
+        identity.transport = Some(SelectedTransport {
+            kind: TransportKind::Tmux,
+            endpoint: None,
+            namespace: None,
+            thread_id: None,
+            pane: Some("%worker-1".into()),
+            capabilities: vec!["send_message".into()],
+            self_check: "test tmux".into(),
+        });
         let before = serde_json::to_value(&identity).unwrap();
         let response = ensure_registration(&Scope { root: root.clone() }, &mut identity).unwrap();
         assert_eq!(response, json!({"reused": true}));

@@ -155,14 +155,11 @@ fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
 
 fn resolve_state_root(
     state_dir: Option<std::ffi::OsString>,
-    xdg_state_home: Option<std::ffi::OsString>,
+    _xdg_state_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> anyhow::Result<PathBuf> {
     if let Some(value) = state_dir.filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(value));
-    }
-    if let Some(value) = xdg_state_home.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(value).join("collab"));
     }
     if let Some(value) = home.filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(value).join(".collab"));
@@ -358,7 +355,6 @@ pub fn init(root: &Path) -> std::io::Result<PathBuf> {
     }
     ensure_project_collab_mcp(root)?;
     ensure_codex_collab_permissions(root)?;
-    ensure_cursor_cli_permissions(root)?;
     ensure_claude_collab_permissions(root)?;
     crate::config::ensure_written()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
@@ -385,7 +381,6 @@ fn collab_mcp_command() -> String {
 }
 
 fn ensure_project_collab_mcp(root: &Path) -> std::io::Result<()> {
-    merge_collab_mcp(root.join(".cursor").join("mcp.json"))?;
     merge_collab_mcp(root.join(".mcp.json"))
 }
 
@@ -467,39 +462,6 @@ fn merge_allow_patterns(value: &mut serde_json::Value, key: &str, patterns: &[&s
     }
 }
 
-fn ensure_cursor_cli_permissions(root: &Path) -> std::io::Result<()> {
-    let path = root.join(".cursor").join("cli.json");
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let mut root_value = if path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&path)?)
-            .unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    if let Some(table) = root_value.as_object_mut() {
-        table.remove("sandbox");
-        table.remove("approvalMode");
-        let permissions = table
-            .entry("permissions")
-            .or_insert_with(|| serde_json::json!({}));
-        merge_allow_patterns(
-            permissions,
-            "allow",
-            &[
-                "Shell(collab)",
-                "Shell(collab *)",
-                "Shell(collab-mcp)",
-                "Mcp(collab,*)",
-            ],
-        );
-        merge_allow_patterns(permissions, "deny", &[]);
-    }
-    std::fs::write(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(&root_value).unwrap()),
-    )
-}
-
 fn ensure_claude_collab_permissions(root: &Path) -> std::io::Result<()> {
     let path = root.join(".claude").join("settings.json");
     std::fs::create_dir_all(path.parent().unwrap())?;
@@ -543,11 +505,13 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
 
 ## Runtime boundary
 
-- Every peer registration must come from a live tmux pane.
+- Every peer registration must include a server-verified AppServer or tmux
+  candidate.
 - Registration owns one deterministic seven-day default direct-message lease;
   daemon restart restores it only while the registered tmux session still
   matches the peer identity. A shorter explicit lease cannot suppress it.
-- tmux is the only live notification channel and carries one bounded preview.
+- AppServer is preferred for live notification when server self-check passes;
+  tmux remains the fallback wake channel and carries one bounded preview.
 - Server state, journal, and mailbox are durable truth; a failed wake cannot
   roll back state or fabricate success.
 - The runtime is part of the worker identity boundary, not a task preference.
@@ -555,7 +519,7 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
 ## Roles
 
 - Every registered identity is an equal `peer`; there is no inferred master
-  from first registration. Codex/Cursor root is not Collab master.
+  from first registration. Codex root is not Collab master.
 - `collab init` and peer registration never create a master. A master exists
   only when a registered peer has a live tmux pane and was assigned by
   user-approved self-promotion or live-master delegation. A recorded identity
@@ -634,8 +598,7 @@ the current task. Query durable state before acting when the notice is relevant.
 or asynchronous-result notices. Never type peer messages with tmux. After the
 receiving Agent registers a finite subscription, the daemon may send one id,
 abbreviated subject, safe one-line original body preview, and final submit key
-as one submit. Cursor uses literal keys, then `C-m` after 250ms in a second
-tmux process; Codex uses `paste-buffer -p` plus `C-m` in one tmux queue. The direct-message lease is reusable until expiry;
+as one submit. Codex uses `paste-buffer -p` plus `C-m` in one tmux queue. The direct-message lease is reusable until expiry;
 resource, deadline, and async-result subscriptions remain one-shot.
 
 `collab inbox` and `collab msg <id>` query the durable local mailbox after a
@@ -970,7 +933,7 @@ mod tests {
         assert!(path.exists());
         let first = std::fs::read_to_string(&path).unwrap();
         assert!(first.contains("# collab workflow"));
-        for mcp in [root.join(".cursor/mcp.json"), root.join(".mcp.json")] {
+        for mcp in [root.join(".mcp.json")] {
             assert!(std::fs::read_to_string(&mcp)
                 .unwrap()
                 .contains("collab-mcp"));
@@ -979,21 +942,12 @@ mod tests {
         init(&root).unwrap();
         let second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(first, second);
-        let cursor_mcp = root.join(".cursor/mcp.json");
-        std::fs::write(&cursor_mcp, "{\"keep\":true}").unwrap();
         std::fs::write(
             root.join(".mcp.json"),
             r#"{"mcpServers":{"other":{"command":"keep-me"}}}"#,
         )
         .unwrap();
         init(&root).unwrap();
-        let merged: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&cursor_mcp).unwrap()).unwrap();
-        assert_eq!(merged["keep"], true);
-        assert!(merged["mcpServers"]["collab"]["command"]
-            .as_str()
-            .unwrap()
-            .contains("collab-mcp"));
         let generic: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(root.join(".mcp.json")).unwrap())
                 .unwrap();
@@ -1011,24 +965,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("collab-mcp"));
-        let cursor_cli: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join(".cursor/cli.json")).unwrap())
-                .unwrap();
-        assert!(cursor_cli.get("sandbox").is_none());
-        assert_eq!(cursor_cli["permissions"]["deny"], serde_json::json!([]));
-        assert!(cursor_cli["permissions"]["allow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item.as_str() == Some("Shell(collab *)")));
         std::fs::write(
             root.join(".codex/config.toml"),
             "model = \"keep-me\"\nsandbox_mode = \"workspace-write\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join(".cursor/cli.json"),
-            r#"{"sandbox":{"mode":"disabled"},"permissions":{"allow":["Shell(other)"]}}"#,
         )
         .unwrap();
         init(&root).unwrap();
@@ -1037,15 +976,6 @@ mod tests {
                 .unwrap();
         assert_eq!(upgraded["model"].as_str(), Some("keep-me"));
         assert!(upgraded.get("sandbox_mode").is_none());
-        let repaired: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join(".cursor/cli.json")).unwrap())
-                .unwrap();
-        assert!(repaired.get("sandbox").is_none());
-        assert!(repaired["permissions"]["allow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item.as_str() == Some("Shell(other)")));
         std::fs::remove_dir_all(root).ok();
     }
 }

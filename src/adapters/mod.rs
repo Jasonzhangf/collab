@@ -7,6 +7,10 @@
 //! `RequestEnvelope`; this module never keeps a mutable peer map or derives
 //! scope/role from business payloads.
 
+pub mod codex_app_server;
+
+pub use codex_app_server::{candidate_from_env, queue_add, verify_candidate};
+
 use crate::identity::{BindingId, RuntimeIdentity, TurnId};
 use crate::proto::{CommandEnvelope, Req, RequestEnvelope};
 use crate::scope::RouteScope;
@@ -312,6 +316,10 @@ impl AdapterRegistry {
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(_) => Err(AdapterError::UnknownEndpoint { observed: None }),
         }
+    }
+
+    pub fn detect_live() -> Result<Option<codex_app_server::LiveAppServer>, AdapterError> {
+        codex_app_server::LiveAppServer::detect()
     }
 
     pub fn adapter(&self, kind: EndpointKind) -> UnavailableAdapter {

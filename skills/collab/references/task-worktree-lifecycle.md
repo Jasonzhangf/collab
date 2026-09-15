@@ -112,7 +112,7 @@ Route escalation by worker type:
   exists, only that master may `collab master delegate`; if none exists, the
   peer may `collab master promote --approval` itself. `appsdk init` proves
   initialization of the current peer, not master ownership. A dead recorded
-  pane is not a live master. Codex/Cursor root is not Collab master.
+  pane is not a live master. Codex root is not Collab master.
 - Master compiles the goal into a dependency graph, then parallel unique-write
   scopes. It assigns managed subagents with `appsdk subagent start` and
   `send` only when delivery conditions (done-iff, artifacts, in/out of

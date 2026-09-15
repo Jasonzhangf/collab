@@ -37,4 +37,4 @@ deadline, proposed solution, attempted actions, and requested decision. Never
 invent a master from `appsdk init`; master promotion requires explicit user
 approval for the exact peer and project plus live identity verification. If a
 live master exists, only that master may delegate; if none exists, a peer may
-promote itself after approval. Codex/Cursor root is not Collab master.
+promote itself after approval. Codex root is not Collab master.

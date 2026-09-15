@@ -2,8 +2,9 @@
 
 Project-local coordination for independent coding agents. One Rust daemon owns
 the append-only journal, durable mailbox, task/resource state, and migration
-transaction. tmux is the only live notification channel. Each subscribed wake
-is a bounded preview; the durable mailbox remains authoritative.
+transaction. The server selects AppServer before tmux when a live App Server
+candidate passes self-check. Each subscribed wake is a bounded preview; the
+durable mailbox remains authoritative.
 
 ## Model
 
@@ -50,23 +51,20 @@ collab who
 collab context
 ```
 
-Identity creation requires a live tmux pane. Commands outside tmux fail before
-writing an identity declaration. A tmux session is the stable peer identity;
-its current pane is only the wake endpoint. Token proves access to that peer's
-mailbox and lifecycle.
+Identity registration requires a server-verified AppServer or tmux candidate.
+When tmux is selected, its session is the stable peer identity and its current
+pane is the wake endpoint. Token proves access to that peer's lifecycle.
 
 `collab init` also merges the shared `collab-mcp` server into project
-`.cursor/mcp.json` and `.mcp.json`, and writes the project CLI permissions
-those agents need so `collab` can reach the tmux socket without a sandbox
-prompt. That same stdio MCP works for Cursor, Codex, Claude Code, and
-other agents. The `collab` CLI is a complete fallback when MCP tools are
-not listed.
+`.mcp.json` and writes the project CLI permissions Codex and Claude Code need
+so `collab` can reach the tmux socket without a sandbox prompt. The `collab`
+CLI is a complete fallback when MCP tools are not listed.
 
 `collab role`, `collab transfer-master`, `collab task claim`, the legacy
 `collab task dispatch`, `collab remove-worker`, and `collab reset` are
 deprecated and fail explicitly. Use `collab subagent dispatch` from the live
 master for a real assignment, then `collab task accept <task-id>` from the
-assigned peer. Collab master is not Codex/Cursor root.
+assigned peer. Collab master is not Codex root.
 Protocol: `collab master status`, `collab master promote --approval` when no
 live master exists, and `collab master delegate` by the current live master.
 Init and register never create a master; a recorded identity without a live
@@ -172,11 +170,9 @@ Never type peer messages into tmux. Without the recipient's active
 `direct-message` subscription, the message remains mailbox-only. Registration
 normally creates this subscription automatically; tmux receives only the short
 message id, abbreviated subject, safe one-line original body preview, and one
-submit. Cursor CLI gets literal keys, then `C-m` from a second tmux process
-250ms later, so bracketed paste cannot swallow Enter on send or receive. Codex
-keeps `paste-buffer -p` and `C-m` in one tmux queue so the paste is submitted.
-Splitting Codex paste from Enter leaves the text unsubmitted; putting Cursor
-Enter in the same PTY chunk as paste swallows it. Notifications deliver only
+submit. Codex keeps `paste-buffer -p` and `C-m` in one tmux queue so the paste
+is submitted. Splitting Codex paste from Enter leaves the text unsubmitted.
+Notifications deliver only
 when an agent is idle (waiting); if the agent is working, delivery defers
 without burning wake attempts until working->idle transition occurs. When a pane
 is dead, unowned, or agent process absent, the subscription cancels to pane-lost
@@ -211,9 +207,7 @@ explicitly subscribe again; no automatic rearm exists. The default
 `direct-message` lease accepts later peer messages until expiry; resource,
 deadline, and async-result event matching remains owner-scoped and finite.
 tmux receives `COLLAB_NOTIFY <message-id> [<subject>] <original-body-preview>`
-then one Enter: Cursor as delayed literal keys, plus one empty Enter when that
-pane is working so the follow-up steers; Codex as paste-plus-`C-m` in
-one command queue. The Agent first weighs the id and
+then one Enter as paste-plus-`C-m` in one command queue. The Agent first weighs the id and
 subject against current work. When it selects the notice, it runs
 `collab msg <message-id>`, reads durable detail, and executes actionable
 in-scope work; it must not stop at ACK or waiting. The first pending notice opens

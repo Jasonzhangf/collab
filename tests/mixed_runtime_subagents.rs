@@ -43,10 +43,12 @@ impl Harness {
         command
             .current_dir(&self.root)
             .env("HOME", &self.home)
+            .env("COLLAB_STATE_DIR", self.home.join(".collab"))
             .env("PATH", &self.path)
             .env("COLLAB_FIXTURE_LOG", &self.log)
             .env("TMUX_PANE", &self.parent_pane)
             .env_remove("COLLAB_WORKER")
+            .env_remove("CODEX_THREAD_ID")
             .env_remove("TMUX");
         command
     }
@@ -187,7 +189,7 @@ fn wait_rx(pane: &str, needle_hex: &str) -> String {
 }
 
 #[test]
-fn cursor_and_codex_subagents_launch_and_message_each_other() {
+fn codex_subagents_launch_and_message_each_other() {
     Command::new("tmux")
         .arg("-V")
         .stdout(Stdio::null())
@@ -203,7 +205,7 @@ fn cursor_and_codex_subagents_launch_and_message_each_other() {
     fs::create_dir_all(home.join(".appsdk")).unwrap();
     fs::write(
         home.join(".appsdk/config.toml"),
-        "[notifications]\nmode = \"immediate\"\n[subagent]\nruntime = \"cursor\"\n",
+        "[notifications]\nmode = \"immediate\"\n[subagent]\nruntime = \"codex\"\n",
     )
     .unwrap();
     let log = root.join("fixture.log");
@@ -211,11 +213,7 @@ fn cursor_and_codex_subagents_launch_and_message_each_other() {
     fs::write(
         &rec,
         r#"process.stdout.write('\x1b[?2004h');
-if (process.env.COLLAB_FAKE_TUI === 'cursor') {
-  process.stdout.write('  Cursor Grok 4.6 High Fast · 54.5%\n  /tmp/project · main\n  Run Everything\n');
-} else {
-  process.stdout.write('› Ask Codex to do anything\n  gpt-5.6-luna high · /tmp/project\n');
-}
+process.stdout.write('› Ask Codex to do anything\n  gpt-5.6-luna high · /tmp/project\n');
 process.stdin.setRawMode(true);
 process.stdin.resume();
 process.stdin.on('data', b => {
@@ -225,21 +223,6 @@ setInterval(() => {}, 1 << 30);
 "#,
     )
     .unwrap();
-    write_exec(
-        &bin.join("agent"),
-        &format!(
-            r#"#!/bin/sh
-printf 'agent %s\n' "$*" >> "${{COLLAB_FIXTURE_LOG:-/dev/null}}"
-if [ "$1" = status ]; then
-  printf '{{"loggedIn":true,"authMethod":"fixture"}}\n'
-  exit 0
-fi
-export COLLAB_FAKE_TUI=cursor
-exec node "{rec}"
-"#,
-            rec = rec.display()
-        ),
-    );
     write_exec(
         &bin.join("codex"),
         &format!(
@@ -286,24 +269,6 @@ exec node "{rec}"
     };
     let init = harness.json(&["init"]);
     assert_eq!(init["ok"], true, "{init}");
-    let cursor = harness.json(&[
-        "subagent",
-        "start",
-        "--id",
-        "cursor-rt",
-        "--runtime",
-        "cursor",
-    ]);
-    assert_eq!(cursor["subagent"]["runtime"], "cursor", "{cursor}");
-    assert_eq!(cursor["close_required"], false);
-    assert_eq!(cursor["next_check"], "status");
-    assert_eq!(cursor["progress"], "snapshot");
-    assert_eq!(cursor["subagent"]["status"], "starting", "{cursor}");
-    let cursor_peer = cursor["subagent"]["peer"].as_str().unwrap().to_owned();
-    let cursor_pane = cursor["subagent"]["pane"].as_str().unwrap().to_owned();
-    harness.sessions.push(cursor_peer.clone());
-    wait_pane_command(&cursor_pane, "node");
-    set_title(&cursor_pane, "⠋ cursor-rt");
     let codex = harness.json(&[
         "subagent",
         "start",
@@ -323,26 +288,9 @@ exec node "{rec}"
     assert!(
         fixture_log
             .lines()
-            .any(|line| line.starts_with("agent status --format json")),
-        "cursor probe must use official status json\n{fixture_log}"
-    );
-    assert!(
-        !fixture_log.contains("--print"),
-        "cursor probe must not use Codex-style --print\n{fixture_log}"
-    );
-    assert!(
-        fixture_log
-            .lines()
             .any(|line| line.starts_with("codex exec")),
         "codex probe must use exec\n{fixture_log}"
     );
-    let cursor_ready = harness.json_as(
-        Some(&cursor_pane),
-        Some(&cursor_peer),
-        &["subagent", "ready", "cursor-rt"],
-    );
-    assert!(cursor_ready.get("subagent").is_some(), "{cursor_ready}");
-    set_title(&cursor_pane, "cursor-rt");
     let codex_ready = harness.json_as(
         Some(&codex_pane),
         Some(&codex_peer),
@@ -350,62 +298,79 @@ exec node "{rec}"
     );
     assert!(codex_ready.get("subagent").is_some(), "{codex_ready}");
     set_title(&codex_pane, "codex-rt");
-    let ping = harness.json_as(
-        Some(&cursor_pane),
-        Some(&cursor_peer),
-        &[
-            "sendmessage",
-            "--to",
-            &codex_peer,
-            "--subject",
-            "cursor-to-codex",
-            "ping from cursor",
-        ],
+    let codex_two = harness.json(&[
+        "subagent",
+        "start",
+        "--id",
+        "codex-rt-two",
+        "--runtime",
+        "codex",
+    ]);
+    assert_eq!(codex_two["subagent"]["runtime"], "codex", "{codex_two}");
+    assert_eq!(codex_two["subagent"]["status"], "starting", "{codex_two}");
+    let codex_two_peer = codex_two["subagent"]["peer"].as_str().unwrap().to_owned();
+    let codex_two_pane = codex_two["subagent"]["pane"].as_str().unwrap().to_owned();
+    harness.sessions.push(codex_two_peer.clone());
+    wait_pane_command(&codex_two_pane, "node");
+    set_title(&codex_two_pane, "⠋ codex-rt-two");
+    let codex_two_ready = harness.json_as(
+        Some(&codex_two_pane),
+        Some(&codex_two_peer),
+        &["subagent", "ready", "codex-rt-two"],
     );
-    assert_eq!(ping["notification"], "sent", "{ping}");
-    let pong = harness.json_as(
+    assert!(
+        codex_two_ready.get("subagent").is_some(),
+        "{codex_two_ready}"
+    );
+    set_title(&codex_two_pane, "codex-rt-two");
+    let ping = harness.json_as(
         Some(&codex_pane),
         Some(&codex_peer),
         &[
             "sendmessage",
             "--to",
-            &cursor_peer,
+            &codex_two_peer,
             "--subject",
-            "codex-to-cursor",
-            "pong from codex",
+            "codex-to-codex",
+            "ping from first codex subworker",
+        ],
+    );
+    assert_eq!(ping["notification"], "sent", "{ping}");
+    let pong = harness.json_as(
+        Some(&codex_two_pane),
+        Some(&codex_two_peer),
+        &[
+            "sendmessage",
+            "--to",
+            &codex_peer,
+            "--subject",
+            "codex-to-codex-reply",
+            "pong from second codex subworker",
         ],
     );
     assert_eq!(pong["notification"], "sent", "{pong}");
-    let cursor_inbox = harness.json_as(Some(&cursor_pane), Some(&cursor_peer), &["inbox"]);
-    let codex_inbox = harness.json_as(Some(&codex_pane), Some(&codex_peer), &["inbox"]);
+    let first_inbox = harness.json_as(Some(&codex_pane), Some(&codex_peer), &["inbox"]);
+    let second_inbox = harness.json_as(Some(&codex_two_pane), Some(&codex_two_peer), &["inbox"]);
     assert!(
-        format!("{cursor_inbox}").contains("codex-to-cursor"),
-        "{cursor_inbox}"
+        format!("{first_inbox}").contains("codex-to-codex-reply"),
+        "{first_inbox}"
     );
     assert!(
-        format!("{codex_inbox}").contains("cursor-to-codex"),
-        "{codex_inbox}"
+        format!("{second_inbox}").contains("codex-to-codex"),
+        "{second_inbox}"
     );
-    let codex_rx = wait_rx(&codex_pane, &ascii_hex("cursor-to-codex"));
-    let cursor_rx = wait_rx(&cursor_pane, &ascii_hex("codex-to-cursor"));
-    let codex_chunks = rx_chunks(&codex_rx);
-    let cursor_chunks = rx_chunks(&cursor_rx);
+    let second_rx = wait_rx(&codex_two_pane, &ascii_hex("codex-to-codex"));
+    let first_rx = wait_rx(&codex_pane, &ascii_hex("codex-to-codex-reply"));
     assert!(
-        codex_chunks.concat().contains("0d"),
-        "codex session must receive Enter with the paste: {codex_rx}"
+        rx_chunks(&second_rx).concat().contains("0d"),
+        "second codex session must receive Enter with the paste: {second_rx}"
     );
     assert!(
-        cursor_chunks
-            .iter()
-            .any(|chunk| chunk.contains(&ascii_hex("codex-to-cursor")) && !chunk.contains("0d")),
-        "cursor payload must not share a chunk with Enter: {cursor_rx}"
+        rx_chunks(&first_rx).concat().contains("0d"),
+        "first codex session must receive Enter with the paste: {first_rx}"
     );
-    assert!(
-        cursor_chunks.iter().any(|chunk| *chunk == "0d"),
-        "cursor session must receive a later Enter: {cursor_rx}"
-    );
-    let snapshot = harness.json(&["subagent", "snapshot", "cursor-rt", "--lines", "20"]);
+    let snapshot = harness.json(&["subagent", "snapshot", "codex-rt", "--lines", "20"]);
     assert!(snapshot.get("screen_tail").is_some(), "{snapshot}");
-    let _ = harness.json(&["subagent", "close", "cursor-rt"]);
+    let _ = harness.json(&["subagent", "close", "codex-rt-two"]);
     let _ = harness.json(&["subagent", "close", "codex-rt"]);
 }

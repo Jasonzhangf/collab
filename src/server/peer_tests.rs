@@ -26,10 +26,24 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
             pane_alive_check: |_| PanePresence::Present,
             pane_owner_check: |_, _| Ok(true),
             pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            appserver_candidate_check: crate::server::default_appserver_candidate_check(),
+            appserver_notification_sink: crate::server::default_appserver_notification_sink(),
             mailbox_notify: tokio::sync::Notify::new(),
         },
         root,
     )
+}
+
+fn test_tmux_transport(pane: &str) -> SelectedTransport {
+    SelectedTransport {
+        kind: TransportKind::Tmux,
+        endpoint: None,
+        namespace: None,
+        thread_id: None,
+        pane: Some(pane.into()),
+        capabilities: vec!["send_message".into()],
+        self_check: "test tmux".into(),
+    }
 }
 
 pub(super) fn register(server: &Server, id: &str, pane: &str) -> Resp {
@@ -932,6 +946,7 @@ fn replay_rejects_a_checkpoint_that_regresses_real_history() {
                 pane: Some("%checkpoint-worker".into()),
                 cwd: "/tmp".into(),
                 registered_ms: 1,
+                transport: None,
             },
         },
         Event::ReducerCheckpoint {
@@ -1270,7 +1285,7 @@ fn subagent_record(id: &str, status: &str, peer: &str) -> crate::subagent::Recor
         last_message: None,
         error: None,
         probe_failures: Vec::new(),
-        runtime: Some("cursor".into()),
+        runtime: Some("codex".into()),
     }
 }
 
@@ -1303,7 +1318,7 @@ fn subagent_start_journal_failure_does_not_launch_or_write_success() {
             &server,
             subagent_req(crate::subagent::Action::Start {
                 id: Some("start-journal-fault".into()),
-                runtime: Some("cursor".into()),
+                runtime: Some("codex".into()),
             }),
         );
         assert!(!result.ok, "{fault:?}: {result:?}");
@@ -1491,6 +1506,8 @@ fn replayed_command_is_idempotent_and_operation_conflict_fails_closed() {
             pane_alive_check: |_| PanePresence::Present,
             pane_owner_check: |_, _| Ok(true),
             pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            appserver_candidate_check: crate::server::default_appserver_candidate_check(),
+            appserver_notification_sink: crate::server::default_appserver_notification_sink(),
             mailbox_notify: tokio::sync::Notify::new(),
         }
     };
@@ -2881,7 +2898,10 @@ fn cancelled_default_lease_stays_suppressed_until_explicit_subscribe() {
         state.notification_subscriptions["sub-default-direct-message-peer"].status,
         "cancelled"
     );
-    assert!(default_direct_message_events(&state, "peer", "%peer", now_ms()).is_empty());
+    assert!(
+        default_direct_message_events(&state, "peer", &test_tmux_transport("%peer"), now_ms())
+            .is_empty()
+    );
     drop(state);
 
     let explicit = handle_notification_subscribe(
@@ -2932,7 +2952,7 @@ fn registration_adds_default_lease_when_only_short_direct_message_lease_exists()
         },
     });
 
-    let events = default_direct_message_events(&state, "peer", "%peer", now);
+    let events = default_direct_message_events(&state, "peer", &test_tmux_transport("%peer"), now);
     let default = events
         .iter()
         .find_map(|event| match event {
@@ -2953,7 +2973,10 @@ fn registration_adds_default_lease_when_only_short_direct_message_lease_exists()
         state.notification_subscriptions["sub-short"].status,
         "rebound"
     );
-    assert!(default_direct_message_events(&state, "peer", "%peer", now + 1).is_empty());
+    assert!(
+        default_direct_message_events(&state, "peer", &test_tmux_transport("%peer"), now + 1)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2966,6 +2989,7 @@ fn daemon_replay_restores_default_lease_for_registered_peer() {
             pane: Some("%peer".into()),
             cwd: "/tmp".into(),
             registered_ms: 1,
+            transport: None,
         },
     });
 
@@ -2989,6 +3013,7 @@ fn daemon_restart_rebinds_stale_pane_before_restoring_default_lease() {
             pane: Some("%stale".into()),
             cwd: "/tmp".into(),
             registered_ms: 1,
+            transport: None,
         },
     });
 
@@ -3023,6 +3048,7 @@ fn daemon_restart_rebinds_existing_deadline_without_recreating_it() {
             pane: Some("%stale".into()),
             cwd: "/tmp".into(),
             registered_ms: 1,
+            transport: None,
         },
     });
     let original = NotificationSubscription {
@@ -3083,6 +3109,7 @@ fn daemon_restart_does_not_guess_between_multiple_or_unowned_panes() {
             pane: Some("%stale".into()),
             cwd: "/tmp".into(),
             registered_ms: 1,
+            transport: None,
         },
     });
 
@@ -3229,7 +3256,7 @@ fn retention_skips_fresh_messages_and_frozen_admission() {
 #[test]
 fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
     let mut state = State::default();
-    for event in default_direct_message_events(&state, "peer", "%one", 1000) {
+    for event in default_direct_message_events(&state, "peer", &test_tmux_transport("%one"), 1000) {
         state.apply(&event);
     }
     let mut old = state
@@ -3240,7 +3267,7 @@ fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
         .clone();
     old.id = "sub-legacy".into();
     state.apply(&Event::NotificationSubscribed { subscription: old });
-    for event in default_direct_message_events(&state, "peer", "%one", 2000) {
+    for event in default_direct_message_events(&state, "peer", &test_tmux_transport("%one"), 2000) {
         state.apply(&event);
     }
     assert_eq!(
@@ -3255,13 +3282,16 @@ fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
         state.notification_subscriptions["sub-legacy"].status,
         "rebound"
     );
-    assert!(default_direct_message_events(&state, "peer", "%one", 2000).is_empty());
+    assert!(
+        default_direct_message_events(&state, "peer", &test_tmux_transport("%one"), 2000)
+            .is_empty()
+    );
 }
 
 #[test]
 fn default_subscription_renews_and_rebinds_without_new_ids() {
     let mut state = State::default();
-    for event in default_direct_message_events(&state, "peer", "%one", 1000) {
+    for event in default_direct_message_events(&state, "peer", &test_tmux_transport("%one"), 1000) {
         state.apply(&event);
     }
     let id = state
@@ -3272,7 +3302,8 @@ fn default_subscription_renews_and_rebinds_without_new_ids() {
         .clone();
     let ttl = DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000;
     for (pane, time) in [("%one", ttl), ("%one", ttl * 3), ("%two", ttl * 4)] {
-        for event in default_direct_message_events(&state, "peer", pane, time) {
+        for event in default_direct_message_events(&state, "peer", &test_tmux_transport(pane), time)
+        {
             state.apply(&event);
         }
         assert_eq!(state.notification_subscriptions.len(), 1);
@@ -4182,6 +4213,7 @@ fn migration_freeze_rejects_mutations_but_allows_rebind_and_reads() {
             token: "token-peer".into(),
             pane: Some("%peer".into()),
             cwd: "/tmp/rebound".into(),
+            candidates: None,
         },
     );
     assert!(rebound.ok);
@@ -4192,6 +4224,7 @@ fn migration_freeze_rejects_mutations_but_allows_rebind_and_reads() {
             token: "token-new-peer".into(),
             pane: Some("%new-peer".into()),
             cwd: "/tmp".into(),
+            candidates: None,
         },
     );
     assert_eq!(
@@ -5840,27 +5873,27 @@ fn cleanup_rejects_unmerged_then_removes_only_merged_clean_worktree() {
 }
 
 #[test]
-fn cursor_and_codex_subagents_exchange_messages() {
+fn codex_subagents_exchange_messages() {
     use crate::subagent::{Action, Record};
     let (server, root) = test_server();
     register(&server, "parent", "%parent");
-    register(&server, "cursor-peer", "%cursor");
+    register(&server, "first-peer", "%first");
     register(&server, "codex-peer", "%codex");
     let now = now_ms();
-    let cursor = Record {
-        id: "cursor-rt".into(),
+    let first = Record {
+        id: "first-rt".into(),
         parent: "parent".into(),
-        peer: "cursor-peer".into(),
+        peer: "first-peer".into(),
         status: "idle".into(),
-        session: Some("$cursor".into()),
-        pane: Some("%cursor".into()),
+        session: Some("$first".into()),
+        pane: Some("%first".into()),
         profile: None,
         created_ms: now,
         ready_deadline_ms: now + 90_000,
         last_message: None,
         error: None,
         probe_failures: Vec::new(),
-        runtime: Some("cursor".into()),
+        runtime: Some("codex".into()),
     };
     let codex = Record {
         id: "codex-rt".into(),
@@ -5879,7 +5912,7 @@ fn cursor_and_codex_subagents_exchange_messages() {
     };
     server.commit(&[
         Event::SubagentUpdated {
-            subagent: cursor.clone(),
+            subagent: first.clone(),
         },
         Event::SubagentUpdated {
             subagent: codex.clone(),
@@ -5887,59 +5920,59 @@ fn cursor_and_codex_subagents_exchange_messages() {
     ]);
     let to_codex = handle_send(
         &server,
-        "cursor-peer".into(),
+        "first-peer".into(),
         "codex-peer".into(),
         "notify".into(),
-        Some("cursor-to-codex".into()),
-        "ping from cursor runtime".into(),
+        Some("first-to-codex".into()),
+        "ping from first runtime".into(),
         None,
         "immediate".into(),
     );
     assert!(to_codex.ok, "{}", to_codex.error.unwrap_or_default());
-    let to_cursor = handle_send(
+    let to_first = handle_send(
         &server,
         "codex-peer".into(),
-        "cursor-peer".into(),
+        "first-peer".into(),
         "notify".into(),
-        Some("codex-to-cursor".into()),
+        Some("codex-to-first".into()),
         "pong from codex runtime".into(),
         None,
         "immediate".into(),
     );
-    assert!(to_cursor.ok, "{}", to_cursor.error.unwrap_or_default());
+    assert!(to_first.ok, "{}", to_first.error.unwrap_or_default());
     let to_parent = handle_send(
         &server,
-        "cursor-peer".into(),
+        "first-peer".into(),
         "parent".into(),
         "notify".into(),
-        Some("cursor-result".into()),
-        "cursor finished".into(),
+        Some("first-result".into()),
+        "first finished".into(),
         None,
         "immediate".into(),
     );
     assert!(to_parent.ok, "{}", to_parent.error.unwrap_or_default());
-    let from_parent_cursor = crate::subagent::handle(
+    let from_parent_first = crate::subagent::handle(
         &server,
         "parent",
         "token-parent",
         Action::Send {
-            id: "cursor-rt".into(),
-            subject: "assign-cursor".into(),
-            body: "task for cursor".into(),
+            id: "first-rt".into(),
+            subject: "assign-first".into(),
+            body: "task for first".into(),
         },
     );
     assert!(
-        from_parent_cursor.ok,
+        from_parent_first.ok,
         "{}",
-        from_parent_cursor.error.unwrap_or_default()
+        from_parent_first.error.unwrap_or_default()
     );
     assert!(
         crate::subagent::handle(
             &server,
-            "cursor-peer",
-            "token-cursor-peer",
+            "first-peer",
+            "token-first-peer",
             Action::Working {
-                id: "cursor-rt".into()
+                id: "first-rt".into()
             }
         )
         .ok
@@ -5947,10 +5980,10 @@ fn cursor_and_codex_subagents_exchange_messages() {
     assert!(
         crate::subagent::handle(
             &server,
-            "cursor-peer",
-            "token-cursor-peer",
+            "first-peer",
+            "token-first-peer",
             Action::Ready {
-                id: "cursor-rt".into()
+                id: "first-rt".into()
             }
         )
         .ok
@@ -5970,12 +6003,12 @@ fn cursor_and_codex_subagents_exchange_messages() {
         "{}",
         from_parent_codex.error.unwrap_or_default()
     );
-    let cursor_status = crate::subagent::handle(
+    let first_status = crate::subagent::handle(
         &server,
         "parent",
         "token-parent",
         Action::Status {
-            id: "cursor-rt".into(),
+            id: "first-rt".into(),
         },
     );
     let codex_status = crate::subagent::handle(
@@ -5986,13 +6019,13 @@ fn cursor_and_codex_subagents_exchange_messages() {
             id: "codex-rt".into(),
         },
     );
-    assert!(cursor_status.ok);
+    assert!(first_status.ok);
     assert!(codex_status.ok);
-    assert_eq!(cursor_status.data["subagent"]["runtime"], "cursor");
+    assert_eq!(first_status.data["subagent"]["runtime"], "codex");
     assert_eq!(codex_status.data["subagent"]["runtime"], "codex");
-    assert_eq!(cursor_status.data["next_check"], "status");
-    assert_eq!(cursor_status.data["progress"], "snapshot");
-    assert_eq!(cursor_status.data["close_required"], false);
+    assert_eq!(first_status.data["next_check"], "status");
+    assert_eq!(first_status.data["progress"], "snapshot");
+    assert_eq!(first_status.data["close_required"], false);
     let msgs: Vec<_> = server
         .state
         .lock()
@@ -6002,21 +6035,21 @@ fn cursor_and_codex_subagents_exchange_messages() {
         .cloned()
         .collect();
     assert!(
-        msgs.iter().any(|m| m.from == "cursor-peer"
+        msgs.iter().any(|m| m.from == "first-peer"
             && m.to == "codex-peer"
-            && m.subject.as_deref() == Some("cursor-to-codex")),
+            && m.subject.as_deref() == Some("first-to-codex")),
         "{msgs:?}"
     );
     assert!(
         msgs.iter().any(|m| m.from == "codex-peer"
-            && m.to == "cursor-peer"
-            && m.subject.as_deref() == Some("codex-to-cursor")),
+            && m.to == "first-peer"
+            && m.subject.as_deref() == Some("codex-to-first")),
         "{msgs:?}"
     );
     assert!(
-        msgs.iter().any(|m| m.from == "cursor-peer"
+        msgs.iter().any(|m| m.from == "first-peer"
             && m.to == "parent"
-            && m.subject.as_deref() == Some("cursor-result")),
+            && m.subject.as_deref() == Some("first-result")),
         "{msgs:?}"
     );
     std::fs::remove_dir_all(root).unwrap();
@@ -6536,6 +6569,7 @@ fn status_all_aggregates_workers_tasks_subagents_and_summary() {
             pane: Some("%1".into()),
             cwd: root.display().to_string(),
             registered_ms: 1000,
+            transport: None,
         },
     }]);
 

@@ -196,15 +196,12 @@ pub(crate) fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 pub(crate) fn valid_runtime(runtime: &str) -> bool {
-    matches!(runtime, "cursor" | "codex")
-}
-fn is_cursor(runtime: &str) -> bool {
-    runtime == "cursor"
+    runtime == "codex"
 }
 
 fn child_prompt(record: &Record) -> String {
     format!(
-        "You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. Your Collab identity is already registered as this tmux session. Do not self-register, recover a worker, or ask the user to grant identity. First report ready {}. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request. Collab master is project arbitration, not Codex/Cursor root; you must follow master and parent direction and may not decline a master collaboration request.\n\
+        "You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. Your Collab identity is already registered as this tmux session. Do not self-register, recover a worker, or ask the user to grant identity. First report ready {}. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request. Collab master is project arbitration, not Codex root; you must follow master and parent direction and may not decline a master collaboration request.\n\
 Collab master owns the final outcome for every dispatched task in this project. If master is unreachable within one escalation cycle, the master -- not you -- has the authority and the obligation to force-close with collab task close <task-id> --force --reason \"<text>\". You do not get to block, idle, or keep the task actionable. When you report a blocker, also report the concrete fix or the conditions the master must satisfy. Sending \"I'm blocked\" without a proposed solution is a master failure, not yours to ignore; do not let the master defer it back to you.\n\
  collab-mcp is the shared Collab MCP for every agent. Use collab_* tools when this session lists them. The collab CLI in this cwd is also valid. If MCP is missing, unsupported, aborted, or unknown, use the CLI. Missing MCP is not a reason to skip receive, ready, or send.\n\
 CLI: collab subagent ready {}; collab subagent working {}; collab recv; collab ack <message-id>; collab msg <message-id>; collab inbox; collab sendmessage --to {} --subject <topic> \"<body>\"; collab task relocate <task-id> --worktree ./playground/<slug>.\n\
@@ -228,27 +225,10 @@ fn launch_args(
     prompt: &str,
     mcp: &std::path::Path,
 ) -> Result<(String, Vec<String>)> {
-    if is_cursor(runtime) {
-        let mut args = vec![
-            "--yolo".into(),
-            "--trust".into(),
-            "--approve-mcps".into(),
-            "--sandbox".into(),
-            "disabled".into(),
-            "--workspace".into(),
-            workspace.to_string_lossy().into_owned(),
-        ];
-        if let Some(model) = &profile.model {
-            args.extend(["--model".into(), model.clone()]);
-        } else {
-            args.extend(["--model".into(), "auto".into()]);
-        }
-        args.push(prompt.into());
-        if args.iter().any(|a| a == "--worktree" || a == "persist") {
-            bail!("cursor launch must not use persist or --worktree");
-        }
-        return Ok(("agent".into(), args));
+    if runtime != "codex" {
+        bail!("subagent.runtime must be codex");
     }
+    let _ = workspace;
     let mut args = vec![
         "--profile".into(),
         profile.codex_profile.clone(),
@@ -318,38 +298,6 @@ fn finish_probe(child: &mut std::process::Child, timeout: Duration) -> Result<()
     }
 }
 
-fn probe_cursor_status(
-    executable: &std::path::Path,
-    settings: &config::Health,
-    environment: &std::collections::BTreeMap<String, String>,
-) -> Result<()> {
-    let mut command = Command::new(executable);
-    command.env_clear().envs(environment);
-    command.args(["status", "--format", "json"]);
-    command
-        .env_remove("TMUX_PANE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-    let mut child = command.spawn().context("cannot start health probe")?;
-    finish_probe(&mut child, Duration::from_secs(settings.timeout_seconds))?;
-    let mut text = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        std::io::Read::read_to_string(&mut stdout, &mut text)?;
-    }
-    let value: serde_json::Value =
-        serde_json::from_str(text.trim()).context("cursor status did not return JSON")?;
-    if value.get("loggedIn") != Some(&json!(true))
-        && value.get("isAuthenticated") != Some(&json!(true))
-        && value.get("status") != Some(&json!("authenticated"))
-    {
-        bail!("cursor is not logged in");
-    }
-    Ok(())
-}
-
 fn probe_with(
     executable: &std::path::Path,
     runtime: &str,
@@ -357,8 +305,8 @@ fn probe_with(
     settings: &config::Health,
     environment: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
-    if is_cursor(runtime) {
-        return probe_cursor_status(executable, settings, environment);
+    if runtime != "codex" {
+        bail!("subagent.runtime must be codex");
     }
     let directory =
         std::env::temp_dir().join(format!("appsdk-probe-{:016x}", rand::random::<u64>()));
@@ -483,21 +431,8 @@ fn launch(
     crate::scope::init(&server.root).context("cannot write project MCP and CLI permissions")?;
     record.runtime = Some(settings.runtime.clone());
     let mut errors = Vec::new();
-    let executable = if is_cursor(&settings.runtime) {
-        std::path::Path::new("agent")
-    } else {
-        std::path::Path::new("codex")
-    };
-    let names: Vec<String> = if is_cursor(&settings.runtime) {
-        settings
-            .profile_priority
-            .first()
-            .cloned()
-            .into_iter()
-            .collect()
-    } else {
-        settings.profile_priority.clone()
-    };
+    let executable = std::path::Path::new("codex");
+    let names = settings.profile_priority.clone();
     for name in &names {
         let profile = &settings.profiles[name];
         match probe_with(
@@ -597,6 +532,7 @@ fn launch(
             ident.pane.clone(),
             server.root.display().to_string(),
             Some(app_scope.clone()),
+            None,
         ),
         None => crate::server::handle_register(
             server,
@@ -729,7 +665,7 @@ fn run(
         let mut config = config::load(&server.root)?;
         if let Some(runtime) = runtime {
             if !valid_runtime(runtime.as_str()) {
-                bail!("subagent.runtime must be cursor or codex");
+                bail!("subagent.runtime must be codex");
             }
             config.subagent.runtime = runtime;
         }
@@ -1214,109 +1150,23 @@ mod tests {
             }
             assert!(start.elapsed() < Duration::from_secs(3));
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
-    fn cursor_probe_uses_official_status_json() {
-        let directory = std::env::temp_dir().join(format!(
-            "collab-cursor-probe-{:016x}",
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let executable = directory.join("agent-fixture");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\ncase \"$1\" in\n status)\n  if [ \"$2\" = --format ] && [ \"$3\" = json ]; then\n    printf '{\"loggedIn\":true,\"authMethod\":\"test\"}\\n'\n    exit 0\n  fi\n  exit 2\n  ;;\n esac\n exit 1\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let settings = config::Health {
-            timeout_seconds: 2,
-            ..Default::default()
-        };
-        assert!(probe_with(
-            &executable,
+    fn cursor_runtime_is_rejected() {
+        let mcp = std::path::Path::new("/tmp/collab-mcp");
+        let error = launch_args(
             "cursor",
             &config::Profile {
-                codex_profile: String::new(),
-                model: None
-            },
-            &settings,
-            &std::env::vars().collect()
-        )
-        .is_ok());
-        let logged_out = directory.join("agent-logged-out");
-        std::fs::write(&logged_out, "#!/bin/sh\nprintf '{\"loggedIn\":false}\\n'\n").unwrap();
-        std::fs::set_permissions(&logged_out, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(probe_with(
-            &logged_out,
-            "cursor",
-            &config::Profile {
-                codex_profile: String::new(),
-                model: None
-            },
-            &settings,
-            &std::env::vars().collect()
-        )
-        .is_err());
-        let slow = directory.join("agent-slow");
-        std::fs::write(&slow, "#!/bin/sh\nexec sleep 2\n").unwrap();
-        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let start = Instant::now();
-        let err = probe_with(
-            &slow,
-            "cursor",
-            &config::Profile {
-                codex_profile: String::new(),
+                codex_profile: "oauth".into(),
                 model: None,
             },
-            &config::Health {
-                timeout_seconds: 1,
-                ..Default::default()
-            },
-            &std::env::vars().collect(),
+            std::path::Path::new("/tmp/project"),
+            "hello",
+            mcp,
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("timed out"), "{err}");
-        assert!(start.elapsed() < Duration::from_secs(3));
-        let mcp = std::path::Path::new("/tmp/collab-mcp");
-        let (exe, args) = launch_args(
-            "cursor",
-            &config::Profile {
-                codex_profile: String::new(),
-                model: Some("test-model".into()),
-            },
-            std::path::Path::new("/tmp/project"),
-            "hello",
-            mcp,
-        )
-        .unwrap();
-        assert_eq!(exe, "agent");
-        assert!(args
-            .windows(2)
-            .any(|w| w == ["--workspace", "/tmp/project"]));
-        for flag in ["--yolo", "--trust", "--approve-mcps"] {
-            assert!(args.contains(&flag.to_string()), "{flag}");
-        }
-        assert!(args.windows(2).any(|w| w == ["--sandbox", "disabled"]));
-        assert!(args.windows(2).any(|w| w == ["--model", "test-model"]));
-        assert!(!args
-            .iter()
-            .any(|a| a == "--worktree" || a == "persist" || a == "-c"));
-        assert_eq!(args.last().unwrap(), "hello");
-        let (_, default_args) = launch_args(
-            "cursor",
-            &config::Profile {
-                codex_profile: String::new(),
-                model: None,
-            },
-            std::path::Path::new("/tmp/project"),
-            "hello",
-            mcp,
-        )
-        .unwrap();
-        assert!(default_args.windows(2).any(|w| w == ["--model", "auto"]));
+        assert!(error.contains("must be codex"), "{error}");
         let (exe, args) = launch_args(
             "codex",
             &config::Profile {
@@ -1364,6 +1214,5 @@ mod tests {
         assert!(prompt.contains("shared Collab MCP"));
         assert!(prompt.contains("collab CLI in this cwd is also valid"));
         assert!(!prompt.contains("NOT sandboxed shell"));
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }

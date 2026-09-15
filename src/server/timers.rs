@@ -1,3 +1,4 @@
+use crate::proto::{SelectedTransport, TransportKind};
 use crate::server::state::{
     goal_deadline_key, is_goal_deadline, now_ms, Event, Message, MAX_WAKE_ATTEMPTS,
 };
@@ -17,6 +18,7 @@ fn tick_at(server: &Arc<Server>, now: i64) {
     tick_with_idle_at(server, now, &|_| true);
 }
 
+#[cfg(test)]
 fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
     tick_with_idle_at(server, now_ms(), _can_receive);
 }
@@ -25,7 +27,7 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
     if server.state.lock().unwrap().admission_frozen() {
         return;
     }
-    let checks: Vec<(String, String, String, Option<String>)> = {
+    let checks: Vec<(String, String, Option<SelectedTransport>)> = {
         let state = server.state.lock().unwrap();
         state
             .notification_subscriptions
@@ -35,47 +37,73 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
                 (
                     s.id.clone(),
                     s.worker_id.clone(),
-                    s.pane.clone(),
-                    state.workers.get(&s.worker_id).and_then(|w| w.pane.clone()),
+                    state
+                        .workers
+                        .get(&s.worker_id)
+                        .and_then(super::selected_transport_for_worker),
                 )
             })
             .collect()
     };
     let mut lost_sub_ids = Vec::new();
     let mut unknown_sub_ids = Vec::new();
-    for (id, worker_id, pane, current_worker_pane) in checks {
-        if current_worker_pane.as_deref() != Some(&pane) {
+    for (id, worker_id, transport) in checks {
+        let Some(transport) = transport else {
             lost_sub_ids.push(id);
             continue;
-        }
-        let presence = (server.pane_alive_check)(&pane);
-        if presence == super::knock::PanePresence::Unknown {
-            unknown_sub_ids.push(id);
-            continue;
-        }
-        let owned = if presence == super::knock::PanePresence::Present {
-            match (server.pane_owner_check)(&worker_id, &pane) {
-                Ok(owned) => owned,
-                Err(()) => {
+        };
+        match transport.kind {
+            TransportKind::AppServer => {
+                // App Server candidates are verified at registration. A
+                // notification attempt performs its own bounded endpoint
+                // check; the timer must not apply tmux pane ownership here.
+                if !super::subscription_matches_transport_by_worker(
+                    server, &id, &worker_id, &transport,
+                ) {
+                    lost_sub_ids.push(id);
+                }
+            }
+            TransportKind::Tmux => {
+                let Some(pane) = transport.pane.as_deref() else {
+                    lost_sub_ids.push(id);
+                    continue;
+                };
+                if !super::subscription_matches_transport_by_worker(
+                    server, &id, &worker_id, &transport,
+                ) {
+                    lost_sub_ids.push(id);
+                    continue;
+                }
+                let presence = (server.pane_alive_check)(pane);
+                if presence == super::knock::PanePresence::Unknown {
                     unknown_sub_ids.push(id);
                     continue;
                 }
+                let owned = if presence == super::knock::PanePresence::Present {
+                    match (server.pane_owner_check)(&worker_id, pane) {
+                        Ok(owned) => owned,
+                        Err(()) => {
+                            unknown_sub_ids.push(id);
+                            continue;
+                        }
+                    }
+                } else {
+                    false
+                };
+                let agent = if presence == super::knock::PanePresence::Present {
+                    (server.pane_state_check)(pane)
+                } else {
+                    super::knock::AgentState::Absent
+                };
+                if presence == super::knock::PanePresence::Missing
+                    || !owned
+                    || agent == crate::server::knock::AgentState::Absent
+                {
+                    lost_sub_ids.push(id);
+                } else if agent == super::knock::AgentState::Unknown {
+                    unknown_sub_ids.push(id);
+                }
             }
-        } else {
-            false
-        };
-        let agent = if presence == super::knock::PanePresence::Present {
-            (server.pane_state_check)(&pane)
-        } else {
-            super::knock::AgentState::Absent
-        };
-        if presence == super::knock::PanePresence::Missing
-            || !owned
-            || agent == crate::server::knock::AgentState::Absent
-        {
-            lost_sub_ids.push(id);
-        } else if agent == super::knock::AgentState::Unknown {
-            unknown_sub_ids.push(id);
         }
     }
 
@@ -432,6 +460,8 @@ mod tests {
                 pane_alive_check: |_| super::super::knock::PanePresence::Present,
                 pane_owner_check: |_, _| Ok(true),
                 pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+                appserver_candidate_check: super::super::default_appserver_candidate_check(),
+                appserver_notification_sink: super::super::default_appserver_notification_sink(),
                 mailbox_notify: tokio::sync::Notify::new(),
             }),
             root,
@@ -446,6 +476,7 @@ mod tests {
                 pane: Some(format!("%test-{worker_id}")),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
+                transport: None,
             },
         }]);
     }
@@ -761,6 +792,8 @@ mod tests {
             pane_alive_check: |_| super::super::knock::PanePresence::Present,
             pane_owner_check: |_, _| Ok(true),
             pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            appserver_candidate_check: super::super::default_appserver_candidate_check(),
+            appserver_notification_sink: super::super::default_appserver_notification_sink(),
             mailbox_notify: tokio::sync::Notify::new(),
         };
         let sent = std::sync::atomic::AtomicBool::new(false);
@@ -2620,6 +2653,7 @@ mod tests {
                 pane: Some("%new-pane".into()),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
+                transport: None,
             },
         }]);
         tick_with_idle(&server, &|_| true);
@@ -2637,6 +2671,7 @@ mod tests {
                 pane: Some(format!("%test-mismatch-worker")),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
+                transport: None,
             },
         }]);
         Arc::get_mut(&mut server).unwrap().pane_state_check =

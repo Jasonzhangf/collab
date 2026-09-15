@@ -7,6 +7,58 @@ use crate::identity::{
 use crate::scope::{ProjectScopeId, RouteScope};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransportKind {
+    #[serde(rename = "appserver")]
+    AppServer,
+    #[serde(rename = "tmux")]
+    Tmux,
+}
+
+impl TransportKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AppServer => "appserver",
+            Self::Tmux => "tmux",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppServerCandidate {
+    pub endpoint: String,
+    pub namespace: String,
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmuxCandidate {
+    pub pane: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportCandidates {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appserver: Option<AppServerCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<TmuxCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedTransport {
+    pub kind: TransportKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+    pub capabilities: Vec<String>,
+    pub self_check: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandEnvelope {
     pub command_id: CommandId,
     pub operation_id: OperationId,
@@ -203,8 +255,11 @@ pub enum Req {
     Register {
         worker_id: String,
         token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<String>,
         cwd: String,
+        #[serde(default)]
+        candidates: Option<TransportCandidates>,
     },
     Send {
         from: String,

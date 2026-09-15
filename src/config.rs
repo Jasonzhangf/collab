@@ -136,7 +136,7 @@ pub struct Subagent {
 impl Default for Subagent {
     fn default() -> Self {
         Self {
-            runtime: "cursor".into(),
+            runtime: "codex".into(),
             profile_priority: vec!["gcm".into(), "oauth".into()],
             persistent: true,
             close_on_task_complete: false,
@@ -256,7 +256,7 @@ fn insert_subagent_runtime(text: &str) -> Option<String> {
         let (head, tail) = text.split_at(insert_at);
         let mut out = String::from(head);
         out.push('\n');
-        out.push_str("runtime = \"cursor\"");
+        out.push_str("runtime = \"codex\"");
         if !tail.starts_with('\n') && !tail.is_empty() {
             out.push('\n');
         }
@@ -267,7 +267,7 @@ fn insert_subagent_runtime(text: &str) -> Option<String> {
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str("\n[subagent]\nruntime = \"cursor\"\n");
+    out.push_str("\n[subagent]\nruntime = \"codex\"\n");
     Some(out)
 }
 fn merge(base: &mut toml::Value, overlay: toml::Value) {
@@ -378,8 +378,8 @@ impl Config {
         {
             bail!("invalid startup timeout or tmux name template");
         }
-        if !matches!(s.runtime.as_str(), "cursor" | "codex") {
-            bail!("subagent.runtime must be cursor or codex");
+        if s.runtime != "codex" {
+            bail!("subagent.runtime must be codex");
         }
         if s.profile_priority.is_empty() || s.profile_priority.len() > 4 {
             bail!("configure 1..4 profiles");
@@ -393,9 +393,7 @@ impl Config {
             if !seen.insert(name) {
                 bail!("invalid or duplicate profile");
             }
-            if s.runtime == "codex"
-                && (p.codex_profile.trim().is_empty() || p.codex_profile.starts_with('-'))
-            {
+            if p.codex_profile.trim().is_empty() || p.codex_profile.starts_with('-') {
                 bail!("invalid or duplicate profile");
             }
         }
@@ -444,7 +442,7 @@ mod tests {
     fn legacy_defaults_and_project_override() {
         let c = parse("", Path::new("/project")).unwrap();
         assert_eq!(c.retention.ttl_days, 7);
-        assert_eq!(c.subagent.runtime, "cursor");
+        assert_eq!(c.subagent.runtime, "codex");
         assert_eq!(c.subagent.health.timeout_seconds, 90);
         assert_eq!(c.notifications.delay_ms("direct-message"), 120000);
         assert_eq!(c.notifications.delay_ms("deadline"), 0);
@@ -472,7 +470,7 @@ mod tests {
     #[test]
     fn writes_default_runtime_into_subagent_table() {
         let added = insert_subagent_runtime("[subagent]\npersistent = true\n").unwrap();
-        assert!(added.contains("runtime = \"cursor\""));
+        assert!(added.contains("runtime = \"codex\""));
         assert!(insert_subagent_runtime("[subagent]\nruntime = \"codex\"\n").is_none());
     }
 }

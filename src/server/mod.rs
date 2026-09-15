@@ -9,8 +9,13 @@ pub mod timers;
 
 pub use global_state::{GlobalState, ProjectRegistration, RuntimeBinding};
 
-use crate::identity::{AgentId, AppServerId, BindingId, CommandId, OperationId, RuntimeId};
-use crate::proto::{CommandEnvelope, ProjectContext, Req, RequestEnvelope, Resp, MSG_TYPES};
+use crate::identity::{
+    AgentId, AppServerId, BindingId, CommandId, NativeThreadId, OperationId, RuntimeId,
+};
+use crate::proto::{
+    CommandEnvelope, ProjectContext, Req, RequestEnvelope, Resp, SelectedTransport, TmuxCandidate,
+    TransportCandidates, TransportKind, MSG_TYPES,
+};
 use crate::scope::{HostPaths, ProjectScopeId, RouteScope, Scope};
 use crate::server::knock::{
     append_log, knock_or_log, pane_alive, pane_idle, pane_presence, PanePresence,
@@ -140,6 +145,24 @@ const MAX_WORKTREE_PATH_BYTES: usize = 80;
 /// A new daemon must fence this writer before it replays the project journal;
 /// otherwise an old binary could append concurrently under the new socket.
 const LEGACY_HOST_DAEMON_LOCK_PATH: &str = "/tmp/collab-host.lock";
+
+type AppServerCandidateCheck =
+    dyn Fn(&crate::proto::AppServerCandidate) -> Result<SelectedTransport, String> + Send + Sync;
+type AppServerNotificationSink =
+    dyn Fn(&SelectedTransport, &str, &str) -> Result<serde_json::Value, String> + Send + Sync;
+
+fn default_appserver_candidate_check() -> Arc<AppServerCandidateCheck> {
+    Arc::new(|candidate| {
+        crate::client::adapters::verify_candidate(candidate).map_err(|error| error.to_string())
+    })
+}
+
+pub(crate) fn default_appserver_notification_sink() -> Arc<AppServerNotificationSink> {
+    Arc::new(|transport, body, message_id| {
+        crate::client::adapters::queue_add(transport, body, message_id)
+            .map_err(|error| error.to_string())
+    })
+}
 
 #[cfg(test)]
 static STARTUP_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -346,6 +369,8 @@ pub struct Server {
     pub pane_alive_check: fn(&str) -> PanePresence,
     pub pane_owner_check: fn(&str, &str) -> Result<bool, ()>,
     pub pane_state_check: fn(&str) -> crate::server::knock::AgentState,
+    pub appserver_candidate_check: Arc<AppServerCandidateCheck>,
+    pub appserver_notification_sink: Arc<AppServerNotificationSink>,
     pub mailbox_notify: Notify,
 }
 
@@ -425,10 +450,19 @@ impl Server {
         let project_scope = GlobalState::canonical_project_scope(Path::new(cwd))
             .map_err(|error| error.to_string())?;
         let app_scope = AppServerId::new("tui-default").map_err(|error| error.to_string())?;
+        let transport = SelectedTransport {
+            kind: TransportKind::Tmux,
+            endpoint: None,
+            namespace: None,
+            thread_id: None,
+            pane: Some(pane.to_string()),
+            capabilities: vec!["send_message".into()],
+            self_check: "legacy tmux registration".into(),
+        };
         self.typed_register_envelope_for_scope(
             worker_id,
             token,
-            pane,
+            &transport,
             project_scope,
             cwd,
             app_scope,
@@ -440,7 +474,7 @@ impl Server {
         &self,
         worker_id: &str,
         token: &str,
-        pane: &str,
+        transport: &SelectedTransport,
         project_scope: ProjectScopeId,
         worker_cwd: &str,
         app_scope: AppServerId,
@@ -448,7 +482,15 @@ impl Server {
     ) -> Result<TypedEnvelope, String> {
         let binding_text = sanitize_identifier(&format!("binding-{worker_id}"));
         let binding_id = BindingId::new(binding_text.clone()).map_err(|error| error.to_string())?;
-        let runtime_text = format!("runtime-{}", sanitize_identifier(pane));
+        let transport_identity = match transport.kind {
+            TransportKind::AppServer => transport.thread_id.as_deref().unwrap_or("appserver"),
+            TransportKind::Tmux => transport.pane.as_deref().unwrap_or("tmux"),
+        };
+        let runtime_text = format!(
+            "runtime-{}-{}",
+            transport.kind.as_str(),
+            sanitize_identifier(transport_identity)
+        );
         let route_scope = RouteScope {
             app_scope_id: app_scope.clone(),
             project_scope_id: project_scope.clone(),
@@ -494,6 +536,12 @@ impl Server {
         };
         let agent_id = AgentId::new(worker_id.to_string()).map_err(|error| error.to_string())?;
         let runtime_id = RuntimeId::new(runtime_text).map_err(|error| error.to_string())?;
+        let native_thread_id = transport
+            .thread_id
+            .as_ref()
+            .map(|value| NativeThreadId::new(value.clone()))
+            .transpose()
+            .map_err(|error| error.to_string())?;
         let binding = RuntimeBinding::new(
             project_scope.clone(),
             app_scope,
@@ -501,7 +549,7 @@ impl Server {
             runtime_id,
             binding_id.clone(),
             generation,
-            None,
+            native_thread_id,
         )
         .map_err(|error| error.to_string())?;
         let command_id = CommandId::new(format!("register-{binding_text}-{generation}"))
@@ -526,9 +574,10 @@ impl Server {
         let worker = WorkerRec {
             id: worker_id.to_string(),
             token: token.to_string(),
-            pane: Some(pane.to_string()),
+            pane: transport.pane.clone(),
             cwd: worker_cwd.to_string(),
             registered_ms,
+            transport: Some(transport.clone()),
         };
         Ok(TypedEnvelope {
             command: TypedCommand::RegisterWorker {
@@ -572,11 +621,11 @@ impl Server {
         events.push(Event::Registered {
             worker: worker.clone(),
         });
-        if let Some(pane) = worker.pane.as_deref() {
+        if let Some(transport) = selected_transport_for_worker(worker) {
             events.extend(default_direct_message_events(
                 &st,
                 &worker.id,
-                pane,
+                &transport,
                 now_ms(),
             ));
         }
@@ -1293,6 +1342,72 @@ impl Server {
     }
 }
 
+fn validate_transport_candidates(
+    server: &Server,
+    worker_id: &str,
+    candidates: &TransportCandidates,
+) -> Result<SelectedTransport, String> {
+    if let Some(candidate) = candidates.appserver.as_ref() {
+        match (server.appserver_candidate_check)(candidate) {
+            Ok(transport) => return Ok(transport),
+            Err(error) => {
+                append_log(
+                    &server.log_path(),
+                    &format!(
+                        "APPSERVER_CANDIDATE_REJECTED worker={worker_id} endpoint={} thread_id={} error={error}",
+                        candidate.endpoint, candidate.thread_id
+                    ),
+                );
+            }
+        }
+    }
+    let Some(candidate) = candidates.tmux.as_ref() else {
+        return Err(
+            "TRANSPORT_NONE: server self-check found no usable App Server or tmux candidate".into(),
+        );
+    };
+    let pane = candidate.pane.as_str();
+    if runtime_for_pane(Some(pane)).is_none() {
+        return Err(format!(
+            "TRANSPORT_NONE: tmux candidate {pane} is not a live tmux pane"
+        ));
+    }
+    match (server.pane_owner_check)(worker_id, pane) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "TRANSPORT_TMUX_OWNERSHIP_REJECTED: worker {worker_id} does not own pane {pane}"
+            ))
+        }
+        Err(()) => {
+            return Err(format!(
+                "TRANSPORT_TMUX_UNKNOWN: server cannot verify ownership of pane {pane}"
+            ))
+        }
+    }
+    if let Some(session) = tmux_session_for_pane(pane) {
+        if session != worker_id {
+            return Err(format!(
+                "TRANSPORT_TMUX_OWNERSHIP_REJECTED: pane {pane} belongs to session {session}, not worker {worker_id}"
+            ));
+        }
+    }
+    if (server.pane_alive_check)(pane) != PanePresence::Present {
+        return Err(format!(
+            "TRANSPORT_TMUX_UNAVAILABLE: server self-check could not prove pane {pane} is live"
+        ));
+    }
+    Ok(SelectedTransport {
+        kind: TransportKind::Tmux,
+        endpoint: None,
+        namespace: None,
+        thread_id: None,
+        pane: Some(pane.to_owned()),
+        capabilities: vec!["send_message".into()],
+        self_check: "tmux pane liveness and ownership verified by server".into(),
+    })
+}
+
 fn validate_command_id(value: &str) -> Result<(), notification_contract::JournalError> {
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
         return Err(notification_contract::JournalError::InvalidCommand(
@@ -1360,7 +1475,7 @@ fn iso(ms: i64) -> String {
 fn default_direct_message_events(
     state: &State,
     worker_id: &str,
-    pane: &str,
+    transport: &SelectedTransport,
     now: i64,
 ) -> Vec<Event> {
     let mut events = Vec::new();
@@ -1378,7 +1493,7 @@ fn default_direct_message_events(
         sub.worker_id == worker_id && sub.event == "direct-message" && sub.status == "armed"
     }) {
         if subscription.id == default_id
-            && subscription.pane == pane
+            && subscription_matches_transport(subscription, transport)
             && subscription.expires_ms - now >= refresh_after_ms
         {
             current_is_fresh = true;
@@ -1395,6 +1510,20 @@ fn default_direct_message_events(
     if current_is_fresh {
         return events;
     }
+    let (pane, method) = match transport.kind {
+        TransportKind::AppServer => {
+            let Some(thread_id) = transport.thread_id.as_deref() else {
+                return events;
+            };
+            (thread_id, "appserver")
+        }
+        TransportKind::Tmux => {
+            let Some(pane) = transport.pane.as_deref() else {
+                return events;
+            };
+            (pane, "tmux")
+        }
+    };
     events.push(Event::NotificationSubscribed {
         subscription: NotificationSubscription {
             id: default_id,
@@ -1402,7 +1531,7 @@ fn default_direct_message_events(
             event: "direct-message".into(),
             subject: None,
             pane: pane.into(),
-            method: "tmux".into(),
+            method: method.into(),
             trigger_ms: None,
             trigger_times_ms: Vec::new(),
             interval_ms: None,
@@ -1428,10 +1557,18 @@ fn registered_peer_default_events(
     workers
         .into_iter()
         .filter_map(|worker| {
-            let pane = worker.pane.as_deref()?;
-            owns_pane(&worker.id, pane).then_some((worker.id.as_str(), pane))
+            let transport = selected_transport_for_worker(worker)?;
+            match transport.kind {
+                TransportKind::AppServer => Some((worker.id.as_str(), transport)),
+                TransportKind::Tmux => {
+                    let pane = transport.pane.as_deref()?;
+                    owns_pane(&worker.id, pane).then_some((worker.id.as_str(), transport))
+                }
+            }
         })
-        .flat_map(|(worker_id, pane)| default_direct_message_events(state, worker_id, pane, now))
+        .flat_map(|(worker_id, transport)| {
+            default_direct_message_events(state, worker_id, &transport, now)
+        })
         .collect()
 }
 
@@ -1501,6 +1638,187 @@ fn restore_registered_peer_default_leases(server: &Server) {
     }
 }
 
+fn selected_transport_for_worker(worker: &WorkerRec) -> Option<SelectedTransport> {
+    if let Some(transport) = worker.transport.clone() {
+        return Some(transport);
+    }
+    worker
+        .pane
+        .as_deref()
+        .and_then(|pane| runtime_for_pane(Some(pane)).map(|_| pane))
+        .map(|_| SelectedTransport {
+            kind: TransportKind::Tmux,
+            endpoint: None,
+            namespace: None,
+            thread_id: None,
+            pane: worker.pane.clone(),
+            capabilities: vec!["send_message".into()],
+            self_check: "legacy tmux registration".into(),
+        })
+}
+
+fn subscription_matches_transport(
+    subscription: &NotificationSubscription,
+    transport: &SelectedTransport,
+) -> bool {
+    match transport.kind {
+        TransportKind::AppServer => {
+            subscription.method == "appserver"
+                && transport
+                    .thread_id
+                    .as_deref()
+                    .is_some_and(|thread_id| subscription.pane == thread_id)
+        }
+        TransportKind::Tmux => {
+            subscription.method == "tmux"
+                && transport
+                    .pane
+                    .as_deref()
+                    .is_some_and(|pane| subscription.pane == pane)
+        }
+    }
+}
+
+pub(crate) fn subscription_matches_transport_by_worker(
+    server: &Server,
+    subscription_id: &str,
+    worker_id: &str,
+    transport: &SelectedTransport,
+) -> bool {
+    let state = server.state.lock().unwrap();
+    let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
+        return false;
+    };
+    subscription.worker_id == worker_id
+        && subscription_matches_transport(subscription, transport)
+        && state
+            .workers
+            .get(worker_id)
+            .is_some_and(|worker| selected_transport_for_worker(worker).as_ref() == Some(transport))
+}
+
+fn attempt_appserver_notification_with_at(
+    server: &Server,
+    message_id: &str,
+    subscription_id: &str,
+    recipient: &str,
+    transport: &SelectedTransport,
+    delay: i64,
+    explicit: bool,
+    now: i64,
+) -> bool {
+    let mut state = server.state.lock().unwrap();
+    let Some(seed_id) = state.msgs.get(message_id).map(|message| message.id.clone()) else {
+        return false;
+    };
+    if !state.scheduler_message_deliverable(message_id) {
+        return false;
+    }
+    let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
+        return false;
+    };
+    if subscription.worker_id != recipient
+        || !subscription_matches_transport(subscription, transport)
+    {
+        return false;
+    }
+    let mut batch = state
+        .msgs
+        .values()
+        .filter_map(|message| {
+            let binding = state.wake_bindings.get(&message.id)?;
+            let sub = state.notification_subscriptions.get(binding)?;
+            let message_explicit = is_explicit_notification(&state, message);
+            (message.to == recipient
+                && state.scheduler_message_deliverable(&message.id)
+                && message_explicit == explicit
+                && state
+                    .delivery_modes
+                    .get(&message.id)
+                    .filter(|mode| mode.as_str() == "explicit-notification")
+                    .map(|_| 0)
+                    .unwrap_or_else(|| server.config.notifications.delay_ms(&sub.event))
+                    == delay
+                && message.state == "pending"
+                && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
+                && sub.worker_id == recipient
+                && subscription_matches_transport(sub, transport)
+                && sub.status == "armed"
+                && sub.expires_ms > now)
+                .then(|| {
+                    notification_text(message).map(|text| {
+                        (
+                            message.created_ms,
+                            message.id.clone(),
+                            binding.clone(),
+                            sub.event.clone(),
+                            text,
+                        )
+                    })
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    batch.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let Some(window_start_ms) = batch.first().map(|candidate| candidate.0) else {
+        return false;
+    };
+    let (batch, remaining) = mailbox::select_batch(batch, delay, window_start_ms);
+    let Some(first) = batch.first() else {
+        return false;
+    };
+    let last_attempt = state
+        .msgs
+        .values()
+        .filter_map(|message| {
+            let binding = state.wake_bindings.get(&message.id)?;
+            let sub = state.notification_subscriptions.get(binding)?;
+            let message_explicit = is_explicit_notification(&state, message);
+            (message.to == recipient
+                && message_explicit == explicit
+                && (message_explicit || server.config.notifications.delay_ms(&sub.event) == delay)
+                && sub.worker_id == recipient
+                && subscription_matches_transport(sub, transport))
+            .then_some(message.last_wake_attempt_ms)
+        })
+        .max()
+        .unwrap_or(0);
+    if now.saturating_sub(window_start_ms) < delay || now.saturating_sub(last_attempt) < delay {
+        return false;
+    }
+    server.commit_locked(
+        &mut state,
+        &[Event::WakeAttempted {
+            ids: batch.iter().map(|message| message.1.clone()).collect(),
+            attempted_ms: now,
+        }],
+    );
+    drop(state);
+
+    let text = truncate_notification(compose_notification(
+        &first.1,
+        "notification-batch",
+        &batch_notification_text(&batch, remaining),
+    ));
+    match (server.appserver_notification_sink)(
+        transport,
+        &text,
+        &format!("collab-notification-{}", first.1),
+    ) {
+        Ok(_) => true,
+        Err(error) => {
+            append_log(
+                &server.log_path(),
+                &format!(
+                    "APPSERVER_NOTIFICATION_REJECTED recipient={recipient} message={} error={error}",
+                    seed_id
+                ),
+            );
+            false
+        }
+    }
+}
+
 fn attempt_notification_with(
     server: &Server,
     message_id: &str,
@@ -1532,8 +1850,8 @@ fn attempt_notification_with_at(
     if !server.config.notifications.enabled {
         return false;
     }
-    let (recipient, pane, delay, worker_pane, explicit) = {
-        let state = server.state.lock().unwrap();
+    let (recipient, transport, delay, explicit) = {
+        let mut state = server.state.lock().unwrap();
         let Some(seed) = state.msgs.get(message_id) else {
             return false;
         };
@@ -1547,28 +1865,60 @@ fn attempt_notification_with_at(
         if subscription.worker_id != recipient {
             return false;
         }
-        let pane = subscription.pane.clone();
         let delay = state
             .delivery_modes
             .get(message_id)
             .filter(|mode| mode.as_str() == "explicit-notification")
             .map(|_| 0)
             .unwrap_or_else(|| server.config.notifications.delay_ms(&subscription.event));
-        let worker_pane = state.workers.get(&recipient).and_then(|w| w.pane.clone());
+        let worker_transport = state
+            .workers
+            .get(&recipient)
+            .and_then(selected_transport_for_worker);
+        let Some(transport) = worker_transport else {
+            return false;
+        };
+        if !subscription_matches_transport(subscription, &transport) {
+            server.commit_locked(
+                &mut state,
+                &[Event::NotificationStatus {
+                    subscription_id: subscription_id.to_string(),
+                    status: "pane-lost".into(),
+                    updated_ms: now,
+                }],
+            );
+            return false;
+        }
         let explicit = is_explicit_notification(&state, seed);
-        (recipient, pane, delay, worker_pane, explicit)
+        (recipient, transport, delay, explicit)
+    };
+    if transport.kind == TransportKind::AppServer {
+        return attempt_appserver_notification_with_at(
+            server,
+            message_id,
+            subscription_id,
+            &recipient,
+            &transport,
+            delay,
+            explicit,
+            now,
+        );
+    }
+    let Some(pane) = transport.pane.clone() else {
+        return false;
     };
 
-    let worker_pane_mismatch = worker_pane.as_deref() != Some(&pane);
-    let presence = if worker_pane_mismatch {
-        PanePresence::Missing
-    } else {
-        (server.pane_alive_check)(&pane)
+    let worker_transport_matches = {
+        let state = server.state.lock().unwrap();
+        state.workers.get(&recipient).is_some_and(|worker| {
+            selected_transport_for_worker(worker).as_ref() == Some(&transport)
+        })
     };
-    if presence == PanePresence::Unknown {
+    let presence = (server.pane_alive_check)(&pane);
+    if presence == PanePresence::Unknown && worker_transport_matches {
         return false;
     }
-    let alive = presence == PanePresence::Present;
+    let alive = presence == PanePresence::Present && worker_transport_matches;
     let owned = if alive {
         match owns_pane(&recipient, &pane) {
             Ok(owned) => owned,
@@ -1584,11 +1934,7 @@ fn attempt_notification_with_at(
     };
 
     let mut state = server.state.lock().unwrap();
-    if worker_pane_mismatch
-        || !alive
-        || !owned
-        || state_probe == crate::server::knock::AgentState::Absent
-    {
+    if !alive || !owned || state_probe == crate::server::knock::AgentState::Absent {
         server.commit_locked(
             &mut state,
             &[Event::NotificationStatus {
@@ -1646,14 +1992,13 @@ fn attempt_notification_with_at(
                 && message.state == "pending"
                 && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
                 && sub.worker_id == recipient
-                && sub.pane == pane
+                && subscription_matches_transport(sub, &transport)
                 && sub.status == "armed"
                 && sub.expires_ms > now
-                && state
-                    .workers
-                    .get(&recipient)
-                    .and_then(|w| w.pane.as_deref())
-                    == Some(pane.as_str()))
+                && state.workers.get(&recipient).is_some_and(|worker| {
+                    selected_transport_for_worker(worker)
+                        .is_some_and(|selected| selected == transport)
+                }))
             .then(|| {
                 notification_text(message).map(|text| {
                     (
@@ -1687,8 +2032,8 @@ fn attempt_notification_with_at(
                 && message_explicit == explicit
                 && (message_explicit || server.config.notifications.delay_ms(&sub.event) == delay)
                 && sub.worker_id == recipient
-                && sub.pane == pane)
-                .then_some(message.last_wake_attempt_ms)
+                && subscription_matches_transport(sub, &transport))
+            .then_some(message.last_wake_attempt_ms)
         })
         .max()
         .unwrap_or(0);
@@ -1787,6 +2132,8 @@ mod notification_batch_tests {
                 pane_alive_check: |_| crate::server::knock::PanePresence::Present,
                 pane_owner_check: |_, _| Ok(true),
                 pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+                appserver_candidate_check: default_appserver_candidate_check(),
+                appserver_notification_sink: default_appserver_notification_sink(),
                 mailbox_notify: tokio::sync::Notify::new(),
             }),
             root,
@@ -1805,6 +2152,7 @@ mod notification_batch_tests {
                     pane: Some(pane.clone()),
                     cwd: "/tmp".into(),
                     registered_ms: now,
+                    transport: None,
                 },
             },
             Event::NotificationSubscribed {
@@ -2222,12 +2570,26 @@ fn handle_notification_subscribe(
             }));
         }
     }
-    let Some(pane) = state.worker_pane(&worker_id) else {
-        return Resp::err("notification subscription requires a registered tmux pane");
+    let Some(worker) = state.workers.get(&worker_id).cloned() else {
+        return Resp::err("notification subscription requires a registered worker");
     };
-    if runtime_for_pane(Some(&pane)).is_none() {
-        return Resp::err("notification subscription method tmux is unavailable for this pane");
-    }
+    let Some(transport) = selected_transport_for_worker(&worker) else {
+        return Resp::err("registered worker has no server-selected transport");
+    };
+    let (pane, method) = match transport.kind {
+        TransportKind::AppServer => {
+            let Some(thread_id) = transport.thread_id.clone() else {
+                return Resp::err("selected App Server transport has no thread_id");
+            };
+            (thread_id, "appserver")
+        }
+        TransportKind::Tmux => {
+            let Some(pane) = transport.pane.clone() else {
+                return Resp::err("selected tmux transport has no pane");
+            };
+            (pane, "tmux")
+        }
+    };
     let active = state
         .notification_subscriptions
         .values()
@@ -2295,7 +2657,7 @@ fn handle_notification_subscribe(
         event,
         subject,
         pane,
-        method: "tmux".into(),
+        method: method.into(),
         trigger_ms,
         trigger_times_ms,
         interval_ms,
@@ -2765,20 +3127,17 @@ fn register_typed(
     server: &Server,
     worker_id: &str,
     token: &str,
-    pane: Option<&str>,
+    transport: &SelectedTransport,
     cwd: &str,
     project_scope: Option<ProjectScopeId>,
     app_scope: Option<AppServerId>,
     reuse_existing: bool,
 ) -> Resp {
-    let Some(pane) = pane else {
-        return Resp::err("collab registration requires a live tmux pane");
-    };
     let typed = match (project_scope, app_scope) {
         (Some(project_scope), Some(app_scope)) => server.typed_register_envelope_for_scope(
             worker_id,
             token,
-            pane,
+            transport,
             project_scope,
             cwd,
             app_scope,
@@ -2790,7 +3149,7 @@ fn register_typed(
                 Ok(app_scope) => server.typed_register_envelope_for_scope(
                     worker_id,
                     token,
-                    pane,
+                    transport,
                     project_scope,
                     cwd,
                     app_scope,
@@ -2803,7 +3162,7 @@ fn register_typed(
             Ok(project_scope) => server.typed_register_envelope_for_scope(
                 worker_id,
                 token,
-                pane,
+                transport,
                 project_scope,
                 cwd,
                 app_scope,
@@ -2819,7 +3178,7 @@ fn register_typed(
                 (Ok(project_scope), Ok(app_scope)) => server.typed_register_envelope_for_scope(
                     worker_id,
                     token,
-                    pane,
+                    transport,
                     project_scope,
                     cwd,
                     app_scope,
@@ -2828,14 +3187,18 @@ fn register_typed(
                 (Err(error), _) | (_, Err(error)) => Err(error),
             }
         }
-        (None, None) => server.typed_register_envelope(worker_id, token, pane, cwd),
+        (None, None) => {
+            let Some(pane) = transport.pane.as_deref() else {
+                return Resp::err(
+                    "collab registration requires an app scope for an App Server transport",
+                );
+            };
+            server.typed_register_envelope(worker_id, token, pane, cwd)
+        }
     };
     match typed {
         Ok(typed) => match server.typed_dispatch(typed.clone()) {
             Ok(outcome) => {
-                let Some(runtime) = runtime_for_pane(Some(pane)) else {
-                    return Resp::err("collab registration requires a live tmux pane");
-                };
                 let (role_brief, registered_at) = {
                     let st = server.state.lock().unwrap();
                     let registered_at = match &typed.command {
@@ -2846,7 +3209,7 @@ fn register_typed(
                 Resp::data(json!({
                     "worker_id": worker_id,
                     "identity_kind": "peer",
-                    "runtime": runtime,
+                    "transport_selected": transport,
                     "registered_at": iso(registered_at),
                     "role_brief": role_brief,
                     "typed": true,
@@ -2871,36 +3234,20 @@ pub(crate) fn handle_register_with_app_scope(
     pane: Option<String>,
     cwd: String,
     app_scope: Option<AppServerId>,
+    candidates: Option<TransportCandidates>,
 ) -> Resp {
-    let st = server.state.lock().unwrap();
-    let Some(runtime) = runtime_for_pane(pane.as_deref()) else {
-        return Resp::err("collab registration requires a live tmux pane");
+    let candidates = match candidates {
+        Some(candidates) => candidates,
+        None => TransportCandidates {
+            appserver: None,
+            tmux: pane.clone().map(|pane| TmuxCandidate { pane }),
+        },
     };
-    if let Some(pane) = pane.as_deref() {
-        match (server.pane_owner_check)(&worker_id, pane) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Resp::err(format!(
-                    "worker {} cannot bind pane {} owned by another tmux session",
-                    worker_id, pane
-                ))
-            }
-            Err(()) => {
-                return Resp::err(format!(
-                    "cannot verify tmux session ownership for pane {}",
-                    pane
-                ))
-            }
-        }
-        if let Some(session) = tmux_session_for_pane(pane) {
-            if session != worker_id {
-                return Resp::err(format!(
-                    "pane {} belongs to tmux session {}; worker {} cannot bind it",
-                    pane, session, worker_id
-                ));
-            }
-        }
-    }
+    let selected = match validate_transport_candidates(server, &worker_id, &candidates) {
+        Ok(selected) => selected,
+        Err(error) => return Resp::err(error),
+    };
+    let st = server.state.lock().unwrap();
     if st.admission_frozen() && !st.workers.contains_key(&worker_id) {
         return Resp::err("MIGRATION_ADMISSION_FROZEN: only an existing tmux identity may rebind");
     }
@@ -2937,7 +3284,7 @@ pub(crate) fn handle_register_with_app_scope(
                     server,
                     &worker_id,
                     &token,
-                    pane.as_deref(),
+                    &selected,
                     &cwd,
                     existing_project_scope,
                     app_scope,
@@ -2954,22 +3301,16 @@ pub(crate) fn handle_register_with_app_scope(
                 worker_id
             ));
         }
-        let Some(existing_runtime) = runtime_for_pane(existing.pane.as_deref()) else {
-            return Resp::err("existing peer has no valid tmux pane");
-        };
-        if existing_runtime != runtime {
-            return Resp::err(format!(
-                "worker {} cannot change runtime from {} to {}",
-                worker_id, existing_runtime, runtime
-            ));
-        }
-        let refreshed_pane = pane.clone().or_else(|| existing.pane.clone());
+        // Transport is a server-selected capability, not a permanent worker
+        // identity. The server may move the same token-bound identity from
+        // tmux to App Server (or back) when the current candidates and
+        // self-checks prove the new route.
         drop(st);
         let mut resp = register_typed(
             server,
             &worker_id,
             &token,
-            refreshed_pane.as_deref(),
+            &selected,
             &cwd,
             existing_project_scope,
             app_scope,
@@ -2982,14 +3323,7 @@ pub(crate) fn handle_register_with_app_scope(
     }
     drop(st);
     register_typed(
-        server,
-        &worker_id,
-        &token,
-        pane.as_deref(),
-        &cwd,
-        None,
-        app_scope,
-        false,
+        server, &worker_id, &token, &selected, &cwd, None, app_scope, false,
     )
 }
 
@@ -3004,7 +3338,7 @@ pub(crate) fn handle_register(
     pane: Option<String>,
     cwd: String,
 ) -> Resp {
-    handle_register_with_app_scope(server, worker_id, token, pane, cwd, None)
+    handle_register_with_app_scope(server, worker_id, token, pane, cwd, None, None)
 }
 
 fn existing_route_scope(state: &State, worker_id: &str) -> Result<Option<RouteScope>, Resp> {
@@ -3069,16 +3403,39 @@ fn role_brief(state: &State, worker_id: &str) -> serde_json::Value {
 }
 
 fn worker_identity_presence(server: &Server, worker: &WorkerRec) -> PanePresence {
-    let Some(pane) = worker.pane.as_deref() else {
+    let Some(transport) = selected_transport_for_worker(worker) else {
         return PanePresence::Missing;
     };
-    match (server.pane_alive_check)(pane) {
-        PanePresence::Present => match (server.pane_owner_check)(&worker.id, pane) {
-            Ok(true) => PanePresence::Present,
-            Ok(false) => PanePresence::Missing,
-            Err(()) => PanePresence::Unknown,
-        },
-        presence => presence,
+    match transport.kind {
+        TransportKind::AppServer => {
+            let (Some(endpoint), Some(namespace), Some(thread_id)) =
+                (transport.endpoint, transport.namespace, transport.thread_id)
+            else {
+                return PanePresence::Missing;
+            };
+            let candidate = crate::proto::AppServerCandidate {
+                endpoint,
+                namespace,
+                thread_id,
+            };
+            match (server.appserver_candidate_check)(&candidate) {
+                Ok(_) => PanePresence::Present,
+                Err(_) => PanePresence::Missing,
+            }
+        }
+        TransportKind::Tmux => {
+            let Some(pane) = transport.pane.as_deref() else {
+                return PanePresence::Missing;
+            };
+            match (server.pane_alive_check)(pane) {
+                PanePresence::Present => match (server.pane_owner_check)(&worker.id, pane) {
+                    Ok(true) => PanePresence::Present,
+                    Ok(false) => PanePresence::Missing,
+                    Err(()) => PanePresence::Unknown,
+                },
+                presence => presence,
+            }
+        }
     }
 }
 
@@ -4490,11 +4847,10 @@ fn handle_cross_project_send(
     let Some(recipient) = st.workers.get(&to) else {
         return Resp::err(format!("recipient {} not registered", to));
     };
-    if recipient.pane.as_deref().is_none_or(|pane| {
-        (server.pane_alive_check)(pane) != PanePresence::Present
-            || (server.pane_owner_check)(&to, pane) != Ok(true)
-    }) {
-        return Resp::err("cross-project communication requires a live target tmux identity");
+    if worker_identity_presence(server, recipient) != PanePresence::Present {
+        return Resp::err(
+            "cross-project communication requires a live target identity on its server-selected transport",
+        );
     }
     if subject.trim().is_empty() {
         return Resp::err("MESSAGE_SUBJECT_REQUIRED: cross-project send requires --subject");
@@ -6233,6 +6589,7 @@ fn validate_wire_runtime_binding(
             worker_id,
             token,
             pane,
+            candidates,
             ..
         } = req
         {
@@ -6245,6 +6602,7 @@ fn validate_wire_runtime_binding(
                     worker_id,
                     token,
                     pane,
+                    candidates,
                 );
             }
         }
@@ -6269,6 +6627,7 @@ fn validate_cli_register_rebind(
     worker_id: &str,
     token: &str,
     pane: &Option<String>,
+    candidates: &Option<TransportCandidates>,
 ) -> Result<(), String> {
     let route_scope = RouteScope {
         app_scope_id: project_context.app_scope_id.clone(),
@@ -6328,21 +6687,32 @@ fn validate_cli_register_rebind(
             .map_err(|error| format!("RUNTIME_BINDING_REJECTED: {error}"))?;
     }
 
-    let Some(pane) = pane.as_deref() else {
-        return Err("RUNTIME_BINDING_REJECTED: CLI rebind requires a live tmux pane".into());
-    };
-    if runtime_for_pane(Some(pane)).is_none() {
-        return Err("RUNTIME_BINDING_REJECTED: CLI rebind requires a live tmux pane".into());
+    if let Some(pane) = pane.as_deref() {
+        if runtime_for_pane(Some(pane)).is_none() {
+            return Err("RUNTIME_BINDING_REJECTED: CLI rebind requires a live tmux pane".into());
+        }
+        return match (server.pane_owner_check)(worker_id, pane) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "RUNTIME_BINDING_REJECTED: pane {pane} is not owned by worker {worker_id}"
+            )),
+            Err(()) => Err(format!(
+                "RUNTIME_BINDING_REJECTED: pane ownership for {pane} is unknown"
+            )),
+        };
     }
-    match (server.pane_owner_check)(worker_id, pane) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(format!(
-            "RUNTIME_BINDING_REJECTED: pane {pane} is not owned by worker {worker_id}"
-        )),
-        Err(()) => Err(format!(
-            "RUNTIME_BINDING_REJECTED: pane ownership for {pane} is unknown"
-        )),
+    if candidates.as_ref().is_some_and(|candidates| {
+        candidates
+            .appserver
+            .as_ref()
+            .is_some_and(|candidate| !candidate.endpoint.is_empty())
+    }) {
+        return Ok(());
     }
+    Err(
+        "RUNTIME_BINDING_REJECTED: CLI rebind requires a live tmux pane or App Server candidate"
+            .into(),
+    )
 }
 
 fn project_route_actor(
@@ -6458,7 +6828,10 @@ fn dispatch_with_route_context(
             token,
             pane,
             cwd,
-        } => handle_register_with_app_scope(server, worker_id, token, pane, cwd, app_scope),
+            candidates,
+        } => handle_register_with_app_scope(
+            server, worker_id, token, pane, cwd, app_scope, candidates,
+        ),
         Req::Send {
             from,
             worker_id,
@@ -6527,7 +6900,8 @@ fn dispatch_with_route_context(
             }
         }
         Req::NotificationMethods => Resp::data(json!({
-            "methods": ["tmux"],
+            "methods": ["appserver", "tmux"],
+            "priority": ["appserver", "tmux"],
             "events": NOTIFICATION_EVENTS,
             "one_shot": false,
             "max_lifetime_attempts": MAX_WAKE_ATTEMPTS,
@@ -7389,6 +7763,7 @@ fn validate_register_cwd(cwd: &str, expected_root: &Path) -> Result<(), String> 
 mod host_route_registry_tests {
     use super::*;
     use crate::identity::RuntimeIdentity;
+    use crate::proto::AppServerCandidate;
 
     static TEST_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -7412,9 +7787,46 @@ mod host_route_registry_tests {
             pane_alive_check: |_| PanePresence::Present,
             pane_owner_check: |_, _| Ok(true),
             pane_state_check: |_| crate::server::knock::AgentState::Working,
+            appserver_candidate_check: default_appserver_candidate_check(),
+            appserver_notification_sink: default_appserver_notification_sink(),
             mailbox_notify: Notify::new(),
         });
         (server, root, journal_path)
+    }
+
+    fn with_appserver_check(
+        server: &mut Arc<Server>,
+        check: impl Fn(&AppServerCandidate) -> Result<SelectedTransport, String> + Send + Sync + 'static,
+    ) {
+        let server = Arc::get_mut(server).expect("unique test server");
+        server.appserver_candidate_check = Arc::new(check);
+    }
+
+    fn with_appserver_notification_sink(
+        server: &mut Arc<Server>,
+        sink: impl Fn(&SelectedTransport, &str, &str) -> Result<serde_json::Value, String>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        let server = Arc::get_mut(server).expect("unique test server");
+        server.appserver_notification_sink = Arc::new(sink);
+    }
+
+    fn verified_appserver(candidate: &AppServerCandidate) -> SelectedTransport {
+        SelectedTransport {
+            kind: TransportKind::AppServer,
+            endpoint: Some(candidate.endpoint.clone()),
+            namespace: Some(candidate.namespace.clone()),
+            thread_id: Some(candidate.thread_id.clone()),
+            pane: None,
+            capabilities: vec![
+                "session_status".into(),
+                "read_thread".into(),
+                "send_message".into(),
+            ],
+            self_check: "server verified App Server candidate".into(),
+        }
     }
 
     fn context_with_app(root: &Path, app_scope: &str) -> ProjectContext {
@@ -7476,6 +7888,265 @@ mod host_route_registry_tests {
             repeat_count: 1,
             ttl_seconds: 60,
         }
+    }
+
+    #[test]
+    fn server_selects_appserver_before_tmux_when_both_candidates_are_valid() {
+        let (mut server, root, _) = test_server();
+        with_appserver_check(&mut server, |candidate| Ok(verified_appserver(candidate)));
+        let appserver = AppServerCandidate {
+            endpoint: "unix:///tmp/collab-test-appserver.sock".into(),
+            namespace: "codex_tui".into(),
+            thread_id: "thread-1".into(),
+        };
+        let selected = validate_transport_candidates(
+            &server,
+            "worker-1",
+            &TransportCandidates {
+                appserver: Some(appserver),
+                tmux: Some(TmuxCandidate {
+                    pane: "%worker-1".into(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.kind, TransportKind::AppServer);
+        assert_eq!(selected.thread_id.as_deref(), Some("thread-1"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tmux_is_selected_only_after_appserver_self_check_fails() {
+        let (mut server, root, _) = test_server();
+        with_appserver_check(&mut server, |_| {
+            Err("server self-check rejected App Server candidate".into())
+        });
+        let selected = validate_transport_candidates(
+            &server,
+            "worker-1",
+            &TransportCandidates {
+                appserver: Some(AppServerCandidate {
+                    endpoint: "unix:///tmp/collab-missing-appserver.sock".into(),
+                    namespace: "codex_tui".into(),
+                    thread_id: "thread-1".into(),
+                }),
+                tmux: Some(TmuxCandidate {
+                    pane: "%worker-1".into(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.kind, TransportKind::Tmux);
+        assert_eq!(selected.pane.as_deref(), Some("%worker-1"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn registration_fails_when_no_server_verified_candidate_exists() {
+        let (mut server, root, _) = test_server();
+        with_appserver_check(&mut server, |_| {
+            Err("server self-check rejected App Server candidate".into())
+        });
+        let error = validate_transport_candidates(
+            &server,
+            "worker-1",
+            &TransportCandidates {
+                appserver: None,
+                tmux: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.starts_with("TRANSPORT_NONE:"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn registration_allows_server_to_reselect_an_existing_identity_transport() {
+        let (mut server, root, _) = test_server();
+        let app_scope = AppServerId::new("app-a").unwrap();
+        let first = handle_register_with_app_scope(
+            &server,
+            "worker-1".into(),
+            "token-1".into(),
+            Some("%worker-1".into()),
+            root.display().to_string(),
+            Some(app_scope.clone()),
+            None,
+        );
+        assert!(first.ok, "{first:?}");
+        assert_eq!(first.data["transport_selected"]["kind"], "tmux");
+
+        with_appserver_check(&mut server, |candidate| Ok(verified_appserver(candidate)));
+        let second = handle_register_with_app_scope(
+            &server,
+            "worker-1".into(),
+            "token-1".into(),
+            Some("%worker-1".into()),
+            root.display().to_string(),
+            Some(app_scope),
+            Some(TransportCandidates {
+                appserver: Some(AppServerCandidate {
+                    endpoint: "unix:///tmp/collab-test-appserver.sock".into(),
+                    namespace: "codex_tui".into(),
+                    thread_id: "thread-1".into(),
+                }),
+                tmux: Some(TmuxCandidate {
+                    pane: "%worker-1".into(),
+                }),
+            }),
+        );
+        assert!(second.ok, "{second:?}");
+        assert_eq!(second.data["transport_selected"]["kind"], "appserver");
+        let worker = server.state.lock().unwrap().workers["worker-1"].clone();
+        assert_eq!(
+            worker.transport.as_ref().map(|transport| &transport.kind),
+            Some(&TransportKind::AppServer)
+        );
+        assert_eq!(worker.pane, None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn appserver_notification_queue_acceptance_stays_pending_and_unread() {
+        let (mut server, root, _) = test_server();
+        with_appserver_check(&mut server, |candidate| Ok(verified_appserver(candidate)));
+        let sink_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink_called_for_server = sink_called.clone();
+        with_appserver_notification_sink(&mut server, move |_, _, _| {
+            sink_called_for_server.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(serde_json::json!({"accepted": true}))
+        });
+        let app_scope = AppServerId::new("app-a").unwrap();
+        let registered = handle_register_with_app_scope(
+            &server,
+            "worker-1".into(),
+            "token-1".into(),
+            None,
+            root.display().to_string(),
+            Some(app_scope),
+            Some(TransportCandidates {
+                appserver: Some(AppServerCandidate {
+                    endpoint: "unix:///tmp/collab-test-appserver.sock".into(),
+                    namespace: "codex_tui".into(),
+                    thread_id: "thread-1".into(),
+                }),
+                tmux: None,
+            }),
+        );
+        assert!(registered.ok, "{registered:?}");
+        let subscribed = handle_notification_subscribe(
+            &server,
+            "worker-1".into(),
+            "token-1".into(),
+            "direct-message".into(),
+            None,
+            None,
+            Vec::new(),
+            None,
+            1,
+            60,
+        );
+        assert!(subscribed.ok, "{subscribed:?}");
+        let subscription_id = subscribed.data["subscription"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let message_id = gen_msg_id();
+        server.commit(&[
+            Event::Sent {
+                msg: Message {
+                    id: message_id.clone(),
+                    from: "sender".into(),
+                    to: "worker-1".into(),
+                    mtype: "notify".into(),
+                    subject: Some("queue-only".into()),
+                    body: "must remain pending after queue acceptance".into(),
+                    in_reply_to: None,
+                    created_ms: now_ms(),
+                    state: "pending".into(),
+                    wake_attempt_count: 0,
+                    last_wake_attempt_ms: 0,
+                },
+            },
+            Event::WakeBound {
+                message_id: message_id.clone(),
+                subscription_id: subscription_id.clone(),
+            },
+            Event::DeliveryMode {
+                msg_id: message_id.clone(),
+                mode: "explicit-notification".into(),
+            },
+        ]);
+
+        let selected = {
+            let state = server.state.lock().unwrap();
+            state.workers["worker-1"].transport.clone().unwrap()
+        };
+        let attempted = attempt_appserver_notification_with_at(
+            &server,
+            &message_id,
+            &subscription_id,
+            "worker-1",
+            &selected,
+            0,
+            true,
+            now_ms(),
+        );
+        assert!(
+            attempted,
+            "the server-selected endpoint accepted the queue write"
+        );
+        assert!(
+            sink_called.load(std::sync::atomic::Ordering::Relaxed),
+            "the App Server notification sink must be exercised"
+        );
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.msgs[&message_id].state, "pending");
+        assert_eq!(
+            state.msgs[&message_id].wake_attempt_count, 1,
+            "queue acceptance records one wake attempt"
+        );
+        assert_ne!(state.msgs[&message_id].state, "delivered");
+        assert_ne!(state.msgs[&message_id].state, "read");
+        assert!(state
+            .inbox_of("worker-1")
+            .iter()
+            .any(|m| m.id == message_id));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn appserver_subscription_is_bound_to_the_selected_thread() {
+        let transport = SelectedTransport {
+            kind: TransportKind::AppServer,
+            endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
+            namespace: Some("codex_tui".into()),
+            thread_id: Some("thread-current".into()),
+            pane: None,
+            capabilities: vec!["send_message".into()],
+            self_check: "server verified".into(),
+        };
+        let mut subscription = NotificationSubscription {
+            id: "subscription-1".into(),
+            worker_id: "worker-1".into(),
+            pane: "thread-stale".into(),
+            method: "appserver".into(),
+            event: "direct-message".into(),
+            subject: None,
+            trigger_ms: None,
+            trigger_times_ms: Vec::new(),
+            interval_ms: None,
+            repeat_count: 1,
+            fired_count: 0,
+            status: "armed".into(),
+            status_reason: None,
+            created_ms: 0,
+            updated_ms: 0,
+            expires_ms: i64::MAX,
+        };
+        assert!(!subscription_matches_transport(&subscription, &transport));
+        subscription.pane = "thread-current".into();
+        assert!(subscription_matches_transport(&subscription, &transport));
     }
 
     type MutationSnapshot = (
@@ -7721,6 +8392,7 @@ mod host_route_registry_tests {
                 token: "token-target-master".into(),
                 pane: Some("%target-master".into()),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -7870,6 +8542,7 @@ mod host_route_registry_tests {
                 Some("%resident".into()),
                 root.display().to_string(),
                 Some(AppServerId::new("app-a").unwrap()),
+                None,
             )
             .ok
         );
@@ -7910,6 +8583,7 @@ mod host_route_registry_tests {
                 token: "token-wire-worker".into(),
                 pane: Some("%wire-worker".into()),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -7947,6 +8621,7 @@ mod host_route_registry_tests {
                 token: "token-wire-worker".into(),
                 pane: Some("%wire-worker".into()),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -7985,12 +8660,14 @@ mod host_route_registry_tests {
             token: "token-worker-a".into(),
             pane: Some("%worker-a".into()),
             cwd: root.display().to_string(),
+            candidates: None,
         };
         let second_request = Req::Register {
             worker_id: "worker-b".into(),
             token: "token-worker-b".into(),
             pane: Some("%worker-b".into()),
             cwd: root.display().to_string(),
+            candidates: None,
         };
 
         // Both wire requests can pass host admission before either handler
@@ -8002,7 +8679,15 @@ mod host_route_registry_tests {
             .typed_register_envelope_for_scope(
                 "worker-a",
                 "token-worker-a",
-                "%worker-a",
+                &SelectedTransport {
+                    kind: TransportKind::Tmux,
+                    endpoint: None,
+                    namespace: None,
+                    thread_id: None,
+                    pane: Some("%worker-a".into()),
+                    capabilities: vec!["send_message".into()],
+                    self_check: "test tmux".into(),
+                },
                 project_scope.clone(),
                 &root.display().to_string(),
                 AppServerId::new("app-a").unwrap(),
@@ -8029,7 +8714,15 @@ mod host_route_registry_tests {
             .typed_register_envelope_for_scope(
                 "worker-b",
                 "token-worker-b",
-                "%worker-b",
+                &SelectedTransport {
+                    kind: TransportKind::Tmux,
+                    endpoint: None,
+                    namespace: None,
+                    thread_id: None,
+                    pane: Some("%worker-b".into()),
+                    capabilities: vec!["send_message".into()],
+                    self_check: "test tmux".into(),
+                },
                 project_scope.clone(),
                 &root.display().to_string(),
                 AppServerId::new("app-b").unwrap(),
@@ -8068,6 +8761,7 @@ mod host_route_registry_tests {
                 token: "token-parent".into(),
                 pane: Some("%parent".into()),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8080,6 +8774,7 @@ mod host_route_registry_tests {
             Some("%child".into()),
             root.display().to_string(),
             Some(app.clone()),
+            None,
         );
         assert!(child.ok, "{child:?}");
 
@@ -8143,6 +8838,7 @@ mod host_route_registry_tests {
                 token: token.into(),
                 pane: Some(format!("%{worker_id}")),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8236,6 +8932,7 @@ mod host_route_registry_tests {
                     token: token.clone(),
                     pane: Some("%route-worker".into()),
                     cwd: root.display().to_string(),
+                    candidates: None,
                 },
             )
             .await;
@@ -8455,6 +9152,7 @@ mod host_route_registry_tests {
                     token: format!("token-{worker_id}"),
                     pane: Some(format!("%{worker_id}")),
                     cwd: root.display().to_string(),
+                    candidates: None,
                 },
             )
             .await;
@@ -8555,6 +9253,7 @@ mod host_route_registry_tests {
                 token: token.into(),
                 pane: Some(format!("%{worker_id}")),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8576,6 +9275,7 @@ mod host_route_registry_tests {
                 token: token.into(),
                 pane: Some(format!("%{worker_id}-recovered")),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8636,6 +9336,7 @@ mod host_route_registry_tests {
                 token: token.into(),
                 pane: Some(format!("%{worker_id}")),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8654,6 +9355,7 @@ mod host_route_registry_tests {
                 token: "forged-token".into(),
                 pane: Some(format!("%{worker_id}")),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8676,6 +9378,7 @@ mod host_route_registry_tests {
                 token: token.into(),
                 pane: Some("%another-worker".into()),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8707,6 +9410,7 @@ mod host_route_registry_tests {
                 token: token.into(),
                 pane: Some(format!("%{worker_id}-wrong-route")),
                 cwd: wrong_root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8739,6 +9443,7 @@ mod host_route_registry_tests {
                 token: "token-forged-worker".into(),
                 pane: Some(format!("%{worker_id}")),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8746,7 +9451,7 @@ mod host_route_registry_tests {
         assert!(forged
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("cannot bind pane")));
+            .is_some_and(|error| error.starts_with("TRANSPORT_TMUX_OWNERSHIP_REJECTED:")));
         assert_eq!(mutation_snapshot(&server), before);
         assert_eq!(std::fs::read(&journal_path).unwrap(), before_journal);
         assert_eq!(
@@ -8773,6 +9478,7 @@ mod host_route_registry_tests {
                 token: token.into(),
                 pane: Some(format!("%{worker_id}")),
                 cwd: root.display().to_string(),
+                candidates: None,
             },
         )
         .await;
@@ -8802,6 +9508,7 @@ mod host_route_registry_tests {
                     token: token.into(),
                     pane: Some(format!("%{worker_id}-recovered")),
                     cwd: rebind_root.display().to_string(),
+                    candidates: None,
                 },
             )
             .await;
@@ -9200,6 +9907,18 @@ fn acquire_legacy_writer_lock(
     Err(error.into())
 }
 
+fn legacy_host_daemon_lock_path(host_paths: &HostPaths) -> PathBuf {
+    #[cfg(test)]
+    {
+        return host_paths.state_root().join("legacy-host.lock");
+    }
+    #[cfg(not(test))]
+    {
+        let _ = host_paths;
+        PathBuf::from(LEGACY_HOST_DAEMON_LOCK_PATH)
+    }
+}
+
 fn probe_legacy_socket(socket_path: &Path) -> anyhow::Result<bool> {
     match crate::client::connect(socket_path) {
         Ok(stream) => {
@@ -9250,10 +9969,13 @@ fn acquire_legacy_writer_fence(
     scope: &Scope,
     host_paths: &HostPaths,
 ) -> anyhow::Result<LegacyWriterFence> {
-    let legacy_host_lock = Path::new(LEGACY_HOST_DAEMON_LOCK_PATH);
+    let legacy_host_lock = legacy_host_daemon_lock_path(host_paths);
     let project_server_dir = scope.server_dir();
     let host_lock = if legacy_host_lock != host_paths.lock_path() {
-        Some(acquire_legacy_writer_lock(legacy_host_lock, "host daemon")?)
+        Some(acquire_legacy_writer_lock(
+            &legacy_host_lock,
+            "host daemon",
+        )?)
     } else {
         None
     };
@@ -9377,6 +10099,8 @@ async fn run_with_host_paths(scope: Scope, host_paths: HostPaths) -> anyhow::Res
         pane_alive_check: pane_presence,
         pane_owner_check: pane_owner_authoritative,
         pane_state_check: knock::probe_agent_state,
+        appserver_candidate_check: default_appserver_candidate_check(),
+        appserver_notification_sink: default_appserver_notification_sink(),
         mailbox_notify: Notify::new(),
     });
     restore_registered_peer_default_leases(&server);
@@ -9460,6 +10184,8 @@ mod reducer_binding_tests {
             pane_alive_check: |_| PanePresence::Present,
             pane_owner_check: |_, _| Ok(true),
             pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            appserver_candidate_check: default_appserver_candidate_check(),
+            appserver_notification_sink: default_appserver_notification_sink(),
             mailbox_notify: Notify::new(),
         };
         let repeated_events = (0..99)
@@ -9554,6 +10280,8 @@ mod reducer_binding_tests {
             pane_alive_check: |_| PanePresence::Present,
             pane_owner_check: |_, _| Ok(true),
             pane_state_check: |_| crate::server::knock::AgentState::Waiting,
+            appserver_candidate_check: default_appserver_candidate_check(),
+            appserver_notification_sink: default_appserver_notification_sink(),
             mailbox_notify: tokio::sync::Notify::new(),
         };
         peer_tests::register(&server, "worker", "%worker");
@@ -9874,7 +10602,7 @@ mod startup_tests {
         let root = test_root("legacy-fence");
         let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
         host_paths.ensure_root().unwrap();
-        let legacy_host_lock = Path::new(LEGACY_HOST_DAEMON_LOCK_PATH);
+        let legacy_host_lock = legacy_host_daemon_lock_path(&host_paths);
         let socket = host_paths.socket_path();
         let running = tokio::spawn(run_with_host_paths(
             Scope { root: root.clone() },
@@ -9896,7 +10624,7 @@ mod startup_tests {
         let journal_before =
             std::fs::read(&journal).expect("host daemon must open project journal");
 
-        let old_host_attempt = acquire_daemon_lock(legacy_host_lock, &legacy_socket);
+        let old_host_attempt = acquire_daemon_lock(&legacy_host_lock, &legacy_socket);
         assert!(old_host_attempt
             .expect_err("old writer must not reacquire its host lock")
             .to_string()
@@ -10220,7 +10948,7 @@ mod scheduler_admission_tests {
                     token: token.into(),
                     command: crate::subagent::Action::Start {
                         id: Some(id.into()),
-                        runtime: Some("cursor".into()),
+                        runtime: Some("codex".into()),
                     },
                     launch_env: Default::default(),
                 },
@@ -10239,7 +10967,7 @@ mod scheduler_admission_tests {
             "token-master",
             crate::subagent::Action::Start {
                 id: Some("direct-child".into()),
-                runtime: Some("cursor".into()),
+                runtime: Some("codex".into()),
             },
             Default::default(),
         );
@@ -10312,7 +11040,7 @@ mod scheduler_admission_tests {
                 last_message: None,
                 error: None,
                 probe_failures: Vec::new(),
-                runtime: Some("cursor".into()),
+                runtime: Some("codex".into()),
             },
         }]);
         assert!(registered_idle_peer_for_admission(&server, "master").is_none());
@@ -10351,7 +11079,7 @@ mod scheduler_admission_tests {
                     last_message: None,
                     error: None,
                     probe_failures: Vec::new(),
-                    runtime: Some("cursor".into()),
+                    runtime: Some("codex".into()),
                 },
             },
         ]);
@@ -10363,7 +11091,7 @@ mod scheduler_admission_tests {
                 token: "token-master".into(),
                 command: crate::subagent::Action::Start {
                     id: Some("new-child".into()),
-                    runtime: Some("cursor".into()),
+                    runtime: Some("codex".into()),
                 },
                 launch_env: Default::default(),
             },
@@ -10394,7 +11122,7 @@ mod scheduler_admission_tests {
             "token-master",
             crate::subagent::Action::Start {
                 id: Some("invalid id".into()),
-                runtime: Some("cursor".into()),
+                runtime: Some("codex".into()),
             },
             Default::default(),
         );
@@ -10414,7 +11142,7 @@ mod scheduler_admission_tests {
         assert!(invalid_runtime
             .error
             .unwrap()
-            .contains("runtime must be cursor or codex"));
+            .contains("runtime must be codex"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -10466,7 +11194,7 @@ mod scheduler_admission_tests {
                 token: "token-master".into(),
                 command: crate::subagent::Action::Start {
                     id: Some("audit-failure-child".into()),
-                    runtime: Some("cursor".into()),
+                    runtime: Some("codex".into()),
                 },
                 launch_env: Default::default(),
             },
@@ -10495,7 +11223,7 @@ mod scheduler_admission_tests {
             "master",
             "token-master",
             Some("new-child"),
-            Some("cursor"),
+            Some("codex"),
         )
         .unwrap();
         assert!(decision.is_none());
@@ -10655,7 +11383,7 @@ mod scheduler_admission_tests {
                     last_message: None,
                     error: None,
                     probe_failures: Vec::new(),
-                    runtime: Some("cursor".into()),
+                    runtime: Some("codex".into()),
                 },
             },
         ]);
@@ -10788,7 +11516,7 @@ mod scheduler_admission_tests {
                     last_message: None,
                     error: None,
                     probe_failures: Vec::new(),
-                    runtime: Some("cursor".into()),
+                    runtime: Some("codex".into()),
                 },
             },
         ]);

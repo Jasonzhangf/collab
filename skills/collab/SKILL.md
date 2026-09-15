@@ -12,8 +12,8 @@ description: >
   reset bindings, or start a second daemon; use explicit down/up or migration
   only; (4) regression recognition: distinguish durable send, tmux delivery,
   agent response, ACK/consume, task close, and cleanup evidence. Ordinary peer
-  notices use one direct command with no discovery or retry step. Codex/Cursor
-  root is not Collab master.
+  notices use one direct command with no discovery or retry step. Codex root
+  is not Collab master.
 ---
 
 # Collab
@@ -170,9 +170,8 @@ With a matching live subscription, the first pending message opens a fixed
 batched delivery globally or per project; `appsdk config` shows effective
 policy. All eligible unsent messages for that recipient are combined
 into one single-line tmux write and one Enter (up to 3 previews per knock, with
-overflow retained in the inbox). Cursor gets literal keys, a 250ms settle, then
-`C-m` in a second tmux process. Codex keeps `paste-buffer -p` and `C-m` in the
-same tmux queue. Daemon-generated notifications require a safe waiting/idle
+overflow retained in the inbox). Codex keeps `paste-buffer -p` and `C-m` in
+the same tmux queue. Daemon-generated notifications require a safe waiting/idle
 agent; actively working panes defer them without burning attempts so in-flight
 tasks are not polluted. Explicit `collab sendmessage` is immediate and follows
 the explicit-message adapter gate, including while the recipient is working.
@@ -192,9 +191,8 @@ status. Never call `tmux send-keys` directly.
 ## Common command card
 
 For user-requested persistent subagents, run `appsdk subagent start --id <id>`.
-That starts Cursor CLI with `--model auto`. Override with `--runtime cursor|codex`.
-Do not look up `agent --help` or start Codex unless config/`--runtime` is `codex`.
-Cursor health is `agent status --format json`, not snapshot. Then `status`,
+That starts Codex with the configured profile. `--runtime codex` is accepted
+for compatibility. Then `status`,
 `send <id> --subject <topic> "<task>"`, and explicit `close <id>`.
 `collab-mcp` is the shared Collab MCP for every agent. Use `collab_*`
 tools when this session lists them. The `collab` CLI is also valid.
@@ -311,7 +309,7 @@ Escalation routing is explicit:
   master. If a live master already exists, do not promote; only that master
   may `collab master delegate <peer>`. `appsdk init` alone never proves master
   ownership; a missing or dead master pane means there is no live master, not
-  permission to invent one. Codex/Cursor root is not Collab master.
+  permission to invent one. Codex root is not Collab master.
 - If a blocker or wait cannot be executed locally after a real solution is
   found, report that solution to the live master immediately instead of
   silently waiting. Keep the durable wait/task state, continue any
@@ -353,7 +351,7 @@ worker's blocker. Concretely:
 
 The human remains the only final authority for goals, money, irreversible
 risk, and version promotion. Collab master is the user-approved project
-dispatcher, not the human 主脑 and not Codex/Cursor root. Master compiles
+dispatcher, not the human 主脑 and not Codex root. Master compiles
 the goal into a task graph, then assigns; it does not take another peer's
 task or worktree.
 
@@ -421,7 +419,7 @@ or restarting panes—closing the loop deterministically.
 Master keeps architecture, dispatch, integration, critical repair, and
 final acceptance. Bulk implementation does not stay on the master's own
 chain. Start a managed subagent with `appsdk subagent start --id <id>`
-(optional `--runtime cursor|codex`), then `send <id> --subject <topic>
+(optional `--runtime codex`), then `send <id> --subject <topic>
 "<assignment>"`, or `collab sendmessage --to <peer>`. Give each child its
 own worktree and file scope. Subagents must obey master and parent;
 independent peers may decline an invite to protect their current task.
@@ -518,8 +516,8 @@ register it.
   and child commands inherit the same environment.
 - Identities are equal peers by default. There is no implicit master from
   first registration, automatic process recovery, or inferred `/goal`. Collab
-  master is explicit, user-approved project arbitration; it is not Codex or
-  Cursor root, and it does not take ownership of another peer's task. If a
+  master is explicit, user-approved project arbitration; it is not Codex root,
+  and it does not take ownership of another peer's task. If a
   live registered master exists, other peers cannot promote and only that
   master may delegate. If no live master exists, a peer may promote itself
   only with explicit user approval and a live pane. Independent peers may
