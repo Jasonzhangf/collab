@@ -6163,6 +6163,31 @@ fn worker_status_query_exposes_appserver_liveness_without_tmux() {
 }
 
 #[test]
+fn worker_status_query_reports_unverified_appserver_as_lost() {
+    let (mut server, root) = test_server();
+    assert!(
+        register_appserver(&mut server, "lost-appserver", "thread-lost-appserver").ok,
+        "appserver registration failed"
+    );
+    server.appserver_candidate_check =
+        Arc::new(|_| Err("test appserver verification failure".into()));
+    let resp = dispatch(&Arc::new(server), Req::WorkerStatus { worker_id: None });
+    assert!(resp.ok);
+    let workers = resp.data["workers"].as_array().unwrap();
+    assert_eq!(workers.len(), 1);
+    let w = &workers[0];
+    assert_eq!(w["transport"]["kind"], "appserver");
+    assert_eq!(w["endpoint_live"], false);
+    assert_eq!(w["agent_state"], "absent");
+    assert_eq!(w["status"], "lost");
+    assert_eq!(
+        w["diagnostic"],
+        "registered transport is not live; verify App Server route or tmux pane"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn bulk_ack_with_empty_ids_acknowledges_all_inbox_messages() {
     let (server, root) = test_server();
     register(&server, "sender-worker", "%test-sender-worker");

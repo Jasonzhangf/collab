@@ -7439,7 +7439,7 @@ fn worker_status_summary_with_maps(
         let identity_valid = endpoint_live;
         // App Server verification proves the native route and queue methods,
         // not the agent's current execution state.
-        let agent_state = "unknown";
+        let agent_state = if endpoint_live { "unknown" } else { "absent" };
         (ownership, identity_valid, agent_state)
     } else {
         let pane = w.pane.as_deref();
