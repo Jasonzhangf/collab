@@ -313,24 +313,38 @@ fn inherited_cwd_if_initialized(cwd: PathBuf) -> anyhow::Result<PathBuf> {
 pub fn project_root() -> anyhow::Result<PathBuf> {
     let pane = std::env::var("TMUX_PANE").ok();
     let cwd = std::env::current_dir()?;
-    match project_root_from(pane.as_deref(), cwd.clone(), |pane| {
-        let output = Command::new("tmux")
-            .args(["display-message", "-p", "-t", pane, "#{pane_current_path}"])
-            .output()?;
-        if !output.status.success() {
-            anyhow::bail!("cannot resolve project root for tmux pane {pane}");
-        }
-        let path = String::from_utf8(output.stdout)?;
-        let path = path.trim();
-        if path.is_empty() {
-            anyhow::bail!("tmux pane {pane} returned an empty project root");
-        }
-        Ok(PathBuf::from(path))
-    }) {
+    match project_root_from(pane.as_deref(), cwd.clone(), |pane| tmux_pane_cwd(pane)) {
         Ok(root) => Ok(root),
         Err(_) if pane.is_some() => inherited_cwd_if_initialized(cwd),
         Err(error) => Err(error),
     }
+}
+
+/// Resolve the exact destination for `collab init`. Initialization binds to
+/// the process cwd and never consults tmux: App Server is the preferred
+/// channel, and tmux is only an optional capability candidate discovered
+/// later during registration.
+pub fn project_root_for_init() -> anyhow::Result<PathBuf> {
+    init_project_root(std::env::current_dir()?)
+}
+
+fn init_project_root(cwd: PathBuf) -> anyhow::Result<PathBuf> {
+    validate_project_root(cwd)
+}
+
+fn tmux_pane_cwd(pane: &str) -> anyhow::Result<PathBuf> {
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "-t", pane, "#{pane_current_path}"])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("cannot resolve project root for tmux pane {pane}");
+    }
+    let path = String::from_utf8(output.stdout)?;
+    let path = path.trim();
+    if path.is_empty() {
+        anyhow::bail!("tmux pane {pane} returned an empty project root");
+    }
+    Ok(PathBuf::from(path))
 }
 
 pub fn init(root: &Path) -> std::io::Result<PathBuf> {
@@ -717,6 +731,22 @@ mod tests {
         let resolved = project_root_from(None, cwd.clone(), |_| unreachable!()).unwrap();
         assert_eq!(resolved, cwd);
         std::fs::remove_dir_all(resolved).ok();
+    }
+
+    #[test]
+    fn init_scope_uses_unmarked_process_cwd() {
+        let cwd = test_root("init-unmarked-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let resolved = init_project_root(cwd.clone()).unwrap();
+        assert_eq!(resolved, cwd);
+        assert!(!resolved.join(".agent-collab").exists());
+        std::fs::remove_dir_all(resolved).ok();
+    }
+
+    #[test]
+    fn init_scope_rejects_a_missing_process_cwd() {
+        let missing = test_root("init-missing-cwd");
+        assert!(init_project_root(missing).is_err());
     }
 
     #[test]

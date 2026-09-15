@@ -557,7 +557,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Init => {
-            let project_root = scope::project_root()?;
+            let project_root = scope::project_root_for_init()?;
             if project_root.ancestors().skip(1).any(|ancestor| {
                 ancestor
                     .file_name()
@@ -571,7 +571,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let scope = Scope { root: project_root };
             let started = !client::alive(&scope.sock_path());
             client::ensure_server(&scope.sock_path())?;
-            let mut ident = identity::load_or_create(&scope, None, None)?;
+            let appserver_available = client::adapters::candidate_from_env()
+                .map_err(anyhow::Error::msg)?
+                .is_some();
+            let mut ident = identity::load_or_create_for_init(&scope, appserver_available)?;
             let registration = ensure_registration(&scope, &mut ident)?;
             let task_board: serde_json::Value =
                 call_project(&scope, &ident, &Req::TaskStatus { task_id: None })?;
