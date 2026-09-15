@@ -6157,8 +6157,8 @@ fn worker_status_query_exposes_appserver_liveness_without_tmux() {
     assert_eq!(w["transport"]["thread_id"], "thread-status-appserver");
     assert_eq!(w["endpoint_live"], true);
     assert_eq!(w["identity_valid"], true);
-    assert_eq!(w["agent_state"], "waiting");
-    assert_eq!(w["status"], "waiting");
+    assert_eq!(w["agent_state"], "unknown");
+    assert_eq!(w["status"], "unknown");
     std::fs::remove_dir_all(root).unwrap();
 }
 
