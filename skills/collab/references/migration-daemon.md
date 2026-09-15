@@ -52,7 +52,8 @@ durable task/message reservation for an eligible peer. Collab master is a
 separate explicit user-approved authority
 decision, not Codex root, migration, or daemon recovery. If a live
 master exists, only that master may delegate. If none exists, a peer may
-promote itself after recording user approval and verifying a live pane.
+promote itself after recording user approval and verifying a live registered
+transport.
 Journal `RootAssigned` events become `MasterAssigned` on daemon replay.
 Hidden `collab root ...` commands run the same master protocol. Independent
 peers may decline a master collaboration invite; managed subagents must obey

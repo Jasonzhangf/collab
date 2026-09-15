@@ -5,12 +5,12 @@ description: >
   one-shot event subscriptions, task/worktree ownership, resource waits,
   controlled daemon maintenance, and explicit user-approved master promotion
   when no live master exists. Guidance: (1) recovery: inspect durable status,
-  verify the real live tmux identity, re-register/rebind only the named peer,
+  verify the real live registered route, re-register/rebind only the named peer,
   then send one recovery report request; (2) failure: preserve the exact error,
   keep journal/mailbox truth, do not retry or claim delivery, and escalate with
   root cause and evidence; (3) reset: never delete journal/mailbox, copy tokens,
   reset bindings, or start a second daemon; use explicit down/up or migration
-  only; (4) regression recognition: distinguish durable send, tmux delivery,
+  only; (4) regression recognition: distinguish durable send, transport delivery,
   agent response, ACK/consume, task close, and cleanup evidence. Ordinary peer
   notices use one direct command with no discovery or retry step. Codex root
   is not Collab master.
@@ -18,8 +18,9 @@ description: >
 
 # Collab
 
-Durable truth lives in the project server. tmux carries only a bounded wake
-preview. Production projects use the globally installed Collab v1.
+Durable truth lives in the project server. App Server is the preferred
+transport when available; tmux is optional and carries at most a bounded wake
+preview when selected. Production projects use the globally installed Collab v1.
 
 ## One lifecycle loop
 
@@ -42,8 +43,8 @@ affected project.
 
 ### 1. Recovery
 
-Use recovery only after a daemon restart, pane replacement, identity mismatch,
-or an explicitly reported delivery failure:
+Use recovery only after a daemon restart, transport replacement, identity
+mismatch, or an explicitly reported delivery failure:
 
 ```sh
 collab status --all
@@ -51,11 +52,11 @@ collab worker status <peer>
 collab context
 ```
 
-Verify the recorded pane is live and owned by the same real tmux identity.
-If the pane is stale, use the explicit pane-scoped re-registration/rebind
-path for that peer, then send one registration/report request. Do not inject
-`collab init` into a foreign pane, guess among multiple panes, or replay an
-old message batch. A recovery request is a maintenance action, not a normal
+Verify the recorded App Server thread or tmux pane is live and belongs to the
+same peer. If the selected transport is stale, use the explicit peer-scoped
+re-registration/rebind path, then send one registration/report request. Do not
+inject `collab init` into a foreign pane, guess among multiple panes, or replay
+an old message batch. A recovery request is a maintenance action, not a normal
 notification.
 
 ### 2. Failure
@@ -64,8 +65,8 @@ Treat each claim separately:
 
 ```text
 durable=true -> mailbox journal accepted
-notification=sent -> tmux command path accepted
-pane evidence -> TUI received/submitted the preview
+notification=accepted -> selected transport accepted the preview
+transport evidence -> App Server queued it or the tmux pane received/submitted it
 recv response -> peer consumed the message
 task close receipt -> lifecycle ended
 ```
@@ -95,10 +96,10 @@ operation; it is not a substitute for task close or identity recovery.
 
 After a fix, verify the same user path again and classify the first divergence:
 
-- `send` durable but no tmux preview: inspect subscription, pane liveness,
-  ownership, Agent state, and daemon log.
-- tmux preview appears but no worker result: inspect the pane snapshot and
-  worker state; do not call that a reply.
+- `send` durable but no transport acceptance: inspect the selected transport,
+  subscription, ownership, Agent state, and daemon log.
+- App Server queue acceptance or a tmux preview appears but no worker result:
+  inspect the native thread or pane and worker state; do not call that a reply.
 - `recv` returns messages: the read is consumed atomically; no follow-up ACK is
   required. `msg`, `inbox`, and `context` remain read-only.
 - task remains open: inspect owner identity, master responsibility, cleanup
@@ -169,12 +170,13 @@ With a matching live subscription, the first pending message opens a fixed
 120-second window by default. `~/.appsdk/config.toml` can select immediate or
 batched delivery globally or per project; `appsdk config` shows effective
 policy. All eligible unsent messages for that recipient are combined
-into one single-line tmux write and one Enter (up to 3 previews per knock, with
-overflow retained in the inbox). Codex keeps `paste-buffer -p` and `C-m` in
-the same tmux queue. Daemon-generated notifications require a safe waiting/idle
-agent; actively working panes defer them without burning attempts so in-flight
-tasks are not polluted. Explicit `collab sendmessage` is immediate and follows
-the explicit-message adapter gate, including while the recipient is working.
+into the selected transport's bounded delivery (up to 3 previews per knock,
+with overflow retained in the inbox). App Server uses `thread/queue/add`; a
+tmux-selected peer uses one single-line write and one Enter. Daemon-generated
+notifications require a safe waiting/idle agent; actively working agents defer
+them without burning attempts so in-flight tasks are not polluted. Explicit
+`collab sendmessage` is immediate and follows the explicit-message adapter
+gate, including while the recipient is working.
 If delivered-but-unconsumed notifications reach the throttle threshold (default
 3), further push knocks pause until `collab recv` consumes them, preventing
 terminal pollution and storms. Each batch has one attempt; the default window
@@ -186,7 +188,8 @@ worker-idle notices are auto-merged by the daemon in the 120-second batch
 window; they are not repeated as heartbeat storms.
 
 Do not retry a failed send automatically. Return its exact error and durable
-status. Never call `tmux send-keys` directly.
+status. Never call a transport command directly; the server owns transport
+selection and sends only through the selected adapter.
 
 ## Common command card
 
@@ -240,7 +243,7 @@ long-horizon wake targets and are not automatically woken from idle. A worker
 acts on an explicit dispatch, a bounded direct-message lease, or its own open
 task state;
 it does not need periodic activation to make progress. Unknown/absent produces
-no tmux input. On each `working` -> `idle` transition, a worker sends one
+no transport input. On each `working` -> `idle` transition, a worker sends one
 idempotent worker-idle fact to the live master and then stops; it does not keep
 knocking. Idle, progress, delivery, bug, and worker-idle notices are
 auto-merged; explicit `collab sendmessage` remains immediate. Master idle
@@ -278,8 +281,8 @@ status before accepting the message.
 
 Task liveness is an obligation, not an ACK ceremony. A worker owns its assigned
 tasks and drives them to verified cleanup/close during its working cycle. This
-is a task-bound inspect obligation, not a tmux activation schedule: it does not
-wake idle workers and does not generate worker tmux input. If an actionable
+is a task-bound inspect obligation, not a transport activation schedule: it
+does not wake idle workers and does not generate worker transport input. If an actionable
 task is open, continue it; if it is blocked, find a concrete solution first,
 then report it to the live master in the same activation. Do not leave a task
 at `assigned`, `working`, `blocked`, `waiting`, `delivered`, or
@@ -305,10 +308,10 @@ Escalation routing is explicit:
 - A peer may promote itself to master only when no live master exists and the
   user explicitly approves that exact peer for that exact project. Record the
   approval with `collab master promote --approval "<user text>"` and verify the
-  promoted peer has a live registered identity/pane before treating it as
+  promoted peer has a live registered identity/transport before treating it as
   master. If a live master already exists, do not promote; only that master
   may `collab master delegate <peer>`. `appsdk init` alone never proves master
-  ownership; a missing or dead master pane means there is no live master, not
+  ownership; a missing or dead master transport means there is no live master, not
   permission to invent one. Codex root is not Collab master.
 - If a blocker or wait cannot be executed locally after a real solution is
   found, report that solution to the live master immediately instead of
@@ -336,7 +339,7 @@ worker's blocker. Concretely:
   the worker's identity stays clean.
 - An ordinary peer that cannot reach a live master within one escalation
   cycle may self-close its own task with `collab task close <id> --force
-  --reason "<text>"`. If a task owner's tmux identity is lost and no live
+  --reason "<text>"`. If a task owner's registered transport identity is lost and no live
   master exists, a registered peer may close that orphaned task with the
   same `--force --reason` command. These are the only allowed fallbacks;
   the reason and cleanup receipt are mandatory so the daemon can show who
@@ -443,10 +446,11 @@ independent review path when review is required; a milestone may use Astra when
 required. Missing AGY is not a blocker because it is excluded; missing a
 declared review gate is a failure.
 
-Without tmux, initialization and observer queries report no notification channel.
-Use local `appsdk subagent list/status/snapshot` without fake registration;
-check the mailbox in status yourself. No automatic completion notification can
-reach this observer. Screen text is diagnostic, never task/control truth.
+Without an available registered transport, initialization and observer queries
+report no notification channel. Use local `appsdk subagent list/status/snapshot`
+without fake registration; check the mailbox in status yourself. No automatic
+completion notification can reach this observer. Screen text is diagnostic,
+never task/control truth.
 
 | Intent | Command |
 |---|---|
@@ -466,7 +470,7 @@ reach this observer. Screen text is diagnostic, never task/control truth.
 | Report a blocker to live master | `collab sendmessage --to <master> --subject blocker "<task_id; cause; proposed fix; decision needed>"` |
 | Cancel one of your own notification leases | `collab notify unsubscribe <subscription-id>` |
 
-After a tmux preview, use its notification ID and abbreviated subject to weigh
+After a transport preview, use its notification ID and abbreviated subject to weigh
 urgency against the current task. When selecting the notice, run
 `collab msg <notification-id>`, read durable detail, and execute the actionable
 request inside this Agent's scope. Do not stop at ACK or waiting; mailbox truth
@@ -480,9 +484,10 @@ For an AppSDK-governed project, the only bootstrap command is:
 appsdk init .
 ```
 
-In a live tmux Agent this runs official `collab init`, starts/reuses the daemon,
-registers the current peer, and creates/refreshes the finite reusable default
-`direct-message` lease. Do not run a second `collab init`,
+In a live App Server or tmux Agent this runs official `collab init`,
+starts/reuses the daemon, registers the current peer through the server-selected
+transport, and creates/refreshes the finite reusable default `direct-message`
+lease. Do not run a second `collab init`,
 `collab whoami`, or manual ordinary-message subscription.
 
 Only a standalone non-AppSDK project uses explicit `collab init`.
@@ -511,16 +516,16 @@ register it.
 ## Hard boundaries
 
 - Never attach production work to v2 or `.agent-collab-v2`.
-- Project scope comes only from inherited tmux pane cwd, or exact process cwd
-  for an explicit non-tmux operator. Never choose/search/hardcode a path. MCP
-  and child commands inherit the same environment.
+- Project scope comes from the exact process cwd. A tmux pane cwd is used only
+  when a live pane is the inherited transport. Never choose/search/hardcode a
+  path. MCP and child commands inherit the same environment.
 - Identities are equal peers by default. There is no implicit master from
   first registration, automatic process recovery, or inferred `/goal`. Collab
   master is explicit, user-approved project arbitration; it is not Codex root,
   and it does not take ownership of another peer's task. If a
   live registered master exists, other peers cannot promote and only that
   master may delegate. If no live master exists, a peer may promote itself
-  only with explicit user approval and a live pane. Independent peers may
+  only with explicit user approval and a live registered transport. Independent peers may
   decline a master collaboration invite; managed subagents must obey the
   master. Master splits by dependency then unique write scope, assigns
   subagents with unambiguous delivery and test conditions, and keeps
@@ -532,17 +537,18 @@ register it.
   lease. AGY review is not a Collab v1 gate; ordinary review is independent,
   and a milestone may use Astra when required. Explicit managed subagent tasks
   use the task-bound inspect obligation above; it is not a free-form task queue
-  and does not create worker tmux input.
+  and does not create worker transport input.
 - Each peer owns its complete task/worktree/integration/resource/cleanup
   lifecycle. Never mutate or close another peer's work.
 - Send only explicit notices, shared-resource coordination, or subscribed async
   results—not routine progress, heartbeat, ACK, review, or completion reports.
 - A wake is only a signal. It cannot change task/resource truth, fabricate
   success, authorize maintenance, or create an ACK loop.
-- `absent` or `unknown` Agent state produces no tmux input. If the pane is dead,
-  reassigned, unowned, or mismatched, subscriptions transition to `pane-lost` to
-  prevent storms. Each due batch is reserved durably once; failed or uncertain
-  attempts are never automatically replayed, including after restart. Details remain
+- `absent` or `unknown` Agent state produces no transport input. If the selected
+  App Server thread or tmux pane is dead, reassigned, unowned, or mismatched,
+  the subscription enters its explicit unavailable state to prevent storms.
+  Each due batch is reserved durably once; failed or uncertain attempts are
+  never automatically replayed, including after restart. Details remain
   readable in the inbox.
 
 ## Load details only when needed

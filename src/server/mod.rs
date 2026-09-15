@@ -1797,8 +1797,8 @@ impl ProjectRuntimeManager {
             .any(|(_, project)| project == project_scope)
     }
 
-    fn storage_root_for_new(&self, root: &Path, app_scope: &str) -> PathBuf {
-        if self.has_project_route(root.to_string_lossy().as_ref()) {
+    fn storage_root_for_new(&self, root: &Path, project_scope: &str, app_scope: &str) -> PathBuf {
+        if self.has_project_route(project_scope) {
             app_scope_storage_path(root, app_scope)
         } else {
             root.to_path_buf()
@@ -2334,7 +2334,11 @@ impl ProjectRuntimeManager {
         if let Err(error) = validate_project_registration_cwd(cwd, &context_root) {
             return (self.host.clone(), Resp::err(error));
         }
-        let storage_root = self.storage_root_for_new(&context_root, context.app_scope_id.as_str());
+        let storage_root = self.storage_root_for_new(
+            &context_root,
+            context.project_scope.as_str(),
+            context.app_scope_id.as_str(),
+        );
         // Admit the project route before opening or mutating its reducer. The
         // host journal is the durable transaction boundary: if it cannot be
         // published, this request must not create or mutate a project
