@@ -1555,6 +1555,16 @@ fn storage_roots_equal(left: &Path, right: &Path) -> Result<bool, String> {
     Ok(storage_owner_path(left)? == storage_owner_path(right)?)
 }
 
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path has no parent directory",
+        )
+    })?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
 fn validate_runtime_storage_root(
     root: &Path,
     storage_root: &Path,
@@ -2088,6 +2098,11 @@ impl ProjectRuntimeManager {
             let _ = std::fs::remove_file(&tmp);
             return Err(format!(
                 "HOST_ROUTE_DURABILITY_FAILED: publish route journal: {error}"
+            ));
+        }
+        if let Err(error) = sync_parent_dir(&self.route_journal) {
+            return Err(format!(
+                "HOST_ROUTE_DURABILITY_FAILED: sync route journal directory: {error}"
             ));
         }
         load_host_route_records(&self.route_journal).map_err(|error| {
