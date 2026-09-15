@@ -511,6 +511,7 @@ fn launch(
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    crate::server::knock::invalidate_pane_presence_cache();
     let binding = String::from_utf8(output.stdout)?;
     let mut parts = binding.split_whitespace();
     record.session = Some(parts.next().context("missing session ID")?.into());
