@@ -455,6 +455,8 @@ mod tests {
             Arc::new(Server {
                 config: crate::config::Config::default(),
                 root: root.clone(),
+                storage_root: root.clone(),
+                journal_path: root.join(".agent-collab/server/journal.jsonl"),
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
                 pane_alive_check: |_| super::super::knock::PanePresence::Present,
@@ -787,6 +789,8 @@ mod tests {
         let restarted = Server {
             config: crate::config::Config::default(),
             root: root.clone(),
+            storage_root: root.clone(),
+            journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(replayed),
             journal: Mutex::new(journal),
             pane_alive_check: |_| super::super::knock::PanePresence::Present,

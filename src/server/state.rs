@@ -45,8 +45,9 @@ pub struct MigrationRecord {
     pub updated_ms: i64,
 }
 
-/// Runtime is encoded in the registered pane handle. The server chooses the
-/// App Server binding first and falls back to tmux when self-check fails.
+/// Runtime is encoded in the registered transport. App Server is preferred
+/// when the server can verify it; tmux is an optional adapter only when the
+/// candidate routes are real and server-verified.
 pub fn runtime_for_pane(pane: Option<&str>) -> Option<&'static str> {
     let pane = pane?;
     if pane.starts_with('%') {

@@ -198,6 +198,18 @@ There is one resident daemon per host. It owns one authenticated socket,
 one journal writer and one in-memory reducer instance. Project registration is
 an operation on that daemon, not a project-local daemon startup.
 
+Project route admission is separate from operational reducer readiness. After
+`collab init` creates the project's `.agent-collab` marker, the first typed
+`Register` may target that project's exact canonical root even when another
+project started the resident daemon. The daemon persists the `(app_scope_id,
+project_scope_id)` registration and runtime binding in its journal, so a
+restart reconstructs the route from durable state. A canonical path without
+the marker, a mismatched registration `cwd`, or an unregistered non-`Register`
+request is rejected. Until the route has an operational reducer/journal owner,
+subsequent project operations return the typed
+`PROJECT_ROUTE_NOT_READY/UNSUPPORTED` error; registration success must not be
+reported as project-operation readiness.
+
 The command path is:
 
 ```text

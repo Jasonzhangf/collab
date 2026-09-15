@@ -26,6 +26,7 @@ use mailbox::{
     read_recipient_mailbox, truncate_notification, DEFAULT_DIRECT_MESSAGE_TTL_SECONDS,
     MAX_ACTIVE_SUBSCRIPTIONS_PER_WORKER, MAX_NOTIFICATION_TTL_SECONDS, NOTIFICATION_EVENTS,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use state::{
     goal_deadline_key, now_ms, runtime_for_pane, task_resource_active, wait_cycle, CleanupReceipt,
@@ -186,6 +187,33 @@ fn sanitize_identifier(value: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Encode an app scope into filesystem components without lossy sanitizing.
+/// AppServerId deliberately accepts any control-free UTF-8 string, so replacing
+/// path punctuation with `_` is not injective (`app/a` and `app:a` would
+/// collide). Hex encodes the original bytes and fixed-size chunks keep every
+/// component below common filesystem name limits even at the 256-byte ID cap.
+fn app_scope_storage_path(root: &Path, app_scope: &str) -> PathBuf {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    const CHUNK_BYTES: usize = 96;
+    let bytes = app_scope.as_bytes();
+    let mut path = root.join(".agent-collab").join("server").join("runtimes");
+    for (index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
+        let prefix = if index == 0 {
+            format!("v1-{}-", bytes.len())
+        } else {
+            String::new()
+        };
+        let mut component = String::with_capacity(prefix.len() + chunk.len() * 2);
+        component.push_str(&prefix);
+        for byte in chunk {
+            component.push(HEX[(byte >> 4) as usize] as char);
+            component.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        path.push(component);
+    }
+    path
 }
 
 #[cfg(test)]
@@ -364,6 +392,14 @@ fn task_transition_allowed(current: &str, next: &str) -> bool {
 pub struct Server {
     pub config: crate::config::Config,
     pub root: PathBuf,
+    /// Project root used for worktree, identity and configuration checks.
+    ///
+    /// `storage_root` is separate because a host daemon may own more than one
+    /// appserver route for the same project.  Those routes must not share a
+    /// reducer journal or mailbox projection.  The resident route keeps both
+    /// paths equal for backwards compatibility.
+    pub storage_root: PathBuf,
+    pub journal_path: PathBuf,
     pub state: Mutex<State>,
     pub journal: Mutex<std::fs::File>,
     pub pane_alive_check: fn(&str) -> PanePresence,
@@ -435,7 +471,11 @@ impl Server {
     }
 
     pub fn log_path(&self) -> PathBuf {
-        Self::log_path_for(&self.root)
+        Self::log_path_for(&self.storage_root)
+    }
+
+    pub(crate) fn storage_server_dir(&self) -> PathBuf {
+        self.storage_root.join(".agent-collab").join("server")
     }
 
     /// Build the R1 typed envelope that the compatible CLI registration path
@@ -1283,7 +1323,7 @@ impl Server {
             &format!("MAILBOX_JSONL_WRITE_FAILED: {error}"),
         );
         if let Err(activity_error) = record_activity(
-            &self.root,
+            &self.storage_root,
             "mailbox_projection_error",
             json!({"exact_error": error, "recoverable": true}),
         ) {
@@ -1295,14 +1335,14 @@ impl Server {
     }
 
     fn backup_message(&self, msg: &Message) -> Result<(), String> {
-        mailbox::backup_message(&self.root, msg)
+        mailbox::backup_message(&self.storage_root, msg)
     }
 
     fn rewrite_journal_locked(
         &self,
         st: &State,
     ) -> Result<(), notification_contract::JournalError> {
-        let path = self.root.join(".agent-collab/server/journal.jsonl");
+        let path = self.journal_path.clone();
         let tmp = path.with_file_name("journal.jsonl.tmp");
         let mut body = String::new();
         let events = st.snapshot_events();
@@ -1408,6 +1448,1039 @@ fn validate_transport_candidates(
     })
 }
 
+type RouteKey = (String, String);
+
+/// A host route is only a small admission record.  The reducer and mailbox
+/// facts belong to the runtime selected by this record, never to the
+/// resident project's journal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostRouteRecord {
+    version: u8,
+    op: String,
+    app_scope_id: String,
+    project_scope: String,
+    canonical_root: String,
+    storage_root: String,
+    registered_ms: i64,
+}
+
+struct RuntimeRoute {
+    root: PathBuf,
+    storage_root: PathBuf,
+    runtime: Option<Arc<Server>>,
+}
+
+/// Owns the single host listener's route table and the independent project
+/// reducers behind it.  The existing handler surface remains unchanged: a
+/// request is first routed here, then dispatched to the selected `Server`.
+struct ProjectRuntimeManager {
+    host: Arc<Server>,
+    host_root: PathBuf,
+    route_journal: PathBuf,
+    routes: Mutex<std::collections::BTreeMap<RouteKey, RuntimeRoute>>,
+    project_locks: Mutex<std::collections::BTreeMap<PathBuf, std::fs::File>>,
+    register_gate: Mutex<()>,
+    runtime_init_gates: Mutex<std::collections::BTreeMap<RouteKey, Arc<Mutex<()>>>>,
+}
+
+fn storage_owner_path(path: &Path) -> Result<PathBuf, String> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut missing_suffix = Vec::new();
+            let mut current = path.to_path_buf();
+            loop {
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        let target = std::fs::read_link(&current).map_err(|error| {
+                            format!("storage owner symlink {}: {error}", current.display())
+                        })?;
+                        let target = if target.is_absolute() {
+                            target
+                        } else {
+                            current
+                                .parent()
+                                .filter(|parent| !parent.as_os_str().is_empty())
+                                .unwrap_or_else(|| Path::new("."))
+                                .join(target)
+                        };
+                        let mut resolved = storage_owner_path(&target)?;
+                        for component in missing_suffix.iter().rev() {
+                            resolved.push(component);
+                        }
+                        return Ok(resolved);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("storage owner path {}: {error}", current.display()));
+                    }
+                }
+                let Some(name) = current.file_name() else {
+                    return Err(format!(
+                        "storage owner path has no resolvable ancestor: {}",
+                        path.display()
+                    ));
+                };
+                missing_suffix.push(name.to_os_string());
+                let parent = current
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                match std::fs::canonicalize(parent) {
+                    Ok(mut resolved) => {
+                        for component in missing_suffix.iter().rev() {
+                            resolved.push(component);
+                        }
+                        return Ok(resolved);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        current = parent.to_path_buf();
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "storage owner path ancestor {}: {error}",
+                            parent.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Err(error) => Err(format!("storage owner path {}: {error}", path.display())),
+    }
+}
+
+fn storage_roots_equal(left: &Path, right: &Path) -> Result<bool, String> {
+    Ok(storage_owner_path(left)? == storage_owner_path(right)?)
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path has no parent directory",
+        )
+    })?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+fn validate_runtime_storage_root(
+    root: &Path,
+    storage_root: &Path,
+    error_prefix: &str,
+) -> Result<PathBuf, String> {
+    if !storage_root.is_absolute() {
+        return Err(format!(
+            "{error_prefix}: runtime storage root must be absolute"
+        ));
+    }
+    let root_owner = storage_owner_path(root)
+        .map_err(|error| format!("{error_prefix}: resolve project storage owner: {error}"))?;
+    let storage_owner = storage_owner_path(storage_root)
+        .map_err(|error| format!("{error_prefix}: resolve runtime storage owner: {error}"))?;
+    if storage_owner == root_owner {
+        return Ok(root_owner);
+    }
+    let expected_parent = root_owner
+        .join(".agent-collab")
+        .join("server")
+        .join("runtimes");
+    if !storage_owner.starts_with(&expected_parent) {
+        return Err(format!(
+            "{error_prefix}: runtime storage root {} resolves outside project runtime storage {}",
+            storage_root.display(),
+            expected_parent.display()
+        ));
+    }
+    Ok(storage_owner)
+}
+
+fn validate_route_owner_table(
+    host: &Arc<Server>,
+    routes: &std::collections::BTreeMap<RouteKey, RuntimeRoute>,
+) -> Result<(), String> {
+    let mut owners = std::collections::BTreeMap::<PathBuf, (String, bool)>::new();
+    owners.insert(
+        storage_owner_path(&host.root)
+            .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?,
+        ("resident host".into(), true),
+    );
+    owners.insert(
+        storage_owner_path(&host.storage_root)
+            .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?,
+        ("resident host".into(), true),
+    );
+
+    for (key, route) in routes {
+        let route_owner = format!("route ({}, {})", key.0, key.1);
+        let is_resident_runtime = route
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| Arc::ptr_eq(runtime, host));
+        let route_storage_root = storage_owner_path(&route.storage_root)
+            .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?;
+        if let Some((owner, is_host)) = owners.get(&route_storage_root) {
+            if is_resident_runtime && *is_host {
+                continue;
+            }
+            return Err(format!(
+                "HOST_ROUTE_REPLAY_FAILED: runtime storage root {} is already owned by {}",
+                route.storage_root.display(),
+                owner
+            ));
+        }
+        owners.insert(route_storage_root, (route_owner, is_resident_runtime));
+    }
+    Ok(())
+}
+
+impl ProjectRuntimeManager {
+    fn new(host: Arc<Server>, host_paths: &crate::scope::HostPaths) -> Result<Arc<Self>, String> {
+        let host_root = GlobalState::canonical_project_scope(&host.root)
+            .map_err(|error| format!("PROJECT_SCOPE_UNKNOWN: {error}"))?;
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let mut routes = std::collections::BTreeMap::new();
+
+        // Preserve the resident route discovered from its own reducer.  Old
+        // external registrations are retained as not-ready route metadata so
+        // a client receives an explicit migration error until its project
+        // runtime can be opened.
+        let registry = HostRouteRegistry::for_server(&host)?;
+        for ((app_scope, project_scope), owner) in registry.routes {
+            match owner {
+                HostRouteOwner::ResidentProject { root, .. } => {
+                    routes.insert(
+                        (app_scope, project_scope),
+                        RuntimeRoute {
+                            root: root.clone(),
+                            storage_root: root,
+                            runtime: Some(host.clone()),
+                        },
+                    );
+                }
+                HostRouteOwner::RegisteredNotReady { root } => {
+                    routes
+                        .entry((app_scope, project_scope))
+                        .or_insert(RuntimeRoute {
+                            root: root.clone(),
+                            storage_root: root,
+                            runtime: None,
+                        });
+                }
+            }
+        }
+
+        let route_records = load_host_route_records(&route_journal)?;
+        // A route record is only usable when its storage path has one owner.
+        // The host resident reducer is an owner even when it has no entry in
+        // routes.jsonl; otherwise replay could admit a second reducer on the
+        // resident journal.
+        for record in &route_records {
+            let key = (record.app_scope_id.clone(), record.project_scope.clone());
+            let storage_root = PathBuf::from(&record.storage_root);
+            if (storage_roots_equal(&storage_root, &host.root)
+                .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?
+                || storage_roots_equal(&storage_root, &host.storage_root)
+                    .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?)
+                && !routes.get(&key).is_some_and(|route| {
+                    route
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| Arc::ptr_eq(runtime, &host))
+                })
+            {
+                return Err(format!(
+                    "HOST_ROUTE_REPLAY_FAILED: runtime storage root {} is already owned by resident host",
+                    record.storage_root
+                ));
+            }
+            let mut owner_key = None;
+            for (candidate_key, route) in &routes {
+                if candidate_key != &key
+                    && storage_roots_equal(&route.storage_root, &storage_root)
+                        .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: {error}"))?
+                {
+                    owner_key = Some(candidate_key.clone());
+                    break;
+                }
+            }
+            if let Some(owner_key) = owner_key {
+                return Err(format!(
+                    "HOST_ROUTE_REPLAY_FAILED: runtime storage root {} is already owned by route ({}, {})",
+                    record.storage_root, owner_key.0, owner_key.1
+                ));
+            }
+        }
+
+        for record in route_records {
+            let (key, root, storage_root) = validate_host_route_record(&record)?;
+            if key.1 == host_root.as_str()
+                && routes.get(&key).is_some_and(|route| {
+                    route
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| Arc::ptr_eq(runtime, &host))
+                })
+            {
+                continue;
+            }
+            routes.insert(
+                key,
+                RuntimeRoute {
+                    root,
+                    storage_root,
+                    runtime: None,
+                },
+            );
+        }
+
+        // Legacy registrations may be present in GlobalState while the host
+        // route journal is empty. Validate the merged table before replay can
+        // open any pending runtime; a pending legacy alias of the resident
+        // storage must fail closed instead of creating a second reducer.
+        validate_route_owner_table(&host, &routes)?;
+
+        let manager = Arc::new(Self {
+            host,
+            host_root: PathBuf::from(host_root.as_str()),
+            route_journal,
+            routes: Mutex::new(routes),
+            project_locks: Mutex::new(std::collections::BTreeMap::new()),
+            register_gate: Mutex::new(()),
+            runtime_init_gates: Mutex::new(std::collections::BTreeMap::new()),
+        });
+
+        // Replay every durable route at startup.  A broken external runtime
+        // remains in the route table and is reported as NOT_READY on use;
+        // it must never silently fall back to the resident reducer.
+        let pending = manager
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, route)| route.runtime.is_none())
+            .map(|(key, route)| (key.clone(), route.root.clone(), route.storage_root.clone()))
+            .collect::<Vec<_>>();
+        for (key, root, storage_root) in pending {
+            let _ = manager.ensure_runtime(&key, &root, &storage_root);
+        }
+        Ok(manager)
+    }
+
+    fn runtimes(&self) -> Vec<Arc<Server>> {
+        let mut result = Vec::new();
+        let routes = self.routes.lock().unwrap();
+        for route in routes.values() {
+            if let Some(runtime) = &route.runtime {
+                // Multiple app scopes may intentionally share the resident
+                // reducer.  The scheduler owns a runtime, not a route key;
+                // ticking once per key would duplicate wakeups and could
+                // consume a timer twice in the same interval.
+                if result.iter().any(|existing| Arc::ptr_eq(existing, runtime)) {
+                    continue;
+                }
+                result.push(runtime.clone());
+            }
+        }
+        if !result
+            .iter()
+            .any(|runtime| Arc::ptr_eq(runtime, &self.host))
+        {
+            result.push(self.host.clone());
+        }
+        result
+    }
+
+    fn route_key(context: &ProjectContext) -> RouteKey {
+        (
+            context.app_scope_id.as_str().to_owned(),
+            context.project_scope.as_str().to_owned(),
+        )
+    }
+
+    fn has_project_route(&self, project_scope: &str) -> bool {
+        self.routes
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(_, project)| project == project_scope)
+    }
+
+    fn storage_root_for_new(&self, root: &Path, project_scope: &str, app_scope: &str) -> PathBuf {
+        if self.has_project_route(project_scope) {
+            app_scope_storage_path(root, app_scope)
+        } else {
+            root.to_path_buf()
+        }
+    }
+
+    fn runtime_init_gate(&self, key: &RouteKey) -> Arc<Mutex<()>> {
+        self.runtime_init_gates
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Open and install a pending route exactly once. The double-check after
+    /// acquiring the per-route gate is required because Poll and blocking
+    /// requests can select the same durable pending route concurrently.
+    fn ensure_runtime(
+        &self,
+        key: &RouteKey,
+        root: &Path,
+        storage_root: &Path,
+    ) -> Result<Arc<Server>, String> {
+        let gate = self.runtime_init_gate(key);
+        let _guard = gate.lock().unwrap();
+        if let Some(runtime) = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(key)
+            .and_then(|route| route.runtime.clone())
+        {
+            return Ok(runtime);
+        }
+        let (runtime, project_lock) = self.build_runtime(root, storage_root)?;
+        self.install_runtime(key, runtime.clone(), project_lock);
+        Ok(runtime)
+    }
+
+    fn build_runtime(
+        &self,
+        root: &Path,
+        storage_root: &Path,
+    ) -> Result<(Arc<Server>, Option<std::fs::File>), String> {
+        let root = std::fs::canonicalize(root).map_err(|error| {
+            format!("PROJECT_ROUTE_NOT_READY/UNSUPPORTED: canonicalize project root: {error}")
+        })?;
+        if !root.join(".agent-collab").is_dir() {
+            return Err(format!(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: project {} is not initialized for Collab",
+                root.display()
+            ));
+        }
+        let storage_root = validate_runtime_storage_root(
+            &root,
+            storage_root,
+            "PROJECT_ROUTE_NOT_READY/UNSUPPORTED",
+        )?;
+        let server_dir = storage_root.join(".agent-collab").join("server");
+        std::fs::create_dir_all(&server_dir).map_err(|error| {
+            format!("PROJECT_ROUTE_NOT_READY/UNSUPPORTED: create runtime storage: {error}")
+        })?;
+
+        let project_lock = if root == self.host_root {
+            None
+        } else if self.project_locks.lock().unwrap().contains_key(&root) {
+            None
+        } else {
+            Some(
+                acquire_legacy_writer_lock(
+                    &root.join(".agent-collab/server/daemon.lock"),
+                    "project daemon",
+                )
+                .map_err(|error| format!("PROJECT_ROUTE_NOT_READY/UNSUPPORTED: {error}"))?,
+            )
+        };
+        let journal_path = server_dir.join("journal.jsonl");
+        let state = replay_from_journal(&root, &journal_path).map_err(|error| {
+            format!(
+                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: runtime journal replay for {}: {error}",
+                root.display()
+            )
+        })?;
+        let journal_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&journal_path)
+            .map_err(|error| {
+                format!("PROJECT_ROUTE_NOT_READY/UNSUPPORTED: open runtime journal: {error}")
+            })?;
+        let runtime = Arc::new(Server {
+            config: crate::config::load(&root).map_err(|error| {
+                format!("PROJECT_ROUTE_NOT_READY/UNSUPPORTED: load project config: {error}")
+            })?,
+            root,
+            storage_root,
+            journal_path,
+            state: Mutex::new(state),
+            journal: Mutex::new(journal_file),
+            pane_alive_check: self.host.pane_alive_check,
+            pane_owner_check: self.host.pane_owner_check,
+            pane_state_check: self.host.pane_state_check,
+            appserver_candidate_check: self.host.appserver_candidate_check.clone(),
+            appserver_notification_sink: self.host.appserver_notification_sink.clone(),
+            mailbox_notify: Notify::new(),
+        });
+        restore_registered_peer_default_leases(&runtime);
+        purge_expired_storage(&runtime, now_ms());
+        Ok((runtime, project_lock))
+    }
+
+    fn install_runtime(
+        &self,
+        key: &RouteKey,
+        runtime: Arc<Server>,
+        project_lock: Option<std::fs::File>,
+    ) {
+        if let Some(lock) = project_lock {
+            self.project_locks
+                .lock()
+                .unwrap()
+                .insert(runtime.root.clone(), lock);
+        }
+        self.routes
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .and_modify(|route| route.runtime = Some(runtime.clone()))
+            .or_insert(RuntimeRoute {
+                root: runtime.root.clone(),
+                storage_root: runtime.storage_root.clone(),
+                runtime: Some(runtime),
+            });
+    }
+
+    fn install_pending_route(&self, key: &RouteKey, root: &Path, storage_root: &Path) {
+        self.routes
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| RuntimeRoute {
+                root: root.to_path_buf(),
+                storage_root: storage_root.to_path_buf(),
+                runtime: None,
+            });
+    }
+
+    fn storage_owner(
+        &self,
+        storage_root: &Path,
+        records: &[HostRouteRecord],
+    ) -> Result<Option<String>, String> {
+        if storage_roots_equal(&self.host.root, storage_root)?
+            || storage_roots_equal(&self.host.storage_root, storage_root)?
+        {
+            return Ok(Some("resident host".into()));
+        }
+        let route_owner = {
+            let routes = self.routes.lock().unwrap();
+            let mut owner = None;
+            for (key, route) in routes.iter() {
+                if storage_roots_equal(&route.storage_root, storage_root)? {
+                    owner = Some(format!("route ({}, {})", key.0, key.1));
+                    break;
+                }
+            }
+            owner
+        };
+        if route_owner.is_some() {
+            return Ok(route_owner);
+        }
+        for record in records {
+            if storage_roots_equal(Path::new(&record.storage_root), storage_root)? {
+                return Ok(Some(format!(
+                    "route ({}, {})",
+                    record.app_scope_id, record.project_scope
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    fn append_route_record(
+        &self,
+        context: &ProjectContext,
+        storage_root: &Path,
+    ) -> Result<(), String> {
+        let project_root = Path::new(&context.canonical_root);
+        let storage_root = validate_runtime_storage_root(
+            project_root,
+            storage_root,
+            "HOST_ROUTE_DURABILITY_FAILED",
+        )?;
+        let record = HostRouteRecord {
+            version: 1,
+            op: "register".into(),
+            app_scope_id: context.app_scope_id.as_str().into(),
+            project_scope: context.project_scope.as_str().into(),
+            canonical_root: context.canonical_root.clone(),
+            storage_root: storage_root.to_string_lossy().into_owned(),
+            registered_ms: now_ms(),
+        };
+        let parent = self.route_journal.parent().ok_or_else(|| {
+            "HOST_ROUTE_DURABILITY_FAILED: route journal has no parent directory".to_string()
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!("HOST_ROUTE_DURABILITY_FAILED: create route journal directory: {error}")
+        })?;
+        let existing = match std::fs::read(&self.route_journal) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(format!(
+                    "HOST_ROUTE_DURABILITY_FAILED: read route journal: {error}"
+                ))
+            }
+        };
+        let existing_records = load_host_route_records(&self.route_journal).map_err(|error| {
+            format!("HOST_ROUTE_DURABILITY_FAILED: validate route journal: {error}")
+        })?;
+        if existing_records.iter().any(|existing| {
+            existing.app_scope_id == record.app_scope_id
+                && existing.project_scope == record.project_scope
+        }) {
+            return Err(format!(
+                "HOST_ROUTE_DURABILITY_FAILED: route key ({}, {}) is already durable",
+                record.app_scope_id, record.project_scope
+            ));
+        }
+        if let Some(owner) = self
+            .storage_owner(&storage_root, &existing_records)
+            .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?
+        {
+            return Err(format!(
+                "HOST_ROUTE_DURABILITY_FAILED: runtime storage root {} is already owned by {}",
+                record.storage_root, owner
+            ));
+        }
+        if !existing.is_empty() && !existing.ends_with(b"\n") {
+            return Err(
+                "HOST_ROUTE_DURABILITY_FAILED: route journal must end with a newline".into(),
+            );
+        }
+        use std::io::Write;
+        let mut line = serde_json::to_vec(&record)
+            .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: serialize route: {error}"))?;
+        line.push(b'\n');
+        let mut body = existing;
+        body.extend_from_slice(&line);
+
+        // Replace the complete JSONL file after syncing a private temporary
+        // file.  A process crash or short write therefore leaves either the
+        // previous valid route set or the complete new route set; it cannot
+        // leave a half JSON object for the next daemon replay.
+        static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self.route_journal.with_file_name(format!(
+            "{}.tmp-{}-{sequence}",
+            self.route_journal
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("routes.jsonl"),
+            std::process::id()
+        ));
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|error| {
+                format!("HOST_ROUTE_DURABILITY_FAILED: create route journal temp: {error}")
+            })?;
+        if let Err(error) = tmp_file.write_all(&body) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "HOST_ROUTE_DURABILITY_FAILED: write route journal temp: {error}"
+            ));
+        }
+        if let Err(error) = tmp_file.sync_data() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "HOST_ROUTE_DURABILITY_FAILED: flush route journal temp: {error}"
+            ));
+        }
+        drop(tmp_file);
+        if let Err(error) = std::fs::rename(&tmp, &self.route_journal) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "HOST_ROUTE_DURABILITY_FAILED: publish route journal: {error}"
+            ));
+        }
+        if let Err(error) = sync_parent_dir(&self.route_journal) {
+            return Err(format!(
+                "HOST_ROUTE_DURABILITY_FAILED: sync route journal directory: {error}"
+            ));
+        }
+        load_host_route_records(&self.route_journal).map_err(|error| {
+            format!("HOST_ROUTE_DURABILITY_FAILED: verify route journal: {error}")
+        })?;
+        Ok(())
+    }
+
+    fn select_runtime(&self, context: &ProjectContext) -> Result<Arc<Server>, String> {
+        context
+            .validate()
+            .map_err(|error| format!("PROJECT_CONTEXT_INVALID: {error}"))?;
+        let key = Self::route_key(context);
+        let pending = {
+            let routes = self.routes.lock().unwrap();
+            let Some(route) = routes.get(&key) else {
+                return Err(format!(
+                    "PROJECT_SCOPE_UNKNOWN: no host route is registered for {}",
+                    context.canonical_root
+                ));
+            };
+            if let Some(runtime) = &route.runtime {
+                return Ok(runtime.clone());
+            }
+            (route.root.clone(), route.storage_root.clone())
+        };
+        self.ensure_runtime(&key, &pending.0, &pending.1)
+    }
+
+    fn verify_cross_project_source(
+        &self,
+        from: &str,
+        from_project: &str,
+        assigned_by: &str,
+        approval: Option<&str>,
+        assigned_ms: i64,
+    ) -> Result<(), String> {
+        let source_root = std::fs::canonicalize(from_project).map_err(|error| {
+            format!("CROSS_PROJECT_SOURCE_REJECTED: canonicalize source project: {error}")
+        })?;
+        if !source_root.join(".agent-collab").is_dir() {
+            return Err(format!(
+                "CROSS_PROJECT_SOURCE_REJECTED: source project {} is not initialized for Collab",
+                source_root.display()
+            ));
+        }
+        let source_scope = GlobalState::canonical_project_scope(&source_root)
+            .map_err(|error| format!("CROSS_PROJECT_SOURCE_REJECTED: {error}"))?;
+        let pending = self
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((_, project_scope), _)| project_scope == source_scope.as_str())
+            .map(|(key, route)| (key.clone(), route.root.clone(), route.storage_root.clone()))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Err(format!(
+                "CROSS_PROJECT_SOURCE_REJECTED: no registered source route for {}",
+                source_scope.as_str()
+            ));
+        }
+
+        let mut matches = Vec::new();
+        for (key, root, storage_root) in pending {
+            let runtime = self
+                .ensure_runtime(&key, &root, &storage_root)
+                .map_err(|error| format!("CROSS_PROJECT_SOURCE_REJECTED: {error}"))?;
+            let state = runtime.state.lock().unwrap();
+            let live_master = match live_master_id(&runtime, &state) {
+                Ok(master) => master,
+                Err(error) => {
+                    return Err(format!("CROSS_PROJECT_SOURCE_REJECTED: {error}"));
+                }
+            };
+            if live_master.as_deref() != Some(from) {
+                continue;
+            }
+            if state.master_assigned_by.as_deref() != Some(assigned_by)
+                || state.master_approval.as_deref() != approval
+                || state.master_assigned_ms != Some(assigned_ms)
+            {
+                return Err(
+                    "CROSS_PROJECT_SOURCE_REJECTED: source master assignment evidence does not match the source reducer"
+                        .into(),
+                );
+            }
+            matches.push(key);
+        }
+
+        match matches.len() {
+            1 => Ok(()),
+            0 => Err(
+                "CROSS_PROJECT_SOURCE_REJECTED: sender is not the live master of the source project"
+                    .into(),
+            ),
+            _ => Err(
+                "CROSS_PROJECT_SOURCE_REJECTED: source master route is ambiguous; use one registered source app scope"
+                    .into(),
+            ),
+        }
+    }
+
+    fn dispatch_cross_project_send(
+        &self,
+        target_context: &ProjectContext,
+        req: Req,
+    ) -> (Arc<Server>, Resp) {
+        let Req::CrossProjectSend {
+            from,
+            from_project,
+            source_master_assigned_by,
+            source_master_approval,
+            source_master_assigned_ms,
+            to,
+            subject,
+            body,
+            in_reply_to,
+        } = req
+        else {
+            unreachable!("cross-project dispatch requires CrossProjectSend");
+        };
+        let target = match self.select_runtime(target_context) {
+            Ok(runtime) => runtime,
+            Err(error) => return (self.host.clone(), Resp::err(error)),
+        };
+        if let Err(error) = self.verify_cross_project_source(
+            &from,
+            &from_project,
+            &source_master_assigned_by,
+            source_master_approval.as_deref(),
+            source_master_assigned_ms,
+        ) {
+            return (target, Resp::err(error));
+        }
+        let response = handle_cross_project_send(
+            &target,
+            from,
+            from_project,
+            source_master_assigned_by,
+            source_master_approval,
+            source_master_assigned_ms,
+            to,
+            subject,
+            body,
+            in_reply_to,
+        );
+        (target, response)
+    }
+
+    fn dispatch_sync(
+        &self,
+        project_context: Option<ProjectContext>,
+        req: Req,
+    ) -> (Arc<Server>, Resp) {
+        let Some(context) = project_context else {
+            if matches!(req, Req::Ping) {
+                let response = dispatch_with_route_context(&self.host, req, None);
+                return (self.host.clone(), response);
+            }
+            return (
+                self.host.clone(),
+                Resp::err(
+                    "PROJECT_CONTEXT_REQUIRED: canonical project root and scope are required",
+                ),
+            );
+        };
+        if let Err(error) = context.validate() {
+            return (
+                self.host.clone(),
+                Resp::err(format!("PROJECT_CONTEXT_INVALID: {error}")),
+            );
+        }
+        let key = Self::route_key(&context);
+        let is_register = matches!(req, Req::Register { .. });
+        let _register_guard = is_register.then(|| self.register_gate.lock().unwrap());
+        if matches!(req, Req::CrossProjectSend { .. }) {
+            return self.dispatch_cross_project_send(&context, req);
+        }
+
+        if let Some((runtime, _)) = self.routes.lock().unwrap().get(&key).and_then(|route| {
+            route
+                .runtime
+                .as_ref()
+                .map(|runtime| (runtime.clone(), false))
+        }) {
+            let response =
+                if let Err(error) = validate_request_context(&runtime, &req, Some(&context)) {
+                    Resp::err(error)
+                } else {
+                    dispatch_with_route_context(&runtime, req, Some(context))
+                };
+            return (runtime, response);
+        }
+
+        let pending_route = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|route| (route.root.clone(), route.storage_root.clone()));
+        if let Some((root, storage_root)) = pending_route {
+            let runtime = match self.ensure_runtime(&key, &root, &storage_root) {
+                Ok(runtime) => runtime,
+                Err(error) => return (self.host.clone(), Resp::err(error)),
+            };
+            let response =
+                if let Err(error) = validate_request_context(&runtime, &req, Some(&context)) {
+                    Resp::err(error)
+                } else {
+                    dispatch_with_route_context(&runtime, req, Some(context))
+                };
+            return (runtime, response);
+        }
+
+        // The first route for the daemon's resident project keeps the
+        // backwards-compatible resident reducer.  A second app scope gets a
+        // separate runtime and storage namespace just like any other route.
+        let context_root = PathBuf::from(&context.canonical_root);
+        if context_root == self.host_root
+            && !self.has_project_route(&context.project_scope.as_str())
+        {
+            let response =
+                if let Err(error) = validate_request_context(&self.host, &req, Some(&context)) {
+                    Resp::err(error)
+                } else {
+                    dispatch_with_route_context(&self.host, req, Some(context.clone()))
+                };
+            if response.ok && is_register {
+                self.install_runtime(&key, self.host.clone(), None);
+            }
+            return (self.host.clone(), response);
+        }
+
+        let Req::Register { cwd, .. } = &req else {
+            return (
+                self.host.clone(),
+                Resp::err(format!(
+                    "PROJECT_SCOPE_UNKNOWN: no host route is registered for {}",
+                    context.canonical_root
+                )),
+            );
+        };
+        if let Err(error) = validate_project_registration_cwd(cwd, &context_root) {
+            return (self.host.clone(), Resp::err(error));
+        }
+        let storage_root = self.storage_root_for_new(
+            &context_root,
+            context.project_scope.as_str(),
+            context.app_scope_id.as_str(),
+        );
+        // Admit the project route before opening or mutating its reducer. The
+        // host journal is the durable transaction boundary: if it cannot be
+        // published, this request must not create or mutate a project
+        // journal that would be unreachable after a restart.
+        if let Err(error) = self.append_route_record(&context, &storage_root) {
+            return (self.host.clone(), Resp::err(error));
+        }
+        self.install_pending_route(&key, &context_root, &storage_root);
+        let runtime = match self.ensure_runtime(&key, &context_root, &storage_root) {
+            Ok(runtime) => runtime,
+            Err(error) => return (self.host.clone(), Resp::err(error)),
+        };
+        let response = if let Err(error) = validate_request_context(&runtime, &req, Some(&context))
+        {
+            Resp::err(error)
+        } else {
+            dispatch_with_route_context(&runtime, req, Some(context.clone()))
+        };
+        (runtime, response)
+    }
+}
+
+fn load_host_route_records(path: &Path) -> Result<Vec<HostRouteRecord>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "HOST_ROUTE_REPLAY_FAILED: read route journal: {error}"
+            ))
+        }
+    };
+    if content.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !content.ends_with('\n') {
+        return Err("HOST_ROUTE_REPLAY_FAILED: route journal must end with a newline".into());
+    }
+    let mut records = Vec::new();
+    let mut seen_keys = std::collections::BTreeMap::<RouteKey, usize>::new();
+    let mut seen_storage_roots = std::collections::BTreeMap::<String, (RouteKey, usize)>::new();
+    for (index, chunk) in content.split_inclusive('\n').enumerate() {
+        let line = chunk
+            .strip_suffix('\n')
+            .expect("split_inclusive always returns a newline-terminated chunk");
+        // Accept the conventional JSONL CRLF representation while treating
+        // every other empty/whitespace-only physical line as corruption. A
+        // trailing newline is framing, not an additional blank record.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim().is_empty() {
+            return Err(format!(
+                "HOST_ROUTE_REPLAY_FAILED: empty route journal line {}",
+                index + 1
+            ));
+        }
+        let record = serde_json::from_str::<HostRouteRecord>(line).map_err(|error| {
+            format!(
+                "HOST_ROUTE_REPLAY_FAILED: route journal line {}: {error}",
+                index + 1
+            )
+        })?;
+        let key = (record.app_scope_id.clone(), record.project_scope.clone());
+        if let Some(previous_line) = seen_keys.insert(key.clone(), index + 1) {
+            return Err(format!(
+                "HOST_ROUTE_REPLAY_FAILED: duplicate route key ({}, {}) at lines {} and {}",
+                key.0,
+                key.1,
+                previous_line,
+                index + 1
+            ));
+        }
+        if let Some((previous_key, previous_line)) =
+            seen_storage_roots.insert(record.storage_root.clone(), (key.clone(), index + 1))
+        {
+            return Err(format!(
+                "HOST_ROUTE_REPLAY_FAILED: duplicate runtime storage root {} for routes ({}, {}) and ({}, {}) at lines {} and {}",
+                record.storage_root,
+                previous_key.0,
+                previous_key.1,
+                key.0,
+                key.1,
+                previous_line,
+                index + 1
+            ));
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn validate_host_route_record(
+    record: &HostRouteRecord,
+) -> Result<(RouteKey, PathBuf, PathBuf), String> {
+    if record.version != 1 || record.op != "register" {
+        return Err(format!(
+            "HOST_ROUTE_REPLAY_FAILED: unsupported route record version/op {}/{}",
+            record.version, record.op
+        ));
+    }
+    let app_scope = AppServerId::new(record.app_scope_id.clone())
+        .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: app scope: {error}"))?;
+    let project_scope = ProjectScopeId::new(record.project_scope.clone())
+        .map_err(|error| format!("HOST_ROUTE_REPLAY_FAILED: project scope: {error}"))?;
+    let root = std::fs::canonicalize(&record.canonical_root).map_err(|error| {
+        format!(
+            "HOST_ROUTE_REPLAY_FAILED: canonical root {}: {error}",
+            record.canonical_root
+        )
+    })?;
+    if root.to_string_lossy() != project_scope.as_str() {
+        return Err(
+            "HOST_ROUTE_REPLAY_FAILED: route project scope does not match canonical root".into(),
+        );
+    }
+    let storage_root = PathBuf::from(&record.storage_root);
+    let storage_root =
+        validate_runtime_storage_root(&root, &storage_root, "HOST_ROUTE_REPLAY_FAILED")?;
+    Ok((
+        (
+            app_scope.as_str().to_owned(),
+            project_scope.as_str().to_owned(),
+        ),
+        root,
+        storage_root,
+    ))
+}
+
 fn validate_command_id(value: &str) -> Result<(), notification_contract::JournalError> {
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
         return Err(notification_contract::JournalError::InvalidCommand(
@@ -1429,7 +2502,7 @@ pub(crate) fn purge_expired_storage(server: &Server, now: i64) -> usize {
         .filter(|message| message.created_ms <= cutoff)
         .map(|message| message.id.clone())
         .collect();
-    mailbox::purge_message_snapshot_files(&server.root, &expired, &st);
+    mailbox::purge_message_snapshot_files(&server.storage_root, &expired, &st);
     if expired.is_empty() {
         return 0;
     }
@@ -2127,6 +3200,8 @@ mod notification_batch_tests {
             Arc::new(Server {
                 config: crate::config::Config::default(),
                 root: root.clone(),
+                storage_root: root.clone(),
+                journal_path: root.join(".agent-collab/server/journal.jsonl"),
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
                 pane_alive_check: |_| crate::server::knock::PanePresence::Present,
@@ -2763,7 +3838,17 @@ fn migration_issues(server: &Server, state: &State) -> Vec<String> {
                     worker.id
                 )),
             },
-            _ => issues.push(format!("worker {} is not bound to tmux", worker.id)),
+            _ => match worker_identity_presence(server, worker) {
+                PanePresence::Present => {}
+                PanePresence::Missing => issues.push(format!(
+                    "worker {} has no live server-verified transport",
+                    worker.id
+                )),
+                PanePresence::Unknown => issues.push(format!(
+                    "worker {} transport liveness is unknown",
+                    worker.id
+                )),
+            },
         }
     }
     for task in state.tasks.values() {
@@ -3594,9 +4679,9 @@ pub(crate) fn live_master_id(
     match worker_identity_presence(server, worker) {
         PanePresence::Present => Ok(Some(worker.id.clone())),
         PanePresence::Missing => Ok(None),
-        PanePresence::Unknown => {
-            Err("master identity is unknown; defer authority changes until pane probes succeed")
-        }
+        PanePresence::Unknown => Err(
+            "master identity is unknown; defer authority changes until transport probes succeed",
+        ),
     }
 }
 
@@ -3698,7 +4783,9 @@ fn scheduler_admission_audit_state(
     server: &Server,
     request_id: &str,
 ) -> Result<Option<SchedulerAdmissionAuditState>, Resp> {
-    let path = server.root.join(".agent-collab/server/events.jsonl");
+    let path = server
+        .storage_root
+        .join(".agent-collab/server/events.jsonl");
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3747,7 +4834,11 @@ fn ensure_scheduler_admission_audit(
             return Ok(state);
         }
     }
-    if let Err(error) = record_activity(&server.root, "scheduler_admission", admission.clone()) {
+    if let Err(error) = record_activity(
+        &server.storage_root,
+        "scheduler_admission",
+        admission.clone(),
+    ) {
         append_log(
             &server.log_path(),
             &format!("SCHEDULER_ADMISSION_RECORD_FAILED: {error}"),
@@ -4253,9 +5344,11 @@ fn handle_master_promote(
     }
     match worker_identity_presence(server, &worker) {
         PanePresence::Present => {}
-        PanePresence::Missing => return Resp::err("master promotion requires a live tmux pane"),
+        PanePresence::Missing => {
+            return Resp::err("master promotion requires a live registered transport")
+        }
         PanePresence::Unknown => return Resp::err(
-            "promotion candidate identity is unknown; defer promotion until pane probes succeed",
+            "promotion candidate identity is unknown; defer promotion until transport probes succeed",
         ),
     }
     server.commit_locked(
@@ -4290,11 +5383,11 @@ fn handle_master_delegate(
     match worker_identity_presence(server, target) {
         PanePresence::Present => {}
         PanePresence::Missing => {
-            return Resp::err("master delegation requires a live target tmux pane")
+            return Resp::err("master delegation requires a live target transport")
         }
         PanePresence::Unknown => {
             return Resp::err(
-                "delegation target identity is unknown; defer delegation until pane probes succeed",
+                "delegation target identity is unknown; defer delegation until transport probes succeed",
             )
         }
     }
@@ -4686,8 +5779,8 @@ pub(crate) fn handle_send_with_task(
     let Some(recipient) = st.workers.get(&to) else {
         return Resp::err(format!("recipient {} not registered", to));
     };
-    if runtime_for_pane(recipient.pane.as_deref()).is_none() {
-        return Resp::err("recipient has no valid tmux pane");
+    if worker_identity_presence(server, recipient) == PanePresence::Missing {
+        return Resp::err("recipient has no live server-verified transport");
     }
     if let Some(ref rid) = in_reply_to {
         if !st.msgs.contains_key(rid) {
@@ -5281,15 +6374,12 @@ fn handle_task_update(
 
 fn stale_worker_views(
     st: &State,
-    presence: &dyn Fn(&str) -> PanePresence,
+    presence: &dyn Fn(&WorkerRec) -> PanePresence,
 ) -> Vec<serde_json::Value> {
     st.workers
         .values()
         .filter(|worker| {
-            worker
-                .pane
-                .as_deref()
-                .is_some_and(|pane| presence(pane) == PanePresence::Missing)
+            presence(worker) == PanePresence::Missing
         })
         .map(|worker| {
             let active_tasks: Vec<String> = st
@@ -5301,6 +6391,7 @@ fn stale_worker_views(
             json!({
                 "worker": worker.id,
                 "pane": worker.pane,
+                "transport_kind": worker.transport.as_ref().map(|transport| transport.kind.as_str()),
                 "active_tasks": active_tasks,
                 "action": "peer owns cleanup; daemon operator may inspect during migration"
             })
@@ -5746,14 +6837,12 @@ fn handle_task_close(
             Ok(master) => master,
             Err(error) => return Resp::err(error),
         };
-        let owner_identity_live = st
-            .workers
-            .get(&task.owner)
-            .and_then(|owner| owner.pane.as_deref())
-            .is_some_and(|pane| {
-                (server.pane_alive_check)(pane) != PanePresence::Missing
-                    && (server.pane_owner_check)(&task.owner, pane) != Ok(false)
-            });
+        let owner_identity_live = st.workers.get(&task.owner).is_some_and(|owner| {
+            !matches!(
+                worker_identity_presence(server, owner),
+                PanePresence::Missing
+            )
+        });
         let authorized = live_master.as_deref() == Some(worker_id.as_str())
             || (live_master.is_none() && (task.owner == worker_id || !owner_identity_live));
         if !authorized {
@@ -5782,7 +6871,9 @@ fn handle_task_close(
                     "reason": receipt.manual_reason,
                     "receipt_id": receipt.id,
                     "superseded_pending_keepalives": [],
-                    "stale_workers": stale_worker_views(&st, &server.pane_alive_check),
+                    "stale_workers": stale_worker_views(&st, &|worker| {
+                        worker_identity_presence(server, worker)
+                    }),
                     "idempotent": true,
                     "next_action": "lifecycle complete; keepalives for this task owner stopped",
                 }));
@@ -5843,7 +6934,8 @@ fn handle_task_close(
             }
         }
         server.commit_locked(&mut st, &events);
-        let stale_workers = stale_worker_views(&st, &server.pane_alive_check);
+        let stale_workers =
+            stale_worker_views(&st, &|worker| worker_identity_presence(server, worker));
         drop(st);
         return Resp::data(json!({
             "task": closed.id,
@@ -6000,7 +7092,7 @@ fn handle_task_close(
         server.commit_locked(&mut st, &events);
     }
 
-    let stale_workers = stale_worker_views(&st, &server.pane_alive_check);
+    let stale_workers = stale_worker_views(&st, &|worker| worker_identity_presence(server, worker));
     drop(st);
     for (message_id, subscription_id) in subscribed_notifications {
         attempt_notification(server, &message_id, &subscription_id);
@@ -6091,9 +7183,27 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         })
         .collect();
     let managed = is_managed_subagent(&st, &worker_id);
+    let presence = worker_identity_presence(server, worker);
+    let transport = worker.transport.as_ref().map(|transport| {
+        json!({
+            "kind": transport.kind.as_str(),
+            "endpoint": transport.endpoint,
+            "namespace": transport.namespace,
+            "thread_id": transport.thread_id,
+            "pane": transport.pane,
+            "self_check": transport.self_check,
+        })
+    });
     Resp::data(json!({
-        "identity": {"worker_id": worker.id, "kind": "peer", "pane": worker.pane},
+        "identity": {"worker_id": worker.id, "kind": "peer", "pane": worker.pane, "transport": transport},
         "liveness": {
+            "live": presence == PanePresence::Present,
+            "presence": match presence {
+                PanePresence::Present => "present",
+                PanePresence::Missing => "missing",
+                PanePresence::Unknown => "unknown",
+            },
+            "transport_kind": worker.transport.as_ref().map(|transport| transport.kind.as_str()),
             "pane_alive": worker.pane.as_deref().is_some_and(pane_alive),
             "pane_idle": worker.pane.as_deref().is_some_and(pane_idle),
         },
@@ -6109,7 +7219,7 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
             "must_obey_master": managed,
             "may_decline_master_invite": !managed,
         },
-        "truth": "server journal and mailbox; tmux is wake-only",
+        "truth": "server journal and mailbox; selected transport is wake-only",
     }))
 }
 
@@ -6318,29 +7428,42 @@ fn worker_status_summary_with_maps(
     let active = tasks
         .values()
         .find(|task| task.owner == w.id && !matches!(task.status.as_str(), "closed" | "cancelled"));
-    let pane = w.pane.as_deref();
-    let presence = pane
-        .map(server.pane_alive_check)
-        .unwrap_or(PanePresence::Missing);
+    let presence = worker_identity_presence(server, w);
     let endpoint_live = presence == PanePresence::Present;
-    let ownership = if endpoint_live {
-        pane.map(|p| (server.pane_owner_check)(&w.id, p))
+    let is_appserver = w
+        .transport
+        .as_ref()
+        .is_some_and(|transport| transport.kind == TransportKind::AppServer);
+    let (ownership, identity_valid, agent_state) = if is_appserver {
+        let ownership = endpoint_live.then_some(Ok(true));
+        let identity_valid = endpoint_live;
+        // App Server verification proves the native route and queue methods,
+        // not the agent's current execution state.
+        let agent_state = if endpoint_live { "unknown" } else { "absent" };
+        (ownership, identity_valid, agent_state)
     } else {
-        None
-    };
-    let identity_valid = endpoint_live && ownership == Some(Ok(true));
-    let agent_state = if endpoint_live && identity_valid {
-        pane.map(|p| match (server.pane_state_check)(p) {
-            crate::server::knock::AgentState::Waiting => "waiting",
-            crate::server::knock::AgentState::Working => "working",
-            crate::server::knock::AgentState::Absent => "absent",
-            crate::server::knock::AgentState::Unknown => "unknown",
-        })
-        .unwrap_or("absent")
-    } else if presence == PanePresence::Unknown || (endpoint_live && ownership == Some(Err(()))) {
-        "unknown"
-    } else {
-        "absent"
+        let pane = w.pane.as_deref();
+        let ownership = if endpoint_live {
+            pane.map(|p| (server.pane_owner_check)(&w.id, p))
+        } else {
+            None
+        };
+        let identity_valid = endpoint_live && ownership == Some(Ok(true));
+        let agent_state = if endpoint_live && identity_valid {
+            pane.map(|p| match (server.pane_state_check)(p) {
+                crate::server::knock::AgentState::Waiting => "waiting",
+                crate::server::knock::AgentState::Working => "working",
+                crate::server::knock::AgentState::Absent => "absent",
+                crate::server::knock::AgentState::Unknown => "unknown",
+            })
+            .unwrap_or("absent")
+        } else if presence == PanePresence::Unknown || (endpoint_live && ownership == Some(Err(())))
+        {
+            "unknown"
+        } else {
+            "absent"
+        };
+        (ownership, identity_valid, agent_state)
     };
     let unacked_notifications = msgs
         .values()
@@ -6368,9 +7491,9 @@ fn worker_status_summary_with_maps(
     let diagnostic = if status == "unknown" {
         None
     } else if status == "lost" {
-        Some("pane dead or not found; clean up task or restart pane")
+        Some("registered transport is not live; verify App Server route or tmux pane")
     } else if status == "identity-mismatch" {
-        Some("pane re-bound or owned by different process; verify pane ownership")
+        Some("selected transport is not live or owned by a different identity; verify route")
     } else if suspected_offline {
         Some("unresponsive; run snapshot: collab subagent snapshot <id> --lines 40")
     } else {
@@ -6379,6 +7502,14 @@ fn worker_status_summary_with_maps(
     json!({
         "id": w.id,
         "pane": w.pane,
+        "transport": w.transport.as_ref().map(|transport| json!({
+            "kind": transport.kind.as_str(),
+            "endpoint": transport.endpoint,
+            "namespace": transport.namespace,
+            "thread_id": transport.thread_id,
+            "pane": transport.pane,
+            "self_check": transport.self_check,
+        })),
         "status": status,
         "presence": match presence {
             PanePresence::Present => "present",
@@ -6971,7 +8102,7 @@ fn dispatch_with_route_context(
                     let in_mem = st.msgs.get(&id).cloned();
                     let msg = in_mem.or_else(|| {
                         let path = server
-                            .root
+                            .storage_root
                             .join(".agent-collab")
                             .join("mailbox")
                             .join(format!("{}.json", id));
@@ -7058,7 +8189,7 @@ fn dispatch_with_route_context(
             let in_mem = st.msgs.get(&msg_id).cloned();
             let msg = in_mem.or_else(|| {
                 let path = server
-                    .root
+                    .storage_root
                     .join(".agent-collab")
                     .join("mailbox")
                     .join(format!("{}.json", msg_id));
@@ -7412,7 +8543,7 @@ fn dispatch_with_route_context(
             drop(st);
             let projection = worker_id.as_deref().and_then(|recipient| {
                 let path = server
-                    .root
+                    .storage_root
                     .join(".agent-collab/mailbox")
                     .join(format!("recipient-{recipient}.jsonl"));
                 match read_recipient_mailbox(&path, recipient) {
@@ -7626,10 +8757,10 @@ fn validate_wire_route_principals(
 }
 
 /// Validate the route carried by a host-daemon request before the legacy
-/// project reducer sees it.  The first host-routing seam intentionally admits
-/// only the project loaded by this daemon instance; a different canonical
-/// project receives an explicit rejection until a multi-project reducer can
-/// preserve independent journals safely.
+/// project reducer sees it. Registration is host-wide: an initialized project
+/// may register its exact canonical root with the resident daemon even when it
+/// is not the daemon's startup project. Operations for that route remain
+/// explicitly not-ready until a project reducer/journal owner is available.
 pub(crate) fn validate_request_context(
     server: &Server,
     req: &Req,
@@ -7669,37 +8800,22 @@ pub(crate) fn validate_request_context(
             }
         }
         Some(HostRouteOwner::RegisteredNotReady { root }) => {
-            return Err(format!(
-                "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: project route {} is registered but has no migrated reducer/journal owner",
-                root.display()
-            ))
+            if let Req::Register { cwd, .. } = req {
+                validate_project_registration_cwd(cwd, root)?;
+            } else {
+                return Err(format!(
+                    "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: project route {} is registered but has no migrated reducer/journal owner",
+                    root.display()
+                ));
+            }
         }
         None => {
             // Registration is the one operation that may create the first
-            // app route for this resident project.  It still has to carry an
-            // explicit app scope in ProjectContext and its cwd must be the
-            // exact resident root; no role/default label may select it.
-            let resident_scope = GlobalState::canonical_project_scope(&server.root)
-                .map_err(|error| format!("PROJECT_SCOPE_UNKNOWN: {error}"))?;
-            let resident_has_registrations = server
-                .state
-                .lock()
-                .unwrap()
-                .global
-                .lookup_project(&resident_scope)
-                .is_some_and(|project| !project.registrations.is_empty());
-            if !resident_has_registrations
-                && project_context.project_scope == resident_scope
-                && project_context.canonical_root == resident_scope.as_str()
-            {
-                if let Req::Register { cwd, .. } = req {
-                    validate_register_cwd(cwd, Path::new(resident_scope.as_str()))?;
-                } else {
-                    return Err(format!(
-                        "PROJECT_SCOPE_UNKNOWN: no host route is registered for {}",
-                        project_context.canonical_root
-                    ));
-                }
+            // app route for any initialized project. It still has to carry an
+            // explicit app scope, use the exact canonical project root, and
+            // prove that the project opted into Collab with its marker.
+            if let Req::Register { cwd, .. } = req {
+                validate_project_registration_cwd(cwd, Path::new(&project_context.canonical_root))?;
             } else {
                 return Err(format!(
                     "PROJECT_SCOPE_UNKNOWN: no host route is registered for {}",
@@ -7716,6 +8832,20 @@ pub(crate) fn validate_request_context(
     }
     validate_wire_route_principals(server, req, &route_scope)?;
     validate_wire_runtime_binding(server, req, project_context)
+}
+
+/// Validate the explicit project-registration boundary. The marker is the
+/// project owner's opt-in to Collab; without it, an arbitrary canonical path
+/// must not create a durable host route. The cwd remains exact and cannot be
+/// replaced by a daemon cwd, ancestor, or worktree path.
+fn validate_project_registration_cwd(cwd: &str, expected_root: &Path) -> Result<(), String> {
+    if !expected_root.join(".agent-collab").is_dir() {
+        return Err(format!(
+            "PROJECT_SCOPE_UNKNOWN: project {} is not initialized for Collab",
+            expected_root.display()
+        ));
+    }
+    validate_register_cwd(cwd, expected_root)
 }
 
 /// Admit the explicit CLI host operator route independently of project
@@ -7782,6 +8912,8 @@ mod host_route_registry_tests {
         let server = Arc::new(Server {
             config: crate::config::Config::default(),
             root: root.clone(),
+            storage_root: root.clone(),
+            journal_path: journal_path.clone(),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
             pane_alive_check: |_| PanePresence::Present,
@@ -8263,6 +9395,1565 @@ mod host_route_registry_tests {
         std::fs::remove_dir_all(other_root).unwrap();
     }
 
+    #[test]
+    fn host_route_replay_requires_framed_unique_jsonl_records() {
+        let (_server, root, _) = test_server();
+        let route_journal = root.join(".agent-collab/server/routes.jsonl");
+        let project_scope = GlobalState::canonical_project_scope(&root).unwrap();
+        let record = HostRouteRecord {
+            version: 1,
+            op: "register".into(),
+            app_scope_id: "route-app".into(),
+            project_scope: project_scope.as_str().into(),
+            canonical_root: project_scope.as_str().into(),
+            storage_root: root.to_string_lossy().into_owned(),
+            registered_ms: 1,
+        };
+        let line = serde_json::to_string(&record).unwrap();
+
+        std::fs::write(&route_journal, &line).unwrap();
+        let missing_final_newline = load_host_route_records(&route_journal).unwrap_err();
+        assert!(
+            missing_final_newline.contains("must end with a newline"),
+            "{missing_final_newline}"
+        );
+
+        std::fs::write(&route_journal, format!("{line}\n\n")).unwrap();
+        let empty_line = load_host_route_records(&route_journal).unwrap_err();
+        assert!(
+            empty_line.contains("empty route journal line 2"),
+            "{empty_line}"
+        );
+
+        std::fs::write(&route_journal, format!("{line}\n{line}\n")).unwrap();
+        let duplicate = load_host_route_records(&route_journal).unwrap_err();
+        assert!(duplicate.contains("duplicate route key"), "{duplicate}");
+        assert!(duplicate.contains("lines 1 and 2"), "{duplicate}");
+
+        std::fs::write(&route_journal, format!("{line}\r\n")).unwrap();
+        let parsed = load_host_route_records(&route_journal).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].app_scope_id, "route-app");
+
+        let mut colliding_record = record.clone();
+        colliding_record.app_scope_id = "route-app-other".into();
+        let colliding_line = serde_json::to_string(&colliding_record).unwrap();
+        std::fs::write(&route_journal, format!("{line}\n{colliding_line}\n")).unwrap();
+        let duplicate_storage = load_host_route_records(&route_journal).unwrap_err();
+        assert!(
+            duplicate_storage.contains("duplicate runtime storage root"),
+            "{duplicate_storage}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_runtime_list_deduplicates_routes_sharing_one_reducer() {
+        let (server, root, _) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        {
+            let mut routes = manager.routes.lock().unwrap();
+            for app_scope in ["app-a", "app-b"] {
+                routes.insert(
+                    (app_scope.into(), "/shared-project".into()),
+                    RuntimeRoute {
+                        root: root.clone(),
+                        storage_root: root.clone(),
+                        runtime: Some(server.clone()),
+                    },
+                );
+            }
+        }
+
+        let runtimes = manager.runtimes();
+        assert_eq!(runtimes.len(), 1);
+        assert!(Arc::ptr_eq(&runtimes[0], &server));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_journal_failure_precedes_external_reducer_mutation() {
+        let (server, root, host_journal) = test_server();
+        let external_root = root.with_file_name(format!(
+            "{}-atomic-register",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(external_root.join(".agent-collab/server")).unwrap();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let mut manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let route_journal_blocker = root.join("route-journal-blocker");
+        std::fs::create_dir_all(&route_journal_blocker).unwrap();
+        Arc::get_mut(&mut manager).unwrap().route_journal = route_journal_blocker;
+
+        let context = context_with_app(&external_root, "atomic-register-app");
+        let response = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: "atomic-register-worker".into(),
+                token: "token-atomic-register-worker".into(),
+                pane: Some("%atomic-register-worker".into()),
+                cwd: external_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(!response.1.ok, "{:?}", response.1);
+        assert!(response
+            .1
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("HOST_ROUTE_DURABILITY_FAILED:")));
+        assert!(!manager
+            .routes
+            .lock()
+            .unwrap()
+            .contains_key(&ProjectRuntimeManager::route_key(&context)));
+        assert!(
+            !external_root
+                .join(".agent-collab/server/journal.jsonl")
+                .exists(),
+            "route admission failure must not create an unreachable reducer journal"
+        );
+        assert!(std::fs::read(&host_journal).unwrap().is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_external_register_is_durable_and_replayed_in_its_runtime() {
+        let (server, root, host_journal) = test_server();
+        let external_root = root.with_file_name(format!(
+            "{}-manager-external",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(external_root.join(".agent-collab/server")).unwrap();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let context = context_with_app(&external_root, "manager-external-app");
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+
+        let (runtime, response) = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: "manager-external-worker".into(),
+                token: "token-manager-external-worker".into(),
+                pane: Some("%manager-external-worker".into()),
+                cwd: external_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        assert!(!Arc::ptr_eq(&runtime, &server));
+        assert_eq!(manager.runtimes().len(), 2);
+        assert!(host_journal.as_path().exists());
+        assert!(std::fs::read(&host_journal).unwrap().is_empty());
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let route_records = load_host_route_records(&route_journal).unwrap();
+        assert_eq!(route_records.len(), 1);
+        assert_eq!(route_records[0].app_scope_id, "manager-external-app");
+        assert!(
+            !std::fs::read(external_root.join(".agent-collab/server/journal.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+
+        let (_, status) = manager.dispatch_sync(Some(context.clone()), Req::StatusAll);
+        assert!(status.ok, "{status:?}");
+        assert_eq!(status.data["workers"][0]["id"], "manager-external-worker");
+
+        drop(manager);
+        let replayed_manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        let (_, replayed_status) = replayed_manager.dispatch_sync(Some(context), Req::StatusAll);
+        assert!(replayed_status.ok, "{replayed_status:?}");
+        assert_eq!(
+            replayed_status.data["workers"][0]["id"],
+            "manager-external-worker"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_routes_project_queries_mutations_and_poll_to_one_runtime() {
+        let (server, root, _) = test_server();
+        let project_root = root.with_file_name(format!(
+            "{}-route-aware",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let app_scope = "route-aware-app";
+        let sender_id = "route-aware-sender";
+        let recipient_id = "route-aware-recipient";
+        let sender_token = "token-route-aware-sender";
+        let recipient_token = "token-route-aware-recipient";
+        let context = context_with_app(&project_root, app_scope);
+
+        let (sender_runtime, sender_registration) = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: sender_id.into(),
+                token: sender_token.into(),
+                pane: Some(format!("%{sender_id}")),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(sender_registration.ok, "{sender_registration:?}");
+        let (recipient_runtime, recipient_registration) = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+                pane: Some(format!("%{recipient_id}")),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(recipient_registration.ok, "{recipient_registration:?}");
+        assert!(Arc::ptr_eq(&sender_runtime, &recipient_runtime));
+        assert!(!Arc::ptr_eq(&sender_runtime, &manager.host));
+
+        let sender_identity =
+            runtime_for_registered(&sender_runtime, &project_root, sender_id, app_scope);
+        let recipient_identity =
+            runtime_for_registered(&recipient_runtime, &project_root, recipient_id, app_scope);
+        let sender_context = context_with_runtime(&project_root, app_scope, &sender_identity);
+        let recipient_context = context_with_runtime(&project_root, app_scope, &recipient_identity);
+
+        let (_, status) = manager.dispatch_sync(Some(sender_context.clone()), Req::StatusAll);
+        assert!(status.ok, "{status:?}");
+        assert_eq!(status.data["summary"]["workers"], 2);
+        let worker_ids = status.data["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|worker| worker["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            worker_ids,
+            std::collections::BTreeSet::from([sender_id, recipient_id])
+        );
+
+        let (_, workers) = manager.dispatch_sync(Some(recipient_context.clone()), Req::Workers);
+        assert!(workers.ok, "{workers:?}");
+        assert_eq!(workers.data["count"], 2);
+
+        let (_, task_registration) = manager.dispatch_sync(
+            Some(sender_context.clone()),
+            Req::TaskRegister {
+                worker_id: sender_id.into(),
+                token: sender_token.into(),
+                task_id: "route-aware-task".into(),
+                owner: None,
+                feature_id: Some("route-aware-feature".into()),
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: "p1".into(),
+                next_step: Some("verify route-aware task".into()),
+                goal_prompt: None,
+            },
+        );
+        assert!(task_registration.ok, "{task_registration:?}");
+        let (_, task_status) = manager.dispatch_sync(
+            Some(recipient_context.clone()),
+            Req::TaskStatus {
+                task_id: Some("route-aware-task".into()),
+            },
+        );
+        assert!(task_status.ok, "{task_status:?}");
+        assert_eq!(task_status.data["id"], "route-aware-task");
+        assert_eq!(task_status.data["owner"], sender_id);
+
+        let (_, subscription) = manager.dispatch_sync(
+            Some(recipient_context.clone()),
+            notification_subscribe_request(recipient_id, recipient_token),
+        );
+        assert!(subscription.ok, "{subscription:?}");
+        assert_eq!(subscription.data["subscription"]["worker_id"], recipient_id);
+
+        let scope = GlobalState::canonical_project_scope(&project_root).unwrap();
+        let sender_command = CommandEnvelope::new(
+            CommandId::new("route-aware-send-command").unwrap(),
+            OperationId::new("route-aware-send-operation").unwrap(),
+            sender_identity.binding_id.clone(),
+            sender_identity.endpoint_generation,
+            RouteScope {
+                app_scope_id: AppServerId::new(app_scope).unwrap(),
+                project_scope_id: scope,
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        let (_, sent) = manager.dispatch_sync(
+            Some(sender_context),
+            Req::Send {
+                from: sender_id.into(),
+                worker_id: Some(sender_id.into()),
+                token: Some(sender_token.into()),
+                command: Some(sender_command),
+                to: recipient_id.into(),
+                mtype: "notify".into(),
+                subject: Some("route-aware message".into()),
+                body: "message must stay in the selected runtime".into(),
+                in_reply_to: None,
+                delivery: "immediate".into(),
+            },
+        );
+        assert!(sent.ok, "{sent:?}");
+        let sent_id = sent.data["msg_id"].as_str().unwrap().to_owned();
+
+        let (_, polled) = dispatch_wire_routed(
+            manager,
+            Some(recipient_context),
+            Req::Poll {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+                timeout_ms: 0,
+            },
+        )
+        .await;
+        assert!(polled.ok, "{polled:?}");
+        assert_eq!(polled.data["count"], 1);
+        assert_eq!(polled.data["messages"][0]["id"], sent_id);
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_isolates_app_and_project_routes_and_replays_each_runtime() {
+        let (server, host_root, host_journal) = test_server();
+        let project_a = host_root.with_file_name(format!(
+            "{}-project-a",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        let project_b = host_root.with_file_name(format!(
+            "{}-project-b",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        for project_root in [&project_a, &project_b] {
+            std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        }
+        let canonical_project_a = project_a.canonicalize().unwrap();
+        let canonical_project_b = project_b.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+
+        let register = |context: ProjectContext, worker_id: &str, token: &str| {
+            let (runtime, response) = manager.dispatch_sync(
+                Some(context),
+                Req::Register {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    pane: Some(format!("%{worker_id}")),
+                    cwd: if worker_id == "app-a-worker" || worker_id == "app-b-worker" {
+                        project_a.display().to_string()
+                    } else {
+                        project_b.display().to_string()
+                    },
+                    candidates: None,
+                },
+            );
+            assert!(response.ok, "registration {worker_id}: {response:?}");
+            runtime
+        };
+
+        // The same project may have two appserver routes. Each route gets a
+        // distinct reducer/storage namespace, so app A cannot observe app B.
+        let app_a_context = context_with_app(&project_a, "app/a");
+        let app_b_context = context_with_app(&project_a, "app:a");
+        let project_b_context = context_with_app(&project_b, "app/a");
+        let app_a_runtime = register(app_a_context.clone(), "app-a-worker", "token-app-a");
+        let app_b_runtime = register(app_b_context.clone(), "app-b-worker", "token-app-b");
+        let project_b_runtime = register(
+            project_b_context.clone(),
+            "project-b-worker",
+            "token-project-b",
+        );
+        assert!(!Arc::ptr_eq(&app_a_runtime, &app_b_runtime));
+        assert!(!Arc::ptr_eq(&app_a_runtime, &project_b_runtime));
+        assert!(!Arc::ptr_eq(&app_b_runtime, &project_b_runtime));
+        assert_ne!(app_a_runtime.storage_root, app_b_runtime.storage_root);
+        assert_ne!(app_a_runtime.storage_root, project_b_runtime.storage_root);
+        assert_ne!(app_b_runtime.storage_root, project_b_runtime.storage_root);
+        assert!(
+            app_a_runtime.storage_root.starts_with(&canonical_project_a),
+            "app-a storage {} is outside project {}",
+            app_a_runtime.storage_root.display(),
+            canonical_project_a.display()
+        );
+        assert!(app_b_runtime
+            .storage_root
+            .starts_with(canonical_project_a.join(".agent-collab/server/runtimes")));
+        assert!(project_b_runtime
+            .storage_root
+            .starts_with(&canonical_project_b));
+
+        let app_a_identity =
+            runtime_for_registered(&app_a_runtime, &project_a, "app-a-worker", "app/a");
+        let app_b_identity =
+            runtime_for_registered(&app_b_runtime, &project_a, "app-b-worker", "app:a");
+        let project_b_identity =
+            runtime_for_registered(&project_b_runtime, &project_b, "project-b-worker", "app/a");
+        let app_a_runtime_context = context_with_runtime(&project_a, "app/a", &app_a_identity);
+        let app_b_runtime_context = context_with_runtime(&project_a, "app:a", &app_b_identity);
+        let project_b_runtime_context =
+            context_with_runtime(&project_b, "app/a", &project_b_identity);
+
+        for (context, runtime, worker_id) in [
+            (
+                app_a_runtime_context.clone(),
+                app_a_runtime.clone(),
+                "app-a-worker",
+            ),
+            (
+                app_b_runtime_context.clone(),
+                app_b_runtime.clone(),
+                "app-b-worker",
+            ),
+            (
+                project_b_runtime_context.clone(),
+                project_b_runtime.clone(),
+                "project-b-worker",
+            ),
+        ] {
+            let (selected, response) = manager.dispatch_sync(Some(context), Req::StatusAll);
+            assert!(response.ok, "{worker_id} status: {response:?}");
+            assert!(Arc::ptr_eq(&selected, &runtime));
+            assert_eq!(response.data["summary"]["workers"], 1);
+            assert_eq!(response.data["workers"][0]["id"], worker_id);
+        }
+
+        let mut subscription_ids = Vec::new();
+        for (context, worker_id, token) in [
+            (app_a_runtime_context.clone(), "app-a-worker", "token-app-a"),
+            (app_b_runtime_context.clone(), "app-b-worker", "token-app-b"),
+            (
+                project_b_runtime_context.clone(),
+                "project-b-worker",
+                "token-project-b",
+            ),
+        ] {
+            let (_, response) = manager.dispatch_sync(
+                Some(context.clone()),
+                Req::TaskRegister {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    task_id: "same-task-id".into(),
+                    owner: None,
+                    feature_id: Some(format!("feature-{worker_id}")),
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p1".into(),
+                    next_step: Some(format!("verify {worker_id}")),
+                    goal_prompt: None,
+                },
+            );
+            assert!(response.ok, "{worker_id} task register: {response:?}");
+            let (_, response) = manager.dispatch_sync(
+                Some(context.clone()),
+                notification_subscribe_request(worker_id, token),
+            );
+            assert!(response.ok, "{worker_id} subscription: {response:?}");
+            subscription_ids.push(
+                response.data["subscription"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+
+        let send_command =
+            |identity: &RuntimeIdentity, project_root: &Path, app_scope: &str, suffix: &str| {
+                CommandEnvelope::new(
+                    CommandId::new(format!("route-isolation-command-{suffix}")).unwrap(),
+                    OperationId::new(format!("route-isolation-operation-{suffix}")).unwrap(),
+                    identity.binding_id.clone(),
+                    identity.endpoint_generation,
+                    RouteScope {
+                        app_scope_id: AppServerId::new(app_scope).unwrap(),
+                        project_scope_id: GlobalState::canonical_project_scope(project_root)
+                            .unwrap(),
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+        let sends = [
+            (
+                app_a_runtime_context.clone(),
+                app_a_identity.clone(),
+                "app-a-worker",
+                "token-app-a",
+                &project_a,
+                "app/a",
+                "app-a",
+            ),
+            (
+                app_b_runtime_context.clone(),
+                app_b_identity.clone(),
+                "app-b-worker",
+                "token-app-b",
+                &project_a,
+                "app:a",
+                "app-b",
+            ),
+            (
+                project_b_runtime_context.clone(),
+                project_b_identity.clone(),
+                "project-b-worker",
+                "token-project-b",
+                &project_b,
+                "app/a",
+                "project-b",
+            ),
+        ];
+        let mut message_ids = Vec::new();
+        for (context, identity, worker_id, token, project_root, app_scope, suffix) in sends {
+            let (_, response) = manager.dispatch_sync(
+                Some(context.clone()),
+                Req::Send {
+                    from: worker_id.into(),
+                    worker_id: Some(worker_id.into()),
+                    token: Some(token.into()),
+                    command: Some(send_command(&identity, project_root, app_scope, suffix)),
+                    to: worker_id.into(),
+                    mtype: "notify".into(),
+                    subject: Some(format!("isolated message {suffix}")),
+                    body: format!("body for {suffix}"),
+                    in_reply_to: None,
+                    delivery: "immediate".into(),
+                },
+            );
+            assert!(response.ok, "{worker_id} send: {response:?}");
+            message_ids.push(response.data["msg_id"].as_str().unwrap().to_owned());
+        }
+
+        // A recipient in another app/project route is absent from this
+        // reducer, so cross-route send cannot silently fall back to a resident
+        // or neighboring runtime.
+        let cross_route_send = manager.dispatch_sync(
+            Some(app_a_runtime_context.clone()),
+            Req::Send {
+                from: "app-a-worker".into(),
+                worker_id: Some("app-a-worker".into()),
+                token: Some("token-app-a".into()),
+                command: Some(send_command(
+                    &app_a_identity,
+                    &project_a,
+                    "app/a",
+                    "cross-route",
+                )),
+                to: "app-b-worker".into(),
+                mtype: "notify".into(),
+                subject: Some("must stay isolated".into()),
+                body: "cross-route delivery must fail closed".into(),
+                in_reply_to: None,
+                delivery: "immediate".into(),
+            },
+        );
+        assert!(!cross_route_send.1.ok, "{:?}", cross_route_send.1);
+        assert!(cross_route_send
+            .1
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("recipient app-b-worker not registered")));
+
+        for (context, worker_id, token, message_id, suffix) in [
+            (
+                app_a_runtime_context.clone(),
+                "app-a-worker",
+                "token-app-a",
+                message_ids[0].clone(),
+                "app-a",
+            ),
+            (
+                app_b_runtime_context.clone(),
+                "app-b-worker",
+                "token-app-b",
+                message_ids[1].clone(),
+                "app-b",
+            ),
+            (
+                project_b_runtime_context.clone(),
+                "project-b-worker",
+                "token-project-b",
+                message_ids[2].clone(),
+                "project-b",
+            ),
+        ] {
+            let (_, polled) = dispatch_wire_routed(
+                manager.clone(),
+                Some(context.clone()),
+                Req::Poll {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    timeout_ms: 0,
+                },
+            )
+            .await;
+            assert!(polled.ok, "{suffix} poll: {polled:?}");
+            assert_eq!(polled.data["count"], 1);
+            assert_eq!(polled.data["messages"][0]["id"], message_id);
+            assert!(polled.data["messages"][0]["body"]
+                .as_str()
+                .unwrap()
+                .contains(suffix));
+        }
+
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let route_records = load_host_route_records(&route_journal).unwrap();
+        assert_eq!(route_records.len(), 3);
+        let route_keys = route_records
+            .iter()
+            .map(|record| (record.app_scope_id.clone(), record.project_scope.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(route_keys.len(), 3);
+        assert!(std::fs::read(&host_journal).unwrap().is_empty());
+        assert!(std::fs::read(&app_a_runtime.journal_path)
+            .unwrap()
+            .windows(b"app-a-worker".len())
+            .any(|window| window == b"app-a-worker"));
+        assert!(std::fs::read(&app_b_runtime.journal_path)
+            .unwrap()
+            .windows(b"app-b-worker".len())
+            .any(|window| window == b"app-b-worker"));
+        assert!(std::fs::read(&project_b_runtime.journal_path)
+            .unwrap()
+            .windows(b"project-b-worker".len())
+            .any(|window| window == b"project-b-worker"));
+
+        drop(app_a_runtime);
+        drop(app_b_runtime);
+        drop(project_b_runtime);
+        drop(manager);
+        let replayed_manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        assert_eq!(replayed_manager.runtimes().len(), 4);
+
+        for (context, worker_id, message_id, subscription_id, suffix) in [
+            (
+                app_a_runtime_context,
+                "app-a-worker",
+                message_ids[0].clone(),
+                subscription_ids[0].clone(),
+                "app-a",
+            ),
+            (
+                app_b_runtime_context,
+                "app-b-worker",
+                message_ids[1].clone(),
+                subscription_ids[1].clone(),
+                "app-b",
+            ),
+            (
+                project_b_runtime_context,
+                "project-b-worker",
+                message_ids[2].clone(),
+                subscription_ids[2].clone(),
+                "project-b",
+            ),
+        ] {
+            let (selected, status) =
+                replayed_manager.dispatch_sync(Some(context.clone()), Req::StatusAll);
+            assert!(status.ok, "{suffix} replay status: {status:?}");
+            assert_eq!(status.data["summary"]["workers"], 1);
+            assert_eq!(status.data["workers"][0]["id"], worker_id);
+            assert_eq!(status.data["summary"]["tasks"], 1);
+            assert!(Arc::ptr_eq(
+                &selected,
+                &replayed_manager.select_runtime(&context).unwrap()
+            ));
+
+            let (_, task_status) = replayed_manager.dispatch_sync(
+                Some(context.clone()),
+                Req::TaskStatus {
+                    task_id: Some("same-task-id".into()),
+                },
+            );
+            assert!(task_status.ok, "{suffix} replay task: {task_status:?}");
+            assert_eq!(task_status.data["owner"], worker_id);
+
+            let (_, message_status) = replayed_manager
+                .dispatch_sync(Some(context.clone()), Req::MsgStatus { msg_id: message_id });
+            assert!(
+                message_status.ok,
+                "{suffix} replay message: {message_status:?}"
+            );
+            assert_eq!(message_status.data["to"], worker_id);
+
+            let (_, notification_status) = replayed_manager.dispatch_sync(
+                Some(context),
+                Req::NotificationStatus {
+                    worker_id: worker_id.into(),
+                    token: match worker_id {
+                        "app-a-worker" => "token-app-a",
+                        "app-b-worker" => "token-app-b",
+                        "project-b-worker" => "token-project-b",
+                        _ => unreachable!(),
+                    }
+                    .into(),
+                },
+            );
+            assert!(
+                notification_status.ok,
+                "{suffix} replay subscription: {notification_status:?}"
+            );
+            assert!(notification_status.data["subscriptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|subscription| subscription["id"] == subscription_id));
+        }
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_a).unwrap();
+        std::fs::remove_dir_all(project_b).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_cross_project_appserver_masters_send_and_reject_forged_source_evidence() {
+        let (mut server, host_root, _) = test_server();
+        with_appserver_check(&mut server, |candidate| Ok(verified_appserver(candidate)));
+        with_appserver_notification_sink(&mut server, |_, _, _| Ok(json!({"queued": true})));
+
+        let project_a = host_root.with_file_name(format!(
+            "{}-cross-project-a",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        let project_b = host_root.with_file_name(format!(
+            "{}-cross-project-b",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        for project_root in [&project_a, &project_b] {
+            std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        }
+        let project_a = project_a.canonicalize().unwrap();
+        let project_b = project_b.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+
+        let app_a = "cross-project-app-a";
+        let app_b = "cross-project-app-b";
+        let master_a = "cross-project-master-a";
+        let master_b = "cross-project-master-b";
+        let token_a = "token-cross-project-master-a";
+        let token_b = "token-cross-project-master-b";
+        let appserver_candidate = |thread_id: &str| AppServerCandidate {
+            endpoint: format!("unix:///tmp/collab-{thread_id}.sock"),
+            namespace: "codex_app".into(),
+            thread_id: thread_id.into(),
+        };
+
+        let (source_runtime, source_registration) = manager.dispatch_sync(
+            Some(context_with_app(&project_a, app_a)),
+            Req::Register {
+                worker_id: master_a.into(),
+                token: token_a.into(),
+                pane: None,
+                cwd: project_a.display().to_string(),
+                candidates: Some(TransportCandidates {
+                    appserver: Some(appserver_candidate("thread-a")),
+                    tmux: None,
+                }),
+            },
+        );
+        assert!(source_registration.ok, "{source_registration:?}");
+        assert_eq!(
+            source_registration.data["transport_selected"]["kind"],
+            "appserver"
+        );
+        assert!(source_registration.data["transport_selected"]["pane"].is_null());
+
+        let (target_runtime, target_registration) = manager.dispatch_sync(
+            Some(context_with_app(&project_b, app_b)),
+            Req::Register {
+                worker_id: master_b.into(),
+                token: token_b.into(),
+                pane: None,
+                cwd: project_b.display().to_string(),
+                candidates: Some(TransportCandidates {
+                    appserver: Some(appserver_candidate("thread-b")),
+                    tmux: None,
+                }),
+            },
+        );
+        assert!(target_registration.ok, "{target_registration:?}");
+        assert_eq!(
+            target_registration.data["transport_selected"]["kind"],
+            "appserver"
+        );
+        assert!(target_registration.data["transport_selected"]["pane"].is_null());
+
+        let source_identity = runtime_for_registered(&source_runtime, &project_a, master_a, app_a);
+        let target_identity = runtime_for_registered(&target_runtime, &project_b, master_b, app_b);
+        let source_context = context_with_runtime(&project_a, app_a, &source_identity);
+        let target_context = context_with_runtime(&project_b, app_b, &target_identity);
+
+        for (context, worker_id, token, approval) in [
+            (
+                source_context.clone(),
+                master_a,
+                token_a,
+                "user approved cross-project-master-a as collab master",
+            ),
+            (
+                target_context.clone(),
+                master_b,
+                token_b,
+                "user approved cross-project-master-b as collab master",
+            ),
+        ] {
+            let (_, promoted) = manager.dispatch_sync(
+                Some(context),
+                Req::MasterPromote {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    approval: approval.into(),
+                },
+            );
+            assert!(promoted.ok, "{worker_id} promotion: {promoted:?}");
+        }
+
+        let (assigned_by, approval, assigned_ms) = {
+            let state = source_runtime.state.lock().unwrap();
+            (
+                state.master_assigned_by.clone().unwrap(),
+                state.master_approval.clone(),
+                state.master_assigned_ms.unwrap(),
+            )
+        };
+        let cross_project_send = |assigned_ms: i64| Req::CrossProjectSend {
+            from: master_a.into(),
+            from_project: project_a.display().to_string(),
+            source_master_assigned_by: assigned_by.clone(),
+            source_master_approval: approval.clone(),
+            source_master_assigned_ms: assigned_ms,
+            to: master_b.into(),
+            subject: "cross-project appserver route".into(),
+            body: "durable cross-project message".into(),
+            in_reply_to: None,
+        };
+
+        let (selected, delivered) = manager.dispatch_sync(
+            Some(target_context.clone()),
+            cross_project_send(assigned_ms),
+        );
+        assert!(Arc::ptr_eq(&selected, &target_runtime));
+        assert!(delivered.ok, "{delivered:?}");
+        assert_eq!(delivered.data["durable"], true);
+        assert_eq!(delivered.data["cross_project"], true);
+        assert_eq!(delivered.data["source_master"], master_a);
+        assert_eq!(delivered.data["target_master"], master_b);
+        let message_id = delivered.data["msg_id"].as_str().unwrap().to_owned();
+        assert!(target_runtime
+            .state
+            .lock()
+            .unwrap()
+            .msgs
+            .contains_key(&message_id));
+
+        let (_, received) = dispatch_wire_routed(
+            manager.clone(),
+            Some(target_context.clone()),
+            Req::Poll {
+                worker_id: master_b.into(),
+                token: token_b.into(),
+                timeout_ms: 0,
+            },
+        )
+        .await;
+        assert!(received.ok, "{received:?}");
+        assert_eq!(received.data["count"], 1);
+        assert_eq!(received.data["messages"][0]["id"], message_id);
+        assert_eq!(received.data["messages"][0]["to"], master_b);
+
+        let target_journal_before = std::fs::read(&target_runtime.journal_path).unwrap();
+        let target_message_count = target_runtime.state.lock().unwrap().msgs.len();
+        let (_, forged) =
+            manager.dispatch_sync(Some(target_context), cross_project_send(assigned_ms + 1));
+        assert!(!forged.ok, "{forged:?}");
+        assert!(forged
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("CROSS_PROJECT_SOURCE_REJECTED:")));
+        assert!(!forged
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("PROJECT_ROUTE_NOT_READY")));
+        assert_eq!(
+            std::fs::read(&target_runtime.journal_path).unwrap(),
+            target_journal_before
+        );
+        assert_eq!(
+            target_runtime.state.lock().unwrap().msgs.len(),
+            target_message_count
+        );
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_a).unwrap();
+        std::fs::remove_dir_all(project_b).unwrap();
+    }
+
+    #[tokio::test]
+    async fn nonresident_route_replays_full_query_mutation_and_notification_surface() {
+        let (server, host_root, host_journal) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-full-replay-surface",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let app_scope = "full-replay-app";
+        let sender_id = "full-replay-sender";
+        let recipient_id = "full-replay-recipient";
+        let sender_token = "token-full-replay-sender";
+        let recipient_token = "token-full-replay-recipient";
+
+        let (sender_runtime, sender_registration) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, app_scope)),
+            Req::Register {
+                worker_id: sender_id.into(),
+                token: sender_token.into(),
+                pane: Some(format!("%{sender_id}")),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(sender_registration.ok, "{sender_registration:?}");
+        let (recipient_runtime, recipient_registration) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, app_scope)),
+            Req::Register {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+                pane: Some(format!("%{recipient_id}")),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(recipient_registration.ok, "{recipient_registration:?}");
+        assert!(Arc::ptr_eq(&sender_runtime, &recipient_runtime));
+        assert!(!Arc::ptr_eq(&sender_runtime, &server));
+
+        let sender_identity =
+            runtime_for_registered(&sender_runtime, &project_root, sender_id, app_scope);
+        let recipient_identity =
+            runtime_for_registered(&recipient_runtime, &project_root, recipient_id, app_scope);
+        let sender_context = context_with_runtime(&project_root, app_scope, &sender_identity);
+        let recipient_context = context_with_runtime(&project_root, app_scope, &recipient_identity);
+
+        let (_, task_registration) = manager.dispatch_sync(
+            Some(sender_context.clone()),
+            Req::TaskRegister {
+                worker_id: sender_id.into(),
+                token: sender_token.into(),
+                task_id: "full-replay-task".into(),
+                owner: None,
+                feature_id: Some("full-replay-feature".into()),
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: "p1".into(),
+                next_step: Some("continue after runtime replay".into()),
+                goal_prompt: None,
+            },
+        );
+        assert!(task_registration.ok, "{task_registration:?}");
+        let (_, subscription) = manager.dispatch_sync(
+            Some(recipient_context.clone()),
+            notification_subscribe_request(recipient_id, recipient_token),
+        );
+        assert!(subscription.ok, "{subscription:?}");
+
+        let send_command = |suffix: &str| {
+            CommandEnvelope::new(
+                CommandId::new(format!("full-replay-command-{suffix}")).unwrap(),
+                OperationId::new(format!("full-replay-operation-{suffix}")).unwrap(),
+                sender_identity.binding_id.clone(),
+                sender_identity.endpoint_generation,
+                RouteScope {
+                    app_scope_id: AppServerId::new(app_scope).unwrap(),
+                    project_scope_id: GlobalState::canonical_project_scope(&project_root).unwrap(),
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let (_, first_send) = manager.dispatch_sync(
+            Some(sender_context.clone()),
+            Req::Send {
+                from: sender_id.into(),
+                worker_id: Some(sender_id.into()),
+                token: Some(sender_token.into()),
+                command: Some(send_command("before-replay")),
+                to: recipient_id.into(),
+                mtype: "notify".into(),
+                subject: Some("full replay before".into()),
+                body: "message retained across runtime replay".into(),
+                in_reply_to: None,
+                delivery: "immediate".into(),
+            },
+        );
+        assert!(first_send.ok, "{first_send:?}");
+        let first_message_id = first_send.data["msg_id"].as_str().unwrap().to_owned();
+        let runtime_storage = sender_runtime.storage_root.clone();
+        let runtime_journal = sender_runtime.journal_path.clone();
+        let mailbox_path = runtime_storage
+            .join(".agent-collab/mailbox")
+            .join(format!("recipient-{recipient_id}.jsonl"));
+        assert!(mailbox_path.exists());
+        assert!(std::fs::read(&mailbox_path)
+            .unwrap()
+            .windows(first_message_id.len())
+            .any(|window| window == first_message_id.as_bytes()));
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let route_journal_before_replay = std::fs::read(&route_journal).unwrap();
+        assert!(std::fs::read(&host_journal).unwrap().is_empty());
+
+        drop(sender_runtime);
+        drop(recipient_runtime);
+        drop(manager);
+        let replayed_manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        let replayed_runtime = replayed_manager.select_runtime(&sender_context).unwrap();
+        assert_eq!(replayed_runtime.storage_root, runtime_storage);
+        assert_eq!(replayed_runtime.journal_path, runtime_journal);
+        assert!(!Arc::ptr_eq(&replayed_runtime, &replayed_manager.host));
+
+        let (selected, status) =
+            replayed_manager.dispatch_sync(Some(sender_context.clone()), Req::StatusAll);
+        assert!(status.ok, "{status:?}");
+        assert!(Arc::ptr_eq(&selected, &replayed_runtime));
+        assert_eq!(status.data["summary"]["workers"], 2);
+        let (_, workers) =
+            replayed_manager.dispatch_sync(Some(recipient_context.clone()), Req::Workers);
+        assert!(workers.ok, "{workers:?}");
+        assert_eq!(workers.data["count"], 2);
+        let (_, task_status) = replayed_manager.dispatch_sync(
+            Some(sender_context.clone()),
+            Req::TaskStatus {
+                task_id: Some("full-replay-task".into()),
+            },
+        );
+        assert!(task_status.ok, "{task_status:?}");
+        assert_eq!(task_status.data["owner"], sender_id);
+        let (_, notification_status) = replayed_manager.dispatch_sync(
+            Some(recipient_context.clone()),
+            Req::NotificationStatus {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+            },
+        );
+        assert!(notification_status.ok, "{notification_status:?}");
+        assert!(!notification_status.data["subscriptions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let (_, second_send) = replayed_manager.dispatch_sync(
+            Some(sender_context),
+            Req::Send {
+                from: sender_id.into(),
+                worker_id: Some(sender_id.into()),
+                token: Some(sender_token.into()),
+                command: Some(send_command("after-replay")),
+                to: recipient_id.into(),
+                mtype: "notify".into(),
+                subject: Some("full replay after".into()),
+                body: "message sent by the replayed runtime".into(),
+                in_reply_to: None,
+                delivery: "immediate".into(),
+            },
+        );
+        assert!(second_send.ok, "{second_send:?}");
+        let second_message_id = second_send.data["msg_id"].as_str().unwrap().to_owned();
+        let (_, polled) = dispatch_wire_routed(
+            replayed_manager.clone(),
+            Some(recipient_context),
+            Req::Poll {
+                worker_id: recipient_id.into(),
+                token: recipient_token.into(),
+                timeout_ms: 0,
+            },
+        )
+        .await;
+        assert!(polled.ok, "{polled:?}");
+        let polled_ids = polled.data["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(polled_ids.contains(first_message_id.as_str()));
+        assert!(polled_ids.contains(second_message_id.as_str()));
+        assert_eq!(
+            std::fs::read(&route_journal).unwrap(),
+            route_journal_before_replay
+        );
+        assert!(std::fs::read(&mailbox_path)
+            .unwrap()
+            .windows(second_message_id.len())
+            .any(|window| window == second_message_id.as_bytes()));
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_app_scope_storage_encoding_is_collision_free_and_replayed() {
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-encoded-scope",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+
+        let register = |context: ProjectContext, worker_id: &str, token: &str| {
+            let (runtime, response) = manager.dispatch_sync(
+                Some(context),
+                Req::Register {
+                    worker_id: worker_id.into(),
+                    token: token.into(),
+                    pane: Some(format!("%{worker_id}")),
+                    cwd: project_root.display().to_string(),
+                    candidates: None,
+                },
+            );
+            assert!(response.ok, "registration {worker_id}: {response:?}");
+            runtime
+        };
+        // A first route owns the project's legacy storage root. The two
+        // colliding sanitized forms are deliberately later routes, where the
+        // encoded namespace is selected.
+        let seed_runtime = register(
+            context_with_app(&project_root, "seed"),
+            "encoded-seed-worker",
+            "token-encoded-seed",
+        );
+        let slash_runtime = register(
+            context_with_app(&project_root, "app/a"),
+            "encoded-slash-worker",
+            "token-encoded-slash",
+        );
+        let colon_runtime = register(
+            context_with_app(&project_root, "app:a"),
+            "encoded-colon-worker",
+            "token-encoded-colon",
+        );
+        let slash_storage = app_scope_storage_path(&canonical_project_root, "app/a");
+        let colon_storage = app_scope_storage_path(&canonical_project_root, "app:a");
+        assert_ne!(slash_storage, colon_storage);
+        assert_eq!(slash_runtime.storage_root, slash_storage);
+        assert_eq!(colon_runtime.storage_root, colon_storage);
+        assert!(!Arc::ptr_eq(&slash_runtime, &colon_runtime));
+
+        let routes = [
+            (
+                context_with_runtime(
+                    &project_root,
+                    "seed",
+                    &runtime_for_registered(
+                        &seed_runtime,
+                        &project_root,
+                        "encoded-seed-worker",
+                        "seed",
+                    ),
+                ),
+                "encoded-seed-worker",
+                "token-encoded-seed",
+            ),
+            (
+                context_with_runtime(
+                    &project_root,
+                    "app/a",
+                    &runtime_for_registered(
+                        &slash_runtime,
+                        &project_root,
+                        "encoded-slash-worker",
+                        "app/a",
+                    ),
+                ),
+                "encoded-slash-worker",
+                "token-encoded-slash",
+            ),
+            (
+                context_with_runtime(
+                    &project_root,
+                    "app:a",
+                    &runtime_for_registered(
+                        &colon_runtime,
+                        &project_root,
+                        "encoded-colon-worker",
+                        "app:a",
+                    ),
+                ),
+                "encoded-colon-worker",
+                "token-encoded-colon",
+            ),
+        ];
+        for (context, worker_id, token) in &routes {
+            let (_selected, status) = manager.dispatch_sync(Some(context.clone()), Req::StatusAll);
+            assert!(status.ok, "{worker_id} status: {status:?}");
+            assert_eq!(status.data["summary"]["workers"], 1);
+            assert_eq!(status.data["workers"][0]["id"], *worker_id);
+            let (_, task) = manager.dispatch_sync(
+                Some(context.clone()),
+                Req::TaskRegister {
+                    worker_id: (*worker_id).into(),
+                    token: (*token).into(),
+                    task_id: "encoded-scope-task".into(),
+                    owner: None,
+                    feature_id: Some(format!("feature-{worker_id}")),
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p1".into(),
+                    next_step: Some("verify encoded scope replay".into()),
+                    goal_prompt: None,
+                },
+            );
+            assert!(task.ok, "{worker_id} task: {task:?}");
+        }
+
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let route_records = load_host_route_records(&route_journal).unwrap();
+        assert_eq!(route_records.len(), 3);
+        let storage_roots = route_records
+            .iter()
+            .map(|record| record.storage_root.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(storage_roots.len(), 3);
+
+        drop(seed_runtime);
+        drop(slash_runtime);
+        drop(colon_runtime);
+        drop(manager);
+        let replayed_manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        for (context, worker_id, _token) in routes {
+            let (selected, status) =
+                replayed_manager.dispatch_sync(Some(context.clone()), Req::StatusAll);
+            assert!(status.ok, "{worker_id} replay status: {status:?}");
+            assert_eq!(status.data["summary"]["workers"], 1);
+            assert_eq!(status.data["workers"][0]["id"], worker_id);
+            assert_eq!(status.data["summary"]["tasks"], 1);
+            assert!(Arc::ptr_eq(
+                &selected,
+                &replayed_manager.select_runtime(&context).unwrap()
+            ));
+        }
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prospective_storage_collision_rejects_register_before_route_publish() {
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-prospective-collision",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        let legacy_app_scope = "v1-3-616263";
+        let candidate_app_scope = "abc";
+        let legacy_storage_root = canonical_project_root
+            .join(".agent-collab/server/runtimes")
+            .join(legacy_app_scope);
+        assert_eq!(
+            legacy_storage_root,
+            app_scope_storage_path(&canonical_project_root, candidate_app_scope)
+        );
+        let project_scope = GlobalState::canonical_project_scope(&canonical_project_root).unwrap();
+        let legacy_record = HostRouteRecord {
+            version: 1,
+            op: "register".into(),
+            app_scope_id: legacy_app_scope.into(),
+            project_scope: project_scope.as_str().into(),
+            canonical_root: project_scope.as_str().into(),
+            storage_root: legacy_storage_root.to_string_lossy().into_owned(),
+            registered_ms: 1,
+        };
+        let legacy_line = serde_json::to_string(&legacy_record).unwrap();
+        std::fs::write(&route_journal, format!("{legacy_line}\n")).unwrap();
+        let before_collision = std::fs::read(&route_journal).unwrap();
+
+        // The existing record uses the old lossy path convention. Startup
+        // must replay it, while a new encoded route must be rejected before
+        // the host route journal is replaced.
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let (_runtime, collision_response) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, candidate_app_scope)),
+            Req::Register {
+                worker_id: "prospective-collision-worker".into(),
+                token: "token-prospective-collision".into(),
+                pane: Some("%prospective-collision-worker".into()),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(!collision_response.ok, "{collision_response:?}");
+        assert!(
+            collision_response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("runtime storage root")),
+            "{collision_response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        // The rejected prospective route must not poison the old route that
+        // was successfully replayed from the durable journal.
+        let legacy_context = context_with_app(&project_root, legacy_app_scope);
+        let (_runtime, registration_response) = manager.dispatch_sync(
+            Some(legacy_context.clone()),
+            Req::Register {
+                worker_id: "legacy-replayed-worker".into(),
+                token: "token-legacy-replayed".into(),
+                pane: Some("%legacy-replayed-worker".into()),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(registration_response.ok, "{registration_response:?}");
+        let (_runtime, status_response) =
+            manager.dispatch_sync(Some(legacy_context), Req::StatusAll);
+        assert!(status_response.ok, "{status_response:?}");
+        assert_eq!(
+            status_response.data["workers"][0]["id"],
+            "legacy-replayed-worker"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        drop(manager);
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resident_storage_collision_rejects_register_before_route_publish() {
+        let (mut server, host_root, _) = test_server();
+        let resident_storage_root = host_root.with_file_name(format!(
+            "{}-resident-storage",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        let resident_server_dir = resident_storage_root.join(".agent-collab/server");
+        std::fs::create_dir_all(&resident_server_dir).unwrap();
+        let resident_storage_root = resident_storage_root.canonicalize().unwrap();
+        let resident_journal_path = resident_server_dir.join("journal.jsonl");
+        let resident_journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&resident_journal_path)
+            .unwrap();
+        {
+            let host = Arc::get_mut(&mut server).unwrap();
+            host.storage_root = resident_storage_root.clone();
+            host.journal_path = resident_journal_path;
+            host.journal = Mutex::new(resident_journal);
+        }
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        std::fs::write(&route_journal, b"").unwrap();
+        let before_collision = std::fs::read(&route_journal).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+
+        // First establish the resident route. Its reducer owns the storage
+        // root even though that ownership is not represented in routes.jsonl.
+        let resident_context = context_with_app(&host_root, "resident-app");
+        let (_runtime, resident_response) = manager.dispatch_sync(
+            Some(resident_context.clone()),
+            Req::Register {
+                worker_id: "resident-worker".into(),
+                token: "token-resident-worker".into(),
+                pane: Some("%resident-worker".into()),
+                cwd: host_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(resident_response.ok, "{resident_response:?}");
+
+        // A second project whose storage root equals the resident reducer's
+        // root must fail before a route record or second reducer is created.
+        let collision_context = context_with_app(&resident_storage_root, "collision-app");
+        let (_runtime, collision_response) = manager.dispatch_sync(
+            Some(collision_context.clone()),
+            Req::Register {
+                worker_id: "resident-collision-worker".into(),
+                token: "token-resident-collision".into(),
+                pane: Some("%resident-collision-worker".into()),
+                cwd: resident_storage_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(!collision_response.ok, "{collision_response:?}");
+        assert!(
+            collision_response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("owned by resident host")),
+            "{collision_response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+        assert!(!manager
+            .routes
+            .lock()
+            .unwrap()
+            .contains_key(&ProjectRuntimeManager::route_key(&collision_context)));
+
+        // The resident route remains the only owner and is still queryable.
+        let (_runtime, status_response) =
+            manager.dispatch_sync(Some(resident_context), Req::StatusAll);
+        assert!(status_response.ok, "{status_response:?}");
+        assert_eq!(status_response.data["workers"][0]["id"], "resident-worker");
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        drop(manager);
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(resident_storage_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prospective_nested_project_collision_rejects_register_before_route_publish() {
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-nested-collision",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server")).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+
+        let (seed_runtime, seed_response) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, "seed")),
+            Req::Register {
+                worker_id: "nested-seed-worker".into(),
+                token: "token-nested-seed".into(),
+                pane: Some("%nested-seed-worker".into()),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(seed_response.ok, "{seed_response:?}");
+        let (app_runtime, app_response) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, "app/a")),
+            Req::Register {
+                worker_id: "nested-app-worker".into(),
+                token: "token-nested-app".into(),
+                pane: Some("%nested-app-worker".into()),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(app_response.ok, "{app_response:?}");
+        assert!(!Arc::ptr_eq(&seed_runtime, &app_runtime));
+
+        let nested_root = app_scope_storage_path(&canonical_project_root, "app/a");
+        assert_eq!(app_runtime.root, canonical_project_root);
+        assert_eq!(app_runtime.storage_root, nested_root);
+        std::fs::create_dir_all(nested_root.join(".agent-collab/server")).unwrap();
+
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let before_collision = std::fs::read(&route_journal).unwrap();
+        let (_runtime, collision_response) = manager.dispatch_sync(
+            Some(context_with_app(&nested_root, "nested-app")),
+            Req::Register {
+                worker_id: "nested-collision-worker".into(),
+                token: "token-nested-collision".into(),
+                pane: Some("%nested-collision-worker".into()),
+                cwd: nested_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(!collision_response.ok, "{collision_response:?}");
+        assert!(
+            collision_response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("runtime storage root")),
+            "{collision_response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        // The existing app/a route remains routable after the prospective
+        // nested project was rejected, and its route journal entry is intact.
+        let (_runtime, status_response) = manager.dispatch_sync(
+            Some(context_with_app(&project_root, "app/a")),
+            Req::StatusAll,
+        );
+        assert!(status_response.ok, "{status_response:?}");
+        assert_eq!(
+            status_response.data["workers"][0]["id"],
+            "nested-app-worker"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+
+        drop(manager);
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_runtime_initialization_is_one_arc_under_concurrent_dispatch() {
+        let (server, root, _) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+        let context = context_with_app(&root, "pending-concurrent");
+        let key = ProjectRuntimeManager::route_key(&context);
+        let canonical_root = root.canonicalize().unwrap();
+        manager.install_pending_route(&key, &canonical_root, &canonical_root);
+
+        let first_manager = manager.clone();
+        let first_context = context.clone();
+        let second_manager = manager.clone();
+        let second_context = context.clone();
+        let (first, second) = tokio::join!(
+            tokio::task::spawn_blocking(move || first_manager.select_runtime(&first_context)),
+            tokio::task::spawn_blocking(move || second_manager.select_runtime(&second_context)),
+        );
+        let first = first.unwrap().unwrap();
+        let second = second.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let installed = manager
+            .routes
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|route| route.runtime.clone())
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &installed));
+        assert_eq!(manager.runtimes().len(), 2);
+        assert_eq!(
+            first.journal_path,
+            canonical_root.join(".agent-collab/server/journal.jsonl")
+        );
+
+        drop(first);
+        drop(second);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn empty_registry_admits_only_exact_cli_host_operator_shutdown() {
         let (server, root, journal_path) = test_server();
@@ -8319,6 +11010,155 @@ mod host_route_registry_tests {
 
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(wrong_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_project_register_is_admitted_and_replayed_from_host_journal() {
+        let (server, root, _) = test_server();
+        let external_root = root.with_file_name(format!(
+            "{}-external",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(external_root.join(".agent-collab").join("server")).unwrap();
+        let context = context_with_app(&external_root, "routecodex-app");
+
+        let response = dispatch_wire(
+            server.clone(),
+            Some(context.clone()),
+            Req::Register {
+                worker_id: "routecodex-master".into(),
+                token: "token-routecodex-master".into(),
+                pane: Some("%routecodex-master".into()),
+                cwd: external_root.display().to_string(),
+                candidates: None,
+            },
+        )
+        .await;
+        assert!(response.ok, "{response:?}");
+
+        let project_scope = GlobalState::canonical_project_scope(&external_root).unwrap();
+        let state = server.state.lock().unwrap();
+        let project = state.global.lookup_project(&project_scope).unwrap();
+        assert!(project
+            .lookup_registration(&AppServerId::new("routecodex-app").unwrap())
+            .is_some());
+        assert!(project
+            .lookup_binding(&BindingId::new("binding-routecodex-master").unwrap())
+            .is_some());
+        drop(state);
+
+        // A route that is not owned by this resident reducer may still be
+        // re-registered through the same explicit route. Reconnect remains
+        // idempotent and does not create a second registration or binding.
+        let runtime = runtime_for_registered(
+            &server,
+            &external_root,
+            "routecodex-master",
+            "routecodex-app",
+        );
+        let repeated = dispatch_wire(
+            server.clone(),
+            Some(context_with_runtime(
+                &external_root,
+                "routecodex-app",
+                &runtime,
+            )),
+            Req::Register {
+                worker_id: "routecodex-master".into(),
+                token: "token-routecodex-master".into(),
+                pane: Some("%routecodex-master".into()),
+                cwd: external_root.display().to_string(),
+                candidates: None,
+            },
+        )
+        .await;
+        assert!(repeated.ok, "{repeated:?}");
+        assert_eq!(repeated.data["replayed"], true);
+
+        // The host daemon's single journal is the durable source for a route
+        // registration. A fresh replay must recover the same external route.
+        let replayed = replay(&root).unwrap();
+        let replayed_project = replayed.global.lookup_project(&project_scope).unwrap();
+        assert!(replayed_project
+            .lookup_registration(&AppServerId::new("routecodex-app").unwrap())
+            .is_some());
+        assert!(matches!(
+            HostRouteRegistry::for_server(&server)
+                .unwrap()
+                .lookup(&context),
+            Some(HostRouteOwner::RegisteredNotReady { .. })
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn uninitialized_external_project_cannot_create_host_route() {
+        let (server, root, journal_path) = test_server();
+        let external_root = root.with_file_name(format!(
+            "{}-uninitialized",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&external_root).unwrap();
+        let context = context_with_app(&external_root, "uninitialized-app");
+        let response = dispatch_wire(
+            server.clone(),
+            Some(context),
+            Req::Register {
+                worker_id: "uninitialized-worker".into(),
+                token: "token-uninitialized-worker".into(),
+                pane: Some("%uninitialized-worker".into()),
+                cwd: external_root.display().to_string(),
+                candidates: None,
+            },
+        )
+        .await;
+        assert!(!response.ok, "{response:?}");
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("PROJECT_SCOPE_UNKNOWN:")));
+        assert!(server.state.lock().unwrap().global.projects.is_empty());
+        assert!(std::fs::read(&journal_path).unwrap().is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_project_register_requires_exact_registered_root() {
+        let (server, root, journal_path) = test_server();
+        let external_root = root.with_file_name(format!(
+            "{}-exact-root",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        let child_root = external_root.join("child");
+        std::fs::create_dir_all(external_root.join(".agent-collab").join("server")).unwrap();
+        std::fs::create_dir_all(child_root.join(".agent-collab").join("server")).unwrap();
+        let context = context_with_app(&external_root, "exact-root-app");
+        let response = dispatch_wire(
+            server.clone(),
+            Some(context),
+            Req::Register {
+                worker_id: "wrong-cwd-worker".into(),
+                token: "token-wrong-cwd-worker".into(),
+                pane: Some("%wrong-cwd-worker".into()),
+                cwd: child_root.display().to_string(),
+                candidates: None,
+            },
+        )
+        .await;
+        assert!(!response.ok, "{response:?}");
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("PROJECT_SCOPE_MISMATCH:")));
+        assert!(server.state.lock().unwrap().global.projects.is_empty());
+        assert!(std::fs::read(&journal_path).unwrap().is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
     }
 
     #[test]
@@ -8569,6 +11409,351 @@ mod host_route_registry_tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_multiple_app_routes_fail_replay_before_opening_a_second_reducer() {
+        let (server, root, journal_path) = test_server();
+        register_known_project_with_app(&server, &root, "app-a");
+        assert!(
+            handle_register_with_app_scope(
+                &server,
+                "legacy-resident".into(),
+                "token-legacy-resident".into(),
+                Some("%legacy-resident".into()),
+                root.display().to_string(),
+                Some(AppServerId::new("app-a").unwrap()),
+                None,
+            )
+            .ok
+        );
+        register_known_project_with_app(&server, &root, "app-b");
+
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        std::fs::write(&route_journal, b"").unwrap();
+        let before_route_journal = std::fs::read(&route_journal).unwrap();
+        let before_resident_journal = std::fs::read(&journal_path).unwrap();
+
+        let error = match ProjectRuntimeManager::new(server.clone(), &host_paths) {
+            Ok(_) => panic!("legacy pending route must not open a second reducer"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("HOST_ROUTE_REPLAY_FAILED:"), "{error}");
+        assert!(error.contains("resident host"), "{error}");
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_route_journal);
+        assert_eq!(
+            std::fs::read(&journal_path).unwrap(),
+            before_resident_journal
+        );
+        assert!(!root.join(".agent-collab/server/runtimes").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_owner_identity_resolves_symlinked_parent_with_missing_tail() {
+        use std::os::unix::fs::symlink;
+
+        let (_server, root, _) = test_server();
+        let real_parent = root.join("real-parent");
+        let alias_parent = root.join("alias-parent");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &alias_parent).unwrap();
+
+        let real_future_path = real_parent.join("future").join("journal");
+        let aliased_future_path = alias_parent.join("future").join("journal");
+        assert_eq!(
+            storage_owner_path(&real_future_path).unwrap(),
+            storage_owner_path(&aliased_future_path).unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_owner_identity_resolves_dangling_symlink_with_missing_target() {
+        use std::os::unix::fs::symlink;
+
+        let (_server, root, _) = test_server();
+        let missing_parent = root.join("missing-parent");
+        let dangling_parent = root.join("dangling-parent");
+        symlink(&missing_parent, &dangling_parent).unwrap();
+
+        let target_path = missing_parent.join("future").join("journal");
+        let dangling_path = dangling_parent.join("future").join("journal");
+        assert_eq!(
+            storage_owner_path(&target_path).unwrap(),
+            storage_owner_path(&dangling_path).unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_storage_symlink_escape_rejects_register_before_journal_write() {
+        use std::os::unix::fs::symlink;
+
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-runtime-escape",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server/runtimes")).unwrap();
+        let external_root = host_root.with_file_name(format!(
+            "{}-runtime-escape-target",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&external_root).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let seed_context = context_with_app(&project_root, "runtime-seed");
+        let (_, seed_response) = manager.dispatch_sync(
+            Some(seed_context),
+            Req::Register {
+                worker_id: "runtime-seed-worker".into(),
+                token: "token-runtime-seed-worker".into(),
+                pane: Some("%runtime-seed-worker".into()),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        assert!(seed_response.ok, "{seed_response:?}");
+
+        let escape_context = context_with_app(&project_root, "runtime-escape");
+        let escape_storage_root = app_scope_storage_path(&canonical_project_root, "runtime-escape");
+        symlink(&external_root, &escape_storage_root).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        let before_route_journal = std::fs::read(&route_journal).unwrap();
+        let (_, escape_response) = manager.dispatch_sync(
+            Some(escape_context.clone()),
+            Req::Register {
+                worker_id: "runtime-escape-worker".into(),
+                token: "token-runtime-escape-worker".into(),
+                pane: Some("%runtime-escape-worker".into()),
+                cwd: project_root.display().to_string(),
+                candidates: None,
+            },
+        );
+
+        assert!(!escape_response.ok, "{escape_response:?}");
+        assert!(
+            escape_response.error.as_deref().is_some_and(|error| {
+                error.starts_with("HOST_ROUTE_DURABILITY_FAILED:")
+                    && error.contains("resolves outside project runtime storage")
+            }),
+            "{escape_response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_route_journal);
+        assert!(!manager
+            .routes
+            .lock()
+            .unwrap()
+            .contains_key(&ProjectRuntimeManager::route_key(&escape_context)));
+        assert!(!external_root
+            .join(".agent-collab/server/journal.jsonl")
+            .exists());
+
+        let build_error = match manager.build_runtime(&project_root, &escape_storage_root) {
+            Ok(_) => panic!("runtime storage symlink escape must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            build_error.starts_with("PROJECT_ROUTE_NOT_READY/UNSUPPORTED:")
+                && build_error.contains("resolves outside project runtime storage"),
+            "{build_error}"
+        );
+        assert!(!external_root
+            .join(".agent-collab/server/journal.jsonl")
+            .exists());
+
+        drop(manager);
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_storage_symlink_escape_rejects_replay_before_runtime_creation() {
+        use std::os::unix::fs::symlink;
+
+        let (server, host_root, _) = test_server();
+        let project_root = host_root.with_file_name(format!(
+            "{}-replay-runtime-escape",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(project_root.join(".agent-collab/server/runtimes")).unwrap();
+        let external_root = host_root.with_file_name(format!(
+            "{}-replay-runtime-escape-target",
+            host_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&external_root).unwrap();
+        let canonical_project_root = project_root.canonicalize().unwrap();
+        let storage_root = app_scope_storage_path(&canonical_project_root, "replay-escape");
+        symlink(&external_root, &storage_root).unwrap();
+        let project_scope = GlobalState::canonical_project_scope(&canonical_project_root).unwrap();
+        let record = HostRouteRecord {
+            version: 1,
+            op: "register".into(),
+            app_scope_id: "replay-escape".into(),
+            project_scope: project_scope.as_str().into(),
+            canonical_root: project_scope.as_str().into(),
+            storage_root: storage_root.to_string_lossy().into_owned(),
+            registered_ms: 1,
+        };
+        let host_paths = HostPaths::for_state_root(host_root.join("host-state")).unwrap();
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::write(
+            &route_journal,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let replay_error = match ProjectRuntimeManager::new(server, &host_paths) {
+            Ok(_) => panic!("runtime storage symlink escape must fail during replay"),
+            Err(error) => error,
+        };
+        assert!(
+            replay_error.starts_with("HOST_ROUTE_REPLAY_FAILED:")
+                && replay_error.contains("resolves outside project runtime storage"),
+            "{replay_error}"
+        );
+        assert!(!external_root
+            .join(".agent-collab/server/journal.jsonl")
+            .exists());
+
+        std::fs::remove_dir_all(host_root).unwrap();
+        std::fs::remove_dir_all(project_root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_storage_owner_rejects_alias_route_before_journal_write() {
+        use std::os::unix::fs::symlink;
+
+        let (server, root, _) = test_server();
+        let runtimes = root.join(".agent-collab/server/runtimes");
+        let real_parent = runtimes.join("real-parent");
+        let alias_parent = runtimes.join("alias-parent");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &alias_parent).unwrap();
+
+        let real_storage_root = real_parent.join("future");
+        let aliased_storage_root = alias_parent.join("future");
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        std::fs::write(&route_journal, b"").unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        manager.routes.lock().unwrap().insert(
+            ("existing-app".into(), "/existing-project".into()),
+            RuntimeRoute {
+                root: root.clone(),
+                storage_root: real_storage_root,
+                runtime: None,
+            },
+        );
+
+        let context = context_with_app(&root, "dangling-alias-app");
+        let before_route_journal = std::fs::read(&route_journal).unwrap();
+        let error = manager
+            .append_route_record(&context, &aliased_storage_root)
+            .unwrap_err();
+
+        assert!(
+            error.starts_with("HOST_ROUTE_DURABILITY_FAILED:")
+                && error.contains("already owned by route (existing-app, /existing-project)"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&route_journal).unwrap(),
+            before_route_journal,
+            "an alias collision must be rejected before route journal publication"
+        );
+        assert!(!manager.routes.lock().unwrap().contains_key(&(
+            "dangling-alias-app".into(),
+            GlobalState::canonical_project_scope(&root)
+                .unwrap()
+                .as_str()
+                .into(),
+        )));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_owner_permission_error_rejects_register_without_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut server, root, _) = test_server();
+        let blocked_parent = root.with_file_name(format!(
+            "{}-blocked-owner",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&blocked_parent).unwrap();
+        let blocked_storage = blocked_parent.join("future-storage");
+        {
+            let host = Arc::get_mut(&mut server).unwrap();
+            host.storage_root = blocked_storage;
+        }
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let external_root = root.with_file_name(format!(
+            "{}-permission-external",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(external_root.join(".agent-collab/server")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        std::fs::write(&route_journal, b"").unwrap();
+        let before_route_journal = std::fs::read(&route_journal).unwrap();
+
+        std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let context = context_with_app(&external_root, "permission-external-app");
+        let (_runtime, response) = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: "permission-external-worker".into(),
+                token: "token-permission-external".into(),
+                pane: Some("%permission-external-worker".into()),
+                cwd: external_root.display().to_string(),
+                candidates: None,
+            },
+        );
+        std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!response.ok, "{response:?}");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("HOST_ROUTE_DURABILITY_FAILED:")
+                    && error.contains("Permission denied")),
+            "{response:?}"
+        );
+        assert_eq!(std::fs::read(&route_journal).unwrap(), before_route_journal);
+        assert!(!manager
+            .routes
+            .lock()
+            .unwrap()
+            .contains_key(&ProjectRuntimeManager::route_key(&context)));
+        assert!(!external_root
+            .join(".agent-collab/server/journal.jsonl")
+            .exists());
+
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external_root).unwrap();
+        std::fs::remove_dir_all(blocked_parent).unwrap();
     }
 
     #[tokio::test]
@@ -9640,6 +12825,83 @@ async fn dispatch_wire(
     }
 }
 
+/// Route a host-daemon connection to the reducer that owns its exact
+/// `(app_scope_id, project_scope_id)` pair.  Registration is handled inside a
+/// blocking transaction so the route table is published only after the target
+/// journal has committed the identity binding.
+async fn dispatch_wire_routed(
+    manager: Arc<ProjectRuntimeManager>,
+    project_context: Option<ProjectContext>,
+    req: Req,
+) -> (Arc<Server>, Resp) {
+    match req {
+        Req::Poll {
+            worker_id,
+            token,
+            timeout_ms,
+        } => {
+            let Some(context) = project_context else {
+                return (
+                    manager.host.clone(),
+                    Resp::err(
+                        "PROJECT_CONTEXT_REQUIRED: canonical project root and scope are required",
+                    ),
+                );
+            };
+            let poll_req = Req::Poll {
+                worker_id: worker_id.clone(),
+                token: token.clone(),
+                timeout_ms,
+            };
+            let server = match manager.select_runtime(&context) {
+                Ok(server) => server,
+                Err(error) => return (manager.host.clone(), Resp::err(error)),
+            };
+            if let Err(error) = validate_request_context(&server, &poll_req, Some(&context)) {
+                return (server, Resp::err(error));
+            }
+            let admission = {
+                let check = server.state.lock().unwrap();
+                if let Err(error) = verify(&check, &worker_id, &token) {
+                    Some(error)
+                } else if check.admission_frozen() {
+                    Some(Resp::err("MIGRATION_ADMISSION_FROZEN: only identity rebind, read queries, daemon restart, and migration verify are allowed"))
+                } else {
+                    None
+                }
+            };
+            let response = match admission {
+                Some(response) => response,
+                None => {
+                    handle_poll_async_with_context(
+                        server.clone(),
+                        worker_id,
+                        Some(token),
+                        timeout_ms,
+                        Some(context),
+                    )
+                    .await
+                }
+            };
+            (server, response)
+        }
+        req => {
+            let result = tokio::task::spawn_blocking({
+                let manager = manager.clone();
+                move || manager.dispatch_sync(project_context, req)
+            })
+            .await;
+            match result {
+                Ok(result) => result,
+                Err(error) => (
+                    manager.host.clone(),
+                    Resp::err(format!("handler join error: {error}")),
+                ),
+            }
+        }
+    }
+}
+
 async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let (reader, mut writer) = stream.into_split();
@@ -9653,7 +12915,7 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
                 let activity_req = req.clone();
                 let resp = dispatch_wire(server.clone(), project_context, req).await;
                 let _ = record_activity(
-                    &server.root,
+                    &server.storage_root,
                     "request",
                     request_activity(&activity_req, &resp),
                 );
@@ -9661,8 +12923,49 @@ async fn conn_task(server: Arc<Server>, stream: tokio::net::UnixStream) {
             }
             Err(error) => {
                 let resp = Resp::err(error);
-                let _ =
-                    record_activity(&server.root, "protocol_error", json!({"error": resp.error}));
+                let _ = record_activity(
+                    &server.storage_root,
+                    "protocol_error",
+                    json!({"error": resp.error}),
+                );
+                resp
+            }
+        };
+        let mut out = serde_json::to_string(&resp).expect("serialize resp");
+        out.push('\n');
+        if writer.write_all(out.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn conn_task_routed(manager: Arc<ProjectRuntimeManager>, stream: tokio::net::UnixStream) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let resp = match parse_wire_request(&line) {
+            Ok((project_context, req)) => {
+                let activity_req = req.clone();
+                let (runtime, resp) =
+                    dispatch_wire_routed(manager.clone(), project_context, req).await;
+                let _ = record_activity(
+                    &runtime.storage_root,
+                    "request",
+                    request_activity(&activity_req, &resp),
+                );
+                resp
+            }
+            Err(error) => {
+                let resp = Resp::err(error);
+                let _ = record_activity(
+                    &manager.host.storage_root,
+                    "protocol_error",
+                    json!({"error": resp.error}),
+                );
                 resp
             }
         };
@@ -9695,7 +12998,13 @@ fn apply_replayed_event(st: &mut State, event: &Event, line: usize) -> anyhow::R
 }
 
 fn replay(root: &Path) -> anyhow::Result<State> {
-    let journal = root.join(".agent-collab/server/journal.jsonl");
+    replay_from_journal(root, &root.join(".agent-collab/server/journal.jsonl"))
+}
+
+/// Replay a project reducer from the journal selected by its runtime owner.
+/// The project root remains the semantic scope used by worktree and identity
+/// validation; the journal path may be an appserver-specific runtime store.
+fn replay_from_journal(_root: &Path, journal: &Path) -> anyhow::Result<State> {
     let mut st = State::default();
     if !journal.exists() {
         return Ok(st);
@@ -10094,6 +13403,8 @@ async fn run_with_host_paths(scope: Scope, host_paths: HostPaths) -> anyhow::Res
     let server = Arc::new(Server {
         config: crate::config::load(&scope.root)?,
         root: scope.root.clone(),
+        storage_root: scope.root.clone(),
+        journal_path: project_server_dir.join("journal.jsonl"),
         state: Mutex::new(state),
         journal: Mutex::new(journal_file),
         pane_alive_check: pane_presence,
@@ -10105,6 +13416,8 @@ async fn run_with_host_paths(scope: Scope, host_paths: HostPaths) -> anyhow::Res
     });
     restore_registered_peer_default_leases(&server);
     purge_expired_storage(&server, now_ms());
+    let runtime_manager = ProjectRuntimeManager::new(server.clone(), &host_paths)
+        .map_err(|error| anyhow::anyhow!(error))?;
     let listener = UnixListener::bind(&sock_path)?;
     let socket_metadata = std::fs::symlink_metadata(&sock_path)?;
     use std::os::unix::fs::PermissionsExt;
@@ -10133,24 +13446,26 @@ async fn run_with_host_paths(scope: Scope, host_paths: HostPaths) -> anyhow::Res
     );
 
     // Background scheduler: bounded waits and explicitly registered notifications.
-    let sched = server.clone();
+    let sched = runtime_manager.clone();
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(Duration::from_millis(sched.config.timers.tick_interval_ms));
+        let mut interval = tokio::time::interval(Duration::from_millis(
+            sched.host.config.timers.tick_interval_ms,
+        ));
         loop {
             interval.tick().await;
-            let s = sched.clone();
-            tokio::task::spawn_blocking(move || crate::server::timers::tick(&s))
-                .await
-                .ok();
+            for runtime in sched.runtimes() {
+                tokio::task::spawn_blocking(move || crate::server::timers::tick(&runtime))
+                    .await
+                    .ok();
+            }
         }
     });
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let srv = server.clone();
-                tokio::spawn(conn_task(srv, stream));
+                let manager = runtime_manager.clone();
+                tokio::spawn(conn_task_routed(manager, stream));
             }
             Err(e) => append_log(&host_paths.log_path(), &format!("accept error: {}", e)),
         }
@@ -10179,6 +13494,8 @@ mod reducer_binding_tests {
         let server = Server {
             config: crate::config::Config::default(),
             root: root.clone(),
+            storage_root: root.clone(),
+            journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
             pane_alive_check: |_| PanePresence::Present,
@@ -10275,6 +13592,8 @@ mod reducer_binding_tests {
         let server = Server {
             config: crate::config::Config::default(),
             root: root.clone(),
+            storage_root: root.clone(),
+            journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
             pane_alive_check: |_| PanePresence::Present,

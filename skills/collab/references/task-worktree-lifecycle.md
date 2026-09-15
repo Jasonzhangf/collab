@@ -68,8 +68,8 @@ owner-scoped lease can be cancelled with
 - Only the owner may update, deliver, cancel, or normally close. Review and
   exact-main integration require the task owner or live master.
 - Force close exceptions are explicit and audited: a live master may close
-  any task; with no live master the owner may self-close, or a registered
-  peer may close a task whose owner tmux identity is lost.
+  any task; with no live master the owner may self-close, or a registered peer
+  may close a task whose owner registered transport identity is lost.
 - A bound worktree creates a mandatory cleanup obligation. Keep its exact path
   and branch bound until close.
 - `delivered`/`merged` are not cleanup. Close requires a clean, removed,

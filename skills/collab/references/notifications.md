@@ -37,10 +37,12 @@ collab notify unsubscribe <subscription-id>
   ends any subscription; one attempted batch exhausts only its messages on a
   reusable direct-message lease.
 - Before every attempt, the daemon revalidates owner, event, subject, TTL,
-  pane liveness, pane ownership, worker registration match, Agent presence, and
-  Agent state. If the pane is dead, unowned, or mismatched (`identity-mismatch`),
-  or the agent is `absent`, the subscription immediately transitions to `pane-lost`
-  to prevent notification storms. `absent` and `unknown` produce zero tmux input.
+  selected App Server thread or tmux pane liveness and ownership, worker
+  registration match, Agent presence, and Agent state. If the selected
+  transport is dead, unowned, or mismatched (`identity-mismatch`), or the agent
+  is `absent`, the subscription transitions to its explicit unavailable state
+  to prevent notification storms. `absent` and `unknown` produce zero
+  transport input.
 - Timer ticks, restart, replay, re-registration, or delivery mode cannot reset
   the one-attempt lifetime cap. Delivery requires the agent to be in a prompt/idle
   `waiting` state; actively `working` agents defer delivery without burning
@@ -65,9 +67,11 @@ collab notify unsubscribe <subscription-id>
   task, wait-timeout, or scheduling blocker is P1 operational work and must not be
   reclassified as a P0 interrupt by subject text alone.
 - One safe preview contains notification ID, abbreviated subject, and one-line
-  original body. Control characters are escaped. Codex keeps `paste-buffer -p`
-  and `C-m` in one tmux queue so
-  the paste is submitted. Dual tmux sessions must prove both mailbox and pane Enter.
+  original body. Control characters are escaped. App Server delivery means
+  `thread/queue/add` accepted the bounded preview; that acceptance is not
+  execution, read, or reply. A tmux-selected peer keeps `paste-buffer -p` and
+  `C-m` in one queue so the paste is submitted. Dual tmux sessions must prove
+  both mailbox and pane Enter.
 - Full subject/body remains in the mailbox without a matching subscription.
   This outcome is not a sender-selected `mailbox-only` mode.
 - A failed/lost/delayed/duplicate wake never rolls back mailbox truth or counts
