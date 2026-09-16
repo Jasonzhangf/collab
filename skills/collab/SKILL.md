@@ -92,6 +92,13 @@ tokens, task records, or bindings to make status look clean. Never start a
 second daemon or use broad process kills. `collab ack` remains a compatibility
 operation; it is not a substitute for task close or identity recovery.
 
+An AppSDK `reset-governance` or `appsdk init --fresh --discard-legacy` is not
+Collab migration and must not remove `.agent-collab/`. AppSDK's reset owner
+explicitly treats `.agent-collab/` as a reserved root. If the project also
+needs to move or retire Collab state, follow
+[Migration and Daemon Maintenance](references/migration-daemon.md); the two
+operations have separate transactions and separate completion evidence.
+
 ### 4. Regression recognition
 
 After a fix, verify the same user path again and classify the first divergence:

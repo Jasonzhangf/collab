@@ -1,5 +1,25 @@
 # Migration and Daemon Maintenance
 
+## Global truth and project-local state
+
+The host-wide runtime truth is the Collab state root resolved by the installed
+binary:
+
+```text
+$COLLAB_STATE_DIR, else $XDG_STATE_HOME/collab, else $HOME/.collab
+  server.sock
+  daemon.lock
+  server.pid
+  events.jsonl
+  log.txt
+```
+
+Each registered project keeps its own `.agent-collab/` reducer input,
+journal, mailbox, tasks, claims, identity bindings, and worktrees. It is
+project-local durable state, not a disposable cache and not the host-wide
+runtime socket. AppSDK governance has a separate truth owner and reset
+transaction; neither owner may delete or rewrite the other's state.
+
 ## Formal v1 migration
 
 ```text
@@ -24,6 +44,50 @@ operator decision; never invent an owner.
 
 Never delete/recreate `.agent-collab`, edit its truth files, clear
 evidence/mailbox, copy identity tokens, reset bindings, or mix old/new writers.
+
+## Legacy project migration or retirement
+
+Use this path when an existing project has `.agent-collab/` from an older
+version and the operator wants to move to the current Collab baseline:
+
+```sh
+cd /abs/path/project
+collab migrate inspect
+collab migrate plan
+collab migrate apply
+# install the reviewed Collab binary
+collab down
+collab up
+collab worker recover
+collab migrate verify
+```
+
+`inspect` is read-only. `plan` does not freeze admission. `apply` freezes
+admission and persists the deterministic snapshot. `verify` resumes admission
+only after journal, mailbox, task, identity, and count continuity pass.
+
+Run the same operation from the project root whose `.agent-collab/` is being
+migrated. Do not run it in a worktree that merely points at another project's
+scope, and do not start a second daemon for the migration.
+
+If the result is `reset_required`, `needs_operator`, `unknown`, a malformed
+journal, a count mismatch, or an unresolved owner:
+
+1. Preserve the exact error, migration ID, snapshot, and source bytes.
+2. Stop admission and dependent writes.
+3. Resolve the named owner or blocker through the Collab server protocol.
+4. Create a new plan only after the source can be proved safe.
+
+Do not manually delete `.agent-collab/`, edit journal or mailbox JSON, clear
+the mailbox, copy identity tokens, or convert a failed migration into a fresh
+registration by deleting the source. A project with no recoverable state still
+needs an explicit operator retirement decision owned by Collab; AppSDK reset
+does not provide that authorization.
+
+After `verify`, record the migration record ID, source and target versions,
+snapshot digest, preserved counts, old/new daemon PID and socket, identity
+rebinds, and one real post-restart subscribed message. Migration verification
+does not prove AppSDK delivery, review, install, or freeze.
 
 ## Controlled daemon lifecycle
 
