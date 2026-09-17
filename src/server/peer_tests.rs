@@ -1,5 +1,5 @@
 use super::*;
-use crate::identity::{BindingId, RuntimeId};
+use crate::identity::{runtime_from_registration_receipt, BindingId, RuntimeId};
 use crate::server::notification_contract::JournalError;
 use crate::server::state::{default_priority, is_goal_deadline, TaskRec};
 use std::process::Command;
@@ -47,7 +47,7 @@ pub(crate) fn test_appserver_transport(thread_id: &str) -> SelectedTransport {
         endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
         namespace: Some("codex_tui".into()),
         thread_id: Some(thread_id.into()),
-        capabilities: vec!["send_message".into()],
+        capabilities: vec!["send_message_to_thread".into()],
         self_check: "test appserver".into(),
     }
 }
@@ -2792,7 +2792,7 @@ fn register_appserver(server: &mut Server, id: &str, thread_id: &str) -> Resp {
                 endpoint: Some(candidate.endpoint.clone()),
                 namespace: Some(candidate.namespace.clone()),
                 thread_id: Some(candidate.thread_id.clone()),
-                capabilities: vec!["send_message".into()],
+                capabilities: vec!["send_message_to_thread".into()],
                 self_check: "test App Server candidate".into(),
             })
         }
@@ -2808,6 +2808,22 @@ fn register_appserver(server: &mut Server, id: &str, thread_id: &str) -> Resp {
             appserver: Some(candidate_for_closure),
         }),
     )
+}
+
+#[test]
+fn init_registration_result_exposes_persisted_runtime_identity() {
+    let (mut server, root) = test_server();
+    let registration = register_appserver(&mut server, "peer-init", "thread-init");
+    assert!(registration.ok, "{registration:?}");
+    let runtime =
+        runtime_from_registration_receipt(&registration.data, "peer-init", &root).unwrap();
+    assert_eq!(runtime.runtime_id.as_str(), "runtime-appserver-thread-init");
+    assert_eq!(
+        runtime.native_thread_id.as_ref().unwrap().as_str(),
+        "thread-init"
+    );
+    assert_eq!(registration.data["transport_selected"]["kind"], "appserver");
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

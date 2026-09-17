@@ -466,6 +466,47 @@ fn runtime_for_request<'a>(ident: &'a Identity) -> anyhow::Result<&'a RuntimeIde
     Ok(runtime)
 }
 
+fn appserver_runtime_projection(
+    scope: &Scope,
+    ident: &Identity,
+    daemon_pid: u32,
+) -> anyhow::Result<serde_json::Value> {
+    let runtime = ident
+        .runtime
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("registered identity is missing its runtime"))?;
+    let transport = ident
+        .transport
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("registered identity is missing its transport"))?;
+    if transport.kind != crate::proto::TransportKind::AppServer {
+        anyhow::bail!("registered transport is not App Server");
+    }
+    let endpoint = transport
+        .endpoint
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("registered transport is missing its endpoint"))?;
+    let namespace = transport
+        .namespace
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("registered transport is missing its namespace"))?;
+    if daemon_pid == 0 {
+        anyhow::bail!("registered daemon PID is zero");
+    }
+    let project_root = std::fs::canonicalize(&scope.root)?;
+    Ok(json!({
+        "runtimeId": runtime.runtime_id,
+        "appserverId": runtime.appserver_id,
+        "namespace": namespace,
+        "endpoint": endpoint,
+        "projectRoot": project_root,
+        "capabilities": transport.capabilities,
+        "processId": daemon_pid,
+    }))
+}
+
 fn call_project<T: DeserializeOwned>(
     scope: &Scope,
     ident: &Identity,
@@ -568,6 +609,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             client::ensure_server(&scope.sock_path())?;
             let mut ident = identity::load_or_create_for_init(&scope)?;
             let registration = ensure_registration(&scope, &mut ident)?;
+            let daemon_pid = std::fs::read_to_string(scope.host_paths()?.pid_path())
+                .map_err(|error| anyhow::anyhow!("registered daemon PID is unavailable: {error}"))?
+                .trim()
+                .parse::<u32>()
+                .map_err(|error| anyhow::anyhow!("registered daemon PID is invalid: {error}"))?;
+            let runtime = appserver_runtime_projection(&scope, &ident, daemon_pid)?;
             let task_board: serde_json::Value =
                 call_project(&scope, &ident, &Req::TaskStatus { task_id: None })?;
             out(&json!({
@@ -575,6 +622,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 "root": scope.root,
                 "worker_id": ident.worker_id,
                 "identity_kind": "peer",
+                "runtime": runtime,
                 "transport_selected": ident.transport,
                 "daemon_started": started,
                 "role_brief": registration["role_brief"],
@@ -1295,13 +1343,54 @@ mod tests {
             endpoint: Some("unix:///tmp/codex.sock".into()),
             namespace: Some("codex_tui".into()),
             thread_id: Some("thread-worker-1".into()),
-            capabilities: vec!["send_message".into()],
+            capabilities: vec!["send_message_to_thread".into()],
             self_check: "test appserver".into(),
         });
         let before = serde_json::to_value(&identity).unwrap();
         let response = ensure_registration(&Scope { root: root.clone() }, &mut identity).unwrap();
         assert_eq!(response, json!({"reused": true}));
         assert_eq!(serde_json::to_value(&identity).unwrap(), before);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn init_runtime_projection_matches_appsdk_host_registry_contract() {
+        let root = test_root("runtime-projection");
+        let runtime = RuntimeIdentity {
+            agent_id: identity::AgentId::new("worker-1").unwrap(),
+            runtime_id: identity::RuntimeId::new("runtime-thread-1").unwrap(),
+            appserver_id: identity::AppServerId::new("tui-default").unwrap(),
+            endpoint_generation: 2,
+            binding_id: identity::BindingId::new("binding-thread-1").unwrap(),
+            native_thread_id: Some(identity::NativeThreadId::new("thread-1").unwrap()),
+        };
+        let mut identity = identity_with_runtime(Some(runtime));
+        identity.transport = Some(SelectedTransport {
+            kind: TransportKind::AppServer,
+            endpoint: Some("unix:///tmp/codex.sock".into()),
+            namespace: Some("codex_tui".into()),
+            thread_id: Some("thread-1".into()),
+            capabilities: vec!["send_message_to_thread".into(), "read_thread".into()],
+            self_check: "test appserver".into(),
+        });
+        let projection =
+            appserver_runtime_projection(&Scope { root: root.clone() }, &identity, 4242).unwrap();
+        assert_eq!(projection["runtimeId"], "runtime-thread-1");
+        assert_eq!(projection["appserverId"], "tui-default");
+        assert_eq!(projection["namespace"], "codex_tui");
+        assert_eq!(projection["endpoint"], "unix:///tmp/codex.sock");
+        assert_eq!(
+            projection["projectRoot"],
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(projection["capabilities"][0], "send_message_to_thread");
+        assert_eq!(projection["processId"], 4242);
+        assert!(
+            appserver_runtime_projection(&Scope { root: root.clone() }, &identity, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("PID is zero")
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

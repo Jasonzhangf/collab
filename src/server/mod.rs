@@ -506,7 +506,7 @@ impl Server {
             endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
             namespace: Some("codex_tui".into()),
             thread_id: Some(thread_id.to_string()),
-            capabilities: vec!["send_message".into()],
+            capabilities: vec!["send_message_to_thread".into()],
             self_check: "test appserver transport".into(),
         };
         let project_scope = GlobalState::canonical_project_scope(std::path::Path::new(worker_cwd))
@@ -2890,7 +2890,7 @@ mod notification_batch_tests {
                         endpoint: Some(candidate.endpoint.clone()),
                         namespace: Some(candidate.namespace.clone()),
                         thread_id: Some(candidate.thread_id.clone()),
-                        capabilities: vec!["send_message".into()],
+                        capabilities: vec!["send_message_to_thread".into()],
                         self_check: "test appserver".into(),
                     })
                 }),
@@ -2924,7 +2924,7 @@ mod notification_batch_tests {
                         endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
                         namespace: Some("codex_tui".into()),
                         thread_id: Some(format!("thread-{worker_id}")),
-                        capabilities: vec!["send_message".into()],
+                        capabilities: vec!["send_message_to_thread".into()],
                         self_check: "test appserver".into(),
                     }),
                 },
@@ -8543,7 +8543,7 @@ mod host_route_registry_tests {
             capabilities: vec![
                 "session_status".into(),
                 "read_thread".into(),
-                "send_message".into(),
+                "send_message_to_thread".into(),
             ],
             self_check: "server verified App Server candidate".into(),
         }
@@ -8844,7 +8844,7 @@ mod host_route_registry_tests {
             endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
             namespace: Some("codex_tui".into()),
             thread_id: Some("thread-current".into()),
-            capabilities: vec!["send_message".into()],
+            capabilities: vec!["send_message_to_thread".into()],
             self_check: "server verified".into(),
         };
         let mut subscription = NotificationSubscription {
@@ -11431,7 +11431,7 @@ mod host_route_registry_tests {
                     endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
                     namespace: Some("codex_tui".into()),
                     thread_id: Some("thread-worker-a".into()),
-                    capabilities: vec!["send_message".into()],
+                    capabilities: vec!["send_message_to_thread".into()],
                     self_check: "test appserver".into(),
                 },
                 project_scope.clone(),
@@ -11465,7 +11465,7 @@ mod host_route_registry_tests {
                     endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
                     namespace: Some("codex_tui".into()),
                     thread_id: Some("thread-worker-b".into()),
-                    capabilities: vec!["send_message".into()],
+                    capabilities: vec!["send_message_to_thread".into()],
                     self_check: "test appserver".into(),
                 },
                 project_scope.clone(),
@@ -13083,7 +13083,7 @@ mod reducer_binding_tests {
                     endpoint: Some(candidate.endpoint.clone()),
                     namespace: Some(candidate.namespace.clone()),
                     thread_id: Some(candidate.thread_id.clone()),
-                    capabilities: vec!["send_message".into()],
+                    capabilities: vec!["send_message_to_thread".into()],
                     self_check: "test appserver".into(),
                 })
             }),

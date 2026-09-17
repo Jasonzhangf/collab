@@ -29,6 +29,10 @@ pub const SKILL_FILES: &[(&str, &str)] = &[
         "references/verification.md",
         include_str!("../skills/collab/references/verification.md"),
     ),
+    (
+        "references/state-paths.md",
+        include_str!("../skills/collab/references/state-paths.md"),
+    ),
 ];
 
 /// Result of installing a single skill file.

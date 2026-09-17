@@ -4,7 +4,6 @@ use crate::identity::{validate_id_for_protocol, AppServerId};
 use serde::{Deserialize, Serialize};
 
 pub const COLLAB_STATE_DIR_ENV: &str = "COLLAB_STATE_DIR";
-pub const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
 pub const HOME_ENV: &str = "HOME";
 pub const COLLAB_SOCKET_PATH_ENV: &str = "COLLAB_SOCKET_PATH";
 pub const COLLAB_HOST_SOCKET_ENV: &str = "COLLAB_HOST_SOCKET";
@@ -35,7 +34,6 @@ impl HostPaths {
     pub fn resolve_from_env() -> anyhow::Result<Self> {
         let state_root = resolve_state_root(
             std::env::var_os(COLLAB_STATE_DIR_ENV),
-            std::env::var_os(XDG_STATE_HOME_ENV),
             std::env::var_os(HOME_ENV),
         )?;
         let mut paths = Self::from_state_root(state_root)?;
@@ -154,7 +152,6 @@ fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
 
 fn resolve_state_root(
     state_dir: Option<std::ffi::OsString>,
-    _xdg_state_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> anyhow::Result<PathBuf> {
     if let Some(value) = state_dir.filter(|value| !value.is_empty()) {
@@ -164,7 +161,7 @@ fn resolve_state_root(
         return Ok(PathBuf::from(value).join(".collab"));
     }
     anyhow::bail!(
-        "collab host state root is unavailable; set ${COLLAB_STATE_DIR_ENV}, ${XDG_STATE_HOME_ENV}, or ${HOME_ENV}"
+        "collab host state root is unavailable; set ${COLLAB_STATE_DIR_ENV} or ${HOME_ENV}"
     )
 }
 
@@ -836,12 +833,8 @@ mod tests {
     fn default_host_endpoint_uses_dot_collab_in_home() {
         let home = test_root("host-home-default");
         std::fs::create_dir_all(&home).unwrap();
-        let state_root = resolve_state_root(
-            Some("".into()),
-            Some("".into()),
-            Some(home.clone().into_os_string()),
-        )
-        .unwrap();
+        let state_root =
+            resolve_state_root(Some("".into()), Some(home.clone().into_os_string())).unwrap();
         assert_eq!(state_root, home.join(".collab"));
         std::fs::remove_dir_all(home).ok();
     }

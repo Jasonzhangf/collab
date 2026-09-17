@@ -343,7 +343,7 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
         capabilities: vec![
             "session_status".into(),
             "read_thread".into(),
-            "send_message".into(),
+            "send_message_to_thread".into(),
             "wait_reply".into(),
         ],
         self_check: "initialize, thread/read identity, and thread/queue/add method probe passed"
@@ -911,7 +911,7 @@ mod tests {
         assert!(selected
             .capabilities
             .iter()
-            .any(|capability| capability == "send_message"));
+            .any(|capability| capability == "send_message_to_thread"));
         assert!(selected.self_check.contains("thread/queue/add"));
     }
 

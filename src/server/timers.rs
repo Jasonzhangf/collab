@@ -405,7 +405,7 @@ mod tests {
                         endpoint: Some(candidate.endpoint.clone()),
                         namespace: Some(candidate.namespace.clone()),
                         thread_id: Some(candidate.thread_id.clone()),
-                        capabilities: vec!["send_message".into()],
+                        capabilities: vec!["send_message_to_thread".into()],
                         self_check: "test appserver".into(),
                     })
                 }),
@@ -437,7 +437,7 @@ mod tests {
                     endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
                     namespace: Some("codex_tui".into()),
                     thread_id: Some(thread_id),
-                    capabilities: vec!["send_message".into()],
+                    capabilities: vec!["send_message_to_thread".into()],
                     self_check: "test appserver".into(),
                 }),
             },

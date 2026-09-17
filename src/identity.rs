@@ -581,7 +581,7 @@ mod tests {
                 "endpoint": "unix:///tmp/codex.sock",
                 "namespace": "codex_tui",
                 "thread_id": "thread-1",
-                "capabilities": ["session_status", "read_thread", "send_message"],
+                "capabilities": ["session_status", "read_thread", "send_message_to_thread"],
                 "self_check": "server verified"
             },
             "command": {
@@ -652,7 +652,7 @@ mod tests {
                 "endpoint": "unix:///tmp/codex.sock",
                 "namespace": "codex_tui",
                 "thread_id": "thread-selected",
-                "capabilities": ["send_message"],
+                "capabilities": ["send_message_to_thread"],
                 "self_check": "server verified"
             },
             "command": {

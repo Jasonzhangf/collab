@@ -6,7 +6,7 @@ The host-wide runtime truth is the Collab state root resolved by the installed
 binary:
 
 ```text
-$COLLAB_STATE_DIR, else $XDG_STATE_HOME/collab, else $HOME/.collab
+$COLLAB_STATE_DIR for isolated tests, else $HOME/.collab
   server.sock
   daemon.lock
   server.pid
