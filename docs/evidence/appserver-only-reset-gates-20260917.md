@@ -12,7 +12,10 @@ restart, or live communication receipt.
 | --- | --- |
 | worktree | `/Volumes/extension/code/collab/playground/reset-canonical-20260917` |
 | branch | `codex/reset-canonical-20260917` |
-| HEAD/base | `6eafb208dcbb07ad6118cbabed6b27b16d7e14db` |
+| candidate base | `6eafb208dcbb07ad6118cbabed6b27b16d7e14db` |
+| candidate commit | `13641a09bf49a56c8c51a63cd8c004daccd28390` |
+| candidate tree | `bc3abfcb49d64cfa44cc4d37b5fa391a9b2c9de2` |
+| candidate branch push | `origin/codex/reset-canonical-20260917` |
 | release binary | `target/release/collab` |
 | release SHA-256 | `9544c56a92f3a33b1568241b9f70ec9281e50c10036fcbc56c2268e0669dfba5` |
 | reset owner | `src/reset.rs` (`fe3e07de957f0dfe0aac9fbcddccf04f9c3e86c031757b5c2654c805473bf869`) |
@@ -20,9 +23,10 @@ restart, or live communication receipt.
 | App Server A/B E2E | `tests/appserver_e2e.mjs` (`fa1a09bf6b64275c628a4d58dff3a061f2311873ec0c7b85ed9d3f2c59100a35`) |
 | reset live replay | `tests/reset_live_replay.mjs` (`de61551132da888afae7d576eb205fe71afb1543df97fcf41691e2d8677313dd`) |
 
-The candidate tree is intentionally still uncommitted for independent review.
-The evidence is read-only during review and contains no secret or copied
-control token.
+The reviewed candidate is committed and pushed. The review ran against the
+uncommitted tree at base `6eafb208dcbb07ad6118cbabed6b27b16d7e14db`; the
+committed candidate preserves that reviewed tree. This evidence contains no
+secret or copied control token.
 
 ## Gate results
 
@@ -36,6 +40,16 @@ control token.
 | isolated A/B App Server E2E | `env -u TMUX -u TMUX_PANE COLLAB_APPSERVER_E2E_COLLAB=<release-binary> node tests/appserver_e2e.mjs` | PASS: two real project roots and native threads selected App Server; `context`/`worker status` reported `live=true`, `presence=present`, `endpoint_live=true`, `identity_valid=true`; cross-project master send was `durable=true`, `cross_project=true`, `notification=sent`; target `inbox` and `recv` consumed the marker; restart preserved identity, route, and one unconsumed message before `recv` |
 | full task lifecycle | same A/B E2E | PASS: owner task reached `working -> verifying -> reviewed -> delivered -> accepted -> merged -> closed`; delivery evidence, independent review evidence, exact `refs/heads/main` commit, and cleanup receipt `verified` were asserted |
 | reset live replay | `env -u TMUX -u TMUX_PANE COLLAB_RESET_REPLAY_COLLAB=<release-binary> node tests/reset_live_replay.mjs` | PASS: archived and removed `.agent-collab` and `.agent-collab-v2`; preserved an unrelated initialized route; removed stale routes; rebuilt the current empty baseline and guidance; `delivery_verified=false`; second reset was idempotent with `already_reset=true`; daemon `up/status/down` passed |
+
+## Review admission
+
+| Field | Observed value |
+| --- | --- |
+| review task | `reset-canonical-20260917-appserver-only-r11` |
+| mode | uncommitted candidate at `6eafb208dcbb07ad6118cbabed6b27b16d7e14db` |
+| verdict | PASS |
+| outcome | `controller_no_blocking_findings` |
+| receipt | `.agent-collab/review/reset-canonical-20260917-appserver-only-r11/status.json` |
 
 ## App Server blackbox boundary
 
@@ -73,10 +87,9 @@ verification.
   server-selected App Server transport when the registered native thread is
   live.
 
-## Not yet proven by this receipt
+## Delivery layers outside this receipt
 
-- independent review admission;
-- commit, push, or merge;
+- final main merge, push, and post-merge rebuild;
 - installation of the candidate binary;
 - controlled daemon restart against the installed global binary;
 - replay against the installed binary in the user's real projects;
