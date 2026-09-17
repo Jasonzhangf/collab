@@ -12806,14 +12806,7 @@ fn probe_legacy_socket(socket_path: &Path) -> anyhow::Result<bool> {
             drop(stream);
             Ok(true)
         }
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            Ok(false)
-        }
+        Err(error) if crate::client::stale_socket_error(&error) => Ok(false),
         Err(error) => Err(anyhow::Error::new(error)),
     }
 }
@@ -12827,9 +12820,9 @@ pub(crate) struct LegacyWriterFence {
 }
 
 /// Reject a reachable pre-host-endpoint socket after all compatible legacy
-/// locks are held.  A stale socket is safe to classify as absent only when the
-/// connection probe returns `NotFound` or `ConnectionRefused`; any other probe
-/// error is unknown and fails closed.
+/// locks are held. A stale socket is safe to classify as absent only for the
+/// platform's explicit stale-socket errors; any other probe error is unknown
+/// and fails closed.
 fn ensure_legacy_socket_absent(scope: &Scope, host_paths: &HostPaths) -> anyhow::Result<()> {
     let project_server_dir = scope.server_dir();
     let legacy_socket = project_server_dir.join("server.sock");
@@ -12912,11 +12905,7 @@ fn prepare_socket_path(sock_path: &Path) -> anyhow::Result<()> {
     }
     match crate::client::connect(sock_path) {
         Ok(_) => anyhow::bail!("server already running at {}", sock_path.display()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) => {}
+        Err(error) if crate::client::stale_socket_error(&error) => {}
         Err(error) => {
             return Err(anyhow::Error::new(error).context(format!(
                 "cannot determine whether stale server socket {} can be removed",

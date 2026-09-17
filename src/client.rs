@@ -53,6 +53,17 @@ pub fn connect(sock: &Path) -> std::io::Result<UnixStream> {
     UnixStream::connect(sock)
 }
 
+/// A Unix socket connection can fail with platform-specific errors after the
+/// listener exits. macOS reports `EOPNOTSUPP` for a stale socket that Linux
+/// reports as `ECONNREFUSED`; both mean that no process is accepting requests
+/// at this endpoint.
+pub fn stale_socket_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    ) || error.raw_os_error() == Some(libc::EOPNOTSUPP)
+}
+
 pub fn record_event(sock: &Path, kind: &str, detail: Value) {
     let Some(server_dir) = sock.parent() else {
         return;
@@ -475,9 +486,7 @@ fn connection_error(sock: &Path, error: io::Error) -> anyhow::Error {
     // A request must never treat a refused connection as permission to
     // replace the endpoint.  Only the explicit `ensure_server` start path
     // may use the unheld stale-socket classification to recover it.
-    let status = if error.kind() == io::ErrorKind::ConnectionRefused
-        && std::fs::symlink_metadata(sock).is_ok()
-    {
+    let status = if stale_socket_error(&error) && std::fs::symlink_metadata(sock).is_ok() {
         DaemonAvailability::Unknown
     } else {
         failed_connection_status(sock, &error)
@@ -494,10 +503,7 @@ fn status_error(sock: &Path, status: DaemonAvailability, detail: &str) -> anyhow
 }
 
 fn failed_connection_status(sock: &Path, error: &io::Error) -> DaemonAvailability {
-    if !matches!(
-        error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-    ) {
+    if !stale_socket_error(error) {
         return DaemonAvailability::Unknown;
     }
     let socket_present = match std::fs::symlink_metadata(sock) {
@@ -517,7 +523,7 @@ fn failed_connection_status(sock: &Path, error: &io::Error) -> DaemonAvailabilit
         // re-checks the inode before removing it, so an explicit `up` may
         // safely launch while preserving the fail-closed result for other
         // probe errors below.
-        (true, LockAvailability::Unheld) if error.kind() == io::ErrorKind::ConnectionRefused => {
+        (true, LockAvailability::Unheld) if stale_socket_error(error) => {
             DaemonAvailability::Unavailable
         }
         (true, LockAvailability::Unheld) => DaemonAvailability::Unknown,
@@ -680,6 +686,12 @@ mod tests {
             daemon_status(&fixture.socket()),
             DaemonAvailability::Unavailable
         );
+    }
+
+    #[test]
+    fn stale_socket_error_accepts_macos_eopnotsupp() {
+        let error = io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+        assert!(stale_socket_error(&error));
     }
 
     #[test]

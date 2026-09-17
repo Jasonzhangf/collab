@@ -30,8 +30,17 @@ struct RetiredRoot {
     absolute: PathBuf,
     staged: Option<PathBuf>,
     files: usize,
+    sockets: Vec<String>,
     bytes: u64,
     digest: String,
+}
+
+fn archive_matches(entry: &RetiredRoot, files: usize, bytes: u64, digest: &str) -> bool {
+    files == entry.files && bytes == entry.bytes && digest == entry.digest
+}
+
+fn source_matches(entry: &RetiredRoot, sockets: &[String]) -> bool {
+    sockets == entry.sockets
 }
 
 fn now_ms() -> i64 {
@@ -50,28 +59,39 @@ fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
     hash
 }
 
-/// Deterministic tree digest: sorted relative path, then file bytes.
-fn tree_digest(root: &Path) -> std::io::Result<(usize, u64, String)> {
+/// Deterministic tree digest for regular files. Unix sockets have no durable
+/// bytes and are returned separately so reset can retire a stale endpoint
+/// without pretending that it copied socket state into the archive.
+fn tree_digest(root: &Path) -> std::io::Result<(usize, Vec<String>, u64, String)> {
     let mut files = Vec::new();
     collect_files(root, root, &mut files)?;
     files.sort();
     let mut count = 0usize;
+    let mut sockets = Vec::new();
     let mut bytes = 0u64;
     let mut hash = 0xcbf29ce484222325_u64;
     for relative in &files {
         let path = root.join(relative);
-        hash = fnv1a64(relative.as_bytes(), hash);
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
             return Err(control_tree_symlink_error(&path));
+        } else if is_unix_socket(&metadata) {
+            sockets.push(relative.clone());
+            continue;
         } else {
+            hash = fnv1a64(relative.as_bytes(), hash);
             let content = std::fs::read(&path)?;
             hash = fnv1a64(&content, hash);
         }
         count += 1;
         bytes += metadata.len();
     }
-    Ok((count, bytes, format!("fnv1a64:{hash:016x}")))
+    Ok((count, sockets, bytes, format!("fnv1a64:{hash:016x}")))
+}
+
+fn is_unix_socket(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    metadata.file_type().is_socket()
 }
 
 fn collect_files(root: &Path, current: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
@@ -116,6 +136,8 @@ fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
             return Err(control_tree_symlink_error(&from));
         } else if metadata.is_dir() {
             copy_tree(&from, &to)?;
+        } else if is_unix_socket(&metadata) {
+            continue;
         } else {
             std::fs::copy(&from, &to)?;
             std::fs::File::open(&to)?.sync_all()?;
@@ -460,12 +482,13 @@ pub fn run(scope: &Scope, host_paths: &HostPaths, request: ResetRequest) -> anyh
         if relative == ".agent-collab" && is_current_empty_baseline(&absolute) {
             continue;
         }
-        let (files, bytes, digest) = tree_digest(&absolute)?;
+        let (files, sockets, bytes, digest) = tree_digest(&absolute)?;
         retired.push(RetiredRoot {
             relative: relative.to_string(),
             absolute,
             staged: None,
             files,
+            sockets,
             bytes,
             digest,
         });
@@ -479,16 +502,25 @@ pub fn run(scope: &Scope, host_paths: &HostPaths, request: ResetRequest) -> anyh
         for entry in &retired {
             let destination = archive_root.join(&entry.relative);
             copy_tree(&entry.absolute, &destination)?;
-            let (files, bytes, digest) = tree_digest(&destination)?;
-            if files != entry.files || bytes != entry.bytes || digest != entry.digest {
+            let (files, sockets, bytes, digest) = tree_digest(&destination)?;
+            if !archive_matches(entry, files, bytes, &digest) {
                 anyhow::bail!(
-                    "RESET_ARCHIVE_MISMATCH: {} -> {} ({files} files, {bytes} bytes, {digest}) \
-                     does not match the source ({} files, {} bytes, {})",
+                    "RESET_ARCHIVE_MISMATCH: {} -> {} ({files} files, {} sockets, {bytes} bytes, \
+                     {digest}) does not match the source ({} files, {} sockets, {} bytes, {})",
                     entry.absolute.display(),
                     destination.display(),
+                    sockets.len(),
                     entry.files,
+                    entry.sockets.len(),
                     entry.bytes,
                     entry.digest
+                );
+            }
+            let source_sockets = tree_digest(&entry.absolute)?.1;
+            if !source_matches(entry, &source_sockets) {
+                anyhow::bail!(
+                    "RESET_SOURCE_SOCKET_CHANGED: {} socket inventory changed during archive",
+                    entry.absolute.display()
                 );
             }
         }
@@ -502,6 +534,7 @@ pub fn run(scope: &Scope, host_paths: &HostPaths, request: ResetRequest) -> anyh
                 .map(|entry| json!({
                     "path": entry.relative,
                     "files": entry.files,
+                    "sockets": entry.sockets,
                     "bytes": entry.bytes,
                     "digest": entry.digest,
                 }))
@@ -571,6 +604,7 @@ pub fn run(scope: &Scope, host_paths: &HostPaths, request: ResetRequest) -> anyh
                 .map(|entry| json!({
                     "path": entry.relative,
                     "files": entry.files,
+                    "sockets": entry.sockets,
                     "bytes": entry.bytes,
                     "digest": entry.digest,
                 }))
@@ -738,6 +772,40 @@ mod tests {
         std::fs::write(root.join("nested/b"), b"changed\n").unwrap();
         assert_ne!(first, tree_digest(&root).unwrap());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tree_digest_ignores_stale_unix_socket_bytes() {
+        let root = temp_root("digest-socket");
+        std::fs::create_dir_all(root.join("server")).unwrap();
+        std::fs::write(root.join("server/journal.jsonl"), b"one\n").unwrap();
+        let socket = root.join("server/server.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+
+        let (files, sockets, bytes, _) = tree_digest(&root).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(sockets, vec![String::from("server/server.sock")]);
+        assert_eq!(bytes, 4);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn source_verification_requires_the_inspected_socket_inventory() {
+        let entry = RetiredRoot {
+            relative: ".agent-collab".into(),
+            absolute: PathBuf::from("/tmp/source"),
+            staged: None,
+            files: 1,
+            sockets: vec!["server/server.sock".into()],
+            bytes: 4,
+            digest: "fnv1a64:test".into(),
+        };
+
+        assert!(source_matches(&entry, &["server/server.sock".into()]));
+        assert!(!source_matches(&entry, &[]));
+        assert!(archive_matches(&entry, 1, 4, "fnv1a64:test"));
     }
 
     #[test]
@@ -1062,6 +1130,58 @@ mod tests {
         assert!(!root.join(".agent-collab/server/events.jsonl").exists());
         assert!(!root.join(".agent-collab/server/log.txt").exists());
         assert_eq!(record["delivery_verified"], json!(false));
+
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(state).ok();
+    }
+
+    #[test]
+    fn reset_retires_stale_project_socket_without_copying_socket_state() {
+        use std::os::unix::net::UnixListener;
+
+        let root = temp_root("retire-socket");
+        std::fs::create_dir_all(root.join(".agent-collab/server")).unwrap();
+        std::fs::write(
+            root.join(".agent-collab/server/journal.jsonl"),
+            b"{\"ev\":\"Sent\",\"msg\":{}}\n",
+        )
+        .unwrap();
+        let legacy_socket = root.join(".agent-collab/server/server.sock");
+        let listener = UnixListener::bind(&legacy_socket).unwrap();
+        drop(listener);
+
+        let state = temp_root("retire-socket-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let host = HostPaths::from_state_root(&state).unwrap();
+        let scope = Scope { root: root.clone() };
+
+        run(
+            &scope,
+            &host,
+            ResetRequest {
+                approval: "operator authorized legacy retirement".into(),
+                discard_legacy: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!legacy_socket.exists());
+        assert!(!root.join(".agent-collab/server/journal.jsonl").exists());
+        let archive_entries = std::fs::read_dir(state.join("archives")).unwrap().count();
+        assert!(archive_entries > 0);
+        let manifest_path = std::fs::read_dir(state.join("archives"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest["retired"][0]["sockets"][0],
+            json!("server/server.sock")
+        );
 
         std::fs::remove_dir_all(root).ok();
         std::fs::remove_dir_all(state).ok();
