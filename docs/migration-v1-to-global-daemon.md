@@ -206,7 +206,7 @@ Reset is a controlled new epoch, not deletion:
    records remain archive-only and visible as `unknown`.
 5. Re-register every live agent as a stable `agent_id` with a new
    `runtime_id`, `binding_id` and `endpoint_generation`. A user must explicitly
-   grant master capability again. Session IDs, pane titles and process names
+   grant master capability again. Session IDs and process names
    are not authorization.
 6. Import only user-confirmed active bugs, open tasks with a proven owner and
    the current goal. Mark every imported item `needs_reconciliation` until its

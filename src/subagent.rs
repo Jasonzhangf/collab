@@ -335,8 +335,6 @@ fn probe_with(
         }
         command
             .current_dir(&directory)
-            .env_remove("TMUX")
-            .env_remove("TMUX_PANE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

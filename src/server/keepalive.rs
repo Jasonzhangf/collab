@@ -249,7 +249,7 @@ pub(crate) fn tick_at(server: &Server, now: i64) {
             if idle_notification_due && server.config.notifications.enabled {
                 if let Some(master_id) = master_id {
                     // An armed subscription can still name the master's old
-                    // pane. Validate its current delivery target before the
+                    // endpoint. Validate its current delivery target before the
                     // idle transition is consumed by Sent/WakeBound.
                     let subscription =
                         state.matching_subscription(&master_id, "direct-message", None, now);

@@ -63,7 +63,7 @@ pub(crate) fn test_appserver_candidate(thread_id: &str) -> crate::proto::AppServ
 pub(super) fn register(server: &Server, id: &str, thread_id: &str) -> Resp {
     let thread_id = thread_id
         .strip_prefix('%')
-        .map(|legacy_pane| format!("thread-{legacy_pane}"))
+        .map(|legacy_fixture| format!("thread-{legacy_fixture}"))
         .unwrap_or_else(|| thread_id.to_string());
     handle_register_with_app_scope(
         server,
@@ -2110,7 +2110,7 @@ fn managed_subagent_send_reclaims_working_child_without_an_owned_task() {
             id: "managed".into(),
             parent: "parent".into(),
             peer: "child".into(),
-            // A keepalive pane observation can leave this stale after the
+            // A keepalive runtime observation can leave this stale after the
             // child has reported ready and consumed an empty recv cycle.
             status: "working".into(),
             thread_id: Some("thread-child".into()),
@@ -2422,7 +2422,7 @@ fn managed_subagent_working_accepts_assignment_after_probe_race_and_is_idempoten
         assert_eq!(state.tasks.len(), 1);
     }
 
-    // Model the keepalive pane probe winning the race: it observes the child
+    // Model the keepalive runtime probe winning the race: it observes the child
     // as working and persists that managed status while the task is assigned.
     let mut probed = server.state.lock().unwrap().subagents["managed"].clone();
     probed.status = "working".into();
@@ -2695,7 +2695,7 @@ fn dead_master_transport_is_not_claimable_and_allows_approved_self_promote() {
         &server,
         "peer-b".into(),
         "token-peer-b".into(),
-        "user approved peer-b after the previous master pane died".into(),
+        "user approved peer-b after the previous master runtime died".into(),
     );
     assert!(promoted.ok, "{}", promoted.error.unwrap_or_default());
     assert_eq!(
@@ -3969,8 +3969,8 @@ fn holder_close_persists_release_only_for_waiter() {
 #[test]
 fn direct_two_peer_and_three_peer_wait_cycles_fail_closed() {
     let (server, root) = test_server();
-    for (id, pane) in [("a", "%a"), ("b", "%b"), ("c", "%c")] {
-        register(&server, id, pane);
+    for (id, thread) in [("a", "%a"), ("b", "%b"), ("c", "%c")] {
+        register(&server, id, thread);
     }
     assert!(create_task(&server, "a", "a-task", "a-feature").ok);
     let direct = handle_task_wait(

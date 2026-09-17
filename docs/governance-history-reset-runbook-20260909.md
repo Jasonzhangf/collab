@@ -174,7 +174,7 @@ notification, or import a fact.
    branch not merged to the project’s `main`. Record each path, branch, owner,
    task, claim, base commit, candidate commit, review receipt and delivery
    state. A branch count alone is not a merge decision.
-2. Resolve every data source: journal, events, mailbox JSONL, claims, panes,
+2. Resolve every data source: journal, events, mailbox JSONL, claims, runtimes,
    runs, AppSDK records, external transport journal, PID, socket and lock.
    Hash exact bytes, including newline framing, and record size and count.
    Validate JSONL framing and the typed v1 event schema without rewriting the
@@ -186,7 +186,7 @@ notification, or import a fact.
 4. Build the owner graph: agent, runtime, AppServer/native thread, endpoint
    generation, project scope, app scope, task, worktree, branch, claim,
    evidence, bug and goal. Missing, conflicting or stale edges remain
-   unresolved. `mcp_session_id`, pane title, process name and session
+   unresolved. `mcp_session_id`, thread identity, process name and session
    compression/fork history are query clues, not identity authorization.
 5. Check the source epoch and latest reducer revision. If either is absent,
    non-monotonic, duplicated or not bound to the source digest, use a fresh
@@ -279,7 +279,7 @@ The controller then, in order:
    socket/lock to force progress.
 3. Copies source bytes into an operator-controlled immutable archive without
    changing source files. The archive includes journals/events, mailbox JSONL,
-   claims, panes/runs, worktree/branch inventory, AppSDK references,
+   claims, runtimes/runs, worktree/branch inventory, AppSDK references,
    codexapp external journal, source manifests, exact errors and the preflight
    evidence. The archive records source path, byte count, newline framing,
    digest, capture time and tool version.
@@ -365,7 +365,7 @@ Scopes are checked independently:
 Peers may communicate only within the allowed app/project scope. Master to
 master collaboration uses the cross-project bug reference path and has no
 subordination. A master grant comes only from a new explicit user approval;
-old role fields, session IDs, pane titles, goal files and historical master
+old role fields, session IDs, thread identities, goal files and historical master
 receipts do not survive the epoch boundary.
 
 For each live runtime, verify:

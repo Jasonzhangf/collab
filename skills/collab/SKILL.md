@@ -19,8 +19,7 @@ description: >
 # Collab
 
 Durable truth lives in the project server. App Server is the only registered
-transport; tmux/TMax is no longer supported and must not be configured or used
-for identity, liveness, or notification. Production projects use the globally
+transport and is selected by the server. Production projects use the globally
 installed Collab v1.
 
 ## One lifecycle loop

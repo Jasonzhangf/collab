@@ -48,7 +48,6 @@ pub struct Notifications {
     pub enabled: bool,
     pub mode: String,
     pub batch_window_seconds: u64,
-    pub transport: String,
     pub submit_enter: bool,
     pub max_unacked: u32,
     pub events: BTreeMap<String, EventPolicy>,
@@ -64,7 +63,6 @@ impl Default for Notifications {
             enabled: true,
             mode: "batch".into(),
             batch_window_seconds: 120,
-            transport: "appserver".into(),
             submit_enter: true,
             max_unacked: 3,
             events: BTreeMap::from([(
@@ -239,10 +237,10 @@ fn remove_retired_transport_fields(table: &mut toml_edit::Table) -> bool {
     if let Some(notifications) = table.get_mut("notifications") {
         match notifications {
             toml_edit::Item::Table(notifications) => {
-                changed |= migrate_notifications_table(notifications);
+                changed |= remove_notifications_transport(notifications);
             }
             toml_edit::Item::Value(toml_edit::Value::InlineTable(notifications)) => {
-                changed |= migrate_notifications_inline_table(notifications);
+                changed |= remove_notifications_transport_inline(notifications);
             }
             _ => {}
         }
@@ -278,28 +276,18 @@ fn remove_retired_transport_fields(table: &mut toml_edit::Table) -> bool {
     changed
 }
 
-fn migrate_notifications_table(table: &mut toml_edit::Table) -> bool {
-    if table.get("transport").and_then(toml_edit::Item::as_str) != Some("tmux") {
-        return false;
-    }
-    if let Some(transport) = table.get_mut("transport") {
-        *transport = toml_edit::value("appserver");
-    }
-    true
+fn remove_notifications_transport(table: &mut toml_edit::Table) -> bool {
+    table.remove("transport").is_some()
 }
 
-fn migrate_notifications_inline_table(table: &mut toml_edit::InlineTable) -> bool {
-    if table.get("transport").and_then(toml_edit::Value::as_str) != Some("tmux") {
-        return false;
-    }
-    table.insert("transport", toml_edit::Value::from("appserver"));
-    true
+fn remove_notifications_transport_inline(table: &mut toml_edit::InlineTable) -> bool {
+    table.remove("transport").is_some()
 }
 
 fn remove_retired_transport_inline_fields(table: &mut toml_edit::InlineTable) -> bool {
     let mut changed = false;
     if let Some(toml_edit::Value::InlineTable(notifications)) = table.get_mut("notifications") {
-        changed |= migrate_notifications_inline_table(notifications);
+        changed |= remove_notifications_transport_inline(notifications);
     }
     if let Some(toml_edit::Value::InlineTable(subagent)) = table.get_mut("subagent") {
         changed |= subagent.remove("tmux").is_some();
@@ -418,8 +406,8 @@ impl Config {
         {
             bail!("invalid notification mode/window");
         }
-        if n.transport != "appserver" || !n.submit_enter {
-            bail!("appserver with native submission is the supported notification transport");
+        if !n.submit_enter {
+            bail!("notifications.submit_enter must remain true for App Server delivery");
         }
         for (event, policy) in &n.events {
             if ![
@@ -556,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_retired_tmux_configuration_without_touching_unrelated_settings() {
+    fn removes_retired_transport_configuration_without_touching_unrelated_settings() {
         let updated = remove_retired_transport_config(
             r#"
 [notifications]
@@ -582,15 +570,11 @@ session = "legacy-project"
         )
         .unwrap();
         let parsed = updated.parse::<toml_edit::DocumentMut>().unwrap();
-        assert_eq!(
-            parsed["notifications"]["transport"].as_str(),
-            Some("appserver")
-        );
+        assert!(parsed["notifications"].get("transport").is_none());
         assert!(parsed["subagent"].get("tmux").is_none());
-        assert_eq!(
-            parsed["projects"][0]["notifications"]["transport"].as_str(),
-            Some("appserver")
-        );
+        assert!(parsed["projects"][0]["notifications"]
+            .get("transport")
+            .is_none());
         assert!(parsed["projects"][0].get("subagent").is_none());
         assert_eq!(parsed["subagent"]["runtime"].as_str(), Some("codex"));
     }
@@ -614,10 +598,9 @@ submit_enter = true
         .unwrap();
         assert!(updated.contains("# top comment"));
         assert!(updated.contains("runtime = \"codex\" # keep runtime"));
-        assert!(updated.contains("# keep notification comment"));
         assert!(updated.contains("submit_enter = true"));
         assert!(!updated.contains("[subagent.tmux]"));
-        assert!(updated.contains("transport = \"appserver\""));
+        assert!(!updated.contains("transport ="));
     }
 
     #[test]
@@ -632,15 +615,11 @@ projects = [
         )
         .unwrap();
         let parsed = updated.parse::<toml_edit::DocumentMut>().unwrap();
-        assert_eq!(
-            parsed["notifications"]["transport"].as_str(),
-            Some("appserver")
-        );
+        assert!(parsed["notifications"].get("transport").is_none());
         assert!(parsed["subagent"].get("tmux").is_none());
-        assert_eq!(
-            parsed["projects"][0]["notifications"]["transport"].as_str(),
-            Some("appserver")
-        );
+        assert!(parsed["projects"][0]["notifications"]
+            .get("transport")
+            .is_none());
         assert!(parsed["projects"][0]["subagent"].get("tmux").is_none());
         assert_eq!(
             parsed["projects"][0]["subagent"]["runtime"].as_str(),

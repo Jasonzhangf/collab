@@ -590,7 +590,7 @@ mod tests {
                     "project_scope": canonical_root.to_str().unwrap(),
                     "app_scope_id": CLI_APP_SERVER_ID,
                     "agent_id": "worker-1",
-                    "runtime_id": "runtime-pane-1",
+                    "runtime_id": "runtime-thread-1",
                     "binding_id": "binding-1",
                     "endpoint_generation": 4,
                     "native_thread_id": "thread-1"
@@ -600,7 +600,7 @@ mod tests {
 
         let runtime = runtime_from_registration_receipt(&receipt, "worker-1", &root).unwrap();
         assert_eq!(runtime.agent_id.as_str(), "worker-1");
-        assert_eq!(runtime.runtime_id.as_str(), "runtime-pane-1");
+        assert_eq!(runtime.runtime_id.as_str(), "runtime-thread-1");
         assert_eq!(runtime.appserver_id.as_str(), CLI_APP_SERVER_ID);
         assert_eq!(runtime.endpoint_generation, 4);
         assert_eq!(runtime.binding_id.as_str(), "binding-1");
