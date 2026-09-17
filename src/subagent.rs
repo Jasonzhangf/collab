@@ -335,6 +335,8 @@ fn probe_with(
         }
         command
             .current_dir(&directory)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -994,7 +996,11 @@ mod tests {
             std::env::temp_dir().join(format!("collab-probe-test-{:016x}", rand::random::<u64>()));
         std::fs::create_dir(&directory).unwrap();
         let executable = directory.join("codex-fixture");
-        std::fs::write(&executable, "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n case \"$1\" in\n --profile) shift; profile=$1;;\n --output-last-message) shift; output=$1;;\n esac\n shift\ndone\ncase \"$profile\" in\n good) printf OK > \"$output\";;\n wrong) printf NOT_OK > \"$output\";;\n fail) exit 3;;\n slow) exec sleep 2;;\nesac\n").unwrap();
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n case \"$1\" in\n --profile) shift; profile=$1;;\n --output-last-message) shift; output=$1;;\n esac\n shift\ndone\ncase \"$profile\" in\n good) printf OK > \"$output\";;\n env) if [ -z \"${TMUX+x}\" ] && [ -z \"${TMUX_PANE+x}\" ]; then printf OK > \"$output\"; else printf INHERITED > \"$output\"; fi;;\n wrong) printf NOT_OK > \"$output\";;\n fail) exit 3;;\n slow) exec sleep 2;;\nesac\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let settings = config::Health {
             timeout_seconds: 1,
@@ -1002,10 +1008,14 @@ mod tests {
         };
         for (name, expected) in [
             ("good", true),
+            ("env", true),
             ("wrong", false),
             ("fail", false),
             ("slow", false),
         ] {
+            let mut environment: std::collections::BTreeMap<_, _> = std::env::vars().collect();
+            environment.insert("TMUX".into(), "/tmp/legacy-tmux".into());
+            environment.insert("TMUX_PANE".into(), "%42".into());
             let start = Instant::now();
             let result = probe_with(
                 &executable,
@@ -1015,7 +1025,7 @@ mod tests {
                     model: None,
                 },
                 &settings,
-                &std::env::vars().collect(),
+                &environment,
             );
             assert_eq!(result.is_ok(), expected);
             if name == "slow" {
