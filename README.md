@@ -2,9 +2,9 @@
 
 Project-local coordination for independent coding agents. One Rust daemon owns
 the append-only journal, durable mailbox, task/resource state, and migration
-transaction. The server selects AppServer before tmux when a live App Server
-candidate passes self-check. Each subscribed wake is a bounded preview; the
-durable mailbox remains authoritative.
+transaction. The server selects the App Server transport; tmux is no longer
+supported and is removed from the registered transports. Each subscribed
+wake is a bounded preview; the durable mailbox remains authoritative.
 
 ## Model
 
@@ -24,7 +24,7 @@ durable mailbox remains authoritative.
 - Registration creates one seven-day reusable `direct-message` lease for the
   peer; each message still has its own bounded attempt lifetime.
   Explicit subscriptions remain available for exact resources, deadlines, and
-  async results. No registration, absent, or unknown means zero tmux
+  async results. No registration, absent, or unknown means no App Server
   input.
 - `/goal` delegation and interactive task recognition are deferred.
 
@@ -51,14 +51,14 @@ collab who
 collab context
 ```
 
-Identity registration requires a server-verified AppServer or tmux candidate.
-When tmux is selected, its session is the stable peer identity and its current
-pane is the wake endpoint. Token proves access to that peer's lifecycle.
+Identity registration requires a server-verified App Server candidate. The
+App Server native thread is the wake endpoint and token proves access to that
+peer's lifecycle.
 
 `collab init` also merges the shared `collab-mcp` server into project
 `.mcp.json` and writes the project CLI permissions Codex and Claude Code need
-so `collab` can reach the tmux socket without a sandbox prompt. The `collab`
-CLI is a complete fallback when MCP tools are not listed.
+so `collab` can reach the App Server socket without a sandbox prompt. The
+`collab` CLI is a complete fallback when MCP tools are not listed.
 
 `collab role`, `collab transfer-master`, `collab task claim`, the legacy
 `collab task dispatch`, `collab remove-worker`, and `collab reset` are
@@ -68,7 +68,7 @@ assigned peer. Collab master is not Codex root.
 Protocol: `collab master status`, `collab master promote --approval` when no
 live master exists, and `collab master delegate` by the current live master.
 Init and register never create a master; a recorded identity without a live
-tmux pane is not a live master. Independent peers may decline a master
+App Server thread is not a live master. Independent peers may decline a master
 collaboration invite; managed subagents must obey the master.
 
 ## Independent task lifecycle
@@ -166,17 +166,15 @@ collab sendmessage --to <peer> --subject resource-busy "RESOURCE_OCCUPIED ..."
 collab sendmessage --to <peer> --subject result-ready "The result is ready; query the mailbox."
 ```
 
-Never type peer messages into tmux. Without the recipient's active
+Never type peer messages into a terminal. Without the recipient's active
 `direct-message` subscription, the message remains mailbox-only. Registration
-normally creates this subscription automatically; tmux receives only the short
-message id, abbreviated subject, safe one-line original body preview, and one
-submit. Codex keeps `paste-buffer -p` and `C-m` in one tmux queue so the paste
-is submitted. Splitting Codex paste from Enter leaves the text unsubmitted.
-Notifications deliver only
-when an agent is idle (waiting); if the agent is working, delivery defers
-without burning wake attempts until working->idle transition occurs. When a pane
-is dead, unowned, or agent process absent, the subscription cancels to pane-lost
-immediately without storm. If unacknowledged delivered notifications reach the limit
+normally creates this subscription automatically; App Server receives the
+short message id, abbreviated subject, safe one-line original body preview,
+and submit as one queued operation. Notifications deliver only when an agent
+is idle (waiting); if the agent is working, delivery defers without burning
+wake attempts until the working->idle transition occurs. When the App Server
+thread is dead, unowned, or its registered identity has changed, the
+subscription enters its explicit unavailable state. If unacknowledged delivered notifications reach the limit
 (default 3, configurable 1..=5), push knocks pause awaiting `collab ack <id>` or
 `collab ack --all` to prevent backlog flooding and terminal pollution. When delivery
 occurs with a larger backlog, batches are capped at 3 with inbox reminders. Worker
@@ -206,15 +204,16 @@ The final delivery says it is the last reminder and instructs the Agent to
 explicitly subscribe again; no automatic rearm exists. The default
 `direct-message` lease accepts later peer messages until expiry; resource,
 deadline, and async-result event matching remains owner-scoped and finite.
-tmux receives `COLLAB_NOTIFY <message-id> [<subject>] <original-body-preview>`
-then one Enter as paste-plus-`C-m` in one command queue. The Agent first weighs the id and
-subject against current work. When it selects the notice, it runs
+App Server receives `COLLAB_NOTIFY <message-id> [<subject>]
+<original-body-preview>` through the registered native thread. The Agent first
+weighs the id and subject against current work. When it selects the notice, it runs
 `collab msg <message-id>`, reads durable detail, and executes actionable
 in-scope work; it must not stop at ACK or waiting. The first pending notice opens
 a fixed 120-second window. At its end all eligible unsent notices for that peer
-are combined into one paste with one Enter, including notices arriving later
+are combined into one bounded batch, including notices arriving later
 in the window. Working Agents receive the batch without waiting for idle.
-Attempts are reserved durably before tmux; failure, unknown/absent Agent, and
+Attempts are reserved durably before the App Server queue; failure,
+unknown/absent Agent, and
 restart never replay an attempted batch. Details remain in the inbox.
 Each recipient has at most one batch attempt per 120-second window. The daemon never creates periodic
 `CONTINUE_TASK` messages.
@@ -231,7 +230,7 @@ collab migrate inspect
 → cargo install reviewed binary
 → collab down
 → collab up
-→ collab worker recover         # each live tmux peer
+→ collab worker recover         # each live App Server peer
 → collab migrate verify         # verify and resume
 ```
 
@@ -258,7 +257,8 @@ the marker and starts one daemon. A second live socket writer is rejected.
 ## Core invariants
 
 - One Server writer; append-only journal; deterministic replay.
-- tmux is wake-only; no control truth is inferred from terminal text.
+- App Server is the only registered transport; no control truth is inferred
+  from terminal text.
 - No fallback, silent strip, automatic ownership, automatic claim release, or
   success projection from failed wake/cleanup/migration.
 - No uncommitted product edits in main as an intermediate test step.

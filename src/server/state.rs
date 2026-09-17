@@ -45,23 +45,10 @@ pub struct MigrationRecord {
     pub updated_ms: i64,
 }
 
-/// Runtime is encoded in the registered transport. App Server is preferred
-/// when the server can verify it; tmux is an optional adapter only when the
-/// candidate routes are real and server-verified.
-pub fn runtime_for_pane(pane: Option<&str>) -> Option<&'static str> {
-    let pane = pane?;
-    if pane.starts_with('%') {
-        Some("tmux")
-    } else {
-        None
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRec {
     pub id: String,
     pub token: String,
-    pub pane: Option<String>,
     pub cwd: String,
     pub registered_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,7 +190,7 @@ pub struct NotificationSubscription {
     pub worker_id: String,
     pub event: String,
     pub subject: Option<String>,
-    pub pane: String,
+    pub target: String,
     pub method: String,
     pub trigger_ms: Option<i64>,
     #[serde(default)]
@@ -231,7 +218,7 @@ impl NotificationSubscription {
         self.worker_id == worker_id
             && self.event == event
             && self.subject.as_deref() == subject
-            && matches!(self.method.as_str(), "appserver" | "tmux")
+            && self.method == "appserver"
             && self.status == "armed"
             && self.expires_ms > now
     }
@@ -426,7 +413,6 @@ pub enum Event {
         worker_id: String,
         closed_by: String,
         reason: String,
-        killed_session: bool,
         at_ms: i64,
     },
     #[serde(rename = "MasterTransferred")]
@@ -456,7 +442,7 @@ pub enum Event {
     },
     NotificationRebound {
         subscription_id: String,
-        pane: String,
+        target: String,
         updated_ms: i64,
     },
     NotificationSuppressed {
@@ -741,12 +727,12 @@ impl State {
             }
             Event::NotificationRebound {
                 subscription_id,
-                pane,
+                target,
                 updated_ms,
             } => {
                 if let Some(subscription) = self.notification_subscriptions.get_mut(subscription_id)
                 {
-                    subscription.pane = pane.clone();
+                    subscription.target = target.clone();
                     subscription.updated_ms = *updated_ms;
                 }
             }
@@ -1210,10 +1196,6 @@ impl State {
         ids
     }
 
-    pub fn worker_pane(&self, worker_id: &str) -> Option<String> {
-        self.workers.get(worker_id)?.pane.clone()
-    }
-
     pub fn matching_subscription(
         &self,
         worker_id: &str,
@@ -1233,13 +1215,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_is_derived_from_pane_namespace() {
-        assert_eq!(runtime_for_pane(Some("%7")), Some("tmux"));
-        assert_eq!(runtime_for_pane(Some("herdr:w4:p1")), None);
-        assert_eq!(runtime_for_pane(None), None);
-        assert_eq!(runtime_for_pane(Some("w4:p1")), None);
-    }
-
     #[test]
     fn master_wake_accumulator_coalesces_generated_signals_until_decision() {
         let mut state = State::default();
@@ -1559,8 +1534,8 @@ mod tests {
                 worker_id: "waiter".into(),
                 event: "resource-released".into(),
                 subject: Some("holder-task".into()),
-                pane: "%7".into(),
-                method: "tmux".into(),
+                target: "thread-7".into(),
+                method: "appserver".into(),
                 trigger_ms: None,
                 trigger_times_ms: Vec::new(),
                 interval_ms: None,
@@ -1621,8 +1596,8 @@ mod tests {
                 worker_id: "waiter".into(),
                 event: "deadline".into(),
                 subject: Some("timer".into()),
-                pane: "%7".into(),
-                method: "tmux".into(),
+                target: "thread-7".into(),
+                method: "appserver".into(),
                 trigger_ms: None,
                 trigger_times_ms: Vec::new(),
                 interval_ms: Some(1_000),
@@ -1665,8 +1640,8 @@ mod tests {
             worker_id: "master".into(),
             event: "deadline".into(),
             subject: Some("periodic".into()),
-            pane: "%7".into(),
-            method: "tmux".into(),
+            target: "thread-7".into(),
+            method: "appserver".into(),
             trigger_ms,
             trigger_times_ms: Vec::new(),
             interval_ms: Some(1_000),
@@ -1738,8 +1713,8 @@ mod tests {
                 worker_id: "master".into(),
                 event: "deadline".into(),
                 subject: Some("ack-periodic".into()),
-                pane: "%7".into(),
-                method: "tmux".into(),
+                target: "thread-7".into(),
+                method: "appserver".into(),
                 trigger_ms: None,
                 trigger_times_ms: Vec::new(),
                 interval_ms: Some(1_000),
@@ -1813,8 +1788,8 @@ mod tests {
                 worker_id: "master".into(),
                 event: "deadline".into(),
                 subject: Some("ack-timer".into()),
-                pane: "%7".into(),
-                method: "tmux".into(),
+                target: "thread-7".into(),
+                method: "appserver".into(),
                 trigger_ms: Some(2_000),
                 trigger_times_ms: Vec::new(),
                 interval_ms: Some(1_000),
@@ -1887,8 +1862,8 @@ mod tests {
                 worker_id: "worker".into(),
                 event: "direct-message".into(),
                 subject: None,
-                pane: "%7".into(),
-                method: "tmux".into(),
+                target: "thread-7".into(),
+                method: "appserver".into(),
                 trigger_ms: None,
                 trigger_times_ms: Vec::new(),
                 interval_ms: None,

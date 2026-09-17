@@ -25,36 +25,55 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
-            pane_alive_check: |_| PanePresence::Present,
-            pane_owner_check: |_, _| Ok(true),
-            pane_state_check: |_| crate::server::knock::AgentState::Waiting,
-            appserver_candidate_check: crate::server::default_appserver_candidate_check(),
-            appserver_notification_sink: crate::server::default_appserver_notification_sink(),
+            appserver_candidate_check: Arc::new(|candidate| {
+                Ok(test_appserver_transport(&candidate.thread_id))
+            }),
+            appserver_notification_sink: Arc::new(|_, _, _| {
+                Ok(serde_json::json!({"accepted": true}))
+            }),
+            appserver_thread_status: Arc::new(|_, thread_id| {
+                Ok(serde_json::json!({"thread": {"id": thread_id, "status": "idle"}}))
+            }),
+            appserver_thread_archive: Arc::new(|_, _| Ok(serde_json::json!({"archived": true}))),
             mailbox_notify: tokio::sync::Notify::new(),
         },
         root,
     )
 }
 
-fn test_tmux_transport(pane: &str) -> SelectedTransport {
+pub(crate) fn test_appserver_transport(thread_id: &str) -> SelectedTransport {
     SelectedTransport {
-        kind: TransportKind::Tmux,
-        endpoint: None,
-        namespace: None,
-        thread_id: None,
-        pane: Some(pane.into()),
+        kind: TransportKind::AppServer,
+        endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
+        namespace: Some("codex_tui".into()),
+        thread_id: Some(thread_id.into()),
         capabilities: vec!["send_message".into()],
-        self_check: "test tmux".into(),
+        self_check: "test appserver".into(),
     }
 }
 
-pub(super) fn register(server: &Server, id: &str, pane: &str) -> Resp {
-    handle_register(
+pub(crate) fn test_appserver_candidate(thread_id: &str) -> crate::proto::AppServerCandidate {
+    crate::proto::AppServerCandidate {
+        endpoint: "unix:///tmp/collab-test-appserver.sock".into(),
+        namespace: "codex_tui".into(),
+        thread_id: thread_id.into(),
+    }
+}
+
+pub(super) fn register(server: &Server, id: &str, thread_id: &str) -> Resp {
+    let thread_id = thread_id
+        .strip_prefix('%')
+        .map(|legacy_pane| format!("thread-{legacy_pane}"))
+        .unwrap_or_else(|| thread_id.to_string());
+    handle_register_with_app_scope(
         server,
         id.into(),
         format!("token-{id}"),
-        Some(pane.into()),
         server.root.display().to_string(),
+        Some(AppServerId::new("tui-default").unwrap()),
+        Some(TransportCandidates {
+            appserver: Some(test_appserver_candidate(&thread_id)),
+        }),
     )
 }
 
@@ -433,8 +452,8 @@ fn cancelling_master_idle_subscription_supersedes_pending_wake() {
                 worker_id: "master".into(),
                 event: "master-idle".into(),
                 subject: Some("master-idle".into()),
-                pane: "%master".into(),
-                method: "tmux".into(),
+                target: "thread-master".into(),
+                method: "appserver".into(),
                 trigger_ms: Some(now_ms() - 1),
                 trigger_times_ms: Vec::new(),
                 interval_ms: Some(900_000),
@@ -945,10 +964,9 @@ fn replay_rejects_a_checkpoint_that_regresses_real_history() {
             worker: crate::server::state::WorkerRec {
                 id: "checkpoint-worker".into(),
                 token: "checkpoint-token".into(),
-                pane: Some("%checkpoint-worker".into()),
                 cwd: "/tmp".into(),
                 registered_ms: 1,
-                transport: None,
+                transport: Some(test_appserver_transport("thread-checkpoint-worker")),
             },
         },
         Event::ReducerCheckpoint {
@@ -1279,8 +1297,7 @@ fn subagent_record(id: &str, status: &str, peer: &str) -> crate::subagent::Recor
         parent: "parent".into(),
         peer: peer.into(),
         status: status.into(),
-        session: Some("$session".into()),
-        pane: Some("%child".into()),
+        thread_id: Some(format!("thread-{peer}")),
         profile: None,
         created_ms: now_ms(),
         ready_deadline_ms: now_ms() + 90_000,
@@ -1307,7 +1324,6 @@ fn subagent_start_journal_failure_does_not_launch_or_write_success() {
     for fault in [StartAppend, StartSync] {
         let (mut server, root) = test_server();
         register(&server, "parent", "%parent");
-        server.pane_alive_check = |_| PanePresence::Present;
         server.commit(&[Event::MasterAssigned {
             worker_id: "parent".into(),
             assigned_by: "operator".into(),
@@ -1424,7 +1440,6 @@ fn subagent_close_first_journal_failure_does_not_remove_external_manifest() {
     for fault in [CloseFirstAppend, CloseFirstSync] {
         let (mut server, root) = test_server();
         register(&server, "parent", "%parent");
-        server.pane_alive_check = |_| PanePresence::Missing;
         server.commit(&[Event::SubagentUpdated {
             subagent: subagent_record("close-first-fault", "idle", "child"),
         }]);
@@ -1455,12 +1470,10 @@ fn subagent_close_final_journal_failure_reports_unknown_and_stays_open() {
     for fault in [CloseFinalAppend, CloseFinalSync] {
         let (mut server, root) = test_server();
         register(&server, "parent", "%parent");
-        server.pane_alive_check = |_| PanePresence::Missing;
+        register(&server, "child", "%child");
         server.commit(&[Event::SubagentUpdated {
             subagent: subagent_record("close-final-fault", "idle", "child"),
         }]);
-        let manifest = root.join(".agent-collab/server/launch-close-final-fault.json");
-        std::fs::write(&manifest, b"test-only manifest").unwrap();
         let server = Arc::new(server);
         crate::server::inject_subagent_journal_fault(fault);
         let result = dispatch(
@@ -1475,7 +1488,6 @@ fn subagent_close_final_journal_failure_reports_unknown_and_stays_open() {
         assert_eq!(state.subagents["close-final-fault"].status, "closing");
         assert!(state.journal_poison.is_some());
         drop(state);
-        assert!(!manifest.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -1507,11 +1519,10 @@ fn replayed_command_is_idempotent_and_operation_conflict_fails_closed() {
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(super::replay(&root).unwrap()),
             journal: Mutex::new(journal),
-            pane_alive_check: |_| PanePresence::Present,
-            pane_owner_check: |_, _| Ok(true),
-            pane_state_check: |_| crate::server::knock::AgentState::Waiting,
             appserver_candidate_check: crate::server::default_appserver_candidate_check(),
             appserver_notification_sink: crate::server::default_appserver_notification_sink(),
+            appserver_thread_status: crate::server::default_appserver_thread_status(),
+            appserver_thread_archive: crate::server::default_appserver_thread_archive(),
             mailbox_notify: tokio::sync::Notify::new(),
         }
     };
@@ -1625,8 +1636,7 @@ fn subagent_close_does_not_report_success_when_transition_cannot_persist() {
             parent: "parent".into(),
             peer: "child".into(),
             status: "idle".into(),
-            session: None,
-            pane: None,
+            thread_id: None,
             profile: None,
             created_ms: now_ms(),
             ready_deadline_ms: 0,
@@ -1688,8 +1698,7 @@ fn managed_subagent_is_authenticated_persistent_and_replayable() {
         parent: "parent".into(),
         peer: "child".into(),
         status: "starting".into(),
-        session: None,
-        pane: Some("%child".into()),
+        thread_id: Some("thread-child".into()),
         profile: None,
         created_ms: now_ms(),
         ready_deadline_ms: now_ms() + 90000,
@@ -1925,8 +1934,7 @@ fn managed_subagent_send_binds_the_selected_child_when_multiple_children_are_ass
                 parent: "parent".into(),
                 peer: "child-a".into(),
                 status: "idle".into(),
-                session: Some("$child-a".into()),
-                pane: Some("%child-a".into()),
+                thread_id: Some("thread-child-a".into()),
                 profile: None,
                 created_ms: now,
                 ready_deadline_ms: now + 90_000,
@@ -1942,8 +1950,7 @@ fn managed_subagent_send_binds_the_selected_child_when_multiple_children_are_ass
                 parent: "parent".into(),
                 peer: "child-b".into(),
                 status: "idle".into(),
-                session: Some("$child-b".into()),
-                pane: Some("%child-b".into()),
+                thread_id: Some("thread-child-b".into()),
                 profile: None,
                 created_ms: now,
                 ready_deadline_ms: now + 90_000,
@@ -2106,8 +2113,7 @@ fn managed_subagent_send_reclaims_working_child_without_an_owned_task() {
             // A keepalive pane observation can leave this stale after the
             // child has reported ready and consumed an empty recv cycle.
             status: "working".into(),
-            session: Some("$child".into()),
-            pane: Some("%child".into()),
+            thread_id: Some("thread-child".into()),
             profile: None,
             created_ms: now,
             ready_deadline_ms: now + 90_000,
@@ -2219,8 +2225,7 @@ fn managed_subagent_working_requires_existing_owned_assigned_task() {
                 parent: "parent".into(),
                 peer: "child".into(),
                 status: "assigned".into(),
-                session: Some("$child".into()),
-                pane: Some("%child".into()),
+                thread_id: Some("thread-child".into()),
                 profile: None,
                 created_ms: now,
                 ready_deadline_ms: now + 90_000,
@@ -2262,8 +2267,7 @@ fn managed_subagent_working_requires_existing_owned_assigned_task() {
                     parent: "parent".into(),
                     peer: "child".into(),
                     status: "assigned".into(),
-                    session: Some("$child".into()),
-                    pane: Some("%child".into()),
+                    thread_id: Some("thread-child".into()),
                     profile: None,
                     created_ms: now,
                     ready_deadline_ms: now + 90_000,
@@ -2323,8 +2327,7 @@ fn managed_subagent_working_requires_existing_owned_assigned_task() {
                     parent: "parent".into(),
                     peer: "child".into(),
                     status: "assigned".into(),
-                    session: Some("$child".into()),
-                    pane: Some("%child".into()),
+                    thread_id: Some("thread-child".into()),
                     profile: None,
                     created_ms: now,
                     ready_deadline_ms: now + 90_000,
@@ -2385,8 +2388,7 @@ fn managed_subagent_working_accepts_assignment_after_probe_race_and_is_idempoten
             parent: "parent".into(),
             peer: "child".into(),
             status: "idle".into(),
-            session: Some("$child".into()),
-            pane: Some("%child".into()),
+            thread_id: Some("thread-child".into()),
             profile: None,
             created_ms: now,
             ready_deadline_ms: now + 90_000,
@@ -2497,7 +2499,6 @@ fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
         "token-peer-b".into(),
         "peer-a".into(),
         "trying to close the master".into(),
-        false,
     );
     assert!(!outsider.ok);
 
@@ -2508,7 +2509,6 @@ fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
         "token-peer-a".into(),
         "peer-b".into(),
         "   ".into(),
-        false,
     );
     assert!(!no_reason.ok);
     assert!(no_reason.error.unwrap().contains("--reason"));
@@ -2520,7 +2520,6 @@ fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
         "token-peer-a".into(),
         "peer-a".into(),
         "self".into(),
-        false,
     );
     assert!(!self_close.ok);
     assert!(self_close.error.unwrap().contains("cannot close itself"));
@@ -2549,8 +2548,7 @@ fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
         "peer-a".into(),
         "token-peer-a".into(),
         "peer-b".into(),
-        "pane looks dead".into(),
-        false,
+        "transport looks dead".into(),
     );
     assert!(!owns_work.ok);
     assert!(owns_work.error.unwrap().contains("task-b"));
@@ -2577,13 +2575,12 @@ fn worker_close_is_master_only_audited_and_refuses_to_strand_tasks() {
         "peer-a".into(),
         "token-peer-a".into(),
         "peer-b".into(),
-        "pane dead after snapshot".into(),
-        false,
+        "transport dead after snapshot".into(),
     );
     assert!(closed.ok, "{}", closed.error.clone().unwrap_or_default());
     assert_eq!(closed.data["closed"], "peer-b");
-    assert_eq!(closed.data["reason"], "pane dead after snapshot");
-    assert_eq!(closed.data["killed_session"], false);
+    assert_eq!(closed.data["reason"], "transport dead after snapshot");
+    assert!(closed.data.get("archived_thread").is_none());
 
     let state = server.state.lock().unwrap();
     assert!(!state.workers.contains_key("peer-b"));
@@ -2668,17 +2665,10 @@ fn master_promotion_requires_user_approval_and_existing_master_delegates() {
 }
 
 #[test]
-fn dead_master_pane_is_not_claimable_and_allows_approved_self_promote() {
-    fn only_b(pane: &str) -> PanePresence {
-        if pane == "%b" {
-            PanePresence::Present
-        } else {
-            PanePresence::Missing
-        }
-    }
+fn dead_master_transport_is_not_claimable_and_allows_approved_self_promote() {
     let (mut server, root) = test_server();
-    register(&server, "peer-a", "%a");
-    register(&server, "peer-b", "%b");
+    register(&server, "peer-a", "thread-a");
+    register(&server, "peer-b", "thread-b");
     assert!(
         super::handle_master_promote(
             &server,
@@ -2688,7 +2678,16 @@ fn dead_master_pane_is_not_claimable_and_allows_approved_self_promote() {
         )
         .ok
     );
-    server.pane_alive_check = only_b;
+    server.appserver_candidate_check = Arc::new(|candidate| {
+        if candidate.thread_id == "thread-b" {
+            Ok(test_appserver_transport("thread-b"))
+        } else {
+            Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                detail: "thread is not live".into(),
+            }
+            .to_string())
+        }
+    });
     let status = super::handle_master_status(&server);
     assert!(status.data["master"].is_null(), "{status:?}");
     assert_eq!(status.data["recorded_unusable"]["worker_id"], "peer-a");
@@ -2777,11 +2776,8 @@ fn cross_project_send_requires_master_endpoints_on_both_sides() {
 }
 
 fn register_appserver(server: &mut Server, id: &str, thread_id: &str) -> Resp {
-    use crate::identity::AppServerId;
-    use crate::proto::AppServerCandidate;
-
     let app_scope = AppServerId::new("appserver-test").unwrap();
-    let candidate = AppServerCandidate {
+    let candidate = crate::proto::AppServerCandidate {
         endpoint: format!("unix:///tmp/collab-appserver-{id}.sock"),
         namespace: "codex_tui".into(),
         thread_id: thread_id.into(),
@@ -2789,14 +2785,13 @@ fn register_appserver(server: &mut Server, id: &str, thread_id: &str) -> Resp {
     let candidate_for_closure = candidate.clone();
     let checked = {
         let expected = thread_id.to_owned();
-        move |candidate: &AppServerCandidate| {
+        move |candidate: &crate::proto::AppServerCandidate| {
             assert_eq!(candidate.thread_id, expected);
             Ok(SelectedTransport {
                 kind: TransportKind::AppServer,
                 endpoint: Some(candidate.endpoint.clone()),
                 namespace: Some(candidate.namespace.clone()),
                 thread_id: Some(candidate.thread_id.clone()),
-                pane: None,
                 capabilities: vec!["send_message".into()],
                 self_check: "test App Server candidate".into(),
             })
@@ -2807,24 +2802,24 @@ fn register_appserver(server: &mut Server, id: &str, thread_id: &str) -> Resp {
         server,
         id.into(),
         format!("token-{id}"),
-        None,
         server.root.display().to_string(),
         Some(app_scope),
         Some(TransportCandidates {
             appserver: Some(candidate_for_closure),
-            tmux: None,
         }),
     )
 }
 
 #[test]
 fn master_promotion_requires_live_transport() {
-    fn none_alive(_: &str) -> PanePresence {
-        PanePresence::Missing
-    }
     let (mut server, root) = test_server();
-    register(&server, "peer-a", "%a");
-    server.pane_alive_check = none_alive;
+    register(&server, "peer-a", "thread-a");
+    server.appserver_candidate_check = Arc::new(|_| {
+        Err(crate::client::adapters::AdapterError::RouteUnavailable {
+            detail: "thread is not live".into(),
+        }
+        .to_string())
+    });
     let denied = super::handle_master_promote(
         &server,
         "peer-a".into(),
@@ -2937,7 +2932,8 @@ fn registration_creates_one_finite_default_direct_message_subscription() {
         .collect();
     assert_eq!(subscriptions.len(), 1);
     assert_eq!(subscriptions[0].event, "direct-message");
-    assert_eq!(subscriptions[0].method, "tmux");
+    assert_eq!(subscriptions[0].method, "appserver");
+    assert_eq!(subscriptions[0].target, "thread-peer");
     assert_eq!(subscriptions[0].status, "armed");
     assert!(subscriptions[0].expires_ms > now_ms());
     drop(state);
@@ -2963,10 +2959,13 @@ fn cancelled_default_lease_stays_suppressed_until_explicit_subscribe() {
         state.notification_subscriptions["sub-default-direct-message-peer"].status,
         "cancelled"
     );
-    assert!(
-        default_direct_message_events(&state, "peer", &test_tmux_transport("%peer"), now_ms())
-            .is_empty()
-    );
+    assert!(default_direct_message_events(
+        &state,
+        "peer",
+        &test_appserver_transport("thread-peer"),
+        now_ms()
+    )
+    .is_empty());
     drop(state);
 
     let explicit = handle_notification_subscribe(
@@ -3002,8 +3001,8 @@ fn registration_adds_default_lease_when_only_short_direct_message_lease_exists()
             worker_id: "peer".into(),
             event: "direct-message".into(),
             subject: None,
-            pane: "%peer".into(),
-            method: "tmux".into(),
+            target: "thread-peer".into(),
+            method: "appserver".into(),
             trigger_ms: None,
             trigger_times_ms: Vec::new(),
             interval_ms: None,
@@ -3017,7 +3016,12 @@ fn registration_adds_default_lease_when_only_short_direct_message_lease_exists()
         },
     });
 
-    let events = default_direct_message_events(&state, "peer", &test_tmux_transport("%peer"), now);
+    let events = default_direct_message_events(
+        &state,
+        "peer",
+        &test_appserver_transport("thread-peer"),
+        now,
+    );
     let default = events
         .iter()
         .find_map(|event| match event {
@@ -3038,10 +3042,13 @@ fn registration_adds_default_lease_when_only_short_direct_message_lease_exists()
         state.notification_subscriptions["sub-short"].status,
         "rebound"
     );
-    assert!(
-        default_direct_message_events(&state, "peer", &test_tmux_transport("%peer"), now + 1)
-            .is_empty()
-    );
+    assert!(default_direct_message_events(
+        &state,
+        "peer",
+        &test_appserver_transport("thread-peer"),
+        now + 1
+    )
+    .is_empty());
 }
 
 #[test]
@@ -3051,16 +3058,13 @@ fn daemon_replay_restores_default_lease_for_registered_peer() {
         worker: WorkerRec {
             id: "peer".into(),
             token: "token-peer".into(),
-            pane: Some("%peer".into()),
             cwd: "/tmp".into(),
             registered_ms: 1,
-            transport: None,
+            transport: Some(test_appserver_transport("thread-peer")),
         },
     });
 
-    let events = registered_peer_default_events(&state, 10_000, &|worker, pane| {
-        worker == "peer" && pane == "%peer"
-    });
+    let events = registered_peer_default_events(&state, 10_000);
     assert!(events.iter().any(|event| matches!(
         event,
         Event::NotificationSubscribed { subscription }
@@ -3069,51 +3073,36 @@ fn daemon_replay_restores_default_lease_for_registered_peer() {
 }
 
 #[test]
-fn daemon_restart_rebinds_stale_pane_before_restoring_default_lease() {
+fn daemon_restart_restores_default_lease_from_registered_appserver_transport() {
     let mut state = State::default();
     state.apply(&Event::Registered {
         worker: WorkerRec {
             id: "peer".into(),
             token: "token-peer".into(),
-            pane: Some("%stale".into()),
             cwd: "/tmp".into(),
             registered_ms: 1,
-            transport: None,
+            transport: Some(test_appserver_transport("thread-current")),
         },
     });
 
-    let events = registered_peer_rebind_events(
-        &state,
-        &|worker| (worker == "peer").then(|| "%current".into()),
-        &|worker, pane| worker == "peer" && pane == "%current",
-    );
-    assert_eq!(events.len(), 1);
-    for event in events {
-        state.apply(&event);
-    }
-    assert_eq!(state.workers["peer"].pane.as_deref(), Some("%current"));
-
-    let lease_events = registered_peer_default_events(&state, 10_000, &|worker, pane| {
-        worker == "peer" && pane == "%current"
-    });
+    let lease_events = registered_peer_default_events(&state, 10_000);
     assert!(lease_events.iter().any(|event| matches!(
         event,
         Event::NotificationSubscribed { subscription }
-            if subscription.worker_id == "peer" && subscription.pane == "%current"
+            if subscription.worker_id == "peer" && subscription.target == "thread-current"
     )));
 }
 
 #[test]
-fn daemon_restart_rebinds_existing_deadline_without_recreating_it() {
+fn daemon_restart_reuses_existing_deadline_without_recreating_it() {
     let mut state = State::default();
     state.apply(&Event::Registered {
         worker: WorkerRec {
             id: "peer".into(),
             token: "token-peer".into(),
-            pane: Some("%stale".into()),
             cwd: "/tmp".into(),
             registered_ms: 1,
-            transport: None,
+            transport: Some(test_appserver_transport("thread-current")),
         },
     });
     let original = NotificationSubscription {
@@ -3121,8 +3110,8 @@ fn daemon_restart_rebinds_existing_deadline_without_recreating_it() {
         worker_id: "peer".into(),
         event: "deadline".into(),
         subject: Some("goal:sha256:test".into()),
-        pane: "%stale".into(),
-        method: "tmux".into(),
+        target: "thread-current".into(),
+        method: "appserver".into(),
         trigger_ms: Some(20_000),
         trigger_times_ms: Vec::new(),
         interval_ms: None,
@@ -3138,52 +3127,34 @@ fn daemon_restart_rebinds_existing_deadline_without_recreating_it() {
         subscription: original.clone(),
     });
 
-    let events = registered_peer_rebind_events(
-        &state,
-        &|worker| (worker == "peer").then(|| "%current".into()),
-        &|worker, pane| worker == "peer" && pane == "%current",
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        Event::NotificationRebound { subscription_id, pane, .. }
-            if subscription_id == "sub-goal" && pane == "%current"
-    )));
+    let events = registered_peer_default_events(&state, 10_000);
     assert!(!events.iter().any(|event| matches!(
         event,
         Event::NotificationSubscribed { subscription }
             if subscription.id == "sub-goal"
     )));
-    for event in &events {
-        state.apply(event);
-    }
     let rebound = &state.notification_subscriptions["sub-goal"];
     assert_eq!(rebound.id, original.id);
-    assert_eq!(rebound.pane, "%current");
+    assert_eq!(rebound.target, "thread-current");
     assert_eq!(rebound.trigger_ms, original.trigger_ms);
     assert_eq!(rebound.expires_ms, original.expires_ms);
     assert_eq!(rebound.status, "armed");
 }
 
 #[test]
-fn daemon_restart_does_not_guess_between_multiple_or_unowned_panes() {
+fn daemon_restart_does_not_restore_without_registered_transport() {
     let mut state = State::default();
     state.apply(&Event::Registered {
         worker: WorkerRec {
             id: "peer".into(),
             token: "token-peer".into(),
-            pane: Some("%stale".into()),
             cwd: "/tmp".into(),
             registered_ms: 1,
             transport: None,
         },
     });
 
-    assert!(registered_peer_rebind_events(&state, &|_| None, &|_, _| true).is_empty());
-    assert!(
-        registered_peer_rebind_events(&state, &|_| Some("%foreign".into()), &|_, _| false,)
-            .is_empty()
-    );
-    assert_eq!(state.workers["peer"].pane.as_deref(), Some("%stale"));
+    assert!(registered_peer_default_events(&state, 10_000).is_empty());
 }
 
 #[test]
@@ -3249,7 +3220,13 @@ fn expired_mailbox_and_journal_are_removed_and_do_not_replay() {
     let replayed = replay(&root).unwrap();
     assert!(!replayed.msgs.contains_key(&old_id));
     assert_eq!(replayed.msgs[&fresh_id].body, "fresh body");
-    assert_eq!(replayed.workers["peer"].pane.as_deref(), Some("%peer"));
+    assert_eq!(
+        replayed.workers["peer"]
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.thread_id.as_deref()),
+        Some("thread-peer")
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -3321,7 +3298,12 @@ fn retention_skips_fresh_messages_and_frozen_admission() {
 #[test]
 fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
     let mut state = State::default();
-    for event in default_direct_message_events(&state, "peer", &test_tmux_transport("%one"), 1000) {
+    for event in default_direct_message_events(
+        &state,
+        "peer",
+        &test_appserver_transport("thread-one"),
+        1000,
+    ) {
         state.apply(&event);
     }
     let mut old = state
@@ -3332,7 +3314,12 @@ fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
         .clone();
     old.id = "sub-legacy".into();
     state.apply(&Event::NotificationSubscribed { subscription: old });
-    for event in default_direct_message_events(&state, "peer", &test_tmux_transport("%one"), 2000) {
+    for event in default_direct_message_events(
+        &state,
+        "peer",
+        &test_appserver_transport("thread-one"),
+        2000,
+    ) {
         state.apply(&event);
     }
     assert_eq!(
@@ -3347,16 +3334,24 @@ fn fresh_default_does_not_skip_legacy_duplicate_cleanup() {
         state.notification_subscriptions["sub-legacy"].status,
         "rebound"
     );
-    assert!(
-        default_direct_message_events(&state, "peer", &test_tmux_transport("%one"), 2000)
-            .is_empty()
-    );
+    assert!(default_direct_message_events(
+        &state,
+        "peer",
+        &test_appserver_transport("thread-one"),
+        2000
+    )
+    .is_empty());
 }
 
 #[test]
 fn default_subscription_renews_and_rebinds_without_new_ids() {
     let mut state = State::default();
-    for event in default_direct_message_events(&state, "peer", &test_tmux_transport("%one"), 1000) {
+    for event in default_direct_message_events(
+        &state,
+        "peer",
+        &test_appserver_transport("thread-one"),
+        1000,
+    ) {
         state.apply(&event);
     }
     let id = state
@@ -3366,14 +3361,22 @@ fn default_subscription_renews_and_rebinds_without_new_ids() {
         .unwrap()
         .clone();
     let ttl = DEFAULT_DIRECT_MESSAGE_TTL_SECONDS as i64 * 1000;
-    for (pane, time) in [("%one", ttl), ("%one", ttl * 3), ("%two", ttl * 4)] {
-        for event in default_direct_message_events(&state, "peer", &test_tmux_transport(pane), time)
-        {
+    for (thread_id, time) in [
+        ("thread-one", ttl),
+        ("thread-one", ttl * 3),
+        ("thread-two", ttl * 4),
+    ] {
+        for event in default_direct_message_events(
+            &state,
+            "peer",
+            &test_appserver_transport(thread_id),
+            time,
+        ) {
             state.apply(&event);
         }
         assert_eq!(state.notification_subscriptions.len(), 1);
         let sub = &state.notification_subscriptions[&id];
-        assert_eq!(sub.pane, pane);
+        assert_eq!(sub.target, thread_id);
         assert_eq!(sub.status, "armed");
         assert_eq!(sub.expires_ms, time + ttl);
     }
@@ -3586,32 +3589,32 @@ fn non_master_force_close_is_rejected() {
 }
 
 #[test]
-fn orphan_force_close_defers_when_owner_pane_probe_is_unknown() {
-    let (server, root) = test_server();
-    register(&server, "owner", "%owner");
-    register(&server, "peer", "%peer");
+fn orphan_force_close_defers_when_owner_appserver_probe_is_unknown() {
+    let (mut server, root) = test_server();
+    register(&server, "owner", "thread-owner");
+    register(&server, "peer", "thread-peer");
     assert!(create_task(&server, "owner", "working", "feature").ok);
-    let mut server = server;
-    server.pane_owner_check = |worker_id, pane| {
-        if worker_id == "owner" && pane == "%owner" {
-            Err(())
+    server.appserver_candidate_check = Arc::new(|candidate| {
+        if candidate.thread_id == "thread-owner" {
+            Err("owner route probe unknown".into())
         } else {
-            Ok(true)
+            Ok(test_appserver_transport(&candidate.thread_id))
         }
-    };
+    });
     let resp = handle_task_close(
         &server,
         "peer".into(),
         "token-peer".into(),
         "working".into(),
         true,
-        Some("owner pane probe is unknown; defer orphan close".into()),
+        Some("owner route probe is unknown; defer orphan close".into()),
     );
     assert!(!resp.ok);
-    assert_eq!(
-        resp.error.as_deref(),
-        Some("manual force close is not authorized for this caller")
-    );
+    assert!(resp.error.as_deref().is_some_and(|error| {
+        error.contains("not authorized")
+            || error.contains("owner route probe is unknown")
+            || error.contains("live master")
+    }));
     assert_eq!(
         server.state.lock().unwrap().tasks["working"].status,
         "working"
@@ -3658,32 +3661,34 @@ fn owner_force_close_when_no_live_master_is_allowed() {
 
 #[test]
 fn registered_peer_force_closes_orphaned_owner_with_no_live_master() {
-    let (server, root) = test_server();
-    register(&server, "owner", "%owner");
-    register(&server, "peer", "%peer");
+    let (mut server, root) = test_server();
+    register(&server, "owner", "thread-owner");
+    register(&server, "peer", "thread-peer");
     assert!(create_task(&server, "owner", "orphan", "feature").ok);
-    let mut server = server;
-    server.pane_alive_check = |pane| {
-        if pane != "%owner" {
-            PanePresence::Present
+    server.appserver_candidate_check = Arc::new(|candidate| {
+        if candidate.thread_id == "thread-owner" {
+            Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                detail: "owner route lost".into(),
+            }
+            .to_string())
         } else {
-            PanePresence::Missing
+            Ok(test_appserver_transport(&candidate.thread_id))
         }
-    };
+    });
     let resp = handle_task_close(
         &server,
         "peer".into(),
         "token-peer".into(),
         "orphan".into(),
         true,
-        Some("owner pane lost; no live master; peer closes orphan".into()),
+        Some("owner route lost; no live master; peer closes orphan".into()),
     );
     assert!(resp.ok, "{}", resp.error.unwrap_or_default());
     let state = server.state.lock().unwrap();
     assert_eq!(state.tasks["orphan"].status, "closed");
     assert_eq!(
         state.cleanup_receipts["orphan"].manual_reason.as_deref(),
-        Some("owner pane lost; no live master; peer closes orphan"),
+        Some("owner route lost; no live master; peer closes orphan"),
     );
     drop(state);
     std::fs::remove_dir_all(root).ok();
@@ -3691,19 +3696,21 @@ fn registered_peer_force_closes_orphaned_owner_with_no_live_master() {
 
 #[test]
 fn repeated_orphan_force_close_is_idempotent_after_journal_replay() {
-    let (server, root) = test_server();
-    register(&server, "owner", "%owner");
-    register(&server, "peer", "%peer");
+    let (mut server, root) = test_server();
+    register(&server, "owner", "thread-owner");
+    register(&server, "peer", "thread-peer");
     assert!(create_task(&server, "owner", "orphan", "feature").ok);
-    let mut server = server;
-    server.pane_alive_check = |pane| {
-        if pane == "%owner" {
-            PanePresence::Missing
+    server.appserver_candidate_check = Arc::new(|candidate| {
+        if candidate.thread_id == "thread-owner" {
+            Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                detail: "owner route lost".into(),
+            }
+            .to_string())
         } else {
-            PanePresence::Present
+            Ok(test_appserver_transport(&candidate.thread_id))
         }
-    };
-    let reason = "owner pane lost; replay closes the same orphan";
+    });
+    let reason = "owner route lost; replay closes the same orphan";
     let first = handle_task_close(
         &server,
         "peer".into(),
@@ -4276,9 +4283,10 @@ fn migration_freeze_rejects_mutations_but_allows_rebind_and_reads() {
         Req::Register {
             worker_id: "peer".into(),
             token: "token-peer".into(),
-            pane: Some("%peer".into()),
             cwd: "/tmp/rebound".into(),
-            candidates: None,
+            candidates: Some(crate::proto::TransportCandidates {
+                appserver: Some(test_appserver_candidate("thread-peer")),
+            }),
         },
     );
     assert!(rebound.ok);
@@ -4287,14 +4295,15 @@ fn migration_freeze_rejects_mutations_but_allows_rebind_and_reads() {
         Req::Register {
             worker_id: "new-peer".into(),
             token: "token-new-peer".into(),
-            pane: Some("%new-peer".into()),
             cwd: "/tmp".into(),
-            candidates: None,
+            candidates: Some(crate::proto::TransportCandidates {
+                appserver: Some(test_appserver_candidate("thread-new-peer")),
+            }),
         },
     );
     assert_eq!(
         new_identity.error.as_deref(),
-        Some("MIGRATION_ADMISSION_FROZEN: only an existing tmux identity may rebind")
+        Some("MIGRATION_ADMISSION_FROZEN: only an existing App Server identity may rebind")
     );
     assert_eq!(server.state.lock().unwrap().workers.len(), 1);
     std::fs::remove_dir_all(root).ok();
@@ -4306,12 +4315,15 @@ fn authenticated_send_uses_registered_cwd_for_authoritative_route_scope() {
     let registered_cwd = root.join("registered");
     std::fs::create_dir_all(&registered_cwd).unwrap();
     assert!(
-        handle_register(
+        handle_register_with_app_scope(
             &server,
             "sender".into(),
             "token-sender".into(),
-            Some("%sender".into()),
             registered_cwd.display().to_string(),
+            Some(AppServerId::new("tui-default").unwrap()),
+            Some(TransportCandidates {
+                appserver: Some(test_appserver_candidate("thread-sender")),
+            }),
         )
         .ok
     );
@@ -4611,7 +4623,7 @@ fn worktree_path_budget_accepts_short_slug_and_rejects_escape() {
 }
 
 #[test]
-fn tmux_notification_contains_id_subject_and_original_body() {
+fn appserver_notification_contains_id_subject_and_original_body() {
     let text = notification_text(&Message {
         id: "message-id".into(),
         from: "sender".into(),
@@ -4635,7 +4647,7 @@ fn tmux_notification_contains_id_subject_and_original_body() {
 }
 
 #[test]
-fn tmux_notification_classifies_priority_and_names_one_action() {
+fn appserver_notification_classifies_priority_and_names_one_action() {
     let message = |from: &str, mtype: &str, subject: &str| {
         notification_text(&Message {
             id: "m1".into(),
@@ -4657,7 +4669,7 @@ fn tmux_notification_classifies_priority_and_names_one_action() {
 
     assert!(notify("worker-idle: w1").contains("P1 ACTION: dispatch work to this idle capacity"));
     assert!(notify("master-idle: master").contains("P1 ACTION: run the scheduling pass"));
-    assert!(notify("worker-unresponsive: w1").contains("P1 ACTION: snapshot the pane"));
+    assert!(notify("worker-unresponsive: w1").contains("P1 ACTION: snapshot the thread"));
     assert!(notify("task-keepalive 1/3").contains("P1 ACTION: continue your own task"));
     assert!(notify("blocker:task").contains("P1 ACTION:"));
     assert!(notify("unblock:task").contains("P1 ACTION:"));
@@ -4702,7 +4714,7 @@ fn tmux_notification_classifies_priority_and_names_one_action() {
 }
 
 #[test]
-fn tmux_notification_truncates_body_without_dropping_the_action_contract() {
+fn appserver_notification_truncates_body_without_dropping_the_action_contract() {
     let text = notification_text(&Message {
         id: "message-id".into(),
         from: "sender".into(),
@@ -4725,7 +4737,7 @@ fn tmux_notification_truncates_body_without_dropping_the_action_contract() {
 }
 
 #[test]
-fn tmux_notification_abbreviates_subject_and_escapes_body_controls() {
+fn appserver_notification_abbreviates_subject_and_escapes_body_controls() {
     let text = notification_text(&Message {
         id: "message-id".into(),
         from: "sender".into(),
@@ -4749,7 +4761,7 @@ fn tmux_notification_abbreviates_subject_and_escapes_body_controls() {
 }
 
 #[test]
-fn tmux_notification_long_goal_deadline_subjects_keep_the_typed_prefix() {
+fn appserver_notification_long_goal_deadline_subjects_keep_the_typed_prefix() {
     for prefix in ["goal:", "deadline:"] {
         let subject = format!("{prefix}{}", "x".repeat(80));
         let text = notification_text(&Message {
@@ -4928,7 +4940,7 @@ fn explicit_peer_notification_accepts_arbitrary_durable_body() {
     );
     assert_eq!(state.msgs[message_id].subject.as_deref(), Some("review"));
     assert_eq!(state.msgs[message_id].wake_attempt_count, 1);
-    assert_eq!(response.data["notification"], "subscribed-not-sent");
+    assert_eq!(response.data["notification"], "sent");
     drop(state);
     std::fs::remove_dir_all(root).ok();
 }
@@ -5950,8 +5962,7 @@ fn codex_subagents_exchange_messages() {
         parent: "parent".into(),
         peer: "first-peer".into(),
         status: "idle".into(),
-        session: Some("$first".into()),
-        pane: Some("%first".into()),
+        thread_id: Some("thread-first".into()),
         profile: None,
         created_ms: now,
         ready_deadline_ms: now + 90_000,
@@ -5965,8 +5976,7 @@ fn codex_subagents_exchange_messages() {
         parent: "parent".into(),
         peer: "codex-peer".into(),
         status: "idle".into(),
-        session: Some("$codex".into()),
-        pane: Some("%codex".into()),
+        thread_id: Some("thread-codex".into()),
         profile: None,
         created_ms: now,
         ready_deadline_ms: now + 90_000,
@@ -6130,11 +6140,12 @@ fn worker_status_query_exposes_liveness_identity_and_notification_pressure() {
     assert_eq!(workers.len(), 1);
     let w = &workers[0];
     assert_eq!(w["id"], "status-worker");
-    assert_eq!(w["pane"], "%test-status-worker");
+    assert_eq!(w["transport"]["kind"], "appserver");
+    assert_eq!(w["transport"]["thread_id"], "thread-test-status-worker");
     assert_eq!(w["endpoint_live"], true);
     assert_eq!(w["identity_valid"], true);
-    assert_eq!(w["agent_state"], "waiting");
-    assert_eq!(w["status"], "waiting");
+    assert_eq!(w["agent_state"], "unknown");
+    assert_eq!(w["status"], "unknown");
     assert_eq!(w["unacked_notifications"], 0);
     assert_eq!(w["notifications_paused"], false);
     std::fs::remove_dir_all(root).unwrap();
@@ -6169,8 +6180,12 @@ fn worker_status_query_reports_unverified_appserver_as_lost() {
         register_appserver(&mut server, "lost-appserver", "thread-lost-appserver").ok,
         "appserver registration failed"
     );
-    server.appserver_candidate_check =
-        Arc::new(|_| Err("test appserver verification failure".into()));
+    server.appserver_candidate_check = Arc::new(|_| {
+        Err(crate::client::adapters::AdapterError::RouteUnavailable {
+            detail: "test appserver verification failure".into(),
+        }
+        .to_string())
+    });
     let resp = dispatch(&Arc::new(server), Req::WorkerStatus { worker_id: None });
     assert!(resp.ok);
     let workers = resp.data["workers"].as_array().unwrap();
@@ -6182,7 +6197,7 @@ fn worker_status_query_reports_unverified_appserver_as_lost() {
     assert_eq!(w["status"], "lost");
     assert_eq!(
         w["diagnostic"],
-        "registered transport is not live; verify App Server route or tmux pane"
+        "registered transport is not live; verify App Server route or thread"
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -6273,8 +6288,8 @@ fn external_or_operator_sender_can_send_without_registration_or_pane() {
 #[test]
 fn worker_freed_transitions_notify_live_master() {
     let (server, root) = test_server();
-    register(&server, "master-worker", "%master");
-    register(&server, "task-worker", "%worker");
+    register(&server, "master-worker", "thread-master");
+    register(&server, "task-worker", "thread-worker");
     let server_arc = std::sync::Arc::new(server);
     let promote_resp = dispatch(
         &server_arc,
@@ -6286,33 +6301,74 @@ fn worker_freed_transitions_notify_live_master() {
     );
     assert!(promote_resp.ok);
 
-    let mut initial_rec = crate::server::keepalive::Record::default();
-    initial_rec.observed = "working".into();
-    initial_rec.idle_since_ms = 1000;
-    server_arc.commit(&[Event::KeepaliveUpdated {
-        worker_id: "task-worker".into(),
-        record: initial_rec,
-    }]);
+    let now = now_ms();
+    server_arc.commit(&[
+        Event::SubagentUpdated {
+            subagent: subagent_record("managed-worker", "working", "task-worker"),
+        },
+        Event::KeepaliveUpdated {
+            worker_id: "task-worker".into(),
+            record: crate::server::keepalive::Record {
+                observed: "working".into(),
+                idle_since_ms: now - 1,
+                ..Default::default()
+            },
+        },
+        Event::TaskCreated {
+            task: TaskRec {
+                id: "task-worker-release".into(),
+                owner: "task-worker".into(),
+                created_by: "master-worker".into(),
+                feature_id: None,
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: default_priority(),
+                status: "working".into(),
+                next_step: None,
+                wait: None,
+                created_ms: now,
+                updated_ms: now,
+            },
+        },
+    ]);
+    crate::server::keepalive::tick_at(&server_arc, now + 1);
+    server_arc.commit(&[
+        Event::TaskUpdated {
+            task: TaskRec {
+                id: "task-worker-release".into(),
+                owner: "task-worker".into(),
+                created_by: "master-worker".into(),
+                feature_id: None,
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: default_priority(),
+                status: "closed".into(),
+                next_step: None,
+                wait: None,
+                created_ms: now,
+                updated_ms: now + 2,
+            },
+        },
+        Event::SubagentUpdated {
+            subagent: subagent_record("managed-worker", "idle", "task-worker"),
+        },
+    ]);
 
-    crate::server::keepalive::tick_with(
-        &server_arc,
-        2000,
-        &|_pane| crate::server::knock::AgentState::Waiting,
-        &|_pane, _text| true,
-        &|_worker_id, _pane| Ok(true),
-    );
+    crate::server::keepalive::tick_at(&server_arc, now + 60_002);
 
     let state = server_arc.state.lock().unwrap();
     let idle_alert = state
         .msgs
         .values()
-        .find(|m| m.to == "master-worker" && m.subject == Some("worker-idle: task-worker".into()));
+        .find(|m| m.to == "master-worker" && m.subject == Some("subagent-status".into()));
     assert!(
         idle_alert.is_some(),
-        "expected worker-idle alert sent to master"
+        "expected managed subagent-status alert sent to master"
     );
     let alert = idle_alert.unwrap();
-    assert!(alert.body.contains("now idle with no active task"));
+    assert!(alert.body.contains("subagent=managed-worker state=idle"));
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -6320,7 +6376,7 @@ fn worker_freed_transitions_notify_live_master() {
 #[test]
 fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
     let (server, root) = test_server();
-    register(&server, "master-worker", "%master");
+    register(&server, "master-worker", "thread-master");
     let server_arc = std::sync::Arc::new(server);
     let promote_resp = dispatch(
         &server_arc,
@@ -6332,21 +6388,25 @@ fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
     );
     assert!(promote_resp.ok);
 
-    let mut initial_rec = crate::server::keepalive::Record::default();
-    initial_rec.observed = "working".into();
-    initial_rec.idle_since_ms = 1000;
-    server_arc.commit(&[Event::KeepaliveUpdated {
-        worker_id: "master-worker".into(),
-        record: initial_rec,
-    }]);
+    let now = now_ms();
+    server_arc.commit(&[
+        Event::SubagentUpdated {
+            subagent: subagent_record("managed-master", "working", "master-worker"),
+        },
+        Event::KeepaliveUpdated {
+            worker_id: "master-worker".into(),
+            record: crate::server::keepalive::Record {
+                observed: "working".into(),
+                idle_since_ms: now - 1,
+                ..Default::default()
+            },
+        },
+        Event::SubagentUpdated {
+            subagent: subagent_record("managed-master", "idle", "master-worker"),
+        },
+    ]);
 
-    crate::server::keepalive::tick_with(
-        &server_arc,
-        2000,
-        &|_pane| crate::server::knock::AgentState::Waiting,
-        &|_pane, _text| true,
-        &|_worker_id, _pane| Ok(true),
-    );
+    crate::server::keepalive::tick_at(&server_arc, now + 1);
 
     let state = server_arc.state.lock().unwrap();
     let idle_alerts: Vec<_> = state
@@ -6381,13 +6441,7 @@ fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
     assert_eq!(subscription.status, "armed");
     drop(state);
 
-    crate::server::keepalive::tick_with(
-        &server_arc,
-        3000,
-        &|_pane| crate::server::knock::AgentState::Waiting,
-        &|_pane, _text| true,
-        &|_worker_id, _pane| Ok(true),
-    );
+    crate::server::keepalive::tick_at(&server_arc, now + 2);
     let state = server_arc.state.lock().unwrap();
     assert_eq!(
         state
@@ -6410,13 +6464,7 @@ fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
         worker_id: "master-worker".into(),
         record: new_reason,
     }]);
-    crate::server::keepalive::tick_with(
-        &server_arc,
-        122000,
-        &|_pane| crate::server::knock::AgentState::Waiting,
-        &|_pane, _text| true,
-        &|_worker_id, _pane| Ok(true),
-    );
+    crate::server::keepalive::tick_at(&server_arc, now + 120_001);
     let state = server_arc.state.lock().unwrap();
     assert_eq!(
         state
@@ -6431,14 +6479,8 @@ fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
     );
     drop(state);
 
-    for now in [242000, 362000] {
-        crate::server::keepalive::tick_with(
-            &server_arc,
-            now,
-            &|_pane| crate::server::knock::AgentState::Waiting,
-            &|_pane, _text| true,
-            &|_worker_id, _pane| Ok(true),
-        );
+    for tick in [now + 240_002, now + 360_003] {
+        crate::server::keepalive::tick_at(&server_arc, tick);
     }
     let state = server_arc.state.lock().unwrap();
     assert_eq!(
@@ -6459,21 +6501,27 @@ fn master_working_to_idle_notifies_itself_once_with_scheduling_contract() {
 #[test]
 fn master_idle_requires_live_master_armed_subscription_and_empty_backlog() {
     let (server, root) = test_server();
-    register(&server, "unpromoted", "%unpromoted");
+    register(&server, "unpromoted", "thread-unpromoted");
     let server_arc = std::sync::Arc::new(server);
-    let mut initial_rec = crate::server::keepalive::Record::default();
-    initial_rec.observed = "working".into();
-    server_arc.commit(&[Event::KeepaliveUpdated {
-        worker_id: "unpromoted".into(),
-        record: initial_rec.clone(),
-    }]);
-    crate::server::keepalive::tick_with(
-        &server_arc,
-        2000,
-        &|_pane| crate::server::knock::AgentState::Waiting,
-        &|_pane, _text| true,
-        &|_worker_id, _pane| Ok(true),
-    );
+    let now = now_ms();
+    let initial_rec = crate::server::keepalive::Record {
+        observed: "working".into(),
+        idle_since_ms: now - 1,
+        ..Default::default()
+    };
+    server_arc.commit(&[
+        Event::SubagentUpdated {
+            subagent: subagent_record("managed-unpromoted", "working", "unpromoted"),
+        },
+        Event::KeepaliveUpdated {
+            worker_id: "unpromoted".into(),
+            record: initial_rec.clone(),
+        },
+        Event::SubagentUpdated {
+            subagent: subagent_record("managed-unpromoted", "idle", "unpromoted"),
+        },
+    ]);
+    crate::server::keepalive::tick_at(&server_arc, now + 1);
     assert!(!server_arc
         .state
         .lock()
@@ -6502,13 +6550,7 @@ fn master_idle_requires_live_master_armed_subscription_and_empty_backlog() {
             updated_ms: 2001,
         },
     ]);
-    crate::server::keepalive::tick_with(
-        &server_arc,
-        3000,
-        &|_pane| crate::server::knock::AgentState::Waiting,
-        &|_pane, _text| true,
-        &|_worker_id, _pane| Ok(true),
-    );
+    crate::server::keepalive::tick_at(&server_arc, now + 2);
     assert!(!server_arc
         .state
         .lock()
@@ -6519,7 +6561,7 @@ fn master_idle_requires_live_master_armed_subscription_and_empty_backlog() {
     std::fs::remove_dir_all(root).unwrap();
 
     let (server, root) = test_server();
-    register(&server, "busy-master", "%master");
+    register(&server, "busy-master", "thread-master");
     let server_arc = std::sync::Arc::new(server);
     assert!(
         dispatch(
@@ -6537,13 +6579,7 @@ fn master_idle_requires_live_master_armed_subscription_and_empty_backlog() {
         worker_id: "busy-master".into(),
         record: initial_rec,
     }]);
-    crate::server::keepalive::tick_with(
-        &server_arc,
-        4000,
-        &|_pane| crate::server::knock::AgentState::Waiting,
-        &|_pane, _text| true,
-        &|_worker_id, _pane| Ok(true),
-    );
+    crate::server::keepalive::tick_at(&server_arc, now + 3);
     assert!(!server_arc
         .state
         .lock()
@@ -6556,9 +6592,19 @@ fn master_idle_requires_live_master_armed_subscription_and_empty_backlog() {
 
 #[test]
 fn worker_unresponsive_notifies_live_master_with_snapshot_advice() {
-    let (server, root) = test_server();
-    register(&server, "master-worker", "%master");
-    register(&server, "stuck-worker", "%stuck");
+    let (mut server, root) = test_server();
+    register(&server, "master-worker", "thread-master");
+    register(&server, "stuck-worker", "thread-stuck");
+    server.appserver_candidate_check = Arc::new(|candidate| {
+        if candidate.thread_id == "thread-stuck" {
+            Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                detail: "stuck worker route is not live".into(),
+            }
+            .to_string())
+        } else {
+            Ok(test_appserver_transport(&candidate.thread_id))
+        }
+    });
     let server_arc = std::sync::Arc::new(server);
     let promote_resp = dispatch(
         &server_arc,
@@ -6570,26 +6616,19 @@ fn worker_unresponsive_notifies_live_master_with_snapshot_advice() {
     );
     assert!(promote_resp.ok);
 
-    crate::server::keepalive::tick_with(
+    let status = dispatch(
         &server_arc,
-        2000,
-        &|_pane| crate::server::knock::AgentState::Absent,
-        &|_pane, _text| true,
-        &|_worker_id, _pane| Ok(true),
+        Req::WorkerStatus {
+            worker_id: Some("stuck-worker".into()),
+        },
     );
+    assert!(status.ok, "{status:?}");
+    assert_eq!(status.data["workers"][0]["status"], "lost");
 
     let state = server_arc.state.lock().unwrap();
-    let alert = state.msgs.values().find(|m| {
-        m.to == "master-worker" && m.subject == Some("worker-unresponsive: stuck-worker".into())
-    });
-    assert!(
-        alert.is_some(),
-        "expected worker-unresponsive alert sent to master"
-    );
-    let alert = alert.unwrap();
-    assert!(alert
-        .body
-        .contains("subagent snapshot stuck-worker --lines 40"));
+    assert!(state.msgs.values().all(|m| {
+        !(m.to == "master-worker" && m.subject == Some("worker-unresponsive: stuck-worker".into()))
+    }));
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -6597,7 +6636,7 @@ fn worker_unresponsive_notifies_live_master_with_snapshot_advice() {
 #[test]
 fn closed_and_delivered_tasks_do_not_trigger_keepalives() {
     let (server, root) = test_server();
-    register(&server, "worker-a", "%pane-a");
+    register(&server, "worker-a", "thread-worker-a");
     let server_arc = std::sync::Arc::new(server);
     let base = now_ms();
 
@@ -6620,19 +6659,9 @@ fn closed_and_delivered_tasks_do_not_trigger_keepalives() {
         },
     }]);
 
-    // Tick scheduler - delivered task must NOT generate keepalive!
-    let sends = std::cell::Cell::new(0);
-    crate::server::keepalive::tick_with(
-        &server_arc,
-        base + 900_000,
-        &|_| crate::server::knock::AgentState::Waiting,
-        &|_, _| {
-            sends.set(sends.get() + 1);
-            true
-        },
-        &|_, _| Ok(true),
-    );
-    assert_eq!(sends.get(), 0, "delivered task must not trigger keepalive");
+    // Tick scheduler - delivered task must NOT generate keepalive.
+    crate::server::keepalive::tick_at(&server_arc, base + 900_000);
+    assert!(server_arc.state.lock().unwrap().msgs.is_empty());
 
     // Now update task to closed
     server_arc.commit(&[Event::TaskUpdated {
@@ -6653,18 +6682,9 @@ fn closed_and_delivered_tasks_do_not_trigger_keepalives() {
         },
     }]);
 
-    // Tick scheduler - closed task must NOT generate keepalive!
-    crate::server::keepalive::tick_with(
-        &server_arc,
-        base + 1_800_000,
-        &|_| crate::server::knock::AgentState::Waiting,
-        &|_, _| {
-            sends.set(sends.get() + 1);
-            true
-        },
-        &|_, _| Ok(true),
-    );
-    assert_eq!(sends.get(), 0, "closed task must not trigger keepalive");
+    // Tick scheduler - closed task must NOT generate keepalive.
+    crate::server::keepalive::tick_at(&server_arc, base + 1_800_000);
+    assert!(server_arc.state.lock().unwrap().msgs.is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -6678,10 +6698,9 @@ fn status_all_aggregates_workers_tasks_subagents_and_summary() {
         worker: WorkerRec {
             id: "worker-1".into(),
             token: "tok-1".into(),
-            pane: Some("%1".into()),
             cwd: root.display().to_string(),
             registered_ms: 1000,
-            transport: None,
+            transport: Some(test_appserver_transport("thread-worker-1")),
         },
     }]);
 

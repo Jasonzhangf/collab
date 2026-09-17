@@ -49,7 +49,6 @@ impl EndpointKind {
 #[serde(rename_all = "snake_case")]
 pub enum WakeMode {
     None,
-    TmuxOptional,
     Native,
 }
 
@@ -71,7 +70,7 @@ impl AdapterCapabilities {
                 endpoint,
                 submit: true,
                 interrupt: true,
-                wake: WakeMode::TmuxOptional,
+                wake: WakeMode::Native,
             },
             EndpointKind::Desktop => Self {
                 endpoint,
@@ -133,6 +132,9 @@ pub enum AdapterError {
     EndpointUnavailable {
         endpoint: EndpointKind,
     },
+    RouteUnavailable {
+        detail: String,
+    },
     CapabilityUnavailable {
         endpoint: EndpointKind,
         operation: &'static str,
@@ -173,6 +175,9 @@ impl fmt::Display for AdapterError {
                 "ADAPTER_ENDPOINT_UNAVAILABLE: {} AppServer endpoint has no live native transport",
                 endpoint.as_str()
             ),
+            Self::RouteUnavailable { detail } => {
+                write!(f, "ADAPTER_ROUTE_UNAVAILABLE: {detail}")
+            }
             Self::CapabilityUnavailable {
                 endpoint,
                 operation,
@@ -229,7 +234,7 @@ pub struct UnavailableAdapter {
 
 /// Placeholder used until the host supplies a verified native transport.
 /// Every operation fails explicitly so callers cannot silently switch to the
-/// daemon or a tmux wake path.
+/// daemon or any unselected wake path.
 impl AppServerAdapter for UnavailableAdapter {
     fn capabilities(&self) -> AdapterCapabilities {
         AdapterCapabilities::for_endpoint(self.kind)
@@ -746,7 +751,7 @@ mod tests {
         let desktop = AdapterCapabilities::for_endpoint(EndpointKind::Desktop);
 
         assert_eq!(tui.endpoint, EndpointKind::Tui);
-        assert_eq!(tui.wake, WakeMode::TmuxOptional);
+        assert_eq!(tui.wake, WakeMode::Native);
         assert_eq!(desktop.endpoint, EndpointKind::Desktop);
         assert_eq!(desktop.wake, WakeMode::Native);
         assert!(tui.submit && desktop.submit);
@@ -754,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_tui_and_desktop_detection_does_not_guess_tmux_identity() {
+    fn explicit_tui_and_desktop_detection_does_not_guess_terminal_identity() {
         let tui = AdapterRegistry::detect(Some(EndpointKind::Tui)).unwrap();
         assert_eq!(tui.kind, EndpointKind::Tui);
 
@@ -999,7 +1004,7 @@ mod tests {
                 endpoint: EndpointKind::Tui
             }
         );
-        assert!(!submit_error.to_string().contains("tmux"));
+        assert!(!submit_error.to_string().contains("terminal"));
 
         let interrupt_error =
             interrupt_registered(&adapter, &binding, &turn("turn-1")).unwrap_err();
@@ -1070,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_endpoint_failure_does_not_retry_daemon_or_tmux() {
+    fn selected_endpoint_failure_does_not_retry_daemon_or_other_transport() {
         let root = temp_root("no-fallback");
         let socket = PathBuf::from(format!(
             "/tmp/collab-adapter-no-fallback-{}-{}",

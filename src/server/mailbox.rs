@@ -62,7 +62,7 @@ pub fn visible_body(body: &str) -> String {
 
 pub fn notification_class(subject: &str, from: &str, mtype: &str) -> (&'static str, &'static str) {
     if subject.starts_with("worker-unresponsive") {
-        return ("P1", "snapshot the pane, then recover or close it");
+        return ("P1", "snapshot the thread");
     }
     if subject.starts_with("worker-idle") {
         return ("P1", "dispatch work to this idle capacity");
@@ -862,13 +862,13 @@ fn update_latest_mailbox_projection(root: &Path, msg: &Message) -> Result<(), St
                 errors.push("unterminated latest projection tail".into());
             }
             if !errors.is_empty() {
-                super::knock::append_log(
+                super::presence::append_log(
                     &super::Server::log_path_for(root),
                     &format!("MAILBOX_LATEST_RECOVERABLE: {}", errors.join(" | ")),
                 );
                 let rebuilt = rebuild_latest_projection(root, recipient)?;
                 if !rebuilt.recoverable_errors.is_empty() {
-                    super::knock::append_log(
+                    super::presence::append_log(
                         &super::Server::log_path_for(root),
                         &format!(
                             "MAILBOX_LATEST_RAW_RECOVERABLE: {}",
@@ -900,7 +900,7 @@ fn update_latest_mailbox_projection(root: &Path, msg: &Message) -> Result<(), St
                 );
             }
             if !recoverable_errors.is_empty() {
-                super::knock::append_log(
+                super::presence::append_log(
                     &super::Server::log_path_for(root),
                     &format!(
                         "MAILBOX_LATEST_RECOVERABLE: {}",
@@ -909,7 +909,7 @@ fn update_latest_mailbox_projection(root: &Path, msg: &Message) -> Result<(), St
                 );
                 let rebuilt = rebuild_latest_projection(root, recipient)?;
                 if !rebuilt.recoverable_errors.is_empty() {
-                    super::knock::append_log(
+                    super::presence::append_log(
                         &super::Server::log_path_for(root),
                         &format!(
                             "MAILBOX_LATEST_RAW_RECOVERABLE: {}",
@@ -939,13 +939,13 @@ fn update_latest_mailbox_projection(root: &Path, msg: &Message) -> Result<(), St
             write_latest_projection(&path, &records)
         }
         Err(error) => {
-            super::knock::append_log(
+            super::presence::append_log(
                 &super::Server::log_path_for(root),
                 &format!("MAILBOX_LATEST_RECOVERABLE: {error}"),
             );
             let rebuilt = rebuild_latest_projection(root, recipient)?;
             if !rebuilt.recoverable_errors.is_empty() {
-                super::knock::append_log(
+                super::presence::append_log(
                     &super::Server::log_path_for(root),
                     &format!(
                         "MAILBOX_LATEST_RAW_RECOVERABLE: {}",
@@ -978,7 +978,7 @@ pub fn backup_message(root: &Path, msg: &Message) -> Result<(), String> {
         match read_recipient_mailbox(&jsonl_path, &msg.to) {
             Ok(projection) => {
                 if !projection.recoverable_errors.is_empty() {
-                    super::knock::append_log(
+                    super::presence::append_log(
                         &super::Server::log_path_for(root),
                         &format!(
                             "MAILBOX_JSONL_RECOVERABLE: {}",
@@ -1017,7 +1017,7 @@ pub fn backup_message(root: &Path, msg: &Message) -> Result<(), String> {
                 // queryable and recoverable; it must not prevent a later
                 // durable message from being appended to the mailbox.
                 let truncated = recover_malformed_mailbox_tail(&jsonl_path, &msg.to)?;
-                super::knock::append_log(
+                super::presence::append_log(
                     &super::Server::log_path_for(root),
                     &format!(
                         "MAILBOX_JSONL_RECOVERABLE: {error}; malformed_tail_truncated={truncated}"
@@ -1051,7 +1051,7 @@ pub fn purge_message_snapshot_files(root: &Path, expired_ids: &[String], live: &
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
-                        super::knock::append_log(
+                        super::presence::append_log(
                             &super::Server::log_path_for(root),
                             &format!("MAILBOX_SNAPSHOT_READ_FAILED: {error}"),
                         );
@@ -1069,7 +1069,7 @@ pub fn purge_message_snapshot_files(root: &Path, expired_ids: &[String], live: &
                     || !live.msgs.contains_key(id)
                 {
                     if let Err(error) = std::fs::remove_file(entry.path()) {
-                        super::knock::append_log(
+                        super::presence::append_log(
                             &super::Server::log_path_for(root),
                             &format!("MAILBOX_SNAPSHOT_REMOVE_FAILED: {error}"),
                         );
@@ -1078,7 +1078,7 @@ pub fn purge_message_snapshot_files(root: &Path, expired_ids: &[String], live: &
             }
         }
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            super::knock::append_log(
+            super::presence::append_log(
                 &super::Server::log_path_for(root),
                 &format!("MAILBOX_SNAPSHOT_READ_FAILED: {error}"),
             );
@@ -1138,11 +1138,10 @@ mod tests {
                 journal_path: root.join(".agent-collab/server/journal.jsonl"),
                 state: Mutex::new(crate::server::state::State::default()),
                 journal: Mutex::new(journal),
-                pane_alive_check: |_| crate::server::knock::PanePresence::Present,
-                pane_owner_check: |_, _| Ok(true),
-                pane_state_check: |_| crate::server::knock::AgentState::Waiting,
                 appserver_candidate_check: crate::server::default_appserver_candidate_check(),
                 appserver_notification_sink: crate::server::default_appserver_notification_sink(),
+                appserver_thread_status: crate::server::default_appserver_thread_status(),
+                appserver_thread_archive: crate::server::default_appserver_thread_archive(),
                 mailbox_notify: tokio::sync::Notify::new(),
             },
             root,

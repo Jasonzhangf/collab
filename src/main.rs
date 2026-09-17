@@ -72,7 +72,7 @@ enum Cmd {
         #[command(subcommand)]
         command: MasterCmd,
     },
-    /// Refresh this worker's tmux pane/session registration
+    /// Refresh this worker's App Server registration
     Worker {
         #[command(subcommand)]
         cmd: WorkerCmd,
@@ -90,12 +90,10 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Get or create your worker identity and announce your tmux pane
+    /// Get or create your worker identity and bind the Codex thread
     Whoami {
         #[arg(long)]
         worker: Option<String>,
-        #[arg(long)]
-        pane: Option<String>,
     },
     /// Send a message to another worker
     #[command(alias = "sendmessage")]
@@ -105,7 +103,7 @@ enum Cmd {
         from: Option<String>,
         #[arg(long)]
         to: String,
-        /// Short topic shown in the tmux notification preview
+        /// Short topic shown in the notification preview
         #[arg(long)]
         subject: String,
         #[arg(long, default_value = "notify")]
@@ -294,7 +292,7 @@ enum TaskCmd {
     /// Close a merged task and clean up its declared worktree/branch.
     /// With --force the live master may close any task. With no live master,
     /// the owner may close its task, or a registered peer may close an
-    /// orphaned task after the owner's tmux identity is lost. Force close
+    /// orphaned task after the owner's App Server identity is lost. Force close
     /// stops keepalives without deleting the worktree or branch and requires
     /// a non-empty --reason.
     Close {
@@ -354,23 +352,20 @@ enum MasterCmd {
 
 #[derive(Subcommand)]
 enum WorkerCmd {
-    /// Re-register the current tmux pane without changing task ownership
+    /// Re-register the current App Server thread without changing task ownership
     Recover,
     /// Inspect worker status (liveness, identity, agent state, unacked notifications)
     Status {
         /// Optional worker ID to inspect (defaults to all registered workers)
         id: Option<String>,
     },
-    /// Live master retires a worker registration; optionally kills its tmux session
+    /// Live master retires a worker registration
     Close {
         /// Worker ID to close
         id: String,
         /// Why this worker is being closed; recorded for audit
         #[arg(long)]
         reason: String,
-        /// Also kill the worker's tmux session
-        #[arg(long)]
-        kill_session: bool,
     },
 }
 
@@ -405,12 +400,10 @@ fn register(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::V
         &Req::Register {
             worker_id: ident.worker_id.clone(),
             token: ident.token.clone(),
-            pane: ident.pane.clone(),
             cwd,
             candidates: Some(proto::TransportCandidates {
                 appserver: crate::client::adapters::candidate_from_env()
                     .map_err(anyhow::Error::msg)?,
-                tmux: ident.pane.clone().map(|pane| proto::TmuxCandidate { pane }),
             }),
         },
         &scope.root,
@@ -518,24 +511,20 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Subagent { command } => {
             let scope = Scope::resolve()?;
-            if std::env::var_os("TMUX_PANE").is_none() {
-                let query = match &command {
-                    subagent::Action::List => Some((None, None)),
-                    subagent::Action::Status { id } => Some((Some(id.clone()), None)),
-                    subagent::Action::Snapshot { id, lines } => {
-                        Some((Some(id.clone()), Some(*lines)))
-                    }
-                    _ => None,
-                };
-                if let Some((id, snapshot_lines)) = query {
-                    let value: serde_json::Value = client::call_with_context(
-                        &scope.sock_path(),
-                        &Req::SubagentObserve { id, snapshot_lines },
-                        Some(cli_project_context(&scope.root)?),
-                    )?;
-                    out(&value);
-                    return Ok(());
-                }
+            let query = match &command {
+                subagent::Action::List => Some((None, None)),
+                subagent::Action::Status { id } => Some((Some(id.clone()), None)),
+                subagent::Action::Snapshot { id, lines } => Some((Some(id.clone()), Some(*lines))),
+                _ => None,
+            };
+            if let Some((id, snapshot_lines)) = query {
+                let value: serde_json::Value = client::call_with_context(
+                    &scope.sock_path(),
+                    &Req::SubagentObserve { id, snapshot_lines },
+                    Some(cli_project_context(&scope.root)?),
+                )?;
+                out(&value);
+                return Ok(());
             }
             let ident = me(&scope, None)?;
             let launch_env = if matches!(command, subagent::Action::Start { .. }) {
@@ -699,10 +688,6 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let mut identity = None;
                     let worker_id = if actorless {
                         worker
-                    } else if std::env::var_os("TMUX_PANE").is_none() {
-                        anyhow::bail!(
-                            "collab mailbox read outside tmux requires --all or --worker <id>"
-                        );
                     } else {
                         let ident = me(&scope, None)?;
                         let worker_id = ident.worker_id.clone();
@@ -831,8 +816,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     out(&json!({
                         "recovered": true,
                         "worker_id": ident.worker_id,
-                        "pane": ident.pane,
-                        "session": ident.session,
+                        "transport": ident.transport,
                         "identity_kind": "peer",
                         "next": "run collab who and collab task status; task ownership is unchanged"
                     }));
@@ -845,11 +829,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     out(&v);
                     Ok(())
                 }
-                WorkerCmd::Close {
-                    id,
-                    reason,
-                    kill_session,
-                } => {
+                WorkerCmd::Close { id, reason } => {
                     let ident = me(&scope, None)?;
                     let v: serde_json::Value = call_project(
                         &scope,
@@ -859,7 +839,6 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                             token: ident.token.clone(),
                             target_id: id,
                             reason,
-                            kill_session,
                         },
                     )?;
                     out(&v);
@@ -883,9 +862,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 "collab reset is deprecated; preserve journal/mailbox and use migration rebind"
             )
         }
-        Cmd::Whoami { worker, pane } => {
+        Cmd::Whoami { worker } => {
             let scope = Scope::resolve()?;
-            let mut ident = identity::load_or_create(&scope, worker, pane)?;
+            let mut ident = identity::load_or_create(&scope, worker, None)?;
             let registration = ensure_registration(&scope, &mut ident)?;
             let mut response = serde_json::to_value(&ident)?;
             response["role_brief"] = registration["role_brief"].clone();
@@ -1251,8 +1230,6 @@ mod tests {
         Identity {
             worker_id: "worker-1".into(),
             token: "token-1".into(),
-            pane: None,
-            session: None,
             runtime,
             transport: None,
         }
@@ -1298,13 +1275,12 @@ mod tests {
         let runtime = RuntimeIdentity::cli_adapter("worker-1").unwrap();
         let mut identity = identity_with_runtime(Some(runtime));
         identity.transport = Some(SelectedTransport {
-            kind: TransportKind::Tmux,
-            endpoint: None,
-            namespace: None,
-            thread_id: None,
-            pane: Some("%worker-1".into()),
+            kind: TransportKind::AppServer,
+            endpoint: Some("unix:///tmp/codex.sock".into()),
+            namespace: Some("codex_tui".into()),
+            thread_id: Some("thread-worker-1".into()),
             capabilities: vec!["send_message".into()],
-            self_check: "test tmux".into(),
+            self_check: "test appserver".into(),
         });
         let before = serde_json::to_value(&identity).unwrap();
         let response = ensure_registration(&Scope { root: root.clone() }, &mut identity).unwrap();

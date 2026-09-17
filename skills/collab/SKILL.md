@@ -18,9 +18,10 @@ description: >
 
 # Collab
 
-Durable truth lives in the project server. App Server is the preferred
-transport when available; tmux is optional and carries at most a bounded wake
-preview when selected. Production projects use the globally installed Collab v1.
+Durable truth lives in the project server. App Server is the only registered
+transport; tmux/TMax is no longer supported and must not be configured or used
+for identity, liveness, or notification. Production projects use the globally
+installed Collab v1.
 
 ## One lifecycle loop
 
@@ -52,10 +53,10 @@ collab worker status <peer>
 collab context
 ```
 
-Verify the recorded App Server thread or tmux pane is live and belongs to the
-same peer. If the selected transport is stale, use the explicit peer-scoped
+Verify the recorded App Server thread is live and belongs to the same peer.
+If the selected transport is stale, use the explicit peer-scoped
 re-registration/rebind path, then send one registration/report request. Do not
-inject `collab init` into a foreign pane, guess among multiple panes, or replay
+inject `collab init` into a foreign thread, guess among multiple threads, or replay
 an old message batch. A recovery request is a maintenance action, not a normal
 notification.
 
@@ -66,12 +67,12 @@ Treat each claim separately:
 ```text
 durable=true -> mailbox journal accepted
 notification=accepted -> selected transport accepted the preview
-transport evidence -> App Server queued it or the tmux pane received/submitted it
+transport evidence -> App Server queued it
 recv response -> peer consumed the message
 task close receipt -> lifecycle ended
 ```
 
-An error, timeout, `subscribed-not-sent`, `pane-lost`, `identity-mismatch`,
+An error, timeout, `subscribed-not-sent`, `thread-lost`, `identity-mismatch`,
 `unknown`, or absent Agent is not success. Preserve the exact error and
 durable IDs; do not retry automatically, ACK for another identity, or mark a
 task delivered/closed without its required evidence. A worker reports the
@@ -98,8 +99,8 @@ After a fix, verify the same user path again and classify the first divergence:
 
 - `send` durable but no transport acceptance: inspect the selected transport,
   subscription, ownership, Agent state, and daemon log.
-- App Server queue acceptance or a tmux preview appears but no worker result:
-  inspect the native thread or pane and worker state; do not call that a reply.
+- App Server queue acceptance appears but no worker result: inspect the
+  native thread and worker state; do not call that a reply.
 - `recv` returns messages: the read is consumed atomically; no follow-up ACK is
   required. `msg`, `inbox`, and `context` remain read-only.
 - task remains open: inspect owner identity, master responsibility, cleanup
@@ -171,8 +172,8 @@ With a matching live subscription, the first pending message opens a fixed
 batched delivery globally or per project; `appsdk config` shows effective
 policy. All eligible unsent messages for that recipient are combined
 into the selected transport's bounded delivery (up to 3 previews per knock,
-with overflow retained in the inbox). App Server uses `thread/queue/add`; a
-tmux-selected peer uses one single-line write and one Enter. Daemon-generated
+with overflow retained in the inbox). App Server uses `thread/queue/add`.
+Daemon-generated
 notifications require a safe waiting/idle agent; actively working agents defer
 them without burning attempts so in-flight tasks are not polluted. Explicit
 `collab sendmessage` is immediate and follows the explicit-message adapter
@@ -417,7 +418,7 @@ collab subagent snapshot <id> --lines 40
 Inspect ground-truth terminal output to distinguish between interactive prompt
 waits, process crashes, or infinite loops. Base all recovery decisions on
 concrete snapshot evidence—adjusting instructions, force-closing dead tasks,
-or restarting panes—closing the loop deterministically.
+or restarting App Server threads—closing the loop deterministically.
 
 Master keeps architecture, dispatch, integration, critical repair, and
 final acceptance. Bulk implementation does not stay on the master's own
@@ -484,7 +485,7 @@ For an AppSDK-governed project, the only bootstrap command is:
 appsdk init .
 ```
 
-In a live App Server or tmux Agent this runs official `collab init`,
+In a live App Server Agent this runs official `collab init`,
 starts/reuses the daemon, registers the current peer through the server-selected
 transport, and creates/refreshes the finite reusable default `direct-message`
 lease. Do not run a second `collab init`,
@@ -516,9 +517,8 @@ register it.
 ## Hard boundaries
 
 - Never attach production work to v2 or `.agent-collab-v2`.
-- Project scope comes from the exact process cwd. A tmux pane cwd is used only
-  when a live pane is the inherited transport. Never choose/search/hardcode a
-  path. MCP and child commands inherit the same environment.
+- Project scope comes from the exact process cwd. Never choose/search/hardcode
+  a path. MCP and child commands inherit the same environment.
 - Identities are equal peers by default. There is no implicit master from
   first registration, automatic process recovery, or inferred `/goal`. Collab
   master is explicit, user-approved project arbitration; it is not Codex root,
@@ -545,8 +545,8 @@ register it.
 - A wake is only a signal. It cannot change task/resource truth, fabricate
   success, authorize maintenance, or create an ACK loop.
 - `absent` or `unknown` Agent state produces no transport input. If the selected
-  App Server thread or tmux pane is dead, reassigned, unowned, or mismatched,
-  the subscription enters its explicit unavailable state to prevent storms.
+  App Server thread is dead, reassigned, unowned, or mismatched, the
+  subscription enters its explicit unavailable state to prevent storms.
   Each due batch is reserved durably once; failed or uncertain attempts are
   never automatically replayed, including after restart. Details remain
   readable in the inbox.
