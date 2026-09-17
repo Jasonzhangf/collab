@@ -1650,7 +1650,12 @@ impl ProjectRuntimeManager {
             }
         }
 
-        let route_records = load_host_route_records(&route_journal)?;
+        let mut route_records = Vec::new();
+        for record in load_host_route_records(&route_journal)? {
+            if route_record_is_replayable(&record)? {
+                route_records.push(record);
+            }
+        }
         // A route record is only usable when its storage path has one owner.
         // The host resident reducer is an owner even when it has no entry in
         // routes.jsonl; otherwise replay could admit a second reducer on the
@@ -2457,6 +2462,17 @@ fn validate_host_route_record(
         root,
         storage_root,
     ))
+}
+
+fn route_record_is_replayable(record: &HostRouteRecord) -> Result<bool, String> {
+    match std::fs::canonicalize(&record.canonical_root) {
+        Ok(root) => Ok(root.join(".agent-collab").is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "HOST_ROUTE_REPLAY_FAILED: canonical root {}: {error}",
+            record.canonical_root
+        )),
+    }
 }
 
 fn validate_command_id(value: &str) -> Result<(), notification_contract::JournalError> {
@@ -11017,6 +11033,62 @@ mod host_route_registry_tests {
             before_resident_journal
         );
         assert!(!root.join(".agent-collab/server/runtimes").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_route_root_is_ignored_without_rewriting_route_journal() {
+        let (server, root, _) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        let missing_root = root.join("missing-project");
+        let record = HostRouteRecord {
+            version: 1,
+            op: "register".into(),
+            app_scope_id: "appserver-cli".into(),
+            project_scope: missing_root.to_string_lossy().into_owned(),
+            canonical_root: missing_root.to_string_lossy().into_owned(),
+            storage_root: missing_root.to_string_lossy().into_owned(),
+            registered_ms: 1,
+        };
+        let contents = format!("{}\n", serde_json::to_string(&record).unwrap());
+        std::fs::write(&route_journal, &contents).unwrap();
+
+        let manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+
+        assert!(manager.routes.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&route_journal).unwrap(), contents);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uninitialized_route_root_is_ignored_without_rewriting_route_journal() {
+        let (server, root, _) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let route_journal = host_paths.state_root().join("routes.jsonl");
+        std::fs::create_dir_all(host_paths.state_root()).unwrap();
+        let uninitialized_root = root.join("uninitialized-project");
+        std::fs::create_dir_all(&uninitialized_root).unwrap();
+        let canonical_root = uninitialized_root.canonicalize().unwrap();
+        let record = HostRouteRecord {
+            version: 1,
+            op: "register".into(),
+            app_scope_id: "appserver-cli".into(),
+            project_scope: canonical_root.to_string_lossy().into_owned(),
+            canonical_root: canonical_root.to_string_lossy().into_owned(),
+            storage_root: canonical_root.to_string_lossy().into_owned(),
+            registered_ms: 1,
+        };
+        let contents = format!("{}\n", serde_json::to_string(&record).unwrap());
+        std::fs::write(&route_journal, &contents).unwrap();
+
+        let manager = ProjectRuntimeManager::new(server, &host_paths).unwrap();
+
+        assert!(manager.routes.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&route_journal).unwrap(), contents);
 
         std::fs::remove_dir_all(root).unwrap();
     }
