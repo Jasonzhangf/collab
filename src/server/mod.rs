@@ -12751,6 +12751,16 @@ fn acquire_daemon_lock(lock_path: &Path, socket_path: &Path) -> anyhow::Result<s
     }
 }
 
+/// Acquire the same host writer lock used by the resident daemon. Offline
+/// maintenance commands use this to prove no daemon writer exists before they
+/// mutate durable state.
+pub(crate) fn acquire_reset_lock(
+    lock_path: &Path,
+    socket_path: &Path,
+) -> anyhow::Result<std::fs::File> {
+    acquire_daemon_lock(lock_path, socket_path)
+}
+
 fn acquire_legacy_writer_lock(
     lock_path: &Path,
     description: &str,
@@ -12808,7 +12818,7 @@ fn probe_legacy_socket(socket_path: &Path) -> anyhow::Result<bool> {
     }
 }
 
-struct LegacyWriterFence {
+pub(crate) struct LegacyWriterFence {
     // These guards intentionally stay alive for the complete daemon lifetime.
     // The legacy binary does not know the new host lock, so a one-shot probe is
     // insufficient to prevent it from opening the same journal after startup.
@@ -12836,7 +12846,7 @@ fn ensure_legacy_socket_absent(scope: &Scope, host_paths: &HostPaths) -> anyhow:
 /// daemon exits.  Acquiring these locks before replay/journal open closes the
 /// check-to-open race: an old writer can neither start after the check nor
 /// acquire the same project lock while this process owns the journal.
-fn acquire_legacy_writer_fence(
+pub(crate) fn acquire_legacy_writer_fence(
     scope: &Scope,
     host_paths: &HostPaths,
 ) -> anyhow::Result<LegacyWriterFence> {
@@ -12854,6 +12864,7 @@ fn acquire_legacy_writer_fence(
     let legacy_project_lock = project_server_dir.join("daemon.lock");
     let project_lock = if legacy_project_lock != host_paths.lock_path()
         && legacy_project_lock != legacy_host_lock
+        && project_server_dir.is_dir()
     {
         Some(acquire_legacy_writer_lock(
             &legacy_project_lock,

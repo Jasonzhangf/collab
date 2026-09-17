@@ -309,7 +309,12 @@ fn init_project_root(cwd: PathBuf) -> anyhow::Result<PathBuf> {
     validate_project_root(cwd)
 }
 
-pub fn init(root: &Path) -> std::io::Result<PathBuf> {
+/// Create only the current Collab-owned empty project baseline.
+///
+/// Reset uses this instead of [`init`] so retiring a legacy control plane
+/// cannot mutate project MCP settings, editor permissions, or global AppSDK
+/// configuration as an unrecorded side effect.
+pub fn init_collab_baseline(root: &Path) -> std::io::Result<PathBuf> {
     let base = root.join(".agent-collab");
     for sub in [
         "runs",
@@ -322,6 +327,11 @@ pub fn init(root: &Path) -> std::io::Result<PathBuf> {
     ] {
         std::fs::create_dir_all(base.join(sub))?;
     }
+    Ok(base)
+}
+
+pub fn init(root: &Path) -> std::io::Result<PathBuf> {
+    let base = init_collab_baseline(root)?;
     let docs = root.join("docs");
     std::fs::create_dir_all(&docs)?;
     let collab_doc = docs.join("collab.md");

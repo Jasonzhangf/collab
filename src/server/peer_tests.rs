@@ -2832,7 +2832,7 @@ fn master_promotion_requires_live_transport() {
 }
 
 #[test]
-fn master_promotion_allows_verified_appserver_without_tmux() {
+fn master_promotion_allows_verified_appserver() {
     let (mut server, root) = test_server();
     let registered = register_appserver(&mut server, "peer-appserver", "thread-appserver");
     assert!(registered.ok, "{registered:?}");
@@ -6152,7 +6152,7 @@ fn worker_status_query_exposes_liveness_identity_and_notification_pressure() {
 }
 
 #[test]
-fn worker_status_query_exposes_appserver_liveness_without_tmux() {
+fn worker_status_query_exposes_appserver_liveness() {
     let (mut server, root) = test_server();
     assert!(
         register_appserver(&mut server, "status-appserver", "thread-status-appserver").ok,
@@ -6259,7 +6259,7 @@ fn bulk_ack_with_empty_ids_acknowledges_all_inbox_messages() {
 }
 
 #[test]
-fn external_or_operator_sender_can_send_without_registration_or_pane() {
+fn external_or_operator_sender_can_send_without_registration() {
     let (server, root) = test_server();
     register(&server, "recipient-worker", "%recipient");
     let resp = handle_send(
@@ -6268,7 +6268,7 @@ fn external_or_operator_sender_can_send_without_registration_or_pane() {
         "recipient-worker".into(),
         "notify".into(),
         Some("test-topic".into()),
-        "hello from outside tmux".into(),
+        "hello from outside a registered peer".into(),
         None,
         "immediate".into(),
     );
@@ -6280,7 +6280,7 @@ fn external_or_operator_sender_can_send_without_registration_or_pane() {
     let msg = state.msgs.get(msg_id).unwrap();
     assert_eq!(msg.from, "external-operator");
     assert_eq!(msg.to, "recipient-worker");
-    assert_eq!(msg.body, "hello from outside tmux");
+    assert_eq!(msg.body, "hello from outside a registered peer");
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -25,7 +25,8 @@ epoch, re-register identities, or rebuild projections
 architecture contract assigns one Rust reducer and one journal writer to the
 resident global daemon and requires every mutating command to carry
 `command_id`, `operation_id`, actor binding, scope and any compare-and-swap
-revision (`docs/design/collab-v1-refactor-architecture-20260909.md:195-226`).
+revision (historical architecture evidence, now superseded by
+`docs/collab-v1-lifecycle.manifest.json`).
 
 ## Candidate provenance
 
@@ -100,8 +101,8 @@ architecture's R2 contract, do only the following before S2 resumes:
    epoch, receipt or runtime-binding state machine in `migration.rs` or the
    legacy migration handlers.
 
-The architecture's R2 contract requires the physical reducer/journal wiring,
-not a document-only interface (`docs/design/collab-v1-refactor-architecture-20260909.md:498-524`).
+The historical R2 contract requires the physical reducer/journal wiring, not a
+document-only interface.
 The current evidence still lists the M1 journal/replay candidate and
 deterministic replay evidence, one-writer fencing, archive receipts and native
 runtime/binding rebind as unresolved P1 prerequisites

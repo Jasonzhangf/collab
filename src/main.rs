@@ -4,6 +4,7 @@ mod identity;
 mod install_skills;
 pub(crate) mod migration;
 mod proto;
+mod reset;
 mod scope;
 mod server;
 mod subagent;
@@ -85,10 +86,15 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Deprecated: destructive binding reset was removed
+    /// Retire the legacy project-local Collab control plane and rebuild the
+    /// current empty baseline. Offline, explicit authorization, transactional.
     Reset {
+        /// Explicit operator authorization text; required.
         #[arg(long)]
-        force: bool,
+        approval: Option<String>,
+        /// Confirm that the named legacy control plane may be discarded.
+        #[arg(long)]
+        discard_legacy: bool,
     },
     /// Get or create your worker identity and bind the Codex thread
     Whoami {
@@ -856,10 +862,20 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 "collab remove-worker is deprecated; use owner cleanup and migration verify"
             )
         }
-        Cmd::Reset { force } => {
-            let _ = force;
-            anyhow::bail!(
-                "collab reset is deprecated; preserve journal/mailbox and use migration rebind"
+        Cmd::Reset {
+            approval,
+            discard_legacy,
+        } => {
+            let root = scope::project_root_for_init()?;
+            let scope = Scope { root };
+            let host_paths = scope::HostPaths::resolve()?;
+            reset::run(
+                &scope,
+                &host_paths,
+                reset::ResetRequest {
+                    approval: approval.unwrap_or_default(),
+                    discard_legacy,
+                },
             )
         }
         Cmd::Whoami { worker } => {

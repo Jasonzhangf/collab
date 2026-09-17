@@ -108,11 +108,11 @@ Route escalation by worker type:
   task. If no live master exists, report to the collaborator that initiated
   the task.
 - A peer becomes master only after explicit user approval for that peer and
-  project, with a live registered identity/pane verified. If a live master
+  project, with a live registered App Server identity verified. If a live master
   exists, only that master may `collab master delegate`; if none exists, the
   peer may `collab master promote --approval` itself. `appsdk init` proves
   initialization of the current peer, not master ownership. A dead recorded
-  pane is not a live master. Codex root is not Collab master.
+  thread is not a live master. Codex root is not Collab master.
 - Master compiles the goal into a dependency graph, then parallel unique-write
   scopes. It assigns managed subagents with `appsdk subagent start` and
   `send` only when delivery conditions (done-iff, artifacts, in/out of

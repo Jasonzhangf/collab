@@ -8,8 +8,7 @@ Before review, prove the affected subset and every changed invariant:
 - architecture/resource/function/verification gates;
 - format, unit/state-machine tests, release build;
 - isolated real two-peer App Server blackbox in a disposable project when an
-  App Server capability is available; a tmux blackbox is optional and only
-  verifies the tmux adapter. Never inject a test notice into an existing
+  App Server capability is available. Never inject a test notice into an existing
   production project, transport, or Agent conversation;
 - migration down/up/replay with durable-state preservation;
 - duplicate-daemon rejection without PID/socket corruption;
@@ -20,7 +19,7 @@ Before review, prove the affected subset and every changed invariant:
 - failed wake and daemon restart never replay an attempted batch;
 - one ID/subject/original-body delivery preserves a reusable direct-message
   lease and records one accepted delivery event; App Server proves the native
-  queue accepted the bounded preview, while tmux additionally proves pane Enter;
+  queue accepted the bounded preview;
 - successful resource/deadline/async-result delivery consumes exactly one
   matching one-shot subscription;
 - release clears obsolete wait state and does not wake an unsubscribed Agent;

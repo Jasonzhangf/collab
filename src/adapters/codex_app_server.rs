@@ -310,7 +310,13 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
             ),
         });
     }
-    client.call(
+    // Item history is a diagnostic capability, not a registration or wake
+    // requirement. Some App Server builds expose thread/read and queue/add but
+    // return method-not-found for items/list; that must not block peer
+    // registration. Snapshot calls still fail explicitly if the method is
+    // unavailable.
+    let _items_available = method_exists(
+        &mut client,
         "thread/items/list",
         json!({
             "threadId": thread_id.as_str(),
@@ -340,7 +346,8 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
             "send_message".into(),
             "wait_reply".into(),
         ],
-        self_check: "initialize, thread/read identity, thread/items/list, and thread/queue/add method probe passed".into(),
+        self_check: "initialize, thread/read identity, and thread/queue/add method probe passed"
+            .into(),
     })
 }
 

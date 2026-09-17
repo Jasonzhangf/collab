@@ -1,7 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://appsdk.local/contracts/records/merge-queue-state.schema.json",
-  "type": "object",
-  "required": ["merge_owner", "ordered_entry_ids", "active_entry_id"],
-  "properties": {"merge_owner": {"type": "string"}, "ordered_entry_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}, "active_entry_id": {"type": "string"}}
-}

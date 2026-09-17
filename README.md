@@ -2,8 +2,7 @@
 
 Project-local coordination for independent coding agents. One Rust daemon owns
 the append-only journal, durable mailbox, task/resource state, and migration
-transaction. The server selects the App Server transport; tmux is no longer
-supported and is removed from the registered transports. Each subscribed
+transaction. The server selects the App Server transport. Each subscribed
 wake is a bounded preview; the durable mailbox remains authoritative.
 
 ## Model
@@ -61,10 +60,10 @@ so `collab` can reach the App Server socket without a sandbox prompt. The
 `collab` CLI is a complete fallback when MCP tools are not listed.
 
 `collab role`, `collab transfer-master`, `collab task claim`, the legacy
-`collab task dispatch`, `collab remove-worker`, and `collab reset` are
-deprecated and fail explicitly. Use `collab subagent dispatch` from the live
-master for a real assignment, then `collab task accept <task-id>` from the
-assigned peer. Collab master is not Codex root.
+`collab task dispatch`, and `collab remove-worker` are deprecated and fail
+explicitly. Use `collab subagent dispatch` from the live master for a real
+assignment, then `collab task accept <task-id>` from the assigned peer.
+Collab master is not Codex root.
 Protocol: `collab master status`, `collab master promote --approval` when no
 live master exists, and `collab master delegate` by the current live master.
 Init and register never create a master; a recorded identity without a live
@@ -241,7 +240,6 @@ omitted from new state. Legacy `available` tasks or waits without a real blocker
 explicit operator resolution; the daemon never fabricates ownership. Malformed
 journal lines fail startup, and a snapshot/count mismatch remains frozen.
 
-See [docs/migration-v1-to-low-intervention.md](docs/migration-v1-to-low-intervention.md).
 The active lifecycle contract is
 [docs/collab-v1-lifecycle.manifest.json](docs/collab-v1-lifecycle.manifest.json),
 with source-bound adjacent edges in

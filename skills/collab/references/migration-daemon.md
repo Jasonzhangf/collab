@@ -78,11 +78,40 @@ journal, a count mismatch, or an unresolved owner:
 3. Resolve the named owner or blocker through the Collab server protocol.
 4. Create a new plan only after the source can be proved safe.
 
-Do not manually delete `.agent-collab/`, edit journal or mailbox JSON, clear
-the mailbox, copy identity tokens, or convert a failed migration into a fresh
-registration by deleting the source. A project with no recoverable state still
-needs an explicit operator retirement decision owned by Collab; AppSDK reset
-does not provide that authorization.
+When the operator explicitly decides to abandon the old epoch instead of
+preserving it, and the project-local journal cannot be replayed under the
+current contract, use the single offline reset owner:
+
+```sh
+collab down
+collab reset --discard-legacy --approval "explicit user authorization text"
+collab up
+collab init
+```
+
+`collab reset` is not `collab migrate`. It never imports history, never
+pretends to preserve counts, and never claims delivery, review, or install
+evidence. It requires the daemon to be down, takes the same host writer lock,
+archives the exact retired `.agent-collab/` and `.agent-collab-v2/` bytes under
+`~/.collab/archives/`, verifies archive equality, removes only those
+Collab-owned control roots plus the retired project stale host route, prunes
+host routes whose canonical root is gone or no longer initialized, and
+rebuilds the current empty baseline. It accepts an uninitialized project root
+and therefore also repairs a missing baseline. It is idempotent; a second run
+reports `already_reset: true`, including after the daemon has created an empty
+current journal.
+
+`.appsdk-control/` is AppSDK-owned and is never removed by this command. The
+current project-local `.agent-collab/` is a project scope input, while the
+host-wide runtime truth remains `~/.collab/` (`server.sock`, `events.jsonl`,
+`log.txt`, and route state). It never removes business source, runtime data,
+`active/`, or `protected/`, and it writes `delivery_verified: false`.
+
+Never manually delete `.agent-collab/`, edit journal or mailbox JSON, clear
+the mailbox, or copy identity tokens. Do not convert a failed migration into a
+fresh registration by deleting the source outside this command. AppSDK
+governance reset remains a separate owner and transaction; it never removes
+`.agent-collab/`.
 
 After `verify`, record the migration record ID, source and target versions,
 snapshot digest, preserved counts, old/new daemon PID and socket, identity
@@ -110,7 +139,7 @@ collab up
 
 Never use implicit first-register master, master recovery, transfer-master,
 legacy central dispatch (`collab task dispatch`), task claim queue,
-remove-worker, reset, or heartbeat recovery. A live master may use the
+remove-worker, or heartbeat recovery. A live master may use the
 explicit scheduler assignment (`collab subagent dispatch`) to create one
 durable task/message reservation for an eligible peer. Collab master is a
 separate explicit user-approved authority
@@ -138,5 +167,4 @@ collab transfer-master
 collab task claim
 collab task dispatch
 collab remove-worker
-collab reset
 ```

@@ -271,23 +271,21 @@ lookup. Timer ticks with no accumulator change do not append a record.
 `endpoint_generation` fences reconnects. Compaction retains the agent and
 binding while advancing epoch/watermark. Fork creates a new runtime and
 binding, defaulting to peer. Reconnect increments generation and rejects old
-generation mutations. TUI may use tmux as wake evidence; Desktop uses its
-AppServer endpoint and never invents a tmux identity. `mcp_session_id` is query
-context only.
+generation mutations. Every peer uses the registered App Server native thread
+as its wake endpoint and never invents a terminal identity. `mcp_session_id`
+is query context only.
 
 ## Runtime prerequisite and ownership
 
 This document owns only governance-history migration: inspect, classify,
 snapshot/archive, direct/adapt/reset mapping, reconciliation, rollback fencing
-and cutover evidence. It does not redefine the runtime foundation. The unique
-runtime contract is
-[`docs/design/collab-v1-refactor-architecture-20260909.md`](./design/collab-v1-refactor-architecture-20260909.md),
-which owns R1 identity/scope, R2 journal/reducer and daemon, R3 native
-adapters, R4 notification projection, and R5 bug/worktree/Loop integration.
-The migration controller may start only after the exact reviewed candidate and
-tree receipts for the required runtime rounds are available. A missing,
-conflicting or non-reproducible receipt leaves migration admission stopped; it
-does not create a second implementation of those rounds.
+and cutover evidence. It does not redefine the runtime foundation. The current
+runtime contract is `docs/collab-v1-lifecycle.manifest.json` plus the
+implementation and tests it names. The migration controller may start only
+after the exact reviewed candidate and tree receipts for the required runtime
+contracts are available. A missing, conflicting or non-reproducible receipt
+leaves migration admission stopped; it does not create a second implementation
+of those contracts.
 
 ## Project execution order
 

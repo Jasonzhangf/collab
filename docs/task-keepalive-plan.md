@@ -11,8 +11,8 @@ Wake model:
   and are not automatically woken from idle.
 - A worker acts on an explicit dispatch, a bounded direct-message lease, or its
   own open task state. It inspects and progresses owned tasks during its
-  working cycle; this is a task-bound inspect obligation, not a tmux activation
-  schedule, and it does not produce worker tmux input.
+  working cycle; this is a task-bound inspect obligation, not a terminal
+  activation schedule, and it does not produce worker transport input.
 - Explicit `collab sendmessage` is immediate. Idle, progress, delivery, bug,
   and worker-idle notices are auto-merged by the daemon in the 120-second batch
   window; they are not repeated as heartbeat storms.
@@ -35,7 +35,7 @@ Failure and evidence:
   command.
 - Bugs enter the AppSDK or git-bug backlog with investigation evidence; P0
   blocks the affected project.
-- Tests use injected time/probes/sender, never production panes.
+- Tests use injected time/probes/sender, never a production runtime.
 
 Legacy note: earlier drafts that described periodic worker activation keepalive
 timers are deprecated and non-authoritative; this file does not restore them.

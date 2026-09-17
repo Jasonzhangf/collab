@@ -37,7 +37,7 @@ collab notify unsubscribe <subscription-id>
   ends any subscription; one attempted batch exhausts only its messages on a
   reusable direct-message lease.
 - Before every attempt, the daemon revalidates owner, event, subject, TTL,
-  selected App Server thread or tmux pane liveness and ownership, worker
+  selected App Server thread liveness and ownership, worker
   registration match, Agent presence, and Agent state. If the selected
   transport is dead, unowned, or mismatched (`identity-mismatch`), or the agent
   is `absent`, the subscription transitions to its explicit unavailable state
@@ -69,14 +69,13 @@ collab notify unsubscribe <subscription-id>
 - One safe preview contains notification ID, abbreviated subject, and one-line
   original body. Control characters are escaped. App Server delivery means
   `thread/queue/add` accepted the bounded preview; that acceptance is not
-  execution, read, or reply. A tmux-selected peer keeps `paste-buffer -p` and
-  `C-m` in one queue so the paste is submitted. Dual tmux sessions must prove
-  both mailbox and pane Enter.
+  execution, read, or reply. The selected App Server thread owns the bounded
+  queue operation.
 - Full subject/body remains in the mailbox without a matching subscription.
   This outcome is not a sender-selected `mailbox-only` mode.
 - A failed/lost/delayed/duplicate wake never rolls back mailbox truth or counts
   as lifecycle evidence.
-- The daemon never infers continuation from task state, pane title, heartbeat,
+- The daemon never infers continuation from task state, thread title, heartbeat,
   progress, ACK, or elapsed time, and must not create a `CONTINUE_TASK` message.
   The 15-minute task-liveness rule is an Agent/skill obligation: when a
   legitimate keepalive or scheduled check arrives, the owner inspects durable

@@ -2,7 +2,7 @@
 name = "collab"
 version = "0.1.4"
 edition = "2021"
-description = "Project-local coordination daemon for multi-agent work: mailbox, claims, tmux knock"
+description = "Project-local coordination daemon for multi-agent work: mailbox, claims, App Server transport"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -13,6 +13,7 @@ rand = "0.8"
 chrono = "0.4"
 anyhow = "1"
 toml = "0.8"
+toml_edit = "0.22"
 libc = "0.2"
 
 [dev-dependencies]

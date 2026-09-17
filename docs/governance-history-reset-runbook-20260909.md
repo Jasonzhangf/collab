@@ -14,8 +14,9 @@ The migration goal and contract are in
 [`collab-v1-governance-history-migration-plan.md`](./goals/collab-v1-governance-history-migration-plan.md),
 and the schema is
 [`migration-v1-history-manifest.schema.json`](./migration-v1-history-manifest.schema.json).
-The runtime owner is the v1 architecture in
-[`collab-v1-refactor-architecture-20260909.md`](./design/collab-v1-refactor-architecture-20260909.md).
+The runtime owner is the current v1 contract in
+[`collab-v1-lifecycle.manifest.json`](./collab-v1-lifecycle.manifest.json)
+plus the implementation and tests it names.
 
 ## 1. Safety contract
 
@@ -350,9 +351,8 @@ is not admitted until identity, active facts, projections and invariants pass.
 
 `agent_id` is the stable logical identity. A fresh process receives a new
 `runtime_id`; the AppServer/native endpoint receives a `binding_id`; reconnect
-increments `endpoint_generation`. TUI may use a verified tmux pane as wake
-evidence. Desktop uses its native AppServer endpoint and never invents a tmux
-session. `mcp_session_id` is query context only.
+increments `endpoint_generation`. Every peer uses its native AppServer endpoint
+and never invents a terminal identity. `mcp_session_id` is query context only.
 
 Scopes are checked independently:
 
@@ -378,7 +378,7 @@ agent_id ↔ runtime_id ↔ binding_id ↔ endpoint_generation
 
 The controller appends `IdentityRebound` only after native initialize and
 capability negotiation succeed. A dead or unavailable endpoint remains
-unbound; it is not replaced by a guessed tmux or session identity.
+unbound; it is not replaced by a guessed terminal or session identity.
 
 ## 9. Active bug, task and goal reconciliation
 

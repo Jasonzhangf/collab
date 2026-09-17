@@ -81,20 +81,45 @@ fixing, re-dispatching, or force-closing with an auditable reason.
 
 ### 3. Reset
 
-There is no routine destructive reset:
+Use reset only when the operator explicitly authorizes discarding the named
+legacy Collab control plane. Reset is offline, transactional, and starts a
+new current baseline; it is not migration and does not preserve history:
 
 ```text
 collab down/up -> controlled daemon restart; journal/mailbox survive
 collab migrate -> authenticated migration and identity rebind
+collab reset --discard-legacy --approval "<user text>" -> retire and rebuild
 ```
 
-Never remove `.agent-collab/server/journal.jsonl`, mailbox files, identity
-tokens, task records, or bindings to make status look clean. Never start a
-second daemon or use broad process kills. `collab ack` remains a compatibility
+The exact reset sequence is:
+
+```sh
+collab down
+collab reset --discard-legacy --approval "<explicit user authorization>"
+collab up
+collab init
+```
+
+`collab reset` takes the same host writer lock as the daemon, requires the
+daemon to be down, archives the exact `.agent-collab/` and
+`.agent-collab-v2/` bytes under `~/.collab/archives/`, verifies the archive,
+removes only those Collab-owned project control roots plus stale host routes,
+and rebuilds the current empty scaffold. It is idempotent, repairs a missing
+baseline, ignores legacy history, and never imports old PASS or delivery
+claims. It records `delivery_verified: false`; reset alone is not delivery,
+review, install, restart, or live-communication evidence.
+
+`.appsdk/` and `.appsdk-control/` are AppSDK-owned and are not removed by
+`collab reset`. The host-wide runtime truth remains `~/.collab/`
+(`server.sock`, `events.jsonl`, `log.txt`, and route state); project-local
+`.agent-collab/` is reducer input, not the global truth. Never manually
+remove `.agent-collab/server/journal.jsonl`, mailbox files, identity tokens,
+task records, or bindings to make status look clean. Never start a second
+daemon or use broad process kills. `collab ack` remains a compatibility
 operation; it is not a substitute for task close or identity recovery.
 
 An AppSDK `reset-governance` or `appsdk init --fresh --discard-legacy` is not
-Collab migration and must not remove `.agent-collab/`. AppSDK's reset owner
+Collab reset/migration and must not remove `.agent-collab/`. AppSDK's reset owner
 explicitly treats `.agent-collab/` as a reserved root. If the project also
 needs to move or retire Collab state, follow
 [Migration and Daemon Maintenance](references/migration-daemon.md); the two

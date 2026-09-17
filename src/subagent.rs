@@ -335,6 +335,7 @@ fn probe_with(
         }
         command
             .current_dir(&directory)
+            .env_remove("TMUX")
             .env_remove("TMUX_PANE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -404,14 +405,7 @@ pub fn exec_launch(file: &std::path::Path) -> Result<()> {
     }
     let mut command = Command::new(&spec.executable);
     command.env_clear().envs(spec.env).args(spec.args);
-    for key in [
-        "TMUX",
-        "TMUX_PANE",
-        "TERM",
-        "TERM_PROGRAM",
-        "TERM_PROGRAM_VERSION",
-        "COLORTERM",
-    ] {
+    for key in ["TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLORTERM"] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }

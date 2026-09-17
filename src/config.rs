@@ -215,7 +215,7 @@ pub fn ensure_written() -> Result<()> {
             Ok(())
         }
         Ok(text) => {
-            if let Some(updated) = remove_legacy_transport_keys(&text) {
+            if let Some(updated) = remove_retired_transport_config(&text) {
                 std::fs::write(&path, updated)?;
                 return Ok(());
             }
@@ -228,31 +228,90 @@ pub fn ensure_written() -> Result<()> {
     }
 }
 
-fn remove_legacy_transport_keys(text: &str) -> Option<String> {
-    let mut out = String::new();
+fn remove_retired_transport_config(text: &str) -> Option<String> {
+    let mut document = text.parse::<toml_edit::DocumentMut>().ok()?;
+    let changed = remove_retired_transport_fields(document.as_table_mut());
+    changed.then(|| document.to_string())
+}
+
+fn remove_retired_transport_fields(table: &mut toml_edit::Table) -> bool {
     let mut changed = false;
-    let mut in_subagent_tmux = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_subagent_tmux = trimmed == "[subagent.tmux]";
+    if let Some(notifications) = table.get_mut("notifications") {
+        match notifications {
+            toml_edit::Item::Table(notifications) => {
+                changed |= migrate_notifications_table(notifications);
+            }
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(notifications)) => {
+                changed |= migrate_notifications_inline_table(notifications);
+            }
+            _ => {}
         }
-        if in_subagent_tmux {
-            changed = true;
-            continue;
-        }
-        if trimmed.starts_with("transport =") && trimmed.contains("tmux") {
-            changed = true;
-            out.push_str("transport = \"appserver\"\n");
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
     }
-    if !text.ends_with('\n') {
-        out.pop();
+    if let Some(subagent) = table.get_mut("subagent") {
+        match subagent {
+            toml_edit::Item::Table(subagent) => {
+                changed |= subagent.remove("tmux").is_some();
+            }
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(subagent)) => {
+                changed |= subagent.remove("tmux").is_some();
+            }
+            _ => {}
+        }
     }
-    changed.then_some(out)
+    if let Some(projects) = table.get_mut("projects") {
+        match projects {
+            toml_edit::Item::ArrayOfTables(projects) => {
+                for project in projects.iter_mut() {
+                    changed |= remove_retired_transport_fields(project);
+                }
+            }
+            toml_edit::Item::Value(toml_edit::Value::Array(projects)) => {
+                for project in projects.iter_mut() {
+                    if let toml_edit::Value::InlineTable(project) = project {
+                        changed |= remove_retired_transport_inline_fields(project);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
+fn migrate_notifications_table(table: &mut toml_edit::Table) -> bool {
+    if table.get("transport").and_then(toml_edit::Item::as_str) != Some("tmux") {
+        return false;
+    }
+    if let Some(transport) = table.get_mut("transport") {
+        *transport = toml_edit::value("appserver");
+    }
+    true
+}
+
+fn migrate_notifications_inline_table(table: &mut toml_edit::InlineTable) -> bool {
+    if table.get("transport").and_then(toml_edit::Value::as_str) != Some("tmux") {
+        return false;
+    }
+    table.insert("transport", toml_edit::Value::from("appserver"));
+    true
+}
+
+fn remove_retired_transport_inline_fields(table: &mut toml_edit::InlineTable) -> bool {
+    let mut changed = false;
+    if let Some(toml_edit::Value::InlineTable(notifications)) = table.get_mut("notifications") {
+        changed |= migrate_notifications_inline_table(notifications);
+    }
+    if let Some(toml_edit::Value::InlineTable(subagent)) = table.get_mut("subagent") {
+        changed |= subagent.remove("tmux").is_some();
+    }
+    if let Some(toml_edit::Value::Array(projects)) = table.get_mut("projects") {
+        for project in projects.iter_mut() {
+            if let toml_edit::Value::InlineTable(project) = project {
+                changed |= remove_retired_transport_inline_fields(project);
+            }
+        }
+    }
+    changed
 }
 
 fn insert_subagent_runtime(text: &str) -> Option<String> {
@@ -420,11 +479,15 @@ impl Config {
 }
 pub fn load(root: &Path) -> Result<Config> {
     let path = path()?;
-    let text = match std::fs::read_to_string(&path) {
+    let mut text = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(e.into()),
     };
+    if let Some(updated) = remove_retired_transport_config(&text) {
+        std::fs::write(&path, &updated)?;
+        text = updated;
+    }
     let root = root.canonicalize()?;
     let git = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -490,5 +553,98 @@ mod tests {
         let added = insert_subagent_runtime("[subagent]\npersistent = true\n").unwrap();
         assert!(added.contains("runtime = \"codex\""));
         assert!(insert_subagent_runtime("[subagent]\nruntime = \"codex\"\n").is_none());
+    }
+
+    #[test]
+    fn removes_retired_tmux_configuration_without_touching_unrelated_settings() {
+        let updated = remove_retired_transport_config(
+            r#"
+[notifications]
+transport = "tmux"
+submit_enter = true
+
+[subagent]
+runtime = "codex"
+persistent = true
+
+[subagent.tmux]
+session = "legacy"
+
+[[projects]]
+root = "/project"
+
+[projects.notifications]
+transport = "tmux"
+
+[projects.subagent.tmux]
+session = "legacy-project"
+"#,
+        )
+        .unwrap();
+        let parsed = updated.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            parsed["notifications"]["transport"].as_str(),
+            Some("appserver")
+        );
+        assert!(parsed["subagent"].get("tmux").is_none());
+        assert_eq!(
+            parsed["projects"][0]["notifications"]["transport"].as_str(),
+            Some("appserver")
+        );
+        assert!(parsed["projects"][0].get("subagent").is_none());
+        assert_eq!(parsed["subagent"]["runtime"].as_str(), Some("codex"));
+    }
+
+    #[test]
+    fn retired_config_migration_preserves_comments_order_and_unrelated_text() {
+        let updated = remove_retired_transport_config(
+            r#"# top comment
+[subagent]
+runtime = "codex" # keep runtime
+
+[subagent.tmux]
+session = "legacy"
+
+[notifications]
+# keep notification comment
+transport = "tmux"
+submit_enter = true
+"#,
+        )
+        .unwrap();
+        assert!(updated.contains("# top comment"));
+        assert!(updated.contains("runtime = \"codex\" # keep runtime"));
+        assert!(updated.contains("# keep notification comment"));
+        assert!(updated.contains("submit_enter = true"));
+        assert!(!updated.contains("[subagent.tmux]"));
+        assert!(updated.contains("transport = \"appserver\""));
+    }
+
+    #[test]
+    fn retired_config_migration_handles_inline_tables() {
+        let updated = remove_retired_transport_config(
+            r#"notifications = { transport = "tmux", submit_enter = true }
+subagent = { runtime = "codex", tmux = { session = "legacy" } }
+projects = [
+  { root = "/project", notifications = { transport = "tmux" }, subagent = { runtime = "codex", tmux = { session = "legacy" } } },
+]
+"#,
+        )
+        .unwrap();
+        let parsed = updated.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            parsed["notifications"]["transport"].as_str(),
+            Some("appserver")
+        );
+        assert!(parsed["subagent"].get("tmux").is_none());
+        assert_eq!(
+            parsed["projects"][0]["notifications"]["transport"].as_str(),
+            Some("appserver")
+        );
+        assert!(parsed["projects"][0]["subagent"].get("tmux").is_none());
+        assert_eq!(
+            parsed["projects"][0]["subagent"]["runtime"].as_str(),
+            Some("codex")
+        );
     }
 }

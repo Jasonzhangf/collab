@@ -38,10 +38,10 @@ daemon side effect.
 This goal owns migration of existing governance history. It does not redefine
 the runtime foundation that performs journal writes, identity checks, native
 transport, notification projection or task lifecycle. Those contracts have one
-source of truth in
-[`docs/design/collab-v1-refactor-architecture-20260909.md`](../design/collab-v1-refactor-architecture-20260909.md)
-and its R1–R5 implementation rounds. Migration starts only after the required
-rounds have exact reviewed candidate/tree receipts on the v1 integration line.
+source of truth in `docs/collab-v1-lifecycle.manifest.json`,
+`docs/mainline-call-map.json`, and the current implementation and tests on the
+v1 integration line. Migration starts only after the required contracts have
+exact reviewed candidate/tree receipts on that line.
 If a receipt is missing, conflicting or not reproducible, this goal remains
 blocked at `runtime_prerequisite`; it must not reimplement that round inside a
 migration adapter.

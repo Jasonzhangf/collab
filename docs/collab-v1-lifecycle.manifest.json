@@ -24,7 +24,6 @@
     "docs/function-map.md",
     "docs/mainline-call-map.json",
     "docs/verification-map.md",
-    "docs/migration-v1-to-low-intervention.md",
     "docs/task-keepalive-plan.md",
     "skills/collab/SKILL.md"
   ],
@@ -33,7 +32,7 @@
     {"id": "task-lifecycle", "kind": "truth", "owner": "Server"},
     {"id": "durable-mailbox", "kind": "truth", "owner": "Server"},
     {"id": "notification-subscription", "kind": "control", "owner": "NotificationSubscription"},
-    {"id": "tmux-wake", "kind": "control", "owner": "queue_system_knock"},
+    {"id": "appserver-wake", "kind": "control", "owner": "queue_system_knock"},
     {"id": "agent-context", "kind": "projection", "owner": "handle_context"},
     {"id": "project-master-authority", "kind": "truth", "owner": "Event::MasterAssigned"},
     {"id": "migration-transaction", "kind": "truth", "owner": "MigrationRecord"}
@@ -48,7 +47,7 @@
     {"id": "task-close-release", "owner_feature": "resource.p2p-conflict"},
     {"id": "notification-subscribe", "owner_feature": "notification.subscription"},
     {"id": "subscribed-resource-event", "owner_feature": "notification.subscription"},
-    {"id": "tmux-wake-attempt", "owner_feature": "notification.tmux-wake"},
+    {"id": "appserver-wake-attempt", "owner_feature": "notification.appserver-wake"},
     {"id": "notification-query", "owner_feature": "notification.context"},
     {"id": "master-authority", "owner_feature": "identity.master-authority"},
     {"id": "migration-freeze-verify", "owner_feature": "migration.peer-v1"}
@@ -57,7 +56,7 @@
     "cargo fmt --check",
     "cargo test",
     "cargo build --release",
-    "isolated-real-tmux-blackbox",
+    "isolated-appserver-blackbox",
     "isolated-migration-replay-blackbox",
     "independent-review"
   ],

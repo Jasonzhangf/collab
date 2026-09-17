@@ -13,9 +13,9 @@
     {"from": "task-review", "to": "task-integrated", "caller": "dispatch", "callee": "handle_task_integrated", "path": "src/server/mod.rs"},
     {"from": "task-deliver", "to": "task-close-release", "caller": "dispatch", "callee": "handle_task_close", "path": "src/server/mod.rs"},
     {"from": "peer-register", "to": "notification-subscribe", "caller": "dispatch", "callee": "handle_notification_subscribe", "path": "src/server/mod.rs"},
-    {"from": "notification-subscribe", "to": "tmux-wake-attempt", "caller": "attempt_notification", "callee": "attempt_notification_with", "path": "src/server/mod.rs"},
+    {"from": "notification-subscribe", "to": "appserver-wake-attempt", "caller": "attempt_notification", "callee": "attempt_notification_with", "path": "src/server/mod.rs"},
     {"from": "task-close-release", "to": "subscribed-resource-event", "caller": "handle_task_close", "callee": "matching_subscription", "path": "src/server/mod.rs"},
-    {"from": "tmux-wake-attempt", "to": "notification-query", "caller": "dispatch", "callee": "handle_context", "path": "src/server/mod.rs"},
+    {"from": "appserver-wake-attempt", "to": "notification-query", "caller": "dispatch", "callee": "handle_context", "path": "src/server/mod.rs"},
     {"from": "peer-register", "to": "master-authority", "caller": "dispatch", "callee": "handle_master_promote", "path": "src/server/mod.rs"},
     {"from": "peer-register", "to": "migration-freeze-verify", "caller": "dispatch", "callee": "handle_migration_verify", "path": "src/server/mod.rs"}
   ]
