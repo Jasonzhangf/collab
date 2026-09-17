@@ -12789,15 +12789,23 @@ fn acquire_legacy_writer_lock(
 }
 
 fn legacy_host_daemon_lock_path(host_paths: &HostPaths) -> PathBuf {
-    #[cfg(test)]
-    {
-        return host_paths.state_root().join("legacy-host.lock");
-    }
-    #[cfg(not(test))]
-    {
-        let _ = host_paths;
+    legacy_host_daemon_lock_path_for(host_paths.state_root(), &default_state_root())
+}
+
+fn legacy_host_daemon_lock_path_for(state_root: &Path, default_root: &Path) -> PathBuf {
+    if state_root == default_root {
         PathBuf::from(LEGACY_HOST_DAEMON_LOCK_PATH)
+    } else {
+        state_root.join("legacy-host.lock")
     }
+}
+
+fn default_state_root() -> PathBuf {
+    std::env::var_os(crate::scope::HOME_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".collab"))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/collab-state"))
 }
 
 fn probe_legacy_socket(socket_path: &Path) -> anyhow::Result<bool> {
@@ -13428,6 +13436,23 @@ mod startup_tests {
         std::fs::create_dir_all(root.join(".agent-collab/server"))
             .expect("create startup test root");
         root
+    }
+
+    #[test]
+    fn legacy_host_fence_is_isolated_with_a_custom_state_root() {
+        let root = test_root("legacy-fence-path");
+        let default_root = root.join(".collab");
+        let custom_root = root.join("host-state");
+        assert_eq!(
+            legacy_host_daemon_lock_path_for(&custom_root, &default_root),
+            custom_root.join("legacy-host.lock")
+        );
+        assert_eq!(
+            legacy_host_daemon_lock_path_for(&default_root, &default_root),
+            PathBuf::from(LEGACY_HOST_DAEMON_LOCK_PATH)
+        );
+
+        std::fs::remove_dir_all(root).expect("remove custom state root");
     }
 
     #[tokio::test]
