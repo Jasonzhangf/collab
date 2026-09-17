@@ -334,7 +334,6 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
         endpoint: Some(format!("unix://{}", socket_path.display())),
         namespace: Some(candidate.namespace.clone()),
         thread_id: Some(thread_id.to_string()),
-        pane: None,
         capabilities: vec![
             "session_status".into(),
             "read_thread".into(),
@@ -387,6 +386,85 @@ pub fn queue_add(
             "clientUserMessageId": client_user_message_id,
         }),
     )
+}
+
+fn transport_client(transport: &SelectedTransport) -> Result<Client, AdapterError> {
+    if transport.kind != TransportKind::AppServer {
+        return Err(AdapterError::CapabilityUnavailable {
+            endpoint: EndpointKind::Tui,
+            operation: "App Server transport",
+        });
+    }
+    let endpoint = transport
+        .endpoint
+        .as_deref()
+        .ok_or_else(|| AdapterError::InvalidBinding {
+            detail: "selected App Server transport has no endpoint".into(),
+        })?;
+    let socket_path = endpoint_path(endpoint)?;
+    let mut client = Client::connect(&socket_path, Duration::from_millis(DEFAULT_TIMEOUT_MS))?;
+    client.initialize()?;
+    Ok(client)
+}
+
+pub fn start_thread(
+    transport: &SelectedTransport,
+    cwd: &Path,
+    model: Option<&str>,
+) -> Result<NativeThreadId, AdapterError> {
+    let mut client = transport_client(transport)?;
+    let mut params = json!({
+        "cwd": cwd,
+        "approvalPolicy": "never",
+        "sandbox": "danger-full-access",
+        "sessionStartSource": "startup"
+    });
+    if let Some(model) = model {
+        params["model"] = json!(model);
+    }
+    let response = client.call("thread/start", params)?;
+    let thread_id = response
+        .pointer("/thread/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AdapterError::Unknown {
+            operation: "thread/start",
+            detail: "response is missing thread.id".into(),
+        })?;
+    NativeThreadId::new(thread_id.to_owned()).map_err(|error| AdapterError::InvalidBinding {
+        detail: format!("thread/start returned an invalid thread id: {error}"),
+    })
+}
+
+pub fn archive_thread(
+    transport: &SelectedTransport,
+    thread_id: &str,
+) -> Result<Value, AdapterError> {
+    let mut client = transport_client(transport)?;
+    client.call("thread/archive", json!({"threadId": thread_id}))
+}
+
+pub fn read_thread_items(
+    transport: &SelectedTransport,
+    thread_id: &str,
+    limit: usize,
+) -> Result<Value, AdapterError> {
+    let mut client = transport_client(transport)?;
+    client.call(
+        "thread/items/list",
+        json!({
+            "threadId": thread_id,
+            "limit": limit,
+            "sortDirection": "desc",
+        }),
+    )
+}
+
+pub fn read_thread_status(
+    transport: &SelectedTransport,
+    thread_id: &str,
+) -> Result<Value, AdapterError> {
+    let mut client = transport_client(transport)?;
+    client.call("thread/read", json!({"threadId": thread_id}))
 }
 
 fn endpoint_path(endpoint: &str) -> Result<PathBuf, AdapterError> {
@@ -446,9 +524,23 @@ struct RpcError {
 
 impl Client {
     fn connect(path: &Path, timeout: Duration) -> Result<Self, AdapterError> {
-        let stream = UnixStream::connect(path).map_err(|error| AdapterError::Unknown {
-            operation: "connect",
-            detail: format!("{}: {error}", path.display()),
+        let stream = UnixStream::connect(path).map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            ) {
+                AdapterError::RouteUnavailable {
+                    detail: format!("{}: {error}", path.display()),
+                }
+            } else {
+                AdapterError::Unknown {
+                    operation: "connect",
+                    detail: format!("{}: {error}", path.display()),
+                }
+            }
         })?;
         stream
             .set_read_timeout(Some(timeout))

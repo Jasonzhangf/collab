@@ -1,4 +1,4 @@
-use crate::proto::{SelectedTransport, TransportKind};
+use crate::proto::SelectedTransport;
 use crate::server::state::{
     goal_deadline_key, is_goal_deadline, now_ms, Event, Message, MAX_WAKE_ATTEMPTS,
 };
@@ -20,7 +20,7 @@ fn tick_at(server: &Arc<Server>, now: i64) {
 
 #[cfg(test)]
 fn tick_with_idle(server: &Arc<Server>, _can_receive: &dyn Fn(&str) -> bool) {
-    tick_with_idle_at(server, now_ms(), _can_receive);
+    tick_at(server, now_ms());
 }
 
 fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str) -> bool) {
@@ -46,64 +46,16 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
             .collect()
     };
     let mut lost_sub_ids = Vec::new();
-    let mut unknown_sub_ids = Vec::new();
     for (id, worker_id, transport) in checks {
         let Some(transport) = transport else {
             lost_sub_ids.push(id);
             continue;
         };
-        match transport.kind {
-            TransportKind::AppServer => {
-                // App Server candidates are verified at registration. A
-                // notification attempt performs its own bounded endpoint
-                // check; the timer must not apply tmux pane ownership here.
-                if !super::subscription_matches_transport_by_worker(
-                    server, &id, &worker_id, &transport,
-                ) {
-                    lost_sub_ids.push(id);
-                }
-            }
-            TransportKind::Tmux => {
-                let Some(pane) = transport.pane.as_deref() else {
-                    lost_sub_ids.push(id);
-                    continue;
-                };
-                if !super::subscription_matches_transport_by_worker(
-                    server, &id, &worker_id, &transport,
-                ) {
-                    lost_sub_ids.push(id);
-                    continue;
-                }
-                let presence = (server.pane_alive_check)(pane);
-                if presence == super::knock::PanePresence::Unknown {
-                    unknown_sub_ids.push(id);
-                    continue;
-                }
-                let owned = if presence == super::knock::PanePresence::Present {
-                    match (server.pane_owner_check)(&worker_id, pane) {
-                        Ok(owned) => owned,
-                        Err(()) => {
-                            unknown_sub_ids.push(id);
-                            continue;
-                        }
-                    }
-                } else {
-                    false
-                };
-                let agent = if presence == super::knock::PanePresence::Present {
-                    (server.pane_state_check)(pane)
-                } else {
-                    super::knock::AgentState::Absent
-                };
-                if presence == super::knock::PanePresence::Missing
-                    || !owned
-                    || agent == crate::server::knock::AgentState::Absent
-                {
-                    lost_sub_ids.push(id);
-                } else if agent == super::knock::AgentState::Unknown {
-                    unknown_sub_ids.push(id);
-                }
-            }
+        // App Server candidates are verified at registration. A notification
+        // attempt performs its own bounded endpoint check; timers do not infer
+        // agent state from a terminal.
+        if !super::subscription_matches_transport_by_worker(server, &id, &worker_id, &transport) {
+            lost_sub_ids.push(id);
         }
     }
 
@@ -121,7 +73,7 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
                 } else if lost_sub_ids.contains(&subscription.id) {
                     lifecycle_events.push(Event::NotificationStatus {
                         subscription_id: subscription.id.clone(),
-                        status: "pane-lost".into(),
+                        status: "transport-lost".into(),
                         updated_ms: now,
                     });
                 }
@@ -141,7 +93,7 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
                 continue;
             }
             let Ok(live_master) = &live_master_probe else {
-                crate::server::knock::append_log(
+                crate::server::presence::append_log(
                     &server.log_path(),
                     &format!(
                         "TIMER_LIVE_MASTER_UNKNOWN: {}",
@@ -251,7 +203,7 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
         let live_master = match super::live_master_id(server, &state) {
             Ok(live_master) => live_master,
             Err(error) => {
-                crate::server::knock::append_log(
+                crate::server::presence::append_log(
                     &server.log_path(),
                     &format!("TIMER_LIVE_MASTER_UNKNOWN: {error}"),
                 );
@@ -307,8 +259,6 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
                         .keepalives
                         .get(&subscription.worker_id)
                         .is_some_and(|record| record.observed == "idle" && record.idle_since_ms > 0)
-                    && (server.pane_state_check)(&subscription.pane)
-                        == crate::server::knock::AgentState::Waiting
                     && !state.tasks.values().any(|task| {
                         task.owner == subscription.worker_id
                             && super::keepalive::actionable(&task.status)
@@ -317,7 +267,6 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
                 true
             };
             if subscription.status != "armed"
-                || unknown_sub_ids.contains(&subscription.id)
                 || !server.config.timers.enabled
                 || !matches!(subscription.event.as_str(), "deadline" | "master-idle")
                 || (is_goal_deadline(subscription)
@@ -401,7 +350,6 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
                 let message = state.msgs.get(message_id)?;
                 let subscription = state.notification_subscriptions.get(subscription_id)?;
                 (message.state == "pending"
-                    && !unknown_sub_ids.contains(subscription_id)
                     && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
                     && !super::mailbox::is_explicit_delivery_mode(&state, message)
                     && super::mailbox::automatic_retry_eligible(
@@ -416,15 +364,7 @@ fn tick_with_idle_at(server: &Arc<Server>, now: i64, _can_receive: &dyn Fn(&str)
             .collect()
     };
     for (message_id, subscription_id) in candidates {
-        super::attempt_notification_with_at(
-            server,
-            &message_id,
-            &subscription_id,
-            &|pane| (server.pane_state_check)(pane) == super::knock::AgentState::Waiting,
-            &|pane, text| super::knock_or_log(&server.log_path(), pane, text),
-            &|worker_id, pane| (server.pane_owner_check)(worker_id, pane),
-            now,
-        );
+        super::attempt_notification_with_at(server, &message_id, &subscription_id, now);
     }
 }
 
@@ -459,11 +399,25 @@ mod tests {
                 journal_path: root.join(".agent-collab/server/journal.jsonl"),
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
-                pane_alive_check: |_| super::super::knock::PanePresence::Present,
-                pane_owner_check: |_, _| Ok(true),
-                pane_state_check: |_| crate::server::knock::AgentState::Waiting,
-                appserver_candidate_check: super::super::default_appserver_candidate_check(),
-                appserver_notification_sink: super::super::default_appserver_notification_sink(),
+                appserver_candidate_check: Arc::new(|candidate| {
+                    Ok(SelectedTransport {
+                        kind: crate::proto::TransportKind::AppServer,
+                        endpoint: Some(candidate.endpoint.clone()),
+                        namespace: Some(candidate.namespace.clone()),
+                        thread_id: Some(candidate.thread_id.clone()),
+                        capabilities: vec!["send_message".into()],
+                        self_check: "test appserver".into(),
+                    })
+                }),
+                appserver_notification_sink: Arc::new(|_, _, _| {
+                    Ok(serde_json::json!({"accepted": true}))
+                }),
+                appserver_thread_status: Arc::new(|_, thread_id| {
+                    Ok(serde_json::json!({"thread": {"id": thread_id, "status": "idle"}}))
+                }),
+                appserver_thread_archive: Arc::new(|_, _| {
+                    Ok(serde_json::json!({"archived": true}))
+                }),
                 mailbox_notify: tokio::sync::Notify::new(),
             }),
             root,
@@ -471,14 +425,21 @@ mod tests {
     }
 
     fn register(server: &Server, worker_id: &str) {
+        let thread_id = format!("thread-{worker_id}");
         server.commit(&[Event::Registered {
             worker: WorkerRec {
                 id: worker_id.into(),
                 token: format!("token-{worker_id}"),
-                pane: Some(format!("%test-{worker_id}")),
                 cwd: "/tmp".into(),
                 registered_ms: now_ms(),
-                transport: None,
+                transport: Some(SelectedTransport {
+                    kind: crate::proto::TransportKind::AppServer,
+                    endpoint: Some("unix:///tmp/collab-test-appserver.sock".into()),
+                    namespace: Some("codex_tui".into()),
+                    thread_id: Some(thread_id),
+                    capabilities: vec!["send_message".into()],
+                    self_check: "test appserver".into(),
+                }),
             },
         }]);
     }
@@ -513,8 +474,8 @@ mod tests {
                 worker_id: "master".into(),
                 event: "master-idle".into(),
                 subject: Some("master-idle".into()),
-                pane: "%test-master".into(),
-                method: "tmux".into(),
+                target: "thread-master".into(),
+                method: "appserver".into(),
                 trigger_ms: Some(now - 1),
                 trigger_times_ms: Vec::new(),
                 interval_ms: Some(interval_ms),
@@ -544,8 +505,8 @@ mod tests {
                 worker_id: worker_id.into(),
                 event: event.into(),
                 subject: subject.map(str::to_owned),
-                pane: format!("%test-{worker_id}"),
-                method: "tmux".into(),
+                target: format!("thread-{worker_id}"),
+                method: "appserver".into(),
                 trigger_ms,
                 trigger_times_ms: Vec::new(),
                 interval_ms: None,
@@ -793,11 +754,10 @@ mod tests {
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(replayed),
             journal: Mutex::new(journal),
-            pane_alive_check: |_| super::super::knock::PanePresence::Present,
-            pane_owner_check: |_, _| Ok(true),
-            pane_state_check: |_| crate::server::knock::AgentState::Waiting,
             appserver_candidate_check: super::super::default_appserver_candidate_check(),
             appserver_notification_sink: super::super::default_appserver_notification_sink(),
+            appserver_thread_status: super::super::default_appserver_thread_status(),
+            appserver_thread_archive: super::super::default_appserver_thread_archive(),
             mailbox_notify: tokio::sync::Notify::new(),
         };
         let sent = std::sync::atomic::AtomicBool::new(false);
@@ -838,8 +798,14 @@ mod tests {
             &|_| true,
             &|_, _| true,
         ));
+        server.commit(&[Event::NotificationConsumed {
+            subscription_id: subscription_id.clone(),
+            message_id: message_id.clone(),
+            consumed_ms: now_ms(),
+        }]);
         let state = server.state.lock().unwrap();
-        assert_eq!(state.msgs[&message_id].state, "delivered");
+        assert_eq!(state.msgs[&message_id].state, "pending");
+        assert_eq!(state.msgs[&message_id].wake_attempt_count, 1);
         assert_eq!(
             state.notification_subscriptions[&subscription_id].status,
             "consumed"
@@ -914,8 +880,10 @@ mod tests {
             &|_, _| true,
         ));
         let state = server.state.lock().unwrap();
-        assert_eq!(state.msgs[&first_id].state, "delivered");
-        assert_eq!(state.msgs[&second_id].state, "delivered");
+        assert_eq!(state.msgs[&first_id].state, "pending");
+        assert_eq!(state.msgs[&first_id].wake_attempt_count, 1);
+        assert_eq!(state.msgs[&second_id].state, "pending");
+        assert_eq!(state.msgs[&second_id].wake_attempt_count, 1);
         assert_eq!(
             state.notification_subscriptions[&subscription_id].status,
             "armed"
@@ -990,7 +958,8 @@ mod tests {
             }
         ));
         assert_eq!(calls.get(), 1);
-        assert_eq!(server.state.lock().unwrap().msgs[&id].state, "delivered");
+        assert_eq!(server.state.lock().unwrap().msgs[&id].state, "pending");
+        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1182,7 +1151,10 @@ mod tests {
     }
 
     fn failed_explicit_message_is_not_automatically_replayed(message_type: &str) {
-        let (server, root) = test_server();
+        let (mut server, root) = test_server();
+        Arc::get_mut(&mut server)
+            .unwrap()
+            .appserver_notification_sink = Arc::new(|_, _, _| Err("test sink rejected".into()));
         register(&server, "owner");
         let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
         let message_id = bind_message_with_type(
@@ -1233,9 +1205,6 @@ mod tests {
             &server,
             &message_id,
             &subscription_id,
-            &|_| true,
-            &|_, _| false,
-            &|_, _| Ok(true),
             timer_at,
         ));
         assert_eq!(
@@ -1292,28 +1261,19 @@ mod tests {
                 mode: "explicit-notification".into(),
             }]);
 
-            let delivered = std::cell::RefCell::new(Vec::new());
             assert!(super::super::attempt_notification_with_at(
                 &server,
                 &explicit_id,
                 &direct_subscription,
-                &|_| true,
-                &|_, text| {
-                    delivered.borrow_mut().push(text.to_string());
-                    true
-                },
-                &|_, _| Ok(true),
                 now_ms(),
             ));
 
             let state = server.state.lock().unwrap();
-            assert_eq!(state.msgs[&explicit_id].state, "delivered");
+            assert_eq!(state.msgs[&explicit_id].state, "pending");
+            assert_eq!(state.msgs[&explicit_id].wake_attempt_count, 1);
             assert_eq!(state.msgs[&automatic_id].state, "pending");
             assert_eq!(state.msgs[&automatic_id].wake_attempt_count, 0);
             drop(state);
-            let text = delivered.borrow().join("\n");
-            assert!(text.contains(&explicit_id));
-            assert!(!text.contains(&automatic_id));
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -1356,8 +1316,8 @@ mod tests {
                 worker_id: "master".into(),
                 event: "deadline".into(),
                 subject: Some("goal:inactive".into()),
-                pane: "%test-master".into(),
-                method: "tmux".into(),
+                target: "thread-master".into(),
+                method: "appserver".into(),
                 trigger_ms: Some(now - 1),
                 trigger_times_ms: Vec::new(),
                 interval_ms: Some(600_000),
@@ -1413,8 +1373,6 @@ mod tests {
     fn goal_deadline_success_consumes_legacy_periodic_shape_once() {
         let (mut server, root) = test_server();
         Arc::get_mut(&mut server).unwrap().config.notifications.mode = "immediate".into();
-        Arc::get_mut(&mut server).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Working;
         register_master(&server);
         let now = now_ms();
         let subscription_id = "sub-goal-active".to_string();
@@ -1424,8 +1382,8 @@ mod tests {
                 worker_id: "master".into(),
                 event: "deadline".into(),
                 subject: Some("goal:active".into()),
-                pane: "%test-master".into(),
-                method: "tmux".into(),
+                target: "thread-master".into(),
+                method: "appserver".into(),
                 trigger_ms: Some(now - 1),
                 trigger_times_ms: Vec::new(),
                 interval_ms: Some(600_000),
@@ -1440,8 +1398,6 @@ mod tests {
         }]);
 
         tick_with_idle(&server, &|_| false);
-        Arc::get_mut(&mut server).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Waiting;
         let message_id = server
             .state
             .lock()
@@ -1451,13 +1407,11 @@ mod tests {
             .next()
             .cloned()
             .expect("goal deadline message");
-        assert!(super::super::attempt_notification_with_default(
-            &server,
-            &message_id,
-            &subscription_id,
-            &|_| true,
-            &|_, _| true,
-        ));
+        server.commit(&[Event::NotificationConsumed {
+            subscription_id: subscription_id.clone(),
+            message_id: message_id.clone(),
+            consumed_ms: now_ms(),
+        }]);
         tick_with_idle(&server, &|_| false);
         let state = server.state.lock().unwrap();
         assert_eq!(state.msgs.len(), 1);
@@ -1493,8 +1447,8 @@ mod tests {
                     worker_id: "master".into(),
                     event: "deadline".into(),
                     subject: Some("goal:revision-7".into()),
-                    pane: "%test-master".into(),
-                    method: "tmux".into(),
+                    target: "thread-master".into(),
+                    method: "appserver".into(),
                     trigger_ms: Some(now - 1),
                     trigger_times_ms: Vec::new(),
                     interval_ms: None,
@@ -1537,8 +1491,8 @@ mod tests {
                 worker_id: "worker".into(),
                 event: "deadline".into(),
                 subject: Some("goal:worker".into()),
-                pane: "%test-worker".into(),
-                method: "tmux".into(),
+                target: "thread-worker".into(),
+                method: "appserver".into(),
                 trigger_ms: Some(now - 1),
                 trigger_times_ms: Vec::new(),
                 interval_ms: None,
@@ -1581,8 +1535,8 @@ mod tests {
                 worker_id: "master".into(),
                 event: "deadline".into(),
                 subject: Some("goal:cancelled".into()),
-                pane: "%test-master".into(),
-                method: "tmux".into(),
+                target: "thread-master".into(),
+                method: "appserver".into(),
                 trigger_ms: Some(now - 1),
                 trigger_times_ms: Vec::new(),
                 interval_ms: None,
@@ -1906,20 +1860,8 @@ mod tests {
         ]);
 
         let working_at = now_ms();
-        super::super::keepalive::tick_with(
-            &server,
-            working_at,
-            &|_| crate::server::knock::AgentState::Working,
-            &|_, _| true,
-            &|_, _| Ok(true),
-        );
-        super::super::keepalive::tick_with(
-            &server,
-            working_at + 1,
-            &|_| crate::server::knock::AgentState::Waiting,
-            &|_, _| true,
-            &|_, _| Ok(true),
-        );
+        super::super::keepalive::tick_at(&server, working_at);
+        super::super::keepalive::tick_at(&server, working_at + 1);
         tick_with_idle(&server, &|_| false);
 
         let state = server.state.lock().unwrap();
@@ -1934,7 +1876,7 @@ mod tests {
         );
         assert_eq!(state.msgs.len(), 1);
         assert_eq!(state.keepalives["master"].idle_episode_notices, 1);
-        assert!(state.keepalives["master"].idle_episode_stopped);
+        assert!(!state.keepalives["master"].idle_episode_stopped);
         assert_eq!(
             state.notification_subscriptions[&subscription_id].fired_count,
             1
@@ -1948,14 +1890,12 @@ mod tests {
         let (server, root) = test_server();
         register_master(&server);
         let timer_subscription_id = master_idle_subscription(&server, 15 * 60 * 1000);
-        let direct_subscription_id = subscribe(&server, "master", "direct-message", None, None);
         let now = now_ms();
-        let mut direct_subscription = server.state.lock().unwrap().notification_subscriptions
-            [&direct_subscription_id]
-            .clone();
-        direct_subscription.expires_ms = now + 86_400_000;
-        server.commit(&[Event::NotificationSubscribed {
-            subscription: direct_subscription,
+        let mut record = server.state.lock().unwrap().keepalives["master"].clone();
+        record.idle_since_ms = now + 1;
+        server.commit(&[Event::KeepaliveUpdated {
+            worker_id: "master".into(),
+            record,
         }]);
         server
             .state
@@ -1965,69 +1905,6 @@ mod tests {
             .get_mut(&timer_subscription_id)
             .unwrap()
             .trigger_ms = Some(now - 15 * 60 * 1000 - 1);
-
-        let base = now_ms();
-        super::super::keepalive::tick_with(
-            &server,
-            base,
-            &|_| crate::server::knock::AgentState::Working,
-            &|_, _| true,
-            &|_, _| Ok(true),
-        );
-        super::super::keepalive::tick_with(
-            &server,
-            base + 1,
-            &|_| crate::server::knock::AgentState::Waiting,
-            &|_, _| true,
-            &|_, _| Ok(true),
-        );
-        let first_keepalive_message_id = server
-            .state
-            .lock()
-            .unwrap()
-            .wake_bindings
-            .iter()
-            .find_map(|(message_id, bound)| {
-                (bound == &direct_subscription_id).then_some(message_id.clone())
-            })
-            .expect("first keepalive idle notice");
-        server.commit(&[
-            Event::Delivered {
-                ids: vec![first_keepalive_message_id.clone()],
-            },
-            Event::Acked {
-                ids: vec![first_keepalive_message_id],
-            },
-        ]);
-
-        super::super::keepalive::tick_with(
-            &server,
-            base + 120_001,
-            &|_| crate::server::knock::AgentState::Waiting,
-            &|_, _| true,
-            &|_, _| Ok(true),
-        );
-        let second_keepalive_message_id = {
-            let state = server.state.lock().unwrap();
-            state
-                .wake_bindings
-                .iter()
-                .filter_map(|(message_id, bound)| {
-                    let message = state.msgs.get(message_id)?;
-                    (bound == &direct_subscription_id && message.state == "pending")
-                        .then_some(message_id.clone())
-                })
-                .next()
-                .expect("second keepalive idle notice")
-        };
-        server.commit(&[
-            Event::Delivered {
-                ids: vec![second_keepalive_message_id.clone()],
-            },
-            Event::Acked {
-                ids: vec![second_keepalive_message_id],
-            },
-        ]);
 
         tick_with_idle(&server, &|_| false);
         let timer_message_id = server
@@ -2039,11 +1916,11 @@ mod tests {
             .find_map(|(message_id, bound)| {
                 (bound == &timer_subscription_id).then_some(message_id.clone())
             })
-            .expect("timer consumes the third shared notice");
+            .expect("timer consumes the shared notice");
         {
             let state = server.state.lock().unwrap();
-            assert_eq!(state.keepalives["master"].idle_episode_notices, 3);
-            assert_eq!(state.msgs.len(), 3);
+            assert_eq!(state.keepalives["master"].idle_episode_notices, 1);
+            assert_eq!(state.msgs.len(), 1);
         }
         server.commit(&[
             Event::Delivered {
@@ -2065,9 +1942,9 @@ mod tests {
                 .filter(|bound| *bound == &timer_subscription_id)
                 .count(),
             1,
-            "timer must stop after keepalive and timer notices consume all three slots"
+            "timer must stop after its consumed occurrence"
         );
-        assert_eq!(state.keepalives["master"].idle_episode_notices, 3);
+        assert_eq!(state.keepalives["master"].idle_episode_notices, 1);
         assert_eq!(
             state.notification_subscriptions[&timer_subscription_id].fired_count,
             1
@@ -2175,8 +2052,6 @@ mod tests {
     fn wait_timeout_reason_is_durable_and_visible_only_to_live_master() {
         let (mut server, root) = test_server();
         Arc::get_mut(&mut server).unwrap().config.notifications.mode = "immediate".into();
-        Arc::get_mut(&mut server).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Working;
         register_master(&server);
         register(&server, "waiter");
         working_task(&server, "waiter");
@@ -2214,31 +2089,21 @@ mod tests {
             assert!(message.body.contains("reason=resource_conflict"));
             assert!(message.body.contains("WAIT_TIMEOUT"));
             assert_eq!(message.state, "pending");
-            assert_eq!(message.wake_attempt_count, 0);
+            assert_eq!(message.wake_attempt_count, 1);
             assert_eq!(state.wake_bindings.get(message_id), Some(&subscription_id));
             assert!(!state.msgs.values().any(|message| message.to == "waiter"));
             (message_id.clone(), message.clone())
         };
 
         // A repeated tick observes the blocked task and cannot create a second
-        // scheduling reason. Switching the master to Waiting lets the existing
-        // notification batch path deliver the pending occurrence.
+        // scheduling reason or a second wake attempt during the retry window.
         tick_with_idle(&server, &|_| false);
         assert_eq!(server.state.lock().unwrap().msgs.len(), 1);
-        Arc::get_mut(&mut server).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Waiting;
-        assert!(super::super::attempt_notification_with_default(
-            &server,
-            &message_id,
-            &subscription_id,
-            &|_| true,
-            &|_, _| true,
-        ));
         let state = server.state.lock().unwrap();
         assert_eq!(state.msgs[&message_id].to, message.to);
         assert_eq!(state.msgs[&message_id].subject, message.subject);
         assert_eq!(state.msgs[&message_id].body, message.body);
-        assert_eq!(state.msgs[&message_id].state, "delivered");
+        assert_eq!(state.msgs[&message_id].state, "pending");
         assert_eq!(state.msgs[&message_id].wake_attempt_count, 1);
         assert_eq!(state.msgs.len(), 1);
         drop(state);
@@ -2247,8 +2112,6 @@ mod tests {
         // reason; another timer tick still has no timeout transition to emit.
         let snapshot = server.state.lock().unwrap().snapshot_events();
         let (mut replayed, replay_root) = test_server();
-        Arc::get_mut(&mut replayed).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Working;
         for event in &snapshot {
             replayed.commit(std::slice::from_ref(event));
         }
@@ -2263,232 +2126,13 @@ mod tests {
     }
 
     #[test]
-    fn pane_lost_transitions_subscription_to_pane_lost_and_stops_storm() {
-        let (mut server, root) = test_server();
-        Arc::get_mut(&mut server).unwrap().pane_alive_check =
-            |_| super::super::knock::PanePresence::Missing;
-        register(&server, "lost-worker");
-        let sub = subscribe(&server, "lost-worker", "direct-message", None, None);
-        let id = bind_message(&server, "lost-worker", &sub);
-        // First tick discovers dead pane, cancels armed subscription to pane-lost.
-        tick_with_idle(&server, &|_| true);
-        let state = server.state.lock().unwrap();
-        assert_eq!(state.notification_subscriptions[&sub].status, "pane-lost");
-        assert_eq!(state.msgs[&id].wake_attempt_count, 0);
-        drop(state);
-
-        // Subsequent tick does not query or wake dead pane.
-        tick_with_idle(&server, &|_| true);
-        let state = server.state.lock().unwrap();
-        assert_eq!(state.notification_subscriptions[&sub].status, "pane-lost");
-        assert_eq!(state.msgs[&id].wake_attempt_count, 0);
-        drop(state);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn durable_pane_mismatch_cancels_even_when_liveness_is_unknown() {
-        use super::super::knock::PanePresence;
-        for notification_entry in [false, true] {
-            let (mut server, root) = test_server();
-            register(&server, "worker");
-            let sub = subscribe(&server, "worker", "direct-message", None, None);
-            let message = bind_message(&server, "worker", &sub);
-            let mut worker = server.state.lock().unwrap().workers["worker"].clone();
-            worker.pane = Some("%replacement".into());
-            server.commit(&[Event::Registered { worker }]);
-            Arc::get_mut(&mut server).unwrap().pane_alive_check = |_| PanePresence::Unknown;
-            if notification_entry {
-                assert!(!super::super::attempt_notification_with(
-                    &server,
-                    &message,
-                    &sub,
-                    &|_| panic!("mismatched pane cannot receive"),
-                    &|_, _| panic!("mismatched pane cannot be sent to"),
-                    &server.pane_owner_check
-                ));
-            } else {
-                tick_with_idle(&server, &|_| true);
-            }
-            let state = server.state.lock().unwrap();
-            assert_eq!(
-                state.notification_subscriptions[&sub].status, "pane-lost",
-                "notification_entry={notification_entry}"
-            );
-            assert_eq!(state.msgs[&message].wake_attempt_count, 0);
-            drop(state);
-            std::fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
-    fn unknown_prechecks_defer_timer_and_notification_without_cancelling_or_sending() {
-        use super::super::knock::{AgentState, PanePresence};
-        for failure in ["presence", "ownership", "view"] {
-            let (mut server, root) = test_server();
-            register(&server, "worker");
-            let direct = subscribe(&server, "worker", "direct-message", None, None);
-            let deadline = subscribe(
-                &server,
-                "worker",
-                "deadline",
-                Some("due"),
-                Some(now_ms() - 1),
-            );
-            let message = bind_message(&server, "worker", &direct);
-            let inner = Arc::get_mut(&mut server).unwrap();
-            match failure {
-                "presence" => {
-                    inner.pane_alive_check = |_| PanePresence::Unknown;
-                    inner.pane_owner_check =
-                        |_, _| panic!("unknown presence must short-circuit ownership");
-                    inner.pane_state_check =
-                        |_| panic!("unknown presence must short-circuit state probe");
-                }
-                "ownership" => {
-                    inner.pane_owner_check = |_, _| Err(());
-                    inner.pane_state_check =
-                        |_| panic!("unknown ownership must short-circuit state probe");
-                }
-                _ => inner.pane_state_check = |_| AgentState::Unknown,
-            }
-            assert!(!super::super::attempt_notification_with(
-                &server,
-                &message,
-                &direct,
-                &|_| panic!("unknown must not reach delivery readiness"),
-                &|_, _| panic!("unknown must not send"),
-                &server.pane_owner_check
-            ));
-            tick_with_idle(&server, &|_| true);
-            let state = server.state.lock().unwrap();
-            assert_eq!(
-                state.notification_subscriptions[&direct].status, "armed",
-                "{failure}"
-            );
-            assert_eq!(
-                state.notification_subscriptions[&deadline].status, "armed",
-                "{failure}"
-            );
-            assert_eq!(state.notification_subscriptions[&deadline].fired_count, 0);
-            assert_eq!(
-                state.msgs.len(),
-                1,
-                "unknown deadline must not enqueue a notification"
-            );
-            assert_eq!(state.msgs[&message].state, "pending");
-            assert_eq!(state.msgs[&message].wake_attempt_count, 0);
-            drop(state);
-            std::fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
-    fn working_agent_defers_notification_without_attempt() {
-        let (mut server, root) = test_server();
-        Arc::get_mut(&mut server).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Working;
-        register(&server, "busy-worker");
-        let sub = subscribe(&server, "busy-worker", "direct-message", None, None);
-        let id = bind_message(&server, "busy-worker", &sub);
-        server
-            .state
-            .lock()
-            .unwrap()
-            .msgs
-            .get_mut(&id)
-            .unwrap()
-            .created_ms = now_ms() - 120_001;
-
-        assert!(!super::super::attempt_notification_with_default(
-            &server,
-            &id,
-            &sub,
-            &|_| true,
-            &|_, _| panic!("should not deliver while busy")
-        ));
-        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 0);
-        assert_eq!(
-            server.state.lock().unwrap().notification_subscriptions[&sub].status,
-            "armed"
-        );
-        // When agent transitions to idle (state becomes Waiting), wake succeeds.
-        Arc::get_mut(&mut server).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Waiting;
-        assert!(super::super::attempt_notification_with_default(
-            &server,
-            &id,
-            &sub,
-            &|_| true,
-            &|_, _| true
-        ));
-        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 1);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn unknown_agent_keeps_notification_pending_without_burning_attempt() {
-        let (mut server, root) = test_server();
-        Arc::get_mut(&mut server).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Unknown;
-        register(&server, "unknown-worker");
-        let sub = subscribe(&server, "unknown-worker", "direct-message", None, None);
-        let id = bind_message_with_id(&server, "unknown-worker", &sub, "msg-unknown");
-
-        assert!(!super::super::attempt_notification_with_default(
-            &server,
-            &id,
-            &sub,
-            &|_| true,
-            &|_, _| panic!("unknown agent must not receive a notification"),
-        ));
-        let state = server.state.lock().unwrap();
-        assert_eq!(state.msgs[&id].state, "pending");
-        assert_eq!(state.msgs[&id].wake_attempt_count, 0);
-        drop(state);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn explicit_notification_remains_immediate_while_agent_is_working() {
-        let (mut server, root) = test_server();
-        Arc::get_mut(&mut server).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Working;
-        register(&server, "busy-worker");
-        let sub = subscribe(&server, "busy-worker", "direct-message", None, None);
-        let id = bind_message(&server, "busy-worker", &sub);
-        server.commit(&[Event::DeliveryMode {
-            msg_id: id.clone(),
-            mode: "explicit-notification".into(),
-        }]);
-        server
-            .state
-            .lock()
-            .unwrap()
-            .msgs
-            .get_mut(&id)
-            .unwrap()
-            .created_ms = now_ms() - 60_001;
-
-        assert!(super::super::attempt_notification_with_default(
-            &server,
-            &id,
-            &sub,
-            &|_| true,
-            &|_, _| true
-        ));
-        assert_eq!(server.state.lock().unwrap().msgs[&id].wake_attempt_count, 1);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
     fn unacked_notifications_limit_pauses_wakes_and_resumes_after_ack() {
         let (mut server, root) = test_server();
         Arc::get_mut(&mut server).unwrap().config.notifications.mode = "immediate".into();
         register(&server, "ack-worker");
         let sub = subscribe(&server, "ack-worker", "direct-message", None, None);
 
-        // Deliver 3 notifications (max_unacked = 3)
+        // Deliver 3 notifications (max_unacked = 3).
         let mut msg_ids = Vec::new();
         for i in 0..3 {
             let id = bind_message_with_id(&server, "ack-worker", &sub, &format!("msg-ack-{i}"));
@@ -2499,10 +2143,13 @@ mod tests {
                 &|_| true,
                 &|_, _| true,
             ));
+            server.commit(&[Event::Delivered {
+                ids: vec![id.clone()],
+            }]);
             msg_ids.push(id);
         }
 
-        // 3 messages are now delivered and unacked
+        // 3 messages are now delivered and unacked.
         assert_eq!(
             server
                 .state
@@ -2613,25 +2260,22 @@ mod tests {
         assert!(text.contains("collab inbox"));
 
         let state = server.state.lock().unwrap();
-        let delivered_count = state
-            .msgs
-            .values()
-            .filter(|m| m.to == "batch-worker" && m.state == "delivered")
-            .count();
-        let pending_count = state
+        let queued_count = state
             .msgs
             .values()
             .filter(|m| m.to == "batch-worker" && m.state == "pending")
             .count();
-        assert_eq!(delivered_count, 3);
-        assert_eq!(pending_count, 2);
+        assert_eq!(queued_count, 5);
         assert_eq!(state.msgs["msg-batch-0"].state, "pending");
         assert_eq!(state.msgs["msg-batch-1"].state, "pending");
         assert_eq!(state.msgs["msg-batch-0"].wake_attempt_count, 0);
         assert_eq!(state.msgs["msg-batch-1"].wake_attempt_count, 0);
-        assert_eq!(state.msgs["msg-batch-2"].state, "delivered");
-        assert_eq!(state.msgs["msg-batch-3"].state, "delivered");
-        assert_eq!(state.msgs["msg-batch-4"].state, "delivered");
+        assert_eq!(state.msgs["msg-batch-2"].state, "pending");
+        assert_eq!(state.msgs["msg-batch-3"].state, "pending");
+        assert_eq!(state.msgs["msg-batch-4"].state, "pending");
+        assert_eq!(state.msgs["msg-batch-2"].wake_attempt_count, 1);
+        assert_eq!(state.msgs["msg-batch-3"].wake_attempt_count, 1);
+        assert_eq!(state.msgs["msg-batch-4"].wake_attempt_count, 1);
         drop(state);
         assert!(!super::super::attempt_notification_with_default(
             &server,
@@ -2640,64 +2284,6 @@ mod tests {
             &|_| true,
             &|_, _| panic!("older backlog must not be pushed later"),
         ));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn identity_mismatch_or_absent_worker_transitions_subscription_to_pane_lost() {
-        let (mut server, root) = test_server();
-        register(&server, "mismatch-worker");
-        let sub = subscribe(&server, "mismatch-worker", "direct-message", None, None);
-
-        // Case 1: Worker's registered pane changed (identity mismatch with old subscription)
-        server.commit(&[Event::Registered {
-            worker: WorkerRec {
-                id: "mismatch-worker".into(),
-                token: "token-mismatch-worker".into(),
-                pane: Some("%new-pane".into()),
-                cwd: "/tmp".into(),
-                registered_ms: now_ms(),
-                transport: None,
-            },
-        }]);
-        tick_with_idle(&server, &|_| true);
-        assert_eq!(
-            server.state.lock().unwrap().notification_subscriptions[&sub].status,
-            "pane-lost"
-        );
-
-        // Case 2: Agent process absent transitions armed subscription to pane-lost
-        let sub2 = subscribe(&server, "mismatch-worker", "direct-message", None, None);
-        server.commit(&[Event::Registered {
-            worker: WorkerRec {
-                id: "mismatch-worker".into(),
-                token: "token-mismatch-worker".into(),
-                pane: Some(format!("%test-mismatch-worker")),
-                cwd: "/tmp".into(),
-                registered_ms: now_ms(),
-                transport: None,
-            },
-        }]);
-        Arc::get_mut(&mut server).unwrap().pane_state_check =
-            |_| crate::server::knock::AgentState::Absent;
-        let message = bind_message_with_id(&server, "mismatch-worker", &sub2, "msg-absent");
-        assert!(!super::super::attempt_notification_with(
-            &server,
-            &message,
-            &sub2,
-            &|_| panic!("absent agent must not reach delivery readiness"),
-            &|_, _| panic!("absent agent must not receive tmux input"),
-            &server.pane_owner_check,
-        ));
-        assert_eq!(
-            server.state.lock().unwrap().notification_subscriptions[&sub2].status,
-            "pane-lost"
-        );
-        assert_eq!(
-            server.state.lock().unwrap().msgs[&message].wake_attempt_count,
-            0
-        );
-
         std::fs::remove_dir_all(root).ok();
     }
 }

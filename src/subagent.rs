@@ -80,8 +80,8 @@ pub struct Record {
     pub parent: String,
     pub peer: String,
     pub status: String,
-    pub session: Option<String>,
-    pub pane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub profile: Option<config::Profile>,
     pub created_ms: i64,
     pub ready_deadline_ms: i64,
@@ -97,80 +97,78 @@ pub(crate) fn observe(
     id: Option<&str>,
     lines: Option<usize>,
 ) -> Result<serde_json::Value> {
-    let state = server.state.lock().unwrap();
-    let Some(id) = id else {
-        return Ok(json!({"subagents":state.subagents.values().collect::<Vec<_>>()}));
+    let (record, transport, mailbox, tasks, keepalive) = {
+        let state = server.state.lock().unwrap();
+        let Some(id) = id else {
+            return Ok(json!({"subagents":state.subagents.values().collect::<Vec<_>>()}));
+        };
+        let record = state.subagents.get(id).context("unknown subagent")?.clone();
+        let transport = state
+            .workers
+            .get(&record.peer)
+            .and_then(|worker| worker.transport.clone());
+        let mut mailbox: Vec<_> = state
+            .msgs
+            .values()
+            .filter(|message| message.from == record.peer && message.to == record.parent)
+            .cloned()
+            .collect();
+        mailbox.sort_by_key(|message| message.created_ms);
+        let tasks = state
+            .tasks
+            .values()
+            .filter(|task| task.owner == record.peer)
+            .cloned()
+            .collect::<Vec<_>>();
+        let keepalive = crate::server::keepalive::view(&state, &record.peer);
+        (record, transport, mailbox, tasks, keepalive)
     };
-    let record = state.subagents.get(id).context("unknown subagent")?;
     if let Some(lines) = lines {
         if !(1..=200).contains(&lines) {
             bail!("snapshot lines must be 1..200");
         }
-        if record.pane.is_none() {
-            let mut value = json!({
-                "subagent_id": record.id,
-                "captured_ms": now_ms(),
-                "pane": serde_json::Value::Null,
-                "screen_tail": ""
-            });
-            merge_follow_up(&mut value);
-            return Ok(value);
-        }
-        let pane = record.pane.as_deref().context("subagent has no pane")?;
-        if !crate::server::knock::pane_alive(pane) {
-            bail!("subagent pane exited");
-        }
-        let binding = Command::new("tmux")
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                pane,
-                "#{session_id} #{session_name}",
-            ])
-            .output()?;
-        if !binding.status.success()
-            || String::from_utf8_lossy(&binding.stdout).trim()
-                != format!(
-                    "{} {}",
-                    record.session.as_deref().unwrap_or_default(),
-                    record.peer
-                )
-        {
-            bail!("subagent session identity changed");
-        }
-        let output = Command::new("tmux")
-            .args(["capture-pane", "-p", "-t", pane, "-S", &format!("-{lines}")])
-            .output()?;
-        if !output.status.success() {
-            bail!("tmux snapshot failed");
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
+        let thread_id = record
+            .thread_id
+            .as_deref()
+            .context("subagent has no App Server thread binding")?;
+        let transport = transport.context("subagent has no registered App Server transport")?;
+        let items = crate::client::adapters::codex_app_server::read_thread_items(
+            &transport, thread_id, lines,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let text = serde_json::to_string_pretty(&items)?;
         let tail: Vec<_> = text.lines().rev().take(lines).collect();
-        let mut value = json!({"subagent_id":record.id,"captured_ms":now_ms(),"pane":pane,
-            "screen_tail":tail.into_iter().rev().collect::<Vec<_>>().join("\n")});
+        let mut value = json!({
+            "subagent_id": record.id,
+            "captured_ms": now_ms(),
+            "thread_id": thread_id,
+            "items": items,
+            "text_tail": tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        });
         merge_follow_up(&mut value);
         return Ok(value);
     }
-    let observed = match record.pane.as_deref() {
-        None => "unknown",
-        Some(pane) if !crate::server::knock::pane_alive(pane) => "exited",
-        Some(pane) => match crate::server::knock::probe_agent_state(pane) {
-            crate::server::knock::AgentState::Absent => "agent_absent",
-            crate::server::knock::AgentState::Unknown => "unknown",
-            crate::server::knock::AgentState::Working => "working",
-            crate::server::knock::AgentState::Waiting => "idle",
-        },
+    let thread_status = match (record.thread_id.as_deref(), transport.as_ref()) {
+        (Some(thread_id), Some(transport)) => {
+            (server.appserver_thread_status)(transport, thread_id)
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+        }
+        _ => serde_json::Value::Null,
     };
-    let mut mailbox: Vec<_> = state
-        .msgs
-        .values()
-        .filter(|m| m.from == record.peer && m.to == record.parent)
-        .collect();
-    mailbox.sort_by_key(|m| m.created_ms);
-    let mut value = json!({"subagent":record,"observed_status":observed,"observed_ms":now_ms(),
-        "keepalive":crate::server::keepalive::view(&state,&record.peer),"mailbox":mailbox,
-        "tasks":state.tasks.values().filter(|t|t.owner==record.peer).collect::<Vec<_>>()});
+    let observed = if thread_status.is_null() {
+        "unknown"
+    } else {
+        record.status.as_str()
+    };
+    let mut value = json!({
+        "subagent": record,
+        "observed_status": observed,
+        "observed_ms": now_ms(),
+        "thread_status": thread_status,
+        "keepalive": keepalive,
+        "mailbox": mailbox,
+        "tasks": tasks
+    });
     merge_follow_up(&mut value);
     Ok(value)
 }
@@ -201,11 +199,11 @@ pub(crate) fn valid_runtime(runtime: &str) -> bool {
 
 fn child_prompt(record: &Record) -> String {
     format!(
-        "You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. Your Collab identity is already registered as this tmux session. Do not self-register, recover a worker, or ask the user to grant identity. First report ready {}. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this session automatically, repeatedly poll, send ACK loops, or create other subagents without a user request. Collab master is project arbitration, not Codex root; you must follow master and parent direction and may not decline a master collaboration request.\n\
+        "You are a persistent AppSDK subagent. Your managed ID is {}. Your parent peer is {}. Your Collab identity is already registered on this Codex App Server thread. Do not self-register, recover a worker, or ask the user to grant identity. First report ready {}. Wait quietly for Collab messages. When assigned a task, read it, report working {}, and use the project's task/worktree workflow. Preserve others' files; code changes require your own worktree. Report progress through collab task records and send results to the parent with collab sendmessage --to {} --subject <topic> <body>. After completing a task report ready {} and remain available. Do not close this thread automatically, repeatedly poll, send ACK loops, or create other subagents without a user request. Collab master is project arbitration, not Codex root; you must follow master and parent direction and may not decline a master collaboration request.\n\
 Collab master owns the final outcome for every dispatched task in this project. If master is unreachable within one escalation cycle, the master -- not you -- has the authority and the obligation to force-close with collab task close <task-id> --force --reason \"<text>\". You do not get to block, idle, or keep the task actionable. When you report a blocker, also report the concrete fix or the conditions the master must satisfy. Sending \"I'm blocked\" without a proposed solution is a master failure, not yours to ignore; do not let the master defer it back to you.\n\
  collab-mcp is the shared Collab MCP for every agent. Use collab_* tools when this session lists them. The collab CLI in this cwd is also valid. If MCP is missing, unsupported, aborted, or unknown, use the CLI. Missing MCP is not a reason to skip receive, ready, or send.\n\
 CLI: collab subagent ready {}; collab subagent working {}; collab recv; collab ack <message-id>; collab msg <message-id>; collab inbox; collab sendmessage --to {} --subject <topic> \"<body>\"; collab task relocate <task-id> --worktree ./playground/<slug>.\n\
-Each dispatched message has a canonical task named task-<message-id>. working claims that task; do not register a duplicate. Bind a clean worktree before code edits. ready only means session idle. Use collab recv to read and consume a notification; use explicit ack only for legacy or already-delivered recovery. Never ACK an ACK or request automatic rearm after exhaustion.",
+Each dispatched message has a canonical task named task-<message-id>. working claims that task; do not register a duplicate. Bind a clean worktree before code edits. ready only means thread idle. Use collab recv to read and consume a notification; use explicit ack only for legacy or already-delivered recovery. Never ACK an ACK or request automatic rearm after exhaustion.",
         record.id,
         record.parent,
         record.id,
@@ -244,7 +242,7 @@ fn launch_args(
             serde_json::to_string(&mcp.to_string_lossy())?
         ),
         "-c".into(),
-        "mcp_servers.appsdk-subagent.env_vars=[\"TMUX\",\"TMUX_PANE\",\"PATH\",\"HOME\"]".into(),
+        "mcp_servers.appsdk-subagent.env_vars=[\"CODEX_THREAD_ID\",\"PATH\",\"HOME\"]".into(),
     ]);
     for tool in [
         "collab_init",
@@ -454,111 +452,69 @@ fn launch(
         .profile
         .as_ref()
         .context(format!("no healthy profile: {}", errors.join("; ")))?;
-    let prompt = child_prompt(record);
-    let mcp = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("collab-mcp")))
-        .unwrap_or_else(|| std::path::PathBuf::from("collab-mcp"));
-    let (executable, args) = launch_args(&settings.runtime, profile, &server.root, &prompt, &mcp)?;
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let manifest = server
-        .root
-        .join(".agent-collab/server")
-        .join(format!("launch-{}.json", record.id));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&manifest)?;
-    let mut environment = environment;
-    environment.remove("TMUX");
-    environment.remove("TMUX_PANE");
-    environment.insert("COLLAB_WORKER".into(), record.peer.clone());
-    file.write_all(&serde_json::to_vec(&LaunchSpec {
-        executable,
-        args,
-        env: environment,
-    })?)?;
-    file.sync_all()?;
-    let mut command = Command::new("tmux");
-    command
-        .args([
-            "new-session",
-            "-d",
-            "-P",
-            "-F",
-            "#{session_id} #{pane_id}",
-            "-s",
-            &record.peer,
-            "-c",
-        ])
-        .arg(&server.root)
-        .arg(std::env::current_exe()?)
-        .arg("subagent-exec")
-        .arg(&manifest);
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(error) => {
-            std::fs::remove_file(&manifest)?;
-            return Err(error.into());
-        }
+    let parent_transport = {
+        let state = server.state.lock().unwrap();
+        state
+            .workers
+            .get(&record.parent)
+            .and_then(|worker| worker.transport.clone())
+            .context("parent has no registered App Server transport")?
     };
-    if !output.status.success() {
-        std::fs::remove_file(&manifest)?;
-        bail!(
-            "tmux start failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    crate::server::knock::invalidate_pane_presence_cache();
-    let binding = String::from_utf8(output.stdout)?;
-    let mut parts = binding.split_whitespace();
-    record.session = Some(parts.next().context("missing session ID")?.into());
-    record.pane = Some(parts.next().context("missing pane ID")?.into());
+    let thread_id = crate::client::adapters::codex_app_server::start_thread(
+        &parent_transport,
+        &server.root,
+        profile.model.as_deref(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    record.thread_id = Some(thread_id.to_string());
+    let prompt = child_prompt(record);
+    let candidate = crate::proto::AppServerCandidate {
+        endpoint: parent_transport
+            .endpoint
+            .clone()
+            .context("parent App Server transport has no endpoint")?,
+        namespace: parent_transport
+            .namespace
+            .clone()
+            .context("parent App Server transport has no namespace")?,
+        thread_id: thread_id.to_string(),
+    };
     let scope = crate::scope::Scope {
         root: server.root.clone(),
     };
-    let mut ident = crate::identity::provision(
-        &scope,
-        &record.peer,
-        record.pane.as_deref().context("missing pane")?,
-        &record.peer,
-    )?;
-    let registered = match app_scope {
-        Some(app_scope) => crate::server::handle_register_with_app_scope(
-            server,
-            ident.worker_id.clone(),
-            ident.token.clone(),
-            ident.pane.clone(),
-            server.root.display().to_string(),
-            Some(app_scope.clone()),
-            None,
-        ),
-        None => crate::server::handle_register(
-            server,
-            ident.worker_id.clone(),
-            ident.token.clone(),
-            ident.pane.clone(),
-            server.root.display().to_string(),
-        ),
-    };
+    let mut ident = crate::identity::load_or_create(&scope, Some(record.peer.clone()), None)?;
+    let registered = crate::server::handle_register_with_app_scope(
+        server,
+        ident.worker_id.clone(),
+        ident.token.clone(),
+        server.root.display().to_string(),
+        app_scope.cloned(),
+        Some(crate::proto::TransportCandidates {
+            appserver: Some(candidate),
+        }),
+    );
     if !registered.ok {
+        let _ = crate::client::adapters::codex_app_server::archive_thread(
+            &parent_transport,
+            thread_id.as_str(),
+        );
         bail!(
             "cannot register child identity: {}",
             registered.error.unwrap_or_default()
         );
     }
-    if app_scope.is_some() {
-        let runtime = crate::identity::runtime_from_registration_receipt(
-            &registered.data,
-            &ident.worker_id,
-            &scope.root,
-        )
-        .context("child registration receipt did not contain its runtime binding")?;
-        crate::identity::persist_runtime(&scope, &mut ident, runtime)
-            .context("cannot persist child runtime binding")?;
-    }
+    let (runtime, transport) =
+        crate::identity::registration_from_receipt(&registered.data, &ident.worker_id, &scope.root)
+            .context("child registration receipt did not contain its runtime binding")?;
+    crate::identity::persist_registration(&scope, &mut ident, runtime, transport.clone())
+        .context("cannot persist child runtime binding")?;
+    crate::client::adapters::codex_app_server::queue_add(
+        &transport,
+        &prompt,
+        &format!("collab-subagent-start-{}", record.id),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let _ = environment;
     record.status = "starting".into();
     record.ready_deadline_ms = now_ms() + settings.startup.ready_timeout_seconds as i64 * 1000;
     Ok(())
@@ -692,20 +648,18 @@ fn run(
             .collect();
         let peer = config
             .subagent
-            .tmux
             .name_template
             .replace("{cwd_name}", &prefix)
             .replace("{short_id}", &id);
         if !valid_id(&peer) {
-            bail!("tmux name must contain only ASCII letters, digits, dash or underscore and be <=80 characters");
+            bail!("subagent name must contain only ASCII letters, digits, dash or underscore and be <=80 characters");
         }
         let mut record = Record {
             id: id.clone(),
             parent: actor.into(),
             peer,
             status: "probing".into(),
-            session: None,
-            pane: None,
+            thread_id: None,
             profile: None,
             created_ms: now_ms(),
             ready_deadline_ms: 0,
@@ -720,7 +674,7 @@ fn run(
                 if existing.parent != actor {
                     bail!("subagent belongs to another parent");
                 }
-                if existing.pane.is_some() {
+                if existing.thread_id.is_some() {
                     let existing = existing.clone();
                     return Ok(follow_up(&existing, true));
                 }
@@ -790,7 +744,12 @@ fn run(
     let mut record = state.subagents.get(id).context("unknown subagent")?.clone();
     let child_action = matches!(action, Action::Ready { .. } | Action::Working { .. });
     if child_action {
-        if record.peer != actor || state.workers[actor].pane != record.pane {
+        let bound_thread = state
+            .workers
+            .get(actor)
+            .and_then(|worker| worker.transport.as_ref())
+            .and_then(|transport| transport.thread_id.as_deref());
+        if record.peer != actor || record.thread_id.as_deref() != bound_thread {
             bail!("only the bound subagent may report readiness or work");
         }
     } else if record.parent != actor
@@ -839,7 +798,7 @@ fn run(
                 bail!("accept the assigned task before reporting completion");
             }
             let assigned_task = if !ready {
-                // A keepalive pane probe may persist `working` before the
+                // A keepalive thread probe may persist `working` before the
                 // child gets a chance to claim its still-assigned task. Keep
                 // the task binding as the source of truth and accept both
                 // sides of that short race. A working task is accepted only
@@ -933,7 +892,7 @@ fn run(
             if subject.trim().is_empty() || body.trim().is_empty() {
                 bail!("subject and task body are required");
             }
-            // A keepalive pane observation can race with the child's ready
+            // A keepalive thread observation can race with the child's ready
             // report and leave the durable managed status at working even
             // though the child owns no actionable task. Reconcile that stale
             // state before asking the task sender to bind the next dispatch.
@@ -1007,40 +966,17 @@ fn run(
                 )
                 .map_err(|error| anyhow::anyhow!("subagent close journal failure: {error}"))?;
             drop(state);
-            if let (Some(session), Some(pane)) = (&record.session, &record.pane) {
-                if crate::server::knock::pane_alive(pane) {
-                    let output = Command::new("tmux")
-                        .args([
-                            "display-message",
-                            "-p",
-                            "-t",
-                            pane,
-                            "#{session_id} #{session_name}",
-                        ])
-                        .output()?;
-                    if !output.status.success()
-                        || String::from_utf8_lossy(&output.stdout).trim()
-                            != format!("{} {}", session, record.peer)
-                    {
-                        bail!("session identity changed; refusing to close");
-                    }
-                    if !Command::new("tmux")
-                        .args(["kill-session", "-t", session])
-                        .status()?
-                        .success()
-                    {
-                        bail!("tmux close failed");
-                    }
+            if let Some(thread_id) = record.thread_id.as_deref() {
+                let transport = {
+                    let state = server.state.lock().unwrap();
+                    state
+                        .workers
+                        .get(&record.peer)
+                        .and_then(|worker| worker.transport.clone())
                 }
-            }
-            let manifest = server
-                .root
-                .join(".agent-collab/server")
-                .join(format!("launch-{}.json", record.id));
-            match std::fs::remove_file(&manifest) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+                .context("subagent has no registered App Server transport")?;
+                (server.appserver_thread_archive)(&transport, thread_id)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
             }
             record.status = "closed".into();
             server
@@ -1060,62 +996,6 @@ fn run(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    #[test]
-    #[ignore = "requires tmux and node; creates only a disposable session"]
-    fn snapshot_is_explicit_bounded_and_checks_session_binding() {
-        let (server, root) = crate::server::peer_tests::test_server();
-        let name = format!("collab-snapshot-test-{}", std::process::id());
-        let output = Command::new("tmux").args(["new-session","-d","-P","-F","#{session_id} #{pane_id}","-s",&name,
-            "node -e 'process.stdout.write(\"snapshot-marker\\n\".repeat(100));setInterval(()=>{},1000)'"
-        ]).output().unwrap();
-        assert!(output.status.success());
-        struct Cleanup(String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = Command::new("tmux")
-                    .args(["kill-session", "-t", &self.0])
-                    .status();
-            }
-        }
-        let _cleanup = Cleanup(name.clone());
-        let text = String::from_utf8(output.stdout).unwrap();
-        let binding: Vec<_> = text.split_whitespace().collect();
-        let mut record = Record {
-            id: "snapshot".into(),
-            parent: "parent".into(),
-            peer: name,
-            status: "idle".into(),
-            session: Some(binding[0].into()),
-            pane: Some(binding[1].into()),
-            profile: None,
-            created_ms: now_ms(),
-            ready_deadline_ms: 0,
-            last_message: None,
-            error: None,
-            probe_failures: vec![],
-            runtime: None,
-        };
-        server.commit(&[Event::SubagentUpdated {
-            subagent: record.clone(),
-        }]);
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(observe(&server, Some("snapshot"), None)
-            .unwrap()
-            .get("screen_tail")
-            .is_none());
-        let snap = observe(&server, Some("snapshot"), Some(5)).unwrap();
-        assert!(snap["screen_tail"]
-            .as_str()
-            .unwrap()
-            .contains("snapshot-marker"));
-        assert!(snap["screen_tail"].as_str().unwrap().lines().count() <= 5);
-        assert!(observe(&server, Some("snapshot"), Some(201)).is_err());
-        record.session = Some("$not-ours".into());
-        server.commit(&[Event::SubagentUpdated { subagent: record }]);
-        assert!(observe(&server, Some("snapshot"), Some(5)).is_err());
-        assert!(server.state.lock().unwrap().msgs.is_empty());
-        std::fs::remove_dir_all(root).unwrap();
-    }
     #[test]
     fn probes_are_bounded_and_require_exact_success() {
         let directory =
@@ -1198,8 +1078,7 @@ mod tests {
             parent: "parent-1".into(),
             peer: "peer-1".into(),
             status: "starting".into(),
-            session: None,
-            pane: None,
+            thread_id: None,
             profile: None,
             created_ms: 0,
             ready_deadline_ms: 0,

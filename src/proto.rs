@@ -10,15 +10,12 @@ use crate::scope::{ProjectScopeId, RouteScope};
 pub enum TransportKind {
     #[serde(rename = "appserver")]
     AppServer,
-    #[serde(rename = "tmux")]
-    Tmux,
 }
 
 impl TransportKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AppServer => "appserver",
-            Self::Tmux => "tmux",
         }
     }
 }
@@ -30,17 +27,10 @@ pub struct AppServerCandidate {
     pub thread_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TmuxCandidate {
-    pub pane: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportCandidates {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appserver: Option<AppServerCandidate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tmux: Option<TmuxCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,8 +42,6 @@ pub struct SelectedTransport {
     pub namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pane: Option<String>,
     pub capabilities: Vec<String>,
     pub self_check: String,
 }
@@ -255,8 +243,6 @@ pub enum Req {
     Register {
         worker_id: String,
         token: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pane: Option<String>,
         cwd: String,
         #[serde(default)]
         candidates: Option<TransportCandidates>,
@@ -459,13 +445,12 @@ pub enum Req {
     WorkerStatus {
         worker_id: Option<String>,
     },
-    /// Live master retires a worker registration, optionally killing its tmux session.
+    /// Live master retires a worker registration.
     WorkerClose {
         worker_id: String,
         token: String,
         target_id: String,
         reason: String,
-        kill_session: bool,
     },
     MasterId,
     MasterRecover {
@@ -882,7 +867,7 @@ mod tests {
             "op": "Register",
             "worker_id": "worker-1",
             "token": "token-1",
-            "pane": null,
+            "candidates": null,
             "cwd": env!("CARGO_MANIFEST_DIR")
         });
         assert!(serde_json::from_value::<RequestEnvelope>(old).is_err());

@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::identity::{validate_id_for_protocol, AppServerId};
 use serde::{Deserialize, Serialize};
@@ -284,24 +283,9 @@ fn validate_project_root(root: PathBuf) -> anyhow::Result<PathBuf> {
     Ok(root)
 }
 
-fn project_root_from<F>(pane: Option<&str>, cwd: PathBuf, pane_cwd: F) -> anyhow::Result<PathBuf>
-where
-    F: FnOnce(&str) -> anyhow::Result<PathBuf>,
-{
-    match pane {
-        Some(pane) => {
-            if !pane.starts_with('%') {
-                anyhow::bail!("invalid TMUX_PANE value: {pane}");
-            }
-            validate_project_root(pane_cwd(pane)?)
-        }
-        None => validate_project_root(cwd),
-    }
-}
-
-/// The launching environment owns project scope. A tmux Agent is bound to the
-/// exact current directory of its pane; a non-tmux operator is bound to the
-/// exact process cwd. No caller may select a path and no ancestor is searched.
+/// The launching environment owns project scope. Every peer, including a
+/// Codex App Server thread, is bound to the exact process cwd. No caller may
+/// select a path and no ancestor is searched.
 fn inherited_cwd_if_initialized(cwd: PathBuf) -> anyhow::Result<PathBuf> {
     if cwd.join(".agent-collab").is_dir() {
         validate_project_root(cwd)
@@ -311,19 +295,12 @@ fn inherited_cwd_if_initialized(cwd: PathBuf) -> anyhow::Result<PathBuf> {
 }
 
 pub fn project_root() -> anyhow::Result<PathBuf> {
-    let pane = std::env::var("TMUX_PANE").ok();
     let cwd = std::env::current_dir()?;
-    match project_root_from(pane.as_deref(), cwd.clone(), |pane| tmux_pane_cwd(pane)) {
-        Ok(root) => Ok(root),
-        Err(_) if pane.is_some() => inherited_cwd_if_initialized(cwd),
-        Err(error) => Err(error),
-    }
+    inherited_cwd_if_initialized(cwd)
 }
 
 /// Resolve the exact destination for `collab init`. Initialization binds to
-/// the process cwd and never consults tmux: App Server is the preferred
-/// channel, and tmux is only an optional capability candidate discovered
-/// later during registration.
+/// the process cwd.
 pub fn project_root_for_init() -> anyhow::Result<PathBuf> {
     init_project_root(std::env::current_dir()?)
 }
@@ -332,28 +309,12 @@ fn init_project_root(cwd: PathBuf) -> anyhow::Result<PathBuf> {
     validate_project_root(cwd)
 }
 
-fn tmux_pane_cwd(pane: &str) -> anyhow::Result<PathBuf> {
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", "-t", pane, "#{pane_current_path}"])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!("cannot resolve project root for tmux pane {pane}");
-    }
-    let path = String::from_utf8(output.stdout)?;
-    let path = path.trim();
-    if path.is_empty() {
-        anyhow::bail!("tmux pane {pane} returned an empty project root");
-    }
-    Ok(PathBuf::from(path))
-}
-
 pub fn init(root: &Path) -> std::io::Result<PathBuf> {
     let base = root.join(".agent-collab");
     for sub in [
         "runs",
         "handoff",
         "merge-queue",
-        "panes",
         "mailbox",
         "messages",
         "mailboxes",
@@ -515,18 +476,15 @@ start it again. Never start a second daemon.
 Existing projects migrate through `collab migrate inspect`, `plan`, `apply`,
 controlled daemon upgrade/restart, identity rebind, and `verify`;
 deleting `.agent-collab`, editing JSON state, clearing mailboxes, copying
-tokens, mixed runtime writes, and guessing pane identity are deprecated.
+tokens, mixed runtime writes, and guessing thread identity are deprecated.
 
 ## Runtime boundary
 
-- Every peer registration must include a server-verified AppServer or tmux
-  candidate.
+- Every peer registration must include a server-verified App Server candidate.
 - Registration owns one deterministic seven-day default direct-message lease;
-  daemon restart restores it only while the registered tmux session still
+  daemon restart restores it only while the registered App Server thread still
   matches the peer identity. A shorter explicit lease cannot suppress it.
-- AppServer is preferred for live notification when server self-check passes;
-  tmux is an optional adapter and carries one bounded preview only when the
-  server selects and proves it.
+- App Server is the only registered notification transport.
 - Server state, journal, and mailbox are durable truth; a failed wake cannot
   roll back state or fabricate success.
 - The runtime is part of the worker identity boundary, not a task preference.
@@ -538,7 +496,7 @@ tokens, mixed runtime writes, and guessing pane identity are deprecated.
 - `collab init` and peer registration never create a master. A master exists
   only when a registered peer has a live server-verified transport and was assigned by
   user-approved self-promotion or live-master delegation. A recorded identity
-  with a dead pane is not a live master.
+  with a dead App Server thread is not a live master.
 - If a live master exists, other peers cannot promote; only that master may
   `collab master delegate <peer>`. If no live master exists, a peer may
   `collab master promote --approval "<user text>"` itself after explicit user
@@ -610,14 +568,15 @@ delegation and interactive task recognition are intentionally deferred.
 On a notification, use its id and abbreviated subject to weigh urgency against
 the current task. Query durable state before acting when the notice is relevant.
 `collab sendmessage` requires `--subject` and accepts only explicit coordination
-or asynchronous-result notices. Never type peer messages with tmux. After the
+or asynchronous-result notices. Never type peer messages into a terminal. After the
 receiving Agent registers a finite subscription, the daemon may send one id,
-abbreviated subject, safe one-line original body preview, and final submit key
-as one submit. Codex uses `paste-buffer -p` plus `C-m` in one tmux queue. The direct-message lease is reusable until expiry;
+abbreviated subject, safe one-line original body preview, and final submit as
+one App Server queue operation. The direct-message lease is reusable until expiry;
 resource, deadline, and async-result subscriptions remain one-shot.
 
 `collab inbox` and `collab msg <id>` query the durable local mailbox after a
-tmux pane disappears; mailbox state remains authoritative.
+registered App Server thread becomes unavailable; mailbox state remains
+authoritative.
 
 ## Notifications and waits
 
@@ -625,7 +584,7 @@ There is no periodic continuation. Agent-owned subscriptions are exact-event,
 exact-subject, and finite. Direct-message delivery is serialized and reusable
 until expiry; other subscriptions are one-shot. No registration, absent,
 unknown, working, expired, cancelled, consumed, or exhausted message produces
-tmux input. Every wait stores waiter, blocking task owner, reason, deadline,
+App Server input. Every wait stores waiter, blocking task owner, reason, deadline,
 resume events, and P2P escalation. Timeout changes state without unsolicited
 messages; resource release notifies only an exact active subscriber.
 "#;
@@ -708,32 +667,6 @@ mod tests {
     }
 
     #[test]
-    fn tmux_pane_cwd_is_the_exact_project_root() {
-        let process_cwd = test_root("process-cwd");
-        let pane_cwd = test_root("pane-cwd");
-        std::fs::create_dir_all(&process_cwd).unwrap();
-        std::fs::create_dir_all(&pane_cwd).unwrap();
-
-        let resolved = project_root_from(Some("%7"), process_cwd.clone(), |pane| {
-            assert_eq!(pane, "%7");
-            Ok(pane_cwd.clone())
-        })
-        .unwrap();
-        assert_eq!(resolved, pane_cwd);
-
-        std::fs::remove_dir_all(process_cwd).ok();
-        std::fs::remove_dir_all(resolved).ok();
-    }
-
-    #[test]
-    fn non_tmux_operator_uses_exact_process_cwd() {
-        let cwd = test_root("operator-cwd");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let resolved = project_root_from(None, cwd.clone(), |_| unreachable!()).unwrap();
-        assert_eq!(resolved, cwd);
-        std::fs::remove_dir_all(resolved).ok();
-    }
-
     #[test]
     fn init_scope_uses_unmarked_process_cwd() {
         let cwd = test_root("init-unmarked-cwd");
@@ -766,21 +699,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(parent).ok();
-    }
-
-    #[test]
-    fn invalid_tmux_pane_or_path_fails_closed() {
-        let cwd = test_root("invalid-pane");
-        std::fs::create_dir_all(&cwd).unwrap();
-        assert!(project_root_from(Some("pane-7"), cwd.clone(), |_| Ok(cwd.clone())).is_err());
-        assert!(
-            project_root_from(Some("%7"), cwd.clone(), |_| { Ok(cwd.join("missing")) }).is_err()
-        );
-        assert!(project_root_from(Some("%7"), cwd.clone(), |_| {
-            anyhow::bail!("tmux lookup failed")
-        })
-        .is_err());
-        std::fs::remove_dir_all(cwd).ok();
     }
 
     #[test]
@@ -870,20 +788,6 @@ mod tests {
         assert!(route.project_scope_id.as_str().len() > 256);
         route.validate_registered_cwd(&root).unwrap();
         std::fs::remove_dir_all(base).ok();
-    }
-
-    #[test]
-    fn sandboxed_tmux_lookup_falls_back_to_initialized_cwd() {
-        let cwd = test_root("sandbox-cwd");
-        init(&cwd).unwrap();
-        let resolved = match project_root_from(Some("%743"), cwd.clone(), |_| {
-            anyhow::bail!("cannot resolve project root for tmux pane %743")
-        }) {
-            Ok(root) => root,
-            Err(_) => inherited_cwd_if_initialized(cwd.clone()).unwrap(),
-        };
-        assert_eq!(resolved, cwd);
-        std::fs::remove_dir_all(cwd).ok();
     }
 
     #[test]

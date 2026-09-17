@@ -83,62 +83,39 @@ fn validate_registration_transport(
     transport: &SelectedTransport,
     runtime: &RuntimeIdentity,
 ) -> anyhow::Result<()> {
-    match transport.kind {
-        TransportKind::AppServer => {
-            let endpoint = transport
-                .endpoint
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("selected App Server transport has no endpoint"))?;
-            let namespace = transport
-                .namespace
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("selected App Server transport has no namespace"))?;
-            let thread_id = transport
-                .thread_id
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("selected App Server transport has no thread_id"))?;
-            if transport.pane.is_some() {
-                anyhow::bail!("selected App Server transport unexpectedly carries a tmux pane");
-            }
-            if runtime
-                .native_thread_id
-                .as_ref()
-                .map(NativeThreadId::as_str)
-                != Some(thread_id)
-            {
-                anyhow::bail!(
-                    "selected App Server thread_id does not match typed binding native_thread_id"
-                );
-            }
-            if !matches!(namespace, "codex_tui" | "codex_app") {
-                anyhow::bail!(
-                    "selected App Server transport has unsupported namespace {namespace}"
-                );
-            }
-            if !endpoint.starts_with("unix://") {
-                anyhow::bail!("selected App Server transport endpoint is not unix://");
-            }
-        }
-        TransportKind::Tmux => {
-            let pane = transport
-                .pane
-                .as_deref()
-                .filter(|value| value.starts_with('%'))
-                .ok_or_else(|| anyhow::anyhow!("selected tmux transport has no live pane"))?;
-            if transport.endpoint.is_some()
-                || transport.namespace.is_some()
-                || transport.thread_id.is_some()
-            {
-                anyhow::bail!("selected tmux transport carries App Server fields");
-            }
-            if runtime.native_thread_id.is_some() {
-                anyhow::bail!("selected tmux transport unexpectedly carries a native thread");
-            }
-            let _ = pane;
-        }
+    if transport.kind != TransportKind::AppServer {
+        anyhow::bail!("only the App Server transport is supported");
+    }
+    let endpoint = transport
+        .endpoint
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("selected App Server transport has no endpoint"))?;
+    let namespace = transport
+        .namespace
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("selected App Server transport has no namespace"))?;
+    let thread_id = transport
+        .thread_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("selected App Server transport has no thread_id"))?;
+    if runtime
+        .native_thread_id
+        .as_ref()
+        .map(NativeThreadId::as_str)
+        != Some(thread_id)
+    {
+        anyhow::bail!(
+            "selected App Server thread_id does not match typed binding native_thread_id"
+        );
+    }
+    if !matches!(namespace, "codex_tui" | "codex_app") {
+        anyhow::bail!("selected App Server transport has unsupported namespace {namespace}");
+    }
+    if !endpoint.starts_with("unix://") {
+        anyhow::bail!("selected App Server transport endpoint is not unix://");
     }
     if transport.self_check.trim().is_empty() {
         anyhow::bail!("selected transport is missing its server self-check");
@@ -370,9 +347,6 @@ pub fn validate_binding(
 pub struct Identity {
     pub worker_id: String,
     pub token: String,
-    pub pane: Option<String>,
-    #[serde(default)]
-    pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -394,23 +368,6 @@ fn identity_path(scope: &Scope, worker_id: &str) -> PathBuf {
         .join("identity.json")
 }
 
-fn pane_identity_path(scope: &Scope, pane: &str) -> PathBuf {
-    scope
-        .root
-        .join(".agent-collab")
-        .join("panes")
-        .join(format!("{}.json", pane_file_name(pane)))
-}
-
-fn session_identity_path(scope: &Scope, session: &str) -> PathBuf {
-    scope
-        .root
-        .join(".agent-collab")
-        .join("runs")
-        .join("by-pane")
-        .join(format!("tmux-{}.json", pane_file_name(session)))
-}
-
 fn write_identity(path: &std::path::Path, ident: &Identity) -> anyhow::Result<()> {
     let dir = path.parent().unwrap();
     std::fs::create_dir_all(dir)?;
@@ -422,29 +379,7 @@ fn write_identity(path: &std::path::Path, ident: &Identity) -> anyhow::Result<()
 
 fn persist_identity(scope: &Scope, ident: &Identity) -> anyhow::Result<()> {
     write_identity(&identity_path(scope, &ident.worker_id), ident)?;
-    if let Some(session) = ident.session.as_deref() {
-        write_identity(&session_identity_path(scope, session), ident)?;
-    }
-    if let Some(pane) = ident.pane.as_deref() {
-        write_identity(&pane_identity_path(scope, pane), ident)?;
-    }
     Ok(())
-}
-
-/// Update the live endpoint from an explicit pane/session binding.  A changed
-/// endpoint is a new runtime registration boundary; the old typed binding must
-/// not be reused for a later command envelope.
-fn refresh_endpoint(ident: &mut Identity, pane: &str, session: Option<&str>) -> bool {
-    let changed = ident.pane.as_deref() != Some(pane)
-        || session.is_some_and(|session| ident.session.as_deref() != Some(session));
-    ident.pane = Some(pane.to_owned());
-    if let Some(session) = session {
-        ident.session = Some(session.to_owned());
-    }
-    if changed {
-        ident.runtime = None;
-    }
-    changed
 }
 
 /// Persist a runtime binding recovered from a successful typed registration.
@@ -494,90 +429,22 @@ fn read_identity(path: &std::path::Path) -> anyhow::Result<Option<Identity>> {
     Ok(Some(serde_json::from_str(&std::fs::read_to_string(path)?)?))
 }
 
-fn pane_file_name(pane: &str) -> String {
-    pane.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn tmux_session(pane: &str) -> Option<String> {
-    let output = std::process::Command::new("tmux")
-        .args(["display-message", "-p", "-t", pane, "#S"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let session = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!session.is_empty()).then_some(session)
-}
-
-/// Parent/daemon binds a live child pane so the agent does not self-register.
-pub fn provision(
-    scope: &Scope,
-    worker_id: &str,
-    pane: &str,
-    session: &str,
-) -> anyhow::Result<Identity> {
-    if !pane.starts_with('%') {
-        anyhow::bail!("collab identity requires a live tmux pane");
-    }
-    if worker_id.is_empty() || session.is_empty() {
-        anyhow::bail!("collab identity requires a session name");
-    }
-    let mut ident = read_identity(&identity_path(scope, worker_id))?.unwrap_or_else(|| Identity {
-        worker_id: worker_id.into(),
-        token: hex(16),
-        pane: Some(pane.into()),
-        session: Some(session.into()),
-        runtime: None,
-        transport: None,
-    });
-    refresh_endpoint(&mut ident, pane, Some(session));
-    persist_identity(scope, &ident)?;
-    Ok(ident)
-}
-
-/// Load or create one tmux-session identity. Commands outside tmux fail before
-/// writing a run identity, so diagnostics cannot accidentally declare a peer.
-/// A parent-provisioned pane binding is enough; tmux lookup is not required.
+/// Load or create one Codex thread identity.
 pub fn load_or_create(
     scope: &Scope,
     worker_id: Option<String>,
-    pane_override: Option<String>,
+    _endpoint_override: Option<String>,
 ) -> anyhow::Result<Identity> {
-    let pane_override_explicit = pane_override.is_some();
-    let pane = pane_override.or_else(|| std::env::var("TMUX_PANE").ok());
-    load_or_create_resolved(scope, worker_id, pane, pane_override_explicit)
+    let _ = _endpoint_override;
+    load_or_create_resolved(scope, worker_id)
 }
 
 /// Load or create the identity used by `collab init`. Initialization binds to
-/// the process cwd and never depends on tmux: an advertised pane is only
-/// offered as a capability candidate when it is actually live. The server
-/// remains the sole owner of channel assignment, so init always re-registers
-/// instead of reusing a persisted binding.
+/// the process cwd and the Codex thread. The server remains the sole owner of
+/// channel assignment, so init always re-registers instead of reusing a
+/// persisted binding.
 pub fn load_or_create_for_init(scope: &Scope) -> anyhow::Result<Identity> {
-    load_or_create_for_init_with(scope, std::env::var("TMUX_PANE").ok(), |pane| {
-        tmux_session(pane).is_some()
-    })
-}
-
-fn load_or_create_for_init_with<F>(
-    scope: &Scope,
-    tmux_pane: Option<String>,
-    pane_is_live: F,
-) -> anyhow::Result<Identity>
-where
-    F: FnOnce(&str) -> bool,
-{
-    let live_pane = init_pane_candidate(tmux_pane, pane_is_live);
-    let mut ident = load_or_create_resolved(scope, None, live_pane, false)?;
+    let mut ident = load_or_create_resolved(scope, None)?;
     if ident.runtime.is_some() || ident.transport.is_some() {
         // A persisted binding may describe a channel the server has not
         // re-admitted in this environment. Preserve the worker identity and
@@ -590,24 +457,7 @@ where
     Ok(ident)
 }
 
-/// A pane is a candidate only when it is advertised and resolves live. A
-/// stale or missing pane is ignored rather than blocking initialization.
-/// App Server priority is enforced by the server, which owns channel
-/// assignment, so the worker still offers every candidate it can verify.
-fn init_pane_candidate<F>(tmux_pane: Option<String>, pane_is_live: F) -> Option<String>
-where
-    F: FnOnce(&str) -> bool,
-{
-    let pane = tmux_pane.filter(|pane| pane.starts_with('%'))?;
-    pane_is_live(&pane).then_some(pane)
-}
-
-fn load_or_create_resolved(
-    scope: &Scope,
-    worker_id: Option<String>,
-    pane: Option<String>,
-    pane_override_explicit: bool,
-) -> anyhow::Result<Identity> {
+fn load_or_create_resolved(scope: &Scope, worker_id: Option<String>) -> anyhow::Result<Identity> {
     let requested = worker_id
         .or_else(|| std::env::var("COLLAB_WORKER").ok())
         .or_else(|| {
@@ -616,44 +466,8 @@ fn load_or_create_resolved(
                 .filter(|value| !value.trim().is_empty())
                 .map(|thread_id| format!("codex-{thread_id}"))
         });
-    if let Some(pane) = pane.filter(|pane| pane.starts_with('%')) {
-        if let Some(mut ident) = read_identity(&pane_identity_path(scope, &pane))? {
-            if refresh_endpoint(&mut ident, &pane, None) {
-                persist_identity(scope, &ident)?;
-            }
-            return Ok(ident);
-        }
-        if let Some(worker_id) = requested.clone() {
-            if let Some(mut ident) = read_identity(&identity_path(scope, &worker_id))? {
-                if refresh_endpoint(&mut ident, &pane, None) {
-                    persist_identity(scope, &ident)?;
-                }
-                return Ok(ident);
-            }
-        }
-        let session = tmux_session(&pane)
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve tmux session for pane {}", pane))?;
-        if let Some(mut ident) = read_identity(&session_identity_path(scope, &session))? {
-            refresh_endpoint(&mut ident, &pane, Some(&session));
-            persist_identity(scope, &ident)?;
-            return Ok(ident);
-        }
-        let ident = Identity {
-            worker_id: requested.unwrap_or_else(|| session.clone()),
-            token: hex(16),
-            pane: Some(pane),
-            session: Some(session),
-            runtime: None,
-            transport: None,
-        };
-        persist_identity(scope, &ident)?;
-        return Ok(ident);
-    }
-    if pane_override_explicit {
-        anyhow::bail!("collab identity requires a live tmux pane");
-    }
     let worker_id = requested.ok_or_else(|| {
-        anyhow::anyhow!("collab identity requires COLLAB_WORKER or CODEX_THREAD_ID outside tmux")
+        anyhow::anyhow!("collab identity requires CODEX_THREAD_ID or an explicit worker id")
     })?;
     if let Some(ident) = read_identity(&identity_path(scope, &worker_id))? {
         return Ok(ident);
@@ -661,8 +475,6 @@ fn load_or_create_resolved(
     let ident = Identity {
         worker_id,
         token: hex(16),
-        pane: None,
-        session: None,
         runtime: None,
         transport: None,
     };
@@ -675,7 +487,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_tmux_diagnostic_cannot_declare_identity() {
+    fn identity_requires_a_codex_thread_when_no_worker_is_given() {
         let root = std::env::temp_dir().join(format!(
             "collab-identity-{}-{}",
             std::process::id(),
@@ -686,7 +498,17 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join(".agent-collab/runs")).unwrap();
         let scope = Scope { root: root.clone() };
-        let result = load_or_create(&scope, None, Some("not-tmux".into()));
+        let previous_thread = std::env::var_os("CODEX_THREAD_ID");
+        let previous_worker = std::env::var_os("COLLAB_WORKER");
+        std::env::remove_var("CODEX_THREAD_ID");
+        std::env::remove_var("COLLAB_WORKER");
+        let result = load_or_create(&scope, None, None);
+        if let Some(value) = previous_thread {
+            std::env::set_var("CODEX_THREAD_ID", value);
+        }
+        if let Some(value) = previous_worker {
+            std::env::set_var("COLLAB_WORKER", value);
+        }
         assert!(result.is_err());
         assert_eq!(
             std::fs::read_dir(root.join(".agent-collab/runs"))
@@ -694,85 +516,6 @@ mod tests {
                 .count(),
             0
         );
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn provisioned_pane_identity_does_not_need_tmux() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-identity-provision-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
-        let scope = Scope { root: root.clone() };
-        let provisioned = provision(&scope, "child-peer", "%743", "child-peer").unwrap();
-        let loaded = load_or_create(&scope, None, Some("%743".into())).unwrap();
-        assert_eq!(loaded.worker_id, "child-peer");
-        assert_eq!(loaded.token, provisioned.token);
-        assert_eq!(loaded.pane.as_deref(), Some("%743"));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn endpoint_rebind_clears_runtime_and_updates_current_mirrors() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-identity-rebind-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
-        let scope = Scope { root: root.clone() };
-
-        let mut registered = provision(&scope, "agent-1", "%743", "session-1").unwrap();
-        let runtime = RuntimeIdentity {
-            native_thread_id: None,
-            ..runtime_identity(7, "binding-7")
-        };
-        persist_runtime(&scope, &mut registered, runtime.clone()).unwrap();
-
-        let same_endpoint =
-            load_or_create(&scope, Some("agent-1".into()), Some("%743".into())).unwrap();
-        assert_eq!(same_endpoint.runtime, Some(runtime));
-
-        let rebound = load_or_create(&scope, Some("agent-1".into()), Some("%744".into())).unwrap();
-        assert_eq!(rebound.pane.as_deref(), Some("%744"));
-        assert_eq!(rebound.session.as_deref(), Some("session-1"));
-        assert_eq!(rebound.runtime, None);
-
-        for path in [
-            identity_path(&scope, "agent-1"),
-            session_identity_path(&scope, "session-1"),
-            pane_identity_path(&scope, "%744"),
-        ] {
-            let mirror = read_identity(&path).unwrap().unwrap();
-            assert_eq!(mirror.worker_id, rebound.worker_id);
-            assert_eq!(mirror.token, rebound.token);
-            assert_eq!(mirror.pane, rebound.pane);
-            assert_eq!(mirror.session, rebound.session);
-            assert_eq!(mirror.runtime, None);
-        }
-
-        let mut session_rebound = rebound;
-        let session_runtime = runtime_identity(8, "binding-8");
-        persist_runtime(&scope, &mut session_rebound, session_runtime).unwrap();
-        let session_changed = provision(&scope, "agent-1", "%744", "session-2").unwrap();
-        assert_eq!(session_changed.runtime, None);
-        assert_eq!(session_changed.session.as_deref(), Some("session-2"));
-        assert_eq!(
-            read_identity(&session_identity_path(&scope, "session-2"))
-                .unwrap()
-                .unwrap()
-                .runtime,
-            None
-        );
-
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -869,45 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn registration_receipt_recovers_a_non_cli_app_scope() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-registration-tui-receipt-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let canonical_root = std::fs::canonicalize(&root).unwrap();
-        let receipt = serde_json::json!({
-            "typed": true,
-            "worker_id": "worker-1",
-            "transport_selected": {
-                "kind": "tmux",
-                "pane": "%1",
-                "capabilities": ["send_message"],
-                "self_check": "server verified"
-            },
-            "command": {
-                "cmd": "RegisterWorker",
-                "binding": {
-                    "project_scope": canonical_root.to_str().unwrap(),
-                    "app_scope_id": "tui-default",
-                    "agent_id": "worker-1",
-                    "runtime_id": "runtime-tui",
-                    "binding_id": "binding-tui",
-                    "endpoint_generation": 4
-                }
-            }
-        });
-
-        let runtime = runtime_from_registration_receipt(&receipt, "worker-1", &root).unwrap();
-        assert_eq!(runtime.appserver_id.as_str(), "tui-default");
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
     fn registration_receipt_rejects_missing_runtime_binding() {
         let root = std::env::temp_dir().join(format!(
             "collab-registration-missing-binding-{}-{}",
@@ -970,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn appserver_identity_can_be_created_without_tmux() {
+    fn appserver_identity_uses_codex_thread() {
         let root = std::env::temp_dir().join(format!(
             "collab-identity-appserver-{}-{}",
             std::process::id(),
@@ -981,10 +685,8 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
         let scope = Scope { root: root.clone() };
-        let identity =
-            load_or_create_resolved(&scope, Some("thread-worker".into()), None, false).unwrap();
+        let identity = load_or_create_resolved(&scope, Some("thread-worker".into())).unwrap();
         assert_eq!(identity.worker_id, "thread-worker");
-        assert_eq!(identity.pane, None);
         assert_eq!(identity.runtime, None);
         assert_eq!(identity.transport, None);
         std::fs::remove_dir_all(root).ok();
@@ -1002,56 +704,40 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
         let scope = Scope { root: root.clone() };
-        let mut ident = provision(&scope, "codex-thread-1", "%743", "session-1").unwrap();
+        let mut ident = load_or_create_resolved(&scope, Some("codex-thread-1".into())).unwrap();
         persist_registration(
             &scope,
             &mut ident,
-            RuntimeIdentity {
-                native_thread_id: None,
-                ..runtime_identity(4, "binding-tmux")
-            },
+            runtime_identity(4, "binding-appserver"),
             SelectedTransport {
-                kind: TransportKind::Tmux,
-                endpoint: None,
-                namespace: None,
-                thread_id: None,
-                pane: Some("%743".into()),
-                capabilities: vec!["send_message_to_thread".into()],
+                kind: TransportKind::AppServer,
+                endpoint: Some("unix:///tmp/codex.sock".into()),
+                namespace: Some("codex_tui".into()),
+                thread_id: Some("thread-1".into()),
+                capabilities: vec!["send_message".into()],
                 self_check: "ok".into(),
             },
         )
         .unwrap();
 
-        let resolved =
-            load_or_create_for_init_with(&scope, Some("%743".into()), |pane| pane == "%743")
-                .unwrap();
+        let previous_worker = std::env::var_os("COLLAB_WORKER");
+        let previous_thread = std::env::var_os("CODEX_THREAD_ID");
+        std::env::remove_var("CODEX_THREAD_ID");
+        std::env::set_var("COLLAB_WORKER", "codex-thread-1");
+        let resolved = load_or_create_for_init(&scope).unwrap();
         assert_eq!(resolved.worker_id, "codex-thread-1");
         assert_eq!(resolved.token, ident.token);
         assert_eq!(resolved.runtime, None);
         assert_eq!(resolved.transport, None);
+        match previous_worker {
+            Some(value) => std::env::set_var("COLLAB_WORKER", value),
+            None => std::env::remove_var("COLLAB_WORKER"),
+        }
+        match previous_thread {
+            Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
+            None => std::env::remove_var("CODEX_THREAD_ID"),
+        }
         std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn init_uses_a_live_tmux_pane() {
-        let selected = init_pane_candidate(Some("%7".into()), |pane| pane == "%7");
-        assert_eq!(selected.as_deref(), Some("%7"));
-    }
-
-    #[test]
-    fn init_ignores_a_stale_tmux_pane() {
-        let selected = init_pane_candidate(Some("%7".into()), |_| false);
-        assert_eq!(selected, None);
-    }
-
-    #[test]
-    fn init_offers_every_verifiable_candidate_to_the_server() {
-        // The worker offers every candidate it can verify; the server owns
-        // channel assignment and App Server priority. Suppressing the tmux
-        // candidate here would strand init when the advertised App Server is
-        // rejected by the server self-check.
-        let selected = init_pane_candidate(Some("%7".into()), |pane| pane == "%7");
-        assert_eq!(selected.as_deref(), Some("%7"));
     }
 
     #[test]
@@ -1069,25 +755,19 @@ mod tests {
         let mut identity = Identity {
             worker_id: "agent-1".into(),
             token: "token-1".into(),
-            pane: None,
-            session: None,
             runtime: None,
             transport: None,
         };
-        let runtime = RuntimeIdentity {
-            native_thread_id: None,
-            ..runtime_identity(7, "binding-7")
-        };
+        let runtime = runtime_identity(7, "binding-7");
         persist_registration(
             &scope,
             &mut identity,
             runtime.clone(),
             SelectedTransport {
-                kind: TransportKind::Tmux,
-                endpoint: None,
-                namespace: None,
-                thread_id: None,
-                pane: Some("%7".into()),
+                kind: TransportKind::AppServer,
+                endpoint: Some("unix:///tmp/codex.sock".into()),
+                namespace: Some("codex_tui".into()),
+                thread_id: Some("thread-1".into()),
                 capabilities: vec!["send_message".into()],
                 self_check: "server verified".into(),
             },
@@ -1096,7 +776,7 @@ mod tests {
         assert_eq!(identity.runtime, Some(runtime.clone()));
         assert_eq!(
             identity.transport.as_ref().unwrap().kind,
-            TransportKind::Tmux
+            TransportKind::AppServer
         );
         let persisted = read_identity(&identity_path(&scope, "agent-1"))
             .unwrap()

@@ -64,7 +64,7 @@ impl Default for Notifications {
             enabled: true,
             mode: "batch".into(),
             batch_window_seconds: 120,
-            transport: "tmux".into(),
+            transport: "appserver".into(),
             submit_enter: true,
             max_unacked: 3,
             events: BTreeMap::from([(
@@ -131,7 +131,7 @@ pub struct Subagent {
     pub profiles: BTreeMap<String, Profile>,
     pub health: Health,
     pub startup: Startup,
-    pub tmux: Tmux,
+    pub name_template: String,
 }
 impl Default for Subagent {
     fn default() -> Self {
@@ -158,7 +158,7 @@ impl Default for Subagent {
             ]),
             health: Health::default(),
             startup: Startup::default(),
-            tmux: Tmux::default(),
+            name_template: "{cwd_name}-subagent-{short_id}".into(),
         }
     }
 }
@@ -197,19 +197,6 @@ impl Default for Startup {
         }
     }
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Tmux {
-    pub name_template: String,
-}
-impl Default for Tmux {
-    fn default() -> Self {
-        Self {
-            name_template: "{cwd_name}-subagent-{short_id}".into(),
-        }
-    }
-}
-
 pub fn path() -> Result<PathBuf> {
     Ok(
         PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?)
@@ -228,6 +215,10 @@ pub fn ensure_written() -> Result<()> {
             Ok(())
         }
         Ok(text) => {
+            if let Some(updated) = remove_legacy_transport_keys(&text) {
+                std::fs::write(&path, updated)?;
+                return Ok(());
+            }
             if let Some(updated) = insert_subagent_runtime(&text) {
                 std::fs::write(&path, updated)?;
             }
@@ -235,6 +226,33 @@ pub fn ensure_written() -> Result<()> {
         }
         Err(e) => Err(e.into()),
     }
+}
+
+fn remove_legacy_transport_keys(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut changed = false;
+    let mut in_subagent_tmux = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_subagent_tmux = trimmed == "[subagent.tmux]";
+        }
+        if in_subagent_tmux {
+            changed = true;
+            continue;
+        }
+        if trimmed.starts_with("transport =") && trimmed.contains("tmux") {
+            changed = true;
+            out.push_str("transport = \"appserver\"\n");
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !text.ends_with('\n') {
+        out.pop();
+    }
+    changed.then_some(out)
 }
 
 fn insert_subagent_runtime(text: &str) -> Option<String> {
@@ -341,8 +359,8 @@ impl Config {
         {
             bail!("invalid notification mode/window");
         }
-        if n.transport != "tmux" || !n.submit_enter {
-            bail!("tmux with atomic Enter is the supported notification transport");
+        if n.transport != "appserver" || !n.submit_enter {
+            bail!("appserver with native submission is the supported notification transport");
         }
         for (event, policy) in &n.events {
             if ![
@@ -374,9 +392,9 @@ impl Config {
             bail!("health probe requires one attempt per profile and timeout 1..180s");
         }
         if !(1..=600).contains(&s.startup.ready_timeout_seconds)
-            || !s.tmux.name_template.contains("{short_id}")
+            || !s.name_template.contains("{short_id}")
         {
-            bail!("invalid startup timeout or tmux name template");
+            bail!("invalid startup timeout or subagent name template");
         }
         if s.runtime != "codex" {
             bail!("subagent.runtime must be codex");
