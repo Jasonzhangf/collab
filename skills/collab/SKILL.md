@@ -30,21 +30,24 @@ Use only the current globally installed `collab` and `collab-mcp`. The
 reviewed source and does not migrate, replay, or interpret older local
 versions.
 
-The canonical install entry is:
+The canonical install sequence from the reviewed source is:
 
 ```sh
-scripts/install-global-collab.sh
+cargo install --path . --force
+collab install-skills --target "$HOME/.agents/skills/collab" --force
 ```
 
-It builds the release, stages `collab` and `collab-mcp` together in a
-versioned managed directory, and switches one `current` symlink atomically.
-The canonical commands remain `collab` and `collab-mcp` beside the active
-`cargo`. It refreshes the embedded `collab` Skill and removes only legacy
-copies that identify themselves as one matching Collab version, such as
-`~/.local/bin/collab`, `~/.local/bin/collab-mcp`, and versioned copies under
-`~/.local/lib/collab/`. An unverified path collision fails explicitly and is
-preserved. It does not remove business source, Git history, `~/.collab/`,
-project-local `.agent-collab/`, AppSDK state, run notes, or shared evidence.
+Cargo writes `collab` and `collab-mcp` beside the active `cargo`; the second
+command refreshes the embedded Skill from the new binary. The install does not
+remove business source, Git history, `~/.collab/`, project-local
+`.agent-collab/`, AppSDK state, run notes, or shared evidence.
+
+Legacy user-local copies are not removed automatically by this sequence.
+If an exact old copy must be retired, first prove it is Collab by running its
+own `--version` (and for MCP, its `initialize` response), then remove only the
+verified pair. A path that cannot prove that identity is a collision: preserve
+it and report the exact path. Never delete `~/.local/bin/collab*` or
+`~/.local/lib/collab/*` merely because the pathname matches.
 
 Installing a new binary does not replace a running daemon. The global daemon
 may be serving other projects, so do not run `collab down` or `collab up`
@@ -64,8 +67,9 @@ command -v collab-mcp
 collab status --all
 ```
 
-If the version or command path is stale after installation, run the installer
-once and refresh the shell command cache (`rehash` in zsh, `hash -r` in bash).
+If the version or command path is stale after installation, rerun the two
+install commands once and refresh the shell command cache (`rehash` in zsh,
+`hash -r` in bash).
 Do not hand-copy binaries, leave a second managed entry, or select an older
 binary as a fallback.
 

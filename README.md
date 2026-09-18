@@ -33,24 +33,23 @@ one maintenance action.
 
 ## Install
 
-Use the single repository installation entry:
+Build from the reviewed current source, install both binaries with Cargo, then
+refresh the embedded Skill:
 
 ```sh
-scripts/install-global-collab.sh
+cargo install --path . --force
+collab install-skills --target "$HOME/.agents/skills/collab" --force
 command -v collab
 command -v collab-mcp
 collab --version
 ```
 
-It builds the current release, stages `collab` and `collab-mcp` together in a
-versioned directory, and switches one managed `current` symlink atomically.
-The canonical commands remain `collab` and `collab-mcp` beside the active
-`cargo`. It refreshes the embedded `collab` Skill and removes only verified
-legacy Collab copies; unverified path collisions fail explicitly. It does not
-restart the global daemon or touch `~/.collab/`, project-local
-`.agent-collab/`, AppSDK state, business source, or evidence. An existing
-daemon may keep running the old binary until an explicitly authorized
-maintenance window.
+This writes the canonical `collab` and `collab-mcp` beside the active Cargo
+bin directory and refreshes the globally discovered Skill. It does not remove
+legacy copies, restart the global daemon, or touch `~/.collab/`,
+project-local `.agent-collab/`, AppSDK state, business source, or evidence.
+An existing daemon may keep running the old binary until an explicitly
+authorized maintenance window.
 
 ## Start and identity
 
@@ -239,7 +238,7 @@ mailbox, copy tokens, start a second daemon, or invent an owner. Use:
 collab migrate inspect
 → collab migrate plan
 → collab migrate apply          # admission freeze + deterministic snapshot
-→ scripts/install-global-collab.sh
+→ cargo install --path . --force
 → collab down
 → collab up
 → collab worker recover         # each live App Server peer

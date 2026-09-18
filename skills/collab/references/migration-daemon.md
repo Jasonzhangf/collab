@@ -29,18 +29,19 @@ history merely to make initialization look clean.
 
 ## Version upgrade and local installation cleanup
 
-Use the repository's single install entry from the reviewed current source:
+Use the repository's install sequence from the reviewed current source:
 
 ```sh
-scripts/install-global-collab.sh
+cargo install --path . --force
+collab install-skills --target "$HOME/.agents/skills/collab" --force
 ```
 
-The installer builds and verifies the release, stages `collab` and
-`collab-mcp` as one versioned pair, atomically switches one `current` symlink,
-refreshes the embedded Skill, and removes only legacy copies whose binary
-identity proves they are matching Collab artifacts. Unverified path collisions
-fail explicitly and remain untouched. It never removes `~/.collab/`, a
-project's `.agent-collab/`, AppSDK state, business source, or evidence.
+Cargo installs the verified release binaries and the second command refreshes
+the embedded Skill. The sequence never removes `~/.collab/`, a project's
+`.agent-collab/`, AppSDK state, business source, or evidence. Legacy
+user-local copies are not removed automatically: first prove an exact copy is
+Collab from its own version response, then remove only that verified pair.
+Unverified path collisions remain untouched and must be reported.
 
 The global daemon can be shared by multiple projects. A binary upgrade alone
 does not authorize stopping or restarting it. Keep the existing daemon running
@@ -54,7 +55,7 @@ fallback.
 
 ```text
 inspect -> plan -> admission freeze -> snapshot
-        -> install reviewed binary with scripts/install-global-collab.sh
+        -> install reviewed binaries with cargo install
         -> controlled daemon restart
         -> identity rebind -> verify -> resume
 ```
