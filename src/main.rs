@@ -523,15 +523,25 @@ fn cli_project_context(root: &std::path::Path) -> anyhow::Result<ProjectContext>
     )
 }
 
-fn unregistered_context() -> anyhow::Result<serde_json::Value> {
+fn unregistered_context(
+    scope: Option<&Scope>,
+    identity: Option<&Identity>,
+) -> anyhow::Result<serde_json::Value> {
     let cwd = std::env::current_dir()?;
-    let project_root = std::fs::canonicalize(&cwd)?;
+    let project_root = match scope {
+        Some(scope) => scope.root.clone(),
+        None => std::fs::canonicalize(&cwd)?,
+    };
     Ok(json!({
         "registered": false,
         "project_root": project_root,
         "cwd": cwd,
+        "identity": identity.map(|identity| json!({
+            "worker_id": identity.worker_id,
+            "thread_id": identity.runtime.as_ref().and_then(|runtime| runtime.native_thread_id.as_ref()),
+        })),
         "next_action": "appsdk init .",
-        "truth": "exact process cwd; no project-local Collab state was read or created",
+        "truth": "exact process cwd; context is read-only",
     }))
 }
 
@@ -1056,12 +1066,20 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Context { worker } => {
-            if !std::env::current_dir()?.join(".agent-collab").is_dir() {
-                out(&unregistered_context()?);
+            let cwd = std::env::current_dir()?;
+            if !cwd.join(".agent-collab").is_dir() {
+                out(&unregistered_context(None, None)?);
                 return Ok(());
             }
             let scope = Scope::resolve()?;
-            let ident = me(&scope, worker)?;
+            let Some(ident) = identity::load_existing(&scope, worker)? else {
+                out(&unregistered_context(Some(&scope), None)?);
+                return Ok(());
+            };
+            if ident.runtime.is_none() || ident.transport.is_none() {
+                out(&unregistered_context(Some(&scope), Some(&ident))?);
+                return Ok(());
+            }
             let v: serde_json::Value = call_project(
                 &scope,
                 &ident,
@@ -1354,7 +1372,7 @@ mod tests {
         let root = test_root("unregistered-context");
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(&root).unwrap();
-        let result = unregistered_context();
+        let result = unregistered_context(None, None);
         std::env::set_current_dir(previous).unwrap();
 
         let context = result.unwrap();

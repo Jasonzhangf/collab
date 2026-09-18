@@ -3,6 +3,7 @@ use crate::scope::Scope;
 use anyhow::Context;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -429,6 +430,36 @@ fn read_identity(path: &std::path::Path) -> anyhow::Result<Option<Identity>> {
     Ok(Some(serde_json::from_str(&std::fs::read_to_string(path)?)?))
 }
 
+fn identities_by_native_thread(
+    scope: &Scope,
+    native_thread_id: &str,
+) -> anyhow::Result<Vec<Identity>> {
+    let runs = scope.root.join(".agent-collab").join("runs");
+    if !runs.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut identities = BTreeMap::new();
+    for entry in std::fs::read_dir(runs)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(identity) = read_identity(&entry.path().join("identity.json"))? {
+            identities.insert(identity.worker_id.clone(), identity);
+        }
+    }
+    Ok(identities
+        .into_values()
+        .filter(|identity| {
+            identity
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.native_thread_id.as_ref())
+                .is_some_and(|thread_id| thread_id.as_str() == native_thread_id)
+        })
+        .collect())
+}
+
 /// Load or create one Codex thread identity.
 pub fn load_or_create(
     scope: &Scope,
@@ -437,6 +468,49 @@ pub fn load_or_create(
 ) -> anyhow::Result<Identity> {
     let _ = _endpoint_override;
     load_or_create_resolved(scope, worker_id)
+}
+
+/// Load the identity selected by the current worker/thread without creating or
+/// mutating any identity state. Read-only commands use this before deciding
+/// whether the caller is registered.
+pub fn load_existing(scope: &Scope, worker_id: Option<String>) -> anyhow::Result<Option<Identity>> {
+    let thread_id = std::env::var("CODEX_THREAD_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let explicit_worker = worker_id.or_else(|| {
+        std::env::var("COLLAB_WORKER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let requested = explicit_worker.or_else(|| {
+        thread_id
+            .as_ref()
+            .map(|thread_id| format!("codex-{thread_id}"))
+    });
+    let Some(worker_id) = requested else {
+        return Ok(None);
+    };
+    if let Some(identity) = read_identity(&identity_path(scope, &worker_id))? {
+        return Ok(Some(identity));
+    }
+    if std::env::var("COLLAB_WORKER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let Some(thread_id) = thread_id else {
+        return Ok(None);
+    };
+    let mut matches = identities_by_native_thread(scope, &thread_id)?;
+    match matches.len() {
+        1 => Ok(Some(matches.remove(0))),
+        0 => Ok(None),
+        count => anyhow::bail!(
+            "multiple persisted Collab identities are bound to App Server thread {thread_id}: {count}"
+        ),
+    }
 }
 
 /// Load or create the identity used by `collab init`. Initialization binds to
