@@ -35,11 +35,12 @@ Use the repository's single install entry from the reviewed current source:
 scripts/install-global-collab.sh
 ```
 
-The installer builds and verifies the release, atomically replaces the
-canonical `collab` and `collab-mcp` binaries, refreshes the embedded Skill, and
-removes only exact Collab-managed legacy copies under the user's local install
-roots. It never removes `~/.collab/`, a project's `.agent-collab/`, AppSDK
-state, business source, or evidence.
+The installer builds and verifies the release, stages `collab` and
+`collab-mcp` as one versioned pair, atomically switches one `current` symlink,
+refreshes the embedded Skill, and removes only legacy copies whose binary
+identity proves they are matching Collab artifacts. Unverified path collisions
+fail explicitly and remain untouched. It never removes `~/.collab/`, a
+project's `.agent-collab/`, AppSDK state, business source, or evidence.
 
 The global daemon can be shared by multiple projects. A binary upgrade alone
 does not authorize stopping or restarting it. Keep the existing daemon running

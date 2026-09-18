@@ -42,12 +42,15 @@ command -v collab-mcp
 collab --version
 ```
 
-It builds the current release, atomically installs the canonical binaries,
-refreshes the embedded `collab` Skill, and removes only exact Collab-managed
-legacy local copies. It does not restart the global daemon or touch
-`~/.collab/`, project-local `.agent-collab/`, AppSDK state, business source, or
-evidence. An existing daemon may keep running the old binary until an
-explicitly authorized maintenance window.
+It builds the current release, stages `collab` and `collab-mcp` together in a
+versioned directory, and switches one managed `current` symlink atomically.
+The canonical commands remain `collab` and `collab-mcp` beside the active
+`cargo`. It refreshes the embedded `collab` Skill and removes only verified
+legacy Collab copies; unverified path collisions fail explicitly. It does not
+restart the global daemon or touch `~/.collab/`, project-local
+`.agent-collab/`, AppSDK state, business source, or evidence. An existing
+daemon may keep running the old binary until an explicitly authorized
+maintenance window.
 
 ## Start and identity
 

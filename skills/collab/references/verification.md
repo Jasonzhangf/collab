@@ -4,12 +4,13 @@ Read this for Collab source changes, release, install, restart, or protocol
 verification—not ordinary command use.
 
 For a version bump, verify the current source version, release build version,
-installed binary version, canonical command paths, and refreshed embedded
-Skill. Remove only exact Collab-managed legacy local copies, then validate the
-new baseline only: do not migrate or replay old local control-plane history.
-Installing a binary does not restart the global daemon. A daemon restart is a
-separate, explicitly authorized maintenance operation with PID/socket,
-identity, journal/mailbox, and live-replay evidence.
+installed binary pair version, canonical command paths, managed `current`
+target, and refreshed embedded Skill byte-for-byte. Remove only legacy copies
+whose binary identity proves they are matching Collab artifacts, then validate
+the new baseline only: do not migrate or replay old local control-plane
+history. Installing a binary does not restart the global daemon. A daemon
+restart is a separate, explicitly authorized maintenance operation with
+PID/socket, identity, journal/mailbox, and live-replay evidence.
 
 Before review, prove the affected subset and every changed invariant:
 

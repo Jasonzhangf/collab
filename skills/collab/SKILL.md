@@ -36,12 +36,15 @@ The canonical install entry is:
 scripts/install-global-collab.sh
 ```
 
-It builds the release, atomically replaces `collab` and `collab-mcp` beside
-the active `cargo`, refreshes the embedded `collab` Skill, and removes only
-exact Collab-managed legacy copies such as `~/.local/bin/collab`,
-`~/.local/bin/collab-mcp`, and versioned copies under `~/.local/lib/collab/`.
-It does not remove business source, Git history, `~/.collab/`, project-local
-`.agent-collab/`, AppSDK state, run notes, or shared evidence.
+It builds the release, stages `collab` and `collab-mcp` together in a
+versioned managed directory, and switches one `current` symlink atomically.
+The canonical commands remain `collab` and `collab-mcp` beside the active
+`cargo`. It refreshes the embedded `collab` Skill and removes only legacy
+copies that identify themselves as one matching Collab version, such as
+`~/.local/bin/collab`, `~/.local/bin/collab-mcp`, and versioned copies under
+`~/.local/lib/collab/`. An unverified path collision fails explicitly and is
+preserved. It does not remove business source, Git history, `~/.collab/`,
+project-local `.agent-collab/`, AppSDK state, run notes, or shared evidence.
 
 Installing a new binary does not replace a running daemon. The global daemon
 may be serving other projects, so do not run `collab down` or `collab up`
