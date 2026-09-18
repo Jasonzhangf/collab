@@ -33,11 +33,21 @@ one maintenance action.
 
 ## Install
 
+Use the single repository installation entry:
+
 ```sh
-cargo install --path . --force
+scripts/install-global-collab.sh
 command -v collab
 command -v collab-mcp
+collab --version
 ```
+
+It builds the current release, atomically installs the canonical binaries,
+refreshes the embedded `collab` Skill, and removes only exact Collab-managed
+legacy local copies. It does not restart the global daemon or touch
+`~/.collab/`, project-local `.agent-collab/`, AppSDK state, business source, or
+evidence. An existing daemon may keep running the old binary until an
+explicitly authorized maintenance window.
 
 ## Start and identity
 
@@ -226,7 +236,7 @@ mailbox, copy tokens, start a second daemon, or invent an owner. Use:
 collab migrate inspect
 → collab migrate plan
 → collab migrate apply          # admission freeze + deterministic snapshot
-→ cargo install reviewed binary
+→ scripts/install-global-collab.sh
 → collab down
 → collab up
 → collab worker recover         # each live App Server peer

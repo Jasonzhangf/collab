@@ -43,6 +43,12 @@ Do not `cp`, `grep`, `mv`, truncate, or edit `routes.jsonl`; that bypasses the
 owner and destroys route provenance. If existing `.agent-collab/` state must be
 preserved, use migration instead of reset.
 
+An ordinary version upgrade is not a reset. Install the current reviewed
+binary and refresh the embedded Skill; leave `~/.collab/` and the running
+daemon untouched. If the running daemon must load the new binary, use a
+separately authorized maintenance window and follow the controlled lifecycle
+in [migration-daemon.md](migration-daemon.md).
+
 ## Project-local durable state
 
 Each registered project root has its own `.agent-collab/`:
@@ -58,6 +64,10 @@ Each registered project root has its own `.agent-collab/`:
 `.agent-collab/` is project-local durable state, not the host-wide truth.
 AppSDK reset must never delete it. Use `collab migrate` or the explicit reset
 lifecycle rather than deleting files by hand.
+
+For a new project, initialize from the current global version and do not copy
+or replay old project-local control files. An old local directory is ignored
+unless the operator explicitly chooses the owner's migration or reset route.
 
 ## Identity and role
 
