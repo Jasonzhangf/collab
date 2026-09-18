@@ -2000,6 +2000,42 @@ impl ProjectRuntimeManager {
             storage_root,
             "HOST_ROUTE_DURABILITY_FAILED",
         )?;
+        self.append_route_record_validated(context, &storage_root, false)
+    }
+
+    fn append_resident_route_record(&self, context: &ProjectContext) -> Result<(), String> {
+        let project_root = Path::new(&context.canonical_root);
+        if !storage_roots_equal(project_root, &self.host_root)
+            .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?
+        {
+            return Err(
+                "HOST_ROUTE_DURABILITY_FAILED: resident route root does not match host root".into(),
+            );
+        }
+        let storage_root = storage_owner_path(&self.host.storage_root)
+            .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?;
+        self.append_route_record_validated(context, &storage_root, true)
+    }
+
+    fn append_route_record_validated(
+        &self,
+        context: &ProjectContext,
+        storage_root: &Path,
+        allow_resident_storage: bool,
+    ) -> Result<(), String> {
+        if allow_resident_storage {
+            let project_root = Path::new(&context.canonical_root);
+            let resident_root = storage_roots_equal(project_root, &self.host_root)
+                .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?;
+            let resident_storage = storage_roots_equal(storage_root, &self.host.storage_root)
+                .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?;
+            if !resident_root || !resident_storage {
+                return Err(
+                    "HOST_ROUTE_DURABILITY_FAILED: resident storage exception does not match host"
+                        .into(),
+                );
+            }
+        }
         let record = HostRouteRecord {
             version: 1,
             op: "register".into(),
@@ -2039,6 +2075,7 @@ impl ProjectRuntimeManager {
         if let Some(owner) = self
             .storage_owner(&storage_root, &existing_records)
             .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?
+            .filter(|_| !allow_resident_storage)
         {
             return Err(format!(
                 "HOST_ROUTE_DURABILITY_FAILED: runtime storage root {} is already owned by {}",
@@ -2322,6 +2359,9 @@ impl ProjectRuntimeManager {
         if context_root == self.host_root
             && !self.has_project_route(&context.project_scope.as_str())
         {
+            if let Err(error) = self.append_resident_route_record(&context) {
+                return (self.host.clone(), Resp::err(error));
+            }
             let response =
                 if let Err(error) = validate_request_context(&self.host, &req, Some(&context)) {
                     Resp::err(error)
@@ -2330,6 +2370,8 @@ impl ProjectRuntimeManager {
                 };
             if response.ok && is_register {
                 self.install_runtime(&key, self.host.clone(), None);
+            } else if !response.ok {
+                return (self.host.clone(), response);
             }
             return (self.host.clone(), response);
         }
@@ -10521,11 +10563,10 @@ mod host_route_registry_tests {
         let route_journal = host_paths.state_root().join("routes.jsonl");
         std::fs::create_dir_all(host_paths.state_root()).unwrap();
         std::fs::write(&route_journal, b"").unwrap();
-        let before_collision = std::fs::read(&route_journal).unwrap();
         let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
 
         // First establish the resident route. Its reducer owns the storage
-        // root even though that ownership is not represented in routes.jsonl.
+        // root and the canonical route is durably published.
         let resident_context = context_with_app(&host_root, "resident-app");
         let (_runtime, resident_response) = manager.dispatch_sync(
             Some(resident_context.clone()),
@@ -10537,6 +10578,14 @@ mod host_route_registry_tests {
             },
         );
         assert!(resident_response.ok, "{resident_response:?}");
+        let after_resident = std::fs::read(&route_journal).unwrap();
+        let resident_records = load_host_route_records(&route_journal).unwrap();
+        assert_eq!(resident_records.len(), 1);
+        assert_eq!(resident_records[0].app_scope_id, "resident-app");
+        assert_eq!(
+            resident_records[0].canonical_root,
+            host_root.canonicalize().unwrap().to_string_lossy()
+        );
 
         // A second project whose storage root equals the resident reducer's
         // root must fail before a route record or second reducer is created.
@@ -10558,7 +10607,7 @@ mod host_route_registry_tests {
                 .is_some_and(|error| error.contains("owned by resident host")),
             "{collision_response:?}"
         );
-        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+        assert_eq!(std::fs::read(&route_journal).unwrap(), after_resident);
         assert!(!manager
             .routes
             .lock()
@@ -10570,7 +10619,7 @@ mod host_route_registry_tests {
             manager.dispatch_sync(Some(resident_context), Req::StatusAll);
         assert!(status_response.ok, "{status_response:?}");
         assert_eq!(status_response.data["workers"][0]["id"], "resident-worker");
-        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+        assert_eq!(std::fs::read(&route_journal).unwrap(), after_resident);
 
         drop(manager);
         std::fs::remove_dir_all(host_root).unwrap();

@@ -583,6 +583,21 @@ lease. Do not run a second `collab init`,
 
 Only a standalone non-AppSDK project uses explicit `collab init`.
 
+## Worktree identity
+
+A Git worktree normally has no local `.agent-collab/`; that is not evidence
+that the peer is unregistered or that no live master exists. Run
+`collab context` from the worktree. The server resolves the canonical project
+route from the global Collab state by the same Codex sessionID/App Server
+thread, and the returned `project_root` is the canonical project root.
+
+Use `collab master status` for the authoritative live-master answer; `collab
+who` only lists registered peers. Do not run `appsdk init`, `collab init`,
+`collab worker recover`, or master promotion from a worktree, and do not
+report "no master" because `.agent-collab/` or a `who.master` field is absent.
+If route resolution fails, preserve the exact error and report it to the live
+master after resolving it from the canonical project root.
+
 ## Subscribe to a future event
 
 Use subscriptions only when this Agent wants a later event to wake it:

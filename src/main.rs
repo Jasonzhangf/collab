@@ -61,6 +61,7 @@ enum Cmd {
     /// Deprecated: declared roles were removed
     Role,
     /// List registered peers and their local activity projection
+    /// (does not report live master authority; use `collab master status`)
     Who,
     /// Inspect or explicitly assign collab master authority
     Master {
@@ -1096,11 +1097,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let local_scope = cwd
                 .join(".agent-collab")
                 .is_dir()
-                .then(|| Scope::resolve())
-                .transpose()?;
-            let identity_scope = local_scope
-                .clone()
-                .unwrap_or_else(|| Scope { root: cwd.clone() });
+                .then(|| Scope { root: cwd.clone() });
+            let identity_scope = Scope { root: cwd.clone() };
             let Some(ident) = identity::load_existing(&identity_scope, worker)? else {
                 out(&unregistered_context(local_scope.as_ref(), None)?);
                 return Ok(());
@@ -1109,22 +1107,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 out(&unregistered_context(local_scope.as_ref(), Some(&ident))?);
                 return Ok(());
             };
-            let scope = if let Some(scope) = local_scope {
-                scope
-            } else {
-                let route =
-                    scope::canonical_route_for_identity(&host_paths, &cwd, &runtime.appserver_id);
-                let route = match route {
-                    Ok(route) => route,
-                    Err(error) => {
-                        anyhow::bail!(
-                            "cannot resolve persisted Collab identity {} from cwd {}: {error}",
-                            ident.worker_id,
-                            cwd.display()
-                        );
-                    }
-                };
-                Scope { root: route.root }
+            let route =
+                scope::canonical_route_for_identity(&host_paths, &cwd, &runtime.appserver_id);
+            let scope = match route {
+                Ok(route) => Scope { root: route.root },
+                Err(error) => anyhow::bail!(
+                    "cannot resolve persisted Collab identity {} from cwd {}: {error}",
+                    ident.worker_id,
+                    cwd.display()
+                ),
             };
             if ident.transport.is_none() {
                 out(&unregistered_context(Some(&scope), Some(&ident))?);
@@ -1363,7 +1354,7 @@ mod tests {
 
     fn test_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "collab-main-{name}-{}-{}",
+            "cm-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1419,6 +1410,7 @@ mod tests {
 
     #[test]
     fn unregistered_context_is_read_only_and_points_to_appsdk_init() {
+        let _guard = crate::scope::TEST_ENV_LOCK.lock().unwrap();
         let root = test_root("unregistered-context");
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(&root).unwrap();
@@ -1442,6 +1434,7 @@ mod tests {
 
     #[test]
     fn ensure_registration_reuses_a_valid_runtime_without_rebinding() {
+        let _guard = crate::scope::TEST_ENV_LOCK.lock().unwrap();
         let root = test_root("registration-reuse");
         let state_root = root.join("global");
         std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
@@ -1477,6 +1470,7 @@ mod tests {
 
     #[test]
     fn ensure_registration_rebinds_a_thread_bound_to_another_project() {
+        let _guard = crate::scope::TEST_ENV_LOCK.lock().unwrap();
         let root = test_root("registration-rebind");
         let old_root = root.join("old-project");
         let new_root = root.join("new-project");

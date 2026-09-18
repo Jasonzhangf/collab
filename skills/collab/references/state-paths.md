@@ -85,7 +85,10 @@ unless the operator explicitly chooses the owner's migration or reset route.
 - Default role is `peer`; master is explicit and user-approved.
 - `collab context` is the single information endpoint for the current peer,
   binding, role, transport, liveness, tasks, and peers.
-- `collab who` and `collab status --all` are diagnostics, not setup steps.
+- `collab master status` is the authoritative live-master query.
+- `collab who` and `collab status --all` are peer diagnostics, not setup steps
+  and not a substitute for `collab master status`; `who` has no top-level
+  `master` field.
 
 ## Transport selection
 

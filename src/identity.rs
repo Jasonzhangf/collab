@@ -419,11 +419,21 @@ pub fn persist_registration(
     runtime: RuntimeIdentity,
     transport: SelectedTransport,
 ) -> anyhow::Result<()> {
+    persist_registration_at(&HostPaths::resolve()?, scope, ident, runtime, transport)
+}
+
+fn persist_registration_at(
+    host_paths: &HostPaths,
+    _scope: &Scope,
+    ident: &mut Identity,
+    runtime: RuntimeIdentity,
+    transport: SelectedTransport,
+) -> anyhow::Result<()> {
     validate_registration_transport(&transport, &runtime)?;
     let mut updated = ident.clone();
     updated.runtime = Some(runtime);
     updated.transport = Some(transport);
-    persist_identity(scope, &updated)?;
+    write_identity(&identity_path_at(host_paths, &updated.worker_id)?, &updated)?;
     *ident = updated;
     Ok(())
 }
@@ -436,11 +446,17 @@ fn read_identity(path: &std::path::Path) -> anyhow::Result<Option<Identity>> {
 }
 
 fn identities_by_native_thread(
-    scope: &Scope,
+    _scope: &Scope,
     native_thread_id: &str,
 ) -> anyhow::Result<Vec<Identity>> {
-    let _ = scope;
-    let identities_root = HostPaths::resolve()?.state_root().join("identities");
+    identities_by_native_thread_at(&HostPaths::resolve()?, native_thread_id)
+}
+
+fn identities_by_native_thread_at(
+    host_paths: &HostPaths,
+    native_thread_id: &str,
+) -> anyhow::Result<Vec<Identity>> {
+    let identities_root = host_paths.state_root().join("identities");
     if !identities_root.is_dir() {
         return Ok(Vec::new());
     }
@@ -480,6 +496,14 @@ pub fn load_or_create(
 /// mutating any identity state. Read-only commands use this before deciding
 /// whether the caller is registered.
 pub fn load_existing(scope: &Scope, worker_id: Option<String>) -> anyhow::Result<Option<Identity>> {
+    load_existing_at(&HostPaths::resolve()?, scope, worker_id)
+}
+
+pub(crate) fn load_existing_at(
+    host_paths: &HostPaths,
+    _scope: &Scope,
+    worker_id: Option<String>,
+) -> anyhow::Result<Option<Identity>> {
     let thread_id = std::env::var("CODEX_THREAD_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -497,7 +521,7 @@ pub fn load_existing(scope: &Scope, worker_id: Option<String>) -> anyhow::Result
     let Some(worker_id) = requested else {
         return Ok(None);
     };
-    if let Some(identity) = read_identity(&identity_path(scope, &worker_id)?)? {
+    if let Some(identity) = read_identity(&identity_path_at(host_paths, &worker_id)?)? {
         return Ok(Some(identity));
     }
     if selected_explicitly {
@@ -506,7 +530,7 @@ pub fn load_existing(scope: &Scope, worker_id: Option<String>) -> anyhow::Result
     let Some(thread_id) = thread_id else {
         return Ok(None);
     };
-    let mut matches = identities_by_native_thread(scope, &thread_id)?;
+    let mut matches = identities_by_native_thread_at(host_paths, &thread_id)?;
     match matches.len() {
         1 => Ok(Some(matches.remove(0))),
         0 => Ok(None),
@@ -522,10 +546,22 @@ pub fn load_existing(scope: &Scope, worker_id: Option<String>) -> anyhow::Result
 /// binding must be replaced; identity loading itself never clears a binding
 /// before the replacement is durably accepted.
 pub fn load_or_create_for_init(scope: &Scope) -> anyhow::Result<Identity> {
-    load_or_create_resolved(scope, None)
+    load_or_create_for_init_at(&HostPaths::resolve()?, scope)
+}
+
+fn load_or_create_for_init_at(host_paths: &HostPaths, scope: &Scope) -> anyhow::Result<Identity> {
+    load_or_create_resolved_at(host_paths, scope, None)
 }
 
 fn load_or_create_resolved(scope: &Scope, worker_id: Option<String>) -> anyhow::Result<Identity> {
+    load_or_create_resolved_at(&HostPaths::resolve()?, scope, worker_id)
+}
+
+fn load_or_create_resolved_at(
+    host_paths: &HostPaths,
+    _scope: &Scope,
+    worker_id: Option<String>,
+) -> anyhow::Result<Identity> {
     let thread_id = std::env::var("CODEX_THREAD_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -546,7 +582,7 @@ fn load_or_create_resolved(scope: &Scope, worker_id: Option<String>) -> anyhow::
         })?;
     if explicit_worker.is_none() {
         let thread_id = thread_id.as_deref().unwrap();
-        let mut matches = identities_by_native_thread(scope, thread_id)?;
+        let mut matches = identities_by_native_thread_at(host_paths, thread_id)?;
         match matches.len() {
             1 => return Ok(matches.remove(0)),
             0 => {}
@@ -555,7 +591,7 @@ fn load_or_create_resolved(scope: &Scope, worker_id: Option<String>) -> anyhow::
             ),
         }
     }
-    if let Some(ident) = read_identity(&identity_path(scope, &worker_id)?)? {
+    if let Some(ident) = read_identity(&identity_path_at(host_paths, &worker_id)?)? {
         return Ok(ident);
     }
     let ident = Identity {
@@ -564,7 +600,7 @@ fn load_or_create_resolved(scope: &Scope, worker_id: Option<String>) -> anyhow::
         runtime: None,
         transport: None,
     };
-    persist_identity(scope, &ident)?;
+    write_identity(&identity_path_at(host_paths, &ident.worker_id)?, &ident)?;
     Ok(ident)
 }
 
@@ -572,50 +608,54 @@ fn load_or_create_resolved(scope: &Scope, worker_id: Option<String>) -> anyhow::
 mod tests {
     use super::*;
 
-    fn test_scope(root: PathBuf, state_root: &Path) -> Scope {
-        std::env::set_var(crate::scope::COLLAB_STATE_DIR_ENV, state_root);
+    static ENV_LOCK: &std::sync::Mutex<()> = &crate::scope::TEST_ENV_LOCK;
+
+    fn test_scope(root: PathBuf) -> Scope {
         Scope { root }
     }
 
-    #[test]
-    fn identity_lives_in_the_global_state_root() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-identity-global-{}-{}",
+    fn test_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    #[test]
+    fn identity_lives_in_the_global_state_root() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = test_root("ci-global");
         let state_root = root.join("global");
         std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
-        let scope = test_scope(root.clone(), &state_root);
-        let identity = load_or_create_resolved(&scope, Some("thread-worker".into())).unwrap();
-        let path = identity_path(&scope, &identity.worker_id).unwrap();
+        let scope = test_scope(root.clone());
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let identity =
+            load_or_create_resolved_at(&host_paths, &scope, Some("thread-worker".into())).unwrap();
+        let path = identity_path_at(&host_paths, &identity.worker_id).unwrap();
         assert!(path.starts_with(state_root.join("identities")));
         assert!(!root
             .join(".agent-collab/runs")
             .join(&identity.worker_id)
             .exists());
-        std::env::remove_var(crate::scope::COLLAB_STATE_DIR_ENV);
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn identity_reuses_the_unique_persisted_binding_for_a_codex_thread() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-identity-reuse-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = test_root("ci-reuse");
         let state_root = root.join("global");
         std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
-        let scope = test_scope(root.clone(), &state_root);
-        let mut identity = load_or_create_resolved(&scope, Some("managed-worker".into())).unwrap();
-        persist_registration(
+        let scope = test_scope(root.clone());
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let mut identity =
+            load_or_create_resolved_at(&host_paths, &scope, Some("managed-worker".into())).unwrap();
+        persist_registration_at(
+            &host_paths,
             &scope,
             &mut identity,
             runtime_identity(4, "binding-managed"),
@@ -634,7 +674,7 @@ mod tests {
         let previous_worker = std::env::var_os("COLLAB_WORKER");
         std::env::set_var("CODEX_THREAD_ID", "thread-1");
         std::env::remove_var("COLLAB_WORKER");
-        let resolved = load_or_create_resolved(&scope, None).unwrap();
+        let resolved = load_or_create_resolved_at(&host_paths, &scope, None).unwrap();
         match previous_thread {
             Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
             None => std::env::remove_var("CODEX_THREAD_ID"),
@@ -648,24 +688,17 @@ mod tests {
         assert_eq!(resolved.token, identity.token);
         assert_eq!(resolved.runtime, identity.runtime);
         assert_eq!(resolved.transport, identity.transport);
-        std::env::remove_var(crate::scope::COLLAB_STATE_DIR_ENV);
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn identity_requires_a_codex_thread_when_no_worker_is_given() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-identity-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = test_root("ci-thread");
         std::fs::create_dir_all(root.join(".agent-collab/runs")).unwrap();
         let state_root = root.join(".collab-state");
         std::fs::create_dir_all(&state_root).unwrap();
-        let scope = test_scope(root.clone(), &state_root);
+        let scope = test_scope(root.clone());
         let previous_thread = std::env::var_os("CODEX_THREAD_ID");
         let previous_worker = std::env::var_os("COLLAB_WORKER");
         std::env::remove_var("CODEX_THREAD_ID");
@@ -839,19 +872,15 @@ mod tests {
 
     #[test]
     fn appserver_identity_uses_codex_thread() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-identity-appserver-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = test_root("ci-appserver");
         std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
         let state_root = root.join(".collab-state");
         std::fs::create_dir_all(&state_root).unwrap();
-        let scope = test_scope(root.clone(), &state_root);
-        let identity = load_or_create_resolved(&scope, Some("thread-worker".into())).unwrap();
+        let scope = test_scope(root.clone());
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let identity =
+            load_or_create_resolved_at(&host_paths, &scope, Some("thread-worker".into())).unwrap();
         assert_eq!(identity.worker_id, "thread-worker");
         assert_eq!(identity.runtime, None);
         assert_eq!(identity.transport, None);
@@ -861,20 +890,17 @@ mod tests {
 
     #[test]
     fn init_preserves_a_persisted_binding_until_registration_replaces_it() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-init-priority-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = test_root("ci-init");
         std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
         let state_root = root.join(".collab-state");
         std::fs::create_dir_all(&state_root).unwrap();
-        let scope = test_scope(root.clone(), &state_root);
-        let mut ident = load_or_create_resolved(&scope, Some("codex-thread-1".into())).unwrap();
-        persist_registration(
+        let scope = test_scope(root.clone());
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let mut ident =
+            load_or_create_resolved_at(&host_paths, &scope, Some("codex-thread-1".into())).unwrap();
+        persist_registration_at(
+            &host_paths,
             &scope,
             &mut ident,
             runtime_identity(4, "binding-appserver"),
@@ -893,7 +919,7 @@ mod tests {
         let previous_thread = std::env::var_os("CODEX_THREAD_ID");
         std::env::remove_var("CODEX_THREAD_ID");
         std::env::set_var("COLLAB_WORKER", "codex-thread-1");
-        let resolved = load_or_create_for_init(&scope).unwrap();
+        let resolved = load_or_create_for_init_at(&host_paths, &scope).unwrap();
         assert_eq!(resolved.worker_id, "codex-thread-1");
         assert_eq!(resolved.token, ident.token);
         assert_eq!(resolved.runtime, ident.runtime);
@@ -912,18 +938,13 @@ mod tests {
 
     #[test]
     fn persist_runtime_updates_all_identity_state_after_validation() {
-        let root = std::env::temp_dir().join(format!(
-            "collab-persist-runtime-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = test_root("ci-persist");
         std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
         let state_root = root.join(".collab-state");
         std::fs::create_dir_all(&state_root).unwrap();
-        let scope = test_scope(root.clone(), &state_root);
+        let scope = test_scope(root.clone());
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
         let mut identity = Identity {
             worker_id: "agent-1".into(),
             token: "token-1".into(),
@@ -931,7 +952,8 @@ mod tests {
             transport: None,
         };
         let runtime = runtime_identity(7, "binding-7");
-        persist_registration(
+        persist_registration_at(
+            &host_paths,
             &scope,
             &mut identity,
             runtime.clone(),
@@ -950,7 +972,7 @@ mod tests {
             identity.transport.as_ref().unwrap().kind,
             TransportKind::AppServer
         );
-        let persisted = read_identity(&identity_path(&scope, "agent-1").unwrap())
+        let persisted = read_identity(&identity_path_at(&host_paths, "agent-1").unwrap())
             .unwrap()
             .unwrap();
         assert_eq!(persisted.runtime, Some(runtime));

@@ -41,6 +41,7 @@ Common commands:
 
 ```sh
 collab context
+collab master status
 collab task status [task-id]
 collab task conflicts --feature <feature-id>
 collab task register <task-id> --feature <feature-id> \
@@ -62,6 +63,10 @@ owner-scoped lease can be cancelled with
 
 - One issue owns one clean worktree under
   `<project-main>/playground/<short-slug>`; the project ignores `playground/`.
+- A worktree has no local `.agent-collab/`; `collab context` resolves the
+  canonical route from global state. Use `collab master status` for the live
+  master and `collab who` only for the peer list. Never infer "no master" from
+  the missing worktree directory or from `who` output.
 - Declare task ID, owner, feature/resource ID, worktree, branch, base commit,
   priority, status, and next step before product edits.
 - Never share/reuse a worktree. Never depend on dirty main.

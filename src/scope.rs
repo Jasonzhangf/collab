@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::identity::{validate_id_for_protocol, AppServerId};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,9 @@ pub const COLLAB_SOCKET_PATH_ENV: &str = "COLLAB_SOCKET_PATH";
 pub const COLLAB_HOST_SOCKET_ENV: &str = "COLLAB_HOST_SOCKET";
 pub const COLLAB_LOCK_PATH_ENV: &str = "COLLAB_LOCK_PATH";
 pub const COLLAB_HOST_LOCK_ENV: &str = "COLLAB_HOST_LOCK";
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPaths {
@@ -190,6 +194,10 @@ pub fn canonical_route_for_identity(
             &route.app_scope_id == app_scope_id && cwd.strip_prefix(&route.root).is_ok()
         })
         .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        let main_root = git_main_worktree_root(&cwd)?;
+        matches.retain(|route| route.root == main_root);
+    }
     match matches.len() {
         1 => Ok(matches.pop().unwrap()),
         0 => anyhow::bail!(
@@ -210,6 +218,36 @@ pub fn canonical_route_for_identity(
             )
         }
     }
+}
+
+fn git_main_worktree_root(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(cwd)
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cannot resolve Git common directory from {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let common_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if !common_dir.is_absolute() {
+        anyhow::bail!(
+            "Git common directory is not absolute for {}: {}",
+            cwd.display(),
+            common_dir.display()
+        );
+    }
+    let common_dir = std::fs::canonicalize(&common_dir)?;
+    let main_root = common_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Git common directory has no parent: {}",
+            common_dir.display()
+        )
+    })?;
+    Ok(std::fs::canonicalize(main_root)?)
 }
 
 fn apply_endpoint_overrides(
@@ -714,26 +752,41 @@ pub struct Scope {
 impl Scope {
     pub fn resolve() -> anyhow::Result<Self> {
         let cwd = std::env::current_dir()?;
+        Self::resolve_from_cwd(&cwd)
+    }
+
+    fn resolve_from_cwd(cwd: &Path) -> anyhow::Result<Self> {
         // Validate the host endpoint while resolution is still fallible.
         // The infallible compatibility accessors below are only used after
         // this check (or by isolated unit fixtures).
-        HostPaths::resolve()?;
-        if cwd.join(".agent-collab").is_dir() {
-            return Self::from_project_root(cwd);
-        }
-        let identity_scope = Scope { root: cwd.clone() };
-        let Some(identity) = crate::identity::load_existing(&identity_scope, None)? else {
-            anyhow::bail!("no .agent-collab found in inherited cwd {}", cwd.display());
-        };
-        let Some(runtime) = identity.runtime.as_ref() else {
-            anyhow::bail!(
-                "persisted Collab identity {} has no registered runtime",
-                identity.worker_id
-            );
-        };
         let host_paths = HostPaths::resolve()?;
-        let route = canonical_route_for_identity(&host_paths, &cwd, &runtime.appserver_id)?;
-        Ok(Scope { root: route.root })
+        Self::resolve_from_cwd_with_host_paths(cwd, &host_paths, None)
+    }
+
+    fn resolve_from_cwd_with_host_paths(
+        cwd: &Path,
+        host_paths: &HostPaths,
+        worker_id: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let identity_scope = Scope {
+            root: cwd.to_path_buf(),
+        };
+        if let Some(identity) =
+            crate::identity::load_existing_at(host_paths, &identity_scope, worker_id)?
+        {
+            let runtime = identity.runtime.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "persisted Collab identity {} has no registered runtime",
+                    identity.worker_id
+                )
+            })?;
+            let route = canonical_route_for_identity(&host_paths, &cwd, &runtime.appserver_id)?;
+            return Ok(Scope { root: route.root });
+        }
+        if cwd.join(".agent-collab").is_dir() {
+            return Self::from_project_root(cwd.to_path_buf());
+        }
+        anyhow::bail!("no .agent-collab found in inherited cwd {}", cwd.display())
     }
 
     fn from_project_root(root: PathBuf) -> anyhow::Result<Self> {
@@ -915,6 +968,7 @@ mod tests {
         let state_root = root.join("host-state");
         std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
         std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(worktree.join(".agent-collab")).unwrap();
         std::fs::create_dir_all(&state_root).unwrap();
         let canonical = canonical.canonicalize().unwrap();
         let route = json!({
@@ -955,22 +1009,94 @@ mod tests {
         )
         .unwrap();
 
-        let previous_state = std::env::var_os(COLLAB_STATE_DIR_ENV);
-        let previous_thread = std::env::var_os("CODEX_THREAD_ID");
-        let previous_cwd = std::env::current_dir().unwrap();
-        std::env::set_var(COLLAB_STATE_DIR_ENV, &state_root);
-        std::env::set_var("CODEX_THREAD_ID", "thread-a");
-        std::env::set_current_dir(&worktree).unwrap();
-        let resolved = Scope::resolve().unwrap();
-        std::env::set_current_dir(previous_cwd).unwrap();
-        match previous_state {
-            Some(value) => std::env::set_var(COLLAB_STATE_DIR_ENV, value),
-            None => std::env::remove_var(COLLAB_STATE_DIR_ENV),
-        }
-        match previous_thread {
-            Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
-            None => std::env::remove_var("CODEX_THREAD_ID"),
-        }
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let resolved = Scope::resolve_from_cwd_with_host_paths(
+            &worktree,
+            &host_paths,
+            Some("worker-a".into()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.root, canonical.canonicalize().unwrap());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn identity_route_prefers_git_main_root_when_worktree_route_is_stale() {
+        let root = test_root("worktree-route-disambiguation");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-a",
+                worktree.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let canonical = canonical.canonicalize().unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        let stale_route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": worktree,
+            "canonical_root": worktree,
+            "storage_root": worktree,
+            "registered_ms": 2
+        });
+        let canonical_route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": canonical,
+            "canonical_root": canonical,
+            "storage_root": canonical,
+            "registered_ms": 1
+        });
+        std::fs::write(
+            state_root.join("routes.jsonl"),
+            format!("{stale_route}\n{canonical_route}\n"),
+        )
+        .unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let app_scope = AppServerId::new("appserver-cli").unwrap();
+        let resolved = canonical_route_for_identity(&host_paths, &worktree, &app_scope).unwrap();
 
         assert_eq!(resolved.root, canonical);
         std::fs::remove_dir_all(root).ok();
