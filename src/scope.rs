@@ -187,8 +187,7 @@ pub fn canonical_route_for_identity(
     let mut matches = load_route_records(host_paths)?
         .into_iter()
         .filter(|route| {
-            &route.app_scope_id == app_scope_id
-                && (cwd == route.root || cwd.starts_with(&route.root))
+            &route.app_scope_id == app_scope_id && cwd.strip_prefix(&route.root).is_ok()
         })
         .collect::<Vec<_>>();
     match matches.len() {
@@ -862,8 +861,10 @@ mod tests {
         let root = test_root("worktree-route");
         let canonical = root.join("project");
         let worktree = canonical.join("playground/task-a");
+        let sibling = root.join("project-other");
         let unrelated = root.join("unrelated");
         std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
         std::fs::create_dir_all(&unrelated).unwrap();
 
         let state_root = root.join("host-state");
@@ -887,6 +888,12 @@ mod tests {
         assert!(canonical_route_for_identity(
             &host_paths,
             &unrelated,
+            &AppServerId::new("appserver-cli").unwrap()
+        )
+        .is_err());
+        assert!(canonical_route_for_identity(
+            &host_paths,
+            &sibling,
             &AppServerId::new("appserver-cli").unwrap()
         )
         .is_err());
