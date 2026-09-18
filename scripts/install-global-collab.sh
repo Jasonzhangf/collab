@@ -43,12 +43,15 @@ release_dir="$repo_root/target/release"
 release_bin="$release_dir/collab"
 release_mcp="$release_dir/collab-mcp"
 skill_target="$user_home/.agents/skills/collab"
+managed_marker='managed by scripts/install-global-collab.sh'
 
 stage_dir=''
 stage_link=''
 skill_stage=''
 skill_backup=''
+install_lock=''
 cleanup() {
+  [[ -z "$install_lock" || ! -d "$install_lock" ]] || rmdir "$install_lock" 2>/dev/null || true
   [[ -z "$stage_dir" || ! -d "$stage_dir" ]] || rm -rf -- "$stage_dir"
   [[ -z "$stage_link" || ( ! -e "$stage_link" && ! -L "$stage_link" ) ]] || rm -f -- "$stage_link"
   [[ -z "$skill_stage" || ! -d "$skill_stage" ]] || rm -rf -- "$skill_stage"
@@ -59,6 +62,16 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+acquire_install_lock() {
+  local lock="$managed_root/install.lock"
+  mkdir -p "$managed_root"
+  if ! mkdir "$lock" 2>/dev/null; then
+    echo "error: another Collab installer holds the managed install lock: $lock" >&2
+    exit 1
+  fi
+  install_lock="$lock"
+}
 
 probe_collab_version() {
   local candidate="$1"
@@ -137,6 +150,12 @@ verify_pair() {
   }
 }
 
+verify_managed_marker() {
+  local directory="$1"
+  [[ -f "$directory/.managed" && ! -L "$directory/.managed" ]] || return 1
+  [[ "$(cat "$directory/.managed")" == "$managed_marker" ]]
+}
+
 verify_skill_bundle() {
   local directory="$1"
   local relative
@@ -185,16 +204,30 @@ release_mcp_digest="$(shasum -a 256 "$release_mcp" | cut -d ' ' -f 1)"
 release_id="$release_version-${release_digest:0:12}-${release_mcp_digest:0:12}"
 version_dir="$versions_dir/$release_id"
 mkdir -p "$versions_dir"
+versions_root_real="$(cd "$versions_dir" && pwd -P)"
+acquire_install_lock
 stage_dir="$(mktemp -d "$versions_dir/.stage.XXXXXX")"
 cp "$release_bin" "$stage_dir/collab"
 cp "$release_mcp" "$stage_dir/collab-mcp"
 chmod 0755 "$stage_dir/collab" "$stage_dir/collab-mcp"
 verify_pair "$stage_dir" "$release_version"
-printf '%s\n' "managed by scripts/install-global-collab.sh" > "$stage_dir/.managed"
+printf '%s\n' "$managed_marker" > "$stage_dir/.managed"
 
 if [[ -e "$version_dir" ]]; then
-  [[ -f "$version_dir/.managed" ]] || {
-    echo "error: version directory exists without a managed marker: $version_dir" >&2
+  [[ -d "$version_dir" && ! -L "$version_dir" ]] || {
+    echo "error: managed version path is not a real directory: $version_dir" >&2
+    exit 1
+  }
+  verify_managed_marker "$version_dir" || {
+    echo "error: version directory exists without the exact managed marker: $version_dir" >&2
+    exit 1
+  }
+  [[ -f "$version_dir/collab" && ! -L "$version_dir/collab" ]] || {
+    echo "error: managed version collab is not a regular file: $version_dir/collab" >&2
+    exit 1
+  }
+  [[ -f "$version_dir/collab-mcp" && ! -L "$version_dir/collab-mcp" ]] || {
+    echo "error: managed version collab-mcp is not a regular file: $version_dir/collab-mcp" >&2
     exit 1
   }
   cmp -s "$stage_dir/collab" "$version_dir/collab" || {
@@ -339,12 +372,32 @@ if [[ -L "$current_link" ]]; then
     echo "error: cannot resolve current Collab link: $current_link" >&2
     exit 1
   }
-  [[ "$previous_dir" == "$versions_dir/"* ]] || {
+  [[ -d "$previous_dir" ]] || {
+    echo "error: current Collab link target is not an existing directory: $previous_dir" >&2
+    exit 1
+  }
+  previous_dir_real="$(cd "$previous_dir" && pwd -P)" || {
+    echo "error: cannot resolve current Collab link target: $previous_dir" >&2
+    exit 1
+  }
+  [[ "$previous_dir_real" == "$versions_root_real/"* ]] || {
     echo "error: current Collab link points outside the managed version root: $previous_dir" >&2
     exit 1
   }
-  [[ -f "$previous_dir/.managed" ]] || {
-    echo "error: current Collab link target has no managed marker: $previous_dir" >&2
+  verify_managed_marker "$previous_dir" || {
+    echo "error: current Collab link target has no exact managed marker: $previous_dir" >&2
+    exit 1
+  }
+  [[ ! -L "$previous_dir" ]] || {
+    echo "error: current Collab link target is not a real directory: $previous_dir" >&2
+    exit 1
+  }
+  [[ -f "$previous_dir/collab" && ! -L "$previous_dir/collab" ]] || {
+    echo "error: current Collab target has a non-regular collab file" >&2
+    exit 1
+  }
+  [[ -f "$previous_dir/collab-mcp" && ! -L "$previous_dir/collab-mcp" ]] || {
+    echo "error: current Collab target has a non-regular collab-mcp file" >&2
     exit 1
   }
   previous_version="$(probe_collab_version "$previous_dir/collab")" || exit 1
@@ -379,7 +432,7 @@ else
       exit 1
     }
     verify_pair "$previous_dir" "$previous_version" || exit 1
-    printf '%s\n' "managed by scripts/install-global-collab.sh" > "$previous_dir/.managed"
+    printf '%s\n' "$managed_marker" > "$previous_dir/.managed"
   fi
 fi
 
