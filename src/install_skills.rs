@@ -35,6 +35,11 @@ pub const SKILL_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Files embedded by retired skill bundles. `--force` removes only this
+/// explicit allowlist before writing the current bundle; it never scans or
+/// deletes arbitrary files from the target skill directory.
+pub const OBSOLETE_SKILL_FILES: &[&str] = &["references/command-surface.md"];
+
 /// Result of installing a single skill file.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
@@ -58,6 +63,16 @@ pub fn install(
         .map(|(_, body)| body.len())
         .sum::<usize>();
     let mut outcomes = Vec::with_capacity(SKILL_FILES.len());
+    if force {
+        for relative in OBSOLETE_SKILL_FILES {
+            let stale = target.join(relative);
+            if stale.is_file() {
+                std::fs::remove_file(&stale).map_err(|e| {
+                    format!("remove obsolete skill file {} failed: {e}", stale.display())
+                })?;
+            }
+        }
+    }
     for (relative, body) in SKILL_FILES {
         let dest = target.join(relative);
         if let Some(parent) = dest.parent() {
@@ -129,6 +144,22 @@ mod tests {
     fn empty_target_path_is_rejected() {
         let err = install(std::path::Path::new(""), false).unwrap_err();
         assert!(err.contains("non-empty path"), "{err}");
+    }
+
+    #[test]
+    fn force_removes_known_obsolete_skill_files_only() {
+        let target = temp_target("obsolete");
+        let obsolete = target.join(OBSOLETE_SKILL_FILES[0]);
+        let unrelated = target.join("references/keep-me.md");
+        std::fs::create_dir_all(obsolete.parent().unwrap()).unwrap();
+        std::fs::write(&obsolete, "retired").unwrap();
+        std::fs::write(&unrelated, "keep").unwrap();
+
+        install(&target, true).unwrap();
+
+        assert!(!obsolete.exists());
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "keep");
+        std::fs::remove_dir_all(target).ok();
     }
 
     #[test]

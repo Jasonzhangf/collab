@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -398,6 +398,73 @@ try {
     a: promoteA.mode,
     b: promoteB.mode,
   };
+
+  const masterWorktree = join(projectA, "playground", "master-status");
+  const masterBranch = `codex/master-status-${Date.now()}`;
+  await git(projectA, [
+    "worktree",
+    "add",
+    "-q",
+    "-b",
+    masterBranch,
+    masterWorktree,
+    "main",
+  ]);
+  await mkdir(join(masterWorktree, ".agent-collab", "server"), { recursive: true });
+  const canonicalProjectA = await realpath(projectA);
+  const canonicalMasterWorktree = await realpath(masterWorktree);
+  const routeJournal = join(state, "routes.jsonl");
+  const currentRoutes = await readFile(routeJournal, "utf8");
+  const projectRoute = currentRoutes
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+    .find((record) => record.canonical_root === canonicalProjectA);
+  assert(projectRoute, "project A route was not persisted", currentRoutes);
+  await appendFile(
+    routeJournal,
+    `${JSON.stringify({
+      ...projectRoute,
+      project_scope: canonicalMasterWorktree,
+      canonical_root: canonicalMasterWorktree,
+      storage_root: canonicalMasterWorktree,
+      registered_ms: Number(projectRoute.registered_ms || 0) + 1,
+    })}\n`,
+  );
+  const worktreeContext = await runJson(collab, ["context"], {
+    cwd: masterWorktree,
+    env: envA,
+  });
+  const worktreeMaster = await runJson(collab, ["master", "status"], {
+    cwd: masterWorktree,
+    env: envA,
+  });
+  const worktreeWho = await runJson(collab, ["who"], {
+    cwd: masterWorktree,
+    env: envA,
+  });
+  const worktreeWorkerA = workerById(worktreeWho, workerA);
+  report.checks.worktree_master = {
+    stale_route: canonicalMasterWorktree,
+    project_root: worktreeContext.project_root,
+    worker_id: worktreeContext.identity?.worker_id,
+    presence: worktreeContext.liveness?.presence,
+    master: worktreeMaster.master,
+    recorded_unusable: worktreeMaster.recorded_unusable,
+    who_worker: worktreeWorkerA,
+  };
+  assert(
+    worktreeContext.project_root === canonicalProjectA &&
+      worktreeContext.identity?.worker_id === workerA &&
+      worktreeContext.liveness?.presence === "present" &&
+      worktreeMaster.master?.worker_id === workerA &&
+      worktreeMaster.master?.endpoint_live === true &&
+      worktreeMaster.recorded_unusable == null &&
+      worktreeWorkerA?.presence === "present" &&
+      worktreeWorkerA?.endpoint_live === true,
+    "worktree did not resolve the canonical project route and live master",
+    report.checks.worktree_master,
+  );
 
   const marker = `cross-project-${Date.now()}`;
   const sent = await runJson(

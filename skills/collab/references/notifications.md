@@ -77,10 +77,10 @@ collab notify unsubscribe <subscription-id>
   as lifecycle evidence.
 - The daemon never infers continuation from task state, thread title, heartbeat,
   progress, ACK, or elapsed time, and must not create a `CONTINUE_TASK` message.
-  The 15-minute task-liveness rule is an Agent/skill obligation: when a
-  legitimate keepalive or scheduled check arrives, the owner inspects durable
-  task state and continues or escalates it. It is not a second queue or a
-  synthetic periodic task.
+  The task-liveness rule is an Agent/skill obligation: when a supported
+  timer/wake or direct wake arrives, the owner inspects durable task state and
+  continues or escalates it. It is not a second queue or a synthetic periodic
+  task. A worker does not poll on a fixed internal schedule.
 
 ## Worker inspection and acknowledgment
 

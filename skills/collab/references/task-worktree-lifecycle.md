@@ -41,6 +41,7 @@ Common commands:
 
 ```sh
 collab context
+collab master status
 collab task status [task-id]
 collab task conflicts --feature <feature-id>
 collab task register <task-id> --feature <feature-id> \
@@ -62,6 +63,10 @@ owner-scoped lease can be cancelled with
 
 - One issue owns one clean worktree under
   `<project-main>/playground/<short-slug>`; the project ignores `playground/`.
+- A worktree has no local `.agent-collab/`; `collab context` resolves the
+  canonical route from global state. Use `collab master status` for the live
+  master and `collab who` only for the peer list. Never infer "no master" from
+  the missing worktree directory or from `who` output.
 - Declare task ID, owner, feature/resource ID, worktree, branch, base commit,
   priority, status, and next step before product edits.
 - Never share/reuse a worktree. Never depend on dirty main.
@@ -91,11 +96,12 @@ records task state only and does not create review or integration evidence.
 ## Task liveness and escalation
 
 An assigned task remains live until its actual cleanup receipt and `closed`
-state exist. At least once every 15 minutes, the owner must inspect its task,
-worktree, mailbox, and wait/block state, then take the next actionable step.
-The owner must continue execution when work is available, resolve a blocker
-when it can, and record/escalate when it cannot. ACKing a wake is not progress
-and does not satisfy liveness.
+state exist. The owner acts on an explicit dispatch, a bounded direct-message
+lease, a supported timer/wake, or a real external event; it does not poll on a
+schedule. When a wake arrives, inspect the task, worktree, mailbox, and
+wait/block state, then take the next actionable step. Continue execution when
+work is available, resolve a blocker when it can, and record/escalate when it
+cannot. ACKing a wake is not progress and does not satisfy liveness.
 
 Route escalation by worker type:
 

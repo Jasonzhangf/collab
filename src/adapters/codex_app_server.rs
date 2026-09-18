@@ -474,6 +474,21 @@ pub fn read_thread_status(
     client.call("thread/read", json!({"threadId": thread_id}))
 }
 
+pub fn read_latest_turn_status(
+    transport: &SelectedTransport,
+    thread_id: &str,
+) -> Result<Value, AdapterError> {
+    let mut client = transport_client(transport)?;
+    client.call(
+        "thread/turns/list",
+        json!({
+            "threadId": thread_id,
+            "limit": 1,
+            "sortDirection": "desc",
+        }),
+    )
+}
+
 fn endpoint_path(endpoint: &str) -> Result<PathBuf, AdapterError> {
     let path = endpoint
         .strip_prefix("unix://")

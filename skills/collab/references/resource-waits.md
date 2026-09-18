@@ -25,9 +25,9 @@ Timeout makes the waiter explicitly blocked and never sends a message or
 releases a claim. Holder close clears obsolete wait edges and creates a
 `RESOURCE_RELEASED` notification only for an exact matching subscription.
 
-Waiting is not abandonment. On each 15-minute task-liveness check, the waiter
-must re-read the durable conflict, try any locally available resolution, and
-escalate unresolved work. A managed subagent and an ordinary worker both
+Waiting is not abandonment. On each supported timer/wake or direct wake, the
+waiter must re-read the durable conflict, try any locally available resolution,
+and escalate unresolved work. A managed subagent and an ordinary worker both
 escalate to the live Collab master immediately after finding a concrete
 solution; they do not wait or dump symptoms. A subagent also copies its
 parent when parent is not the master. If no live master exists, escalate to

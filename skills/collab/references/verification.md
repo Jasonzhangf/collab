@@ -36,8 +36,9 @@ Before review, prove the affected subset and every changed invariant:
 - release clears obsolete wait state and does not wake an unsubscribed Agent;
 - no daemon-generated periodic continuation, inferred waiting, progress/ACK
   loop, implicit first-register master, treating Codex root as Collab
-  master, dispatch, heartbeat, or `/goal` semantics; skill-level 15-minute
-  owner checks continue or escalate real unfinished tasks; explicit
+  master, dispatch, heartbeat, or `/goal` semantics; skill-level owner checks
+  run only on supported timer/wake or direct wake and then continue or escalate
+  real unfinished tasks; explicit
   user-approved self-promotion is allowed only when no live master exists, and
   only the live master may delegate; independent peers may decline a master
   invite and managed subagents must obey the master.

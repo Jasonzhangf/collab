@@ -49,21 +49,26 @@ daemon untouched. If the running daemon must load the new binary, use a
 separately authorized maintenance window and follow the controlled lifecycle
 in [migration-daemon.md](migration-daemon.md).
 
-## Project-local durable state
+## Project-local registration input
 
 Each registered project root has its own `.agent-collab/`:
 
 ```text
 <project>/.agent-collab/
   server/
-  runs/<worker-id>/identity.json
+  runs/
   mailbox/
   messages/
 ```
 
-`.agent-collab/` is project-local durable state, not the host-wide truth.
-AppSDK reset must never delete it. Use `collab migrate` or the explicit reset
-lifecycle rather than deleting files by hand.
+`.agent-collab/` is the project registration input and the project runtime
+reducer's durable store. The global `~/.collab/` state owns the host socket,
+route table, and global identity/liveness records; the project reducer owns
+its project-scoped journal, mailbox projection, tasks, claims, and bindings.
+No command may reconstruct the current peer from a legacy
+`runs/<worker-id>/identity.json`. AppSDK reset must never delete
+`.agent-collab/`; use `collab migrate` or the explicit reset lifecycle rather
+than deleting files by hand.
 
 For a new project, initialize from the current global version and do not copy
 or replay old project-local control files. An old local directory is ignored
@@ -73,10 +78,17 @@ unless the operator explicitly chooses the owner's migration or reset route.
 
 - The current client is Codex only. Identity is bound to the Codex sessionID
   through the internal App Server native thread.
+- A Git worktree does not inherit `.agent-collab/`. In a worktree, resolve the
+  canonical project route from the global Collab state by the same Codex
+  sessionID/App Server thread; never register the worktree as a second peer or
+  create a second route.
 - Default role is `peer`; master is explicit and user-approved.
 - `collab context` is the single information endpoint for the current peer,
   binding, role, transport, liveness, tasks, and peers.
-- `collab who` and `collab status --all` are diagnostics, not setup steps.
+- `collab master status` is the authoritative live-master query.
+- `collab who` and `collab status --all` are peer diagnostics, not setup steps
+  and not a substitute for `collab master status`; `who` has no top-level
+  `master` field.
 
 ## Transport selection
 
@@ -91,7 +103,9 @@ unless the operator explicitly chooses the owner's migration or reset route.
 Run `collab context`. If it says unregistered, run the idempotent
 `appsdk init .` (or `collab init` for a standalone project), then run
 `collab context` again. Registration must run from the canonical project main
-tree, not a `playground/` worktree.
+tree, not a `playground/` worktree. `collab context` itself is read-only and
+must remain safe in a worktree: it resolves the canonical route from global
+state and never creates a route or identity.
 
 `collab init` success is not delivery proof. Verify the live binding, selected
 transport, endpoint liveness, presence, and role through `collab context`.

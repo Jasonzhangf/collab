@@ -583,6 +583,21 @@ lease. Do not run a second `collab init`,
 
 Only a standalone non-AppSDK project uses explicit `collab init`.
 
+## Worktree identity
+
+A Git worktree normally has no local `.agent-collab/`; that is not evidence
+that the peer is unregistered or that no live master exists. Run
+`collab context` from the worktree. The server resolves the canonical project
+route from the global Collab state by the same Codex sessionID/App Server
+thread, and the returned `project_root` is the canonical project root.
+
+Use `collab master status` for the authoritative live-master answer; `collab
+who` only lists registered peers. Do not run `appsdk init`, `collab init`,
+`collab worker recover`, or master promotion from a worktree, and do not
+report "no master" because `.agent-collab/` or a `who.master` field is absent.
+If route resolution fails, preserve the exact error and report it to the live
+master after resolving it from the canonical project root.
+
 ## Subscribe to a future event
 
 Use subscriptions only when this Agent wants a later event to wake it:
@@ -654,7 +669,7 @@ register it.
 
 Do not load references for ordinary `sendmessage`, `msg`, or `inbox`.
 
-If any reference still describes 15-minute periodic worker liveness, that
-wording is deprecated and non-authoritative for the current v1 contract; the
-current rules are this SKILL, `docs/collab-v1-lifecycle.manifest.json`, and
-`docs/task-keepalive-plan.md`.
+The current v1 contract has no 15-minute periodic worker liveness. Worker and
+master liveness wake only on a supported timer/wake, direct message, or real
+external event. If any installed copy still contains the old wording, replace
+it from this SKILL and its references.

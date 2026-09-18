@@ -169,8 +169,22 @@ pub(crate) fn default_appserver_notification_sink() -> Arc<AppServerNotification
 
 fn default_appserver_thread_status() -> Arc<AppServerThreadStatus> {
     Arc::new(|transport, thread_id| {
-        crate::client::adapters::codex_app_server::read_thread_status(transport, thread_id)
-            .map_err(|error| error.to_string())
+        let mut status =
+            crate::client::adapters::codex_app_server::read_thread_status(transport, thread_id)
+                .map_err(|error| error.to_string())?;
+        match crate::client::adapters::codex_app_server::read_latest_turn_status(
+            transport, thread_id,
+        ) {
+            Ok(turns) => {
+                if let Some(data) = turns.get("data").and_then(serde_json::Value::as_array) {
+                    status["thread"]["turns"] = serde_json::Value::Array(data.clone());
+                }
+            }
+            Err(error) => {
+                status["thread"]["turn_status_error"] = json!(error.to_string());
+            }
+        }
+        Ok(status)
     })
 }
 
@@ -1434,14 +1448,14 @@ type RouteKey = (String, String);
 /// resident project's journal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HostRouteRecord {
-    version: u8,
-    op: String,
-    app_scope_id: String,
-    project_scope: String,
-    canonical_root: String,
-    storage_root: String,
-    registered_ms: i64,
+pub(crate) struct HostRouteRecord {
+    pub(crate) version: u8,
+    pub(crate) op: String,
+    pub(crate) app_scope_id: String,
+    pub(crate) project_scope: String,
+    pub(crate) canonical_root: String,
+    pub(crate) storage_root: String,
+    pub(crate) registered_ms: i64,
 }
 
 struct RuntimeRoute {
@@ -1986,6 +2000,42 @@ impl ProjectRuntimeManager {
             storage_root,
             "HOST_ROUTE_DURABILITY_FAILED",
         )?;
+        self.append_route_record_validated(context, &storage_root, false)
+    }
+
+    fn append_resident_route_record(&self, context: &ProjectContext) -> Result<(), String> {
+        let project_root = Path::new(&context.canonical_root);
+        if !storage_roots_equal(project_root, &self.host_root)
+            .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?
+        {
+            return Err(
+                "HOST_ROUTE_DURABILITY_FAILED: resident route root does not match host root".into(),
+            );
+        }
+        let storage_root = storage_owner_path(&self.host.storage_root)
+            .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?;
+        self.append_route_record_validated(context, &storage_root, true)
+    }
+
+    fn append_route_record_validated(
+        &self,
+        context: &ProjectContext,
+        storage_root: &Path,
+        allow_resident_storage: bool,
+    ) -> Result<(), String> {
+        if allow_resident_storage {
+            let project_root = Path::new(&context.canonical_root);
+            let resident_root = storage_roots_equal(project_root, &self.host_root)
+                .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?;
+            let resident_storage = storage_roots_equal(storage_root, &self.host.storage_root)
+                .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?;
+            if !resident_root || !resident_storage {
+                return Err(
+                    "HOST_ROUTE_DURABILITY_FAILED: resident storage exception does not match host"
+                        .into(),
+                );
+            }
+        }
         let record = HostRouteRecord {
             version: 1,
             op: "register".into(),
@@ -2025,6 +2075,7 @@ impl ProjectRuntimeManager {
         if let Some(owner) = self
             .storage_owner(&storage_root, &existing_records)
             .map_err(|error| format!("HOST_ROUTE_DURABILITY_FAILED: {error}"))?
+            .filter(|_| !allow_resident_storage)
         {
             return Err(format!(
                 "HOST_ROUTE_DURABILITY_FAILED: runtime storage root {} is already owned by {}",
@@ -2308,6 +2359,9 @@ impl ProjectRuntimeManager {
         if context_root == self.host_root
             && !self.has_project_route(&context.project_scope.as_str())
         {
+            if let Err(error) = self.append_resident_route_record(&context) {
+                return (self.host.clone(), Resp::err(error));
+            }
             let response =
                 if let Err(error) = validate_request_context(&self.host, &req, Some(&context)) {
                     Resp::err(error)
@@ -2316,6 +2370,8 @@ impl ProjectRuntimeManager {
                 };
             if response.ok && is_register {
                 self.install_runtime(&key, self.host.clone(), None);
+            } else if !response.ok {
+                return (self.host.clone(), response);
             }
             return (self.host.clone(), response);
         }
@@ -2359,7 +2415,7 @@ impl ProjectRuntimeManager {
     }
 }
 
-fn load_host_route_records(path: &Path) -> Result<Vec<HostRouteRecord>, String> {
+pub(crate) fn load_host_route_records(path: &Path) -> Result<Vec<HostRouteRecord>, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -2427,7 +2483,7 @@ fn load_host_route_records(path: &Path) -> Result<Vec<HostRouteRecord>, String> 
     Ok(records)
 }
 
-fn validate_host_route_record(
+pub(crate) fn validate_host_route_record(
     record: &HostRouteRecord,
 ) -> Result<(RouteKey, PathBuf, PathBuf), String> {
     if record.version != 1 || record.op != "register" {
@@ -2446,7 +2502,13 @@ fn validate_host_route_record(
             record.canonical_root
         )
     })?;
-    if root.to_string_lossy() != project_scope.as_str() {
+    let expected_root = std::fs::canonicalize(project_scope.as_str()).map_err(|error| {
+        format!(
+            "HOST_ROUTE_REPLAY_FAILED: canonical project scope {}: {error}",
+            project_scope.as_str()
+        )
+    })?;
+    if root != expected_root {
         return Err(
             "HOST_ROUTE_REPLAY_FAILED: route project scope does not match canonical root".into(),
         );
@@ -4249,6 +4311,63 @@ fn worker_identity_presence(server: &Server, worker: &WorkerRec) -> IdentityPres
             }
         }
     }
+}
+
+fn appserver_agent_view(
+    server: &Server,
+    worker: &WorkerRec,
+) -> (serde_json::Value, serde_json::Value) {
+    let Some(transport) = selected_transport_for_worker(worker) else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Some(thread_id) = transport.thread_id.as_deref() else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Ok(raw) = (server.appserver_thread_status)(&transport, thread_id) else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Some(thread) = raw.get("thread") else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Some(status) = thread.get("status").and_then(serde_json::Value::as_object) else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Some(thread_state) = status.get("type").and_then(serde_json::Value::as_str) else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let active_flags = status
+        .get("activeFlags")
+        .and_then(serde_json::Value::as_array)
+        .map(|flags| {
+            flags
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let can_accept_direct_input = thread
+        .get("canAcceptDirectInput")
+        .and_then(serde_json::Value::as_bool);
+    let latest_turn_status = thread
+        .get("turns")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|turns| turns.first())
+        .and_then(|turn| turn.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let latest_turn_error = thread
+        .get("turn_status_error")
+        .and_then(serde_json::Value::as_str);
+    (
+        serde_json::json!({
+            "thread_state": thread_state,
+            "active_flags": active_flags,
+            "can_accept_direct_input": can_accept_direct_input,
+            "latest_turn_status": latest_turn_status,
+            "latest_turn_error": latest_turn_error,
+        }),
+        raw,
+    )
 }
 
 /// Decide whether a new managed child would starve an already registered peer.
@@ -6813,6 +6932,50 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         .collect();
     let managed = is_managed_subagent(&st, &worker_id);
     let presence = worker_identity_presence(server, worker);
+    let is_appserver = worker
+        .transport
+        .as_ref()
+        .is_some_and(|transport| transport.kind == TransportKind::AppServer);
+    let (agent, _raw) = if is_appserver {
+        appserver_agent_view(server, worker)
+    } else {
+        (serde_json::Value::Null, serde_json::Value::Null)
+    };
+    let role = if st.master_worker_id.as_deref() == Some(worker_id.as_str()) {
+        "master"
+    } else if managed {
+        "managed-subagent"
+    } else {
+        "worker"
+    };
+    let mut peers: Vec<_> = st
+        .workers
+        .values()
+        .map(|peer| {
+            let peer_presence = worker_identity_presence(server, peer);
+            json!({
+                "worker_id": peer.id,
+                "role": if st.master_worker_id.as_deref() == Some(peer.id.as_str()) {
+                    "master"
+                } else if is_managed_subagent(&st, &peer.id) {
+                    "managed-subagent"
+                } else {
+                    "worker"
+                },
+                "presence": match peer_presence {
+                    IdentityPresence::Present => "present",
+                    IdentityPresence::Missing => "missing",
+                    IdentityPresence::Unknown => "unknown",
+                },
+                "endpoint_live": peer_presence == IdentityPresence::Present,
+                "transport": peer.transport.as_ref().map(|transport| json!({
+                    "kind": transport.kind.as_str(),
+                    "thread_id": transport.thread_id,
+                })),
+            })
+        })
+        .collect();
+    peers.sort_by(|left, right| left["worker_id"].as_str().cmp(&right["worker_id"].as_str()));
     let transport = worker.transport.as_ref().map(|transport| {
         json!({
             "kind": transport.kind.as_str(),
@@ -6823,7 +6986,13 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         })
     });
     Resp::data(json!({
-        "identity": {"worker_id": worker.id, "kind": "peer", "transport": transport},
+        "project_root": server.root,
+        "identity": {
+            "worker_id": worker.id,
+            "kind": "peer",
+            "role": role,
+            "transport": transport,
+        },
         "liveness": {
             "live": presence == IdentityPresence::Present,
             "presence": match presence {
@@ -6833,7 +7002,9 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
             },
             "transport_kind": worker.transport.as_ref().map(|transport| transport.kind.as_str()),
         },
+        "agent": agent,
         "tasks": tasks,
+        "peers": peers,
         "inbox": {"unread": unread.len()},
         "next_actions": next_actions,
         "master": match live_master_id(server, &st) {
@@ -7060,22 +7231,48 @@ fn worker_status_summary_with_maps(
         .transport
         .as_ref()
         .is_some_and(|transport| transport.kind == TransportKind::AppServer);
-    let (ownership, identity_valid, agent_state) = if is_appserver {
+    let (ownership, identity_valid, agent_state, appserver) = if is_appserver {
         let ownership = endpoint_live.then_some(Ok(true));
         let identity_valid = endpoint_live;
-        // App Server verification proves the native route and queue methods,
-        // not the agent's current execution state.
-        let agent_state = match presence {
-            IdentityPresence::Present => "unknown",
-            IdentityPresence::Unknown => "unknown",
-            IdentityPresence::Missing => "absent",
+        let (agent_view, _raw) = appserver_agent_view(server, w);
+        let thread_state = agent_view
+            .get("thread_state")
+            .and_then(serde_json::Value::as_str);
+        let active_flags = agent_view
+            .get("active_flags")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let agent_state = match (presence, thread_state) {
+            (IdentityPresence::Missing, _) => "absent",
+            (IdentityPresence::Unknown, _) => "unknown",
+            (IdentityPresence::Present, Some("active"))
+                if active_flags.iter().any(|flag| flag == "waitingOnApproval") =>
+            {
+                "waiting_approval"
+            }
+            (IdentityPresence::Present, Some("active"))
+                if active_flags.iter().any(|flag| flag == "waitingOnUserInput") =>
+            {
+                "waiting_input"
+            }
+            (IdentityPresence::Present, Some("active")) => "working",
+            (IdentityPresence::Present, Some("idle")) => "idle",
+            (IdentityPresence::Present, Some("systemError")) => "system_error",
+            (IdentityPresence::Present, Some("notLoaded")) => "not_loaded",
+            _ => "unknown",
         };
-        (ownership, identity_valid, agent_state)
+        (ownership, identity_valid, agent_state, agent_view)
     } else {
         let ownership = None;
         let identity_valid = false;
         let agent_state = "absent";
-        (ownership, identity_valid, agent_state)
+        (
+            ownership,
+            identity_valid,
+            agent_state,
+            serde_json::Value::Null,
+        )
     };
     let unacked_notifications = msgs
         .values()
@@ -7129,6 +7326,7 @@ fn worker_status_summary_with_maps(
         "endpoint_live": (presence != IdentityPresence::Unknown).then_some(endpoint_live),
         "identity_valid": (presence != IdentityPresence::Unknown && ownership != Some(Err(()))).then_some(identity_valid),
         "agent_state": agent_state,
+        "appserver": appserver,
         "unacked_notifications": unacked_notifications,
         "pending_notifications": pending_notifications,
         "notifications_paused": notifications_paused,
@@ -10371,11 +10569,10 @@ mod host_route_registry_tests {
         let route_journal = host_paths.state_root().join("routes.jsonl");
         std::fs::create_dir_all(host_paths.state_root()).unwrap();
         std::fs::write(&route_journal, b"").unwrap();
-        let before_collision = std::fs::read(&route_journal).unwrap();
         let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
 
         // First establish the resident route. Its reducer owns the storage
-        // root even though that ownership is not represented in routes.jsonl.
+        // root and the canonical route is durably published.
         let resident_context = context_with_app(&host_root, "resident-app");
         let (_runtime, resident_response) = manager.dispatch_sync(
             Some(resident_context.clone()),
@@ -10387,6 +10584,14 @@ mod host_route_registry_tests {
             },
         );
         assert!(resident_response.ok, "{resident_response:?}");
+        let after_resident = std::fs::read(&route_journal).unwrap();
+        let resident_records = load_host_route_records(&route_journal).unwrap();
+        assert_eq!(resident_records.len(), 1);
+        assert_eq!(resident_records[0].app_scope_id, "resident-app");
+        assert_eq!(
+            resident_records[0].canonical_root,
+            host_root.canonicalize().unwrap().to_string_lossy()
+        );
 
         // A second project whose storage root equals the resident reducer's
         // root must fail before a route record or second reducer is created.
@@ -10408,7 +10613,7 @@ mod host_route_registry_tests {
                 .is_some_and(|error| error.contains("owned by resident host")),
             "{collision_response:?}"
         );
-        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+        assert_eq!(std::fs::read(&route_journal).unwrap(), after_resident);
         assert!(!manager
             .routes
             .lock()
@@ -10420,7 +10625,7 @@ mod host_route_registry_tests {
             manager.dispatch_sync(Some(resident_context), Req::StatusAll);
         assert!(status_response.ok, "{status_response:?}");
         assert_eq!(status_response.data["workers"][0]["id"], "resident-worker");
-        assert_eq!(std::fs::read(&route_journal).unwrap(), before_collision);
+        assert_eq!(std::fs::read(&route_journal).unwrap(), after_resident);
 
         drop(manager);
         std::fs::remove_dir_all(host_root).unwrap();
