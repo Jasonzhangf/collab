@@ -63,10 +63,12 @@ owner-scoped lease can be cancelled with
 
 - One issue owns one clean worktree under
   `<project-main>/playground/<short-slug>`; the project ignores `playground/`.
-- A worktree has no local `.agent-collab/`; `collab context` resolves the
-  canonical route from global state. Use `collab master status` for the live
-  master and `collab who` only for the peer list. Never infer "no master" from
-  the missing worktree directory or from `who` output.
+- A worktree has no local `.agent-collab/`; `collab master status` resolves
+  the canonical route directly from global state and reports the live master
+  without requiring a new registration. Use `collab context` for this peer's
+  registration/task context and `collab who` only for the peer list. Never
+  infer "no master" from a missing worktree directory, a failed `context`, or
+  `who` output.
 - Declare task ID, owner, feature/resource ID, worktree, branch, base commit,
   priority, status, and next step before product edits.
 - Never share/reuse a worktree. Never depend on dirty main.
