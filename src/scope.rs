@@ -165,31 +165,13 @@ pub fn canonical_route_for_identity(
     app_scope_id: &AppServerId,
 ) -> anyhow::Result<CanonicalProjectRoute> {
     let cwd = std::fs::canonicalize(cwd)?;
-    let mut matches = load_route_records(host_paths)?
+    let matches = load_route_records(host_paths)?
         .into_iter()
         .filter(|route| {
             &route.app_scope_id == app_scope_id && cwd.strip_prefix(&route.root).is_ok()
         })
         .collect::<Vec<_>>();
-    let git_roots = git_worktree_roots_if_any(&cwd)?;
-    if let Some(git_roots) = &git_roots {
-        if matches
-            .iter()
-            .any(|route| route.root == git_roots.main_root)
-        {
-            matches.retain(|route| route.root == git_roots.main_root);
-        } else if matches
-            .iter()
-            .any(|route| route.root == git_roots.worktree_root)
-        {
-            // A linked worktree may not register its own route. When the
-            // route is rooted at the worktree itself, fail closed instead of
-            // treating it as a second project.
-            if git_roots.worktree_root != git_roots.main_root {
-                matches.retain(|route| route.root != git_roots.worktree_root);
-            }
-        }
-    }
+    let (mut matches, git_roots) = narrow_routes_for_git_worktree(&cwd, matches)?;
     match matches.len() {
         1 => Ok(matches.pop().unwrap()),
         0 => anyhow::bail!(
@@ -216,6 +198,77 @@ pub fn canonical_route_for_identity(
     }
 }
 
+/// Resolve the canonical registered project route for a read-only command.
+///
+/// This lookup is deliberately identity-free so `master status` can answer
+/// from a linked worktree or a freshly reset project before the caller has a
+/// local route. It still requires an exact registered route and never guesses
+/// a project from an ancestor directory.
+pub fn canonical_route_for_cwd(
+    host_paths: &HostPaths,
+    cwd: &Path,
+) -> anyhow::Result<CanonicalProjectRoute> {
+    let cwd = std::fs::canonicalize(cwd)?;
+    let matches = load_route_records(host_paths)?
+        .into_iter()
+        .filter(|route| cwd.strip_prefix(&route.root).is_ok())
+        .collect::<Vec<_>>();
+    let (mut matches, _) = narrow_routes_for_git_worktree(&cwd, matches)?;
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap()),
+        0 => anyhow::bail!("no registered Collab route contains cwd {}", cwd.display()),
+        _ => {
+            let roots = matches
+                .iter()
+                .map(|route| route.root.display().to_string())
+                .collect::<Vec<_>>();
+            anyhow::bail!(
+                "multiple canonical Collab routes contain cwd {}: {}",
+                cwd.display(),
+                roots.join(", ")
+            )
+        }
+    }
+}
+
+fn narrow_routes_for_git_worktree(
+    cwd: &Path,
+    mut matches: Vec<CanonicalProjectRoute>,
+) -> anyhow::Result<(Vec<CanonicalProjectRoute>, Option<GitWorktreeRoots>)> {
+    let git_roots = git_worktree_roots_if_any(cwd)?;
+    if let Some(git_roots) = &git_roots {
+        let nested_matches = matches
+            .iter()
+            .filter(|route| {
+                route.root != git_roots.main_root
+                    && route.root != git_roots.worktree_root
+                    && route.root.starts_with(&git_roots.worktree_root)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !nested_matches.is_empty() {
+            return Ok((nested_matches, Some(git_roots.clone())));
+        }
+        if matches
+            .iter()
+            .any(|route| route.root == git_roots.main_root)
+        {
+            matches.retain(|route| route.root == git_roots.main_root);
+        } else if matches
+            .iter()
+            .any(|route| route.root == git_roots.worktree_root)
+            && git_roots.worktree_root != git_roots.main_root
+        {
+            // A linked worktree may not register its own route. When the
+            // route is rooted at the worktree itself, fail closed instead of
+            // treating it as a second project.
+            matches.retain(|route| route.root != git_roots.worktree_root);
+        }
+    }
+    Ok((matches, git_roots))
+}
+
+#[derive(Clone)]
 struct GitWorktreeRoots {
     main_root: PathBuf,
     worktree_root: PathBuf,
@@ -782,6 +835,19 @@ impl Scope {
         Self::resolve_from_cwd(&cwd)
     }
 
+    fn local_baseline_is_authoritative(cwd: &Path) -> anyhow::Result<bool> {
+        if !cwd.join(".agent-collab").is_dir() {
+            return Ok(false);
+        }
+        Ok(match git_worktree_roots_if_any(cwd)? {
+            None => true,
+            Some(roots) => {
+                roots.worktree_root == roots.main_root
+                    || std::fs::canonicalize(cwd)? != roots.worktree_root
+            }
+        })
+    }
+
     fn resolve_from_cwd(cwd: &Path) -> anyhow::Result<Self> {
         // Validate the host endpoint while resolution is still fallible.
         // The infallible compatibility accessors below are only used after
@@ -795,6 +861,9 @@ impl Scope {
         host_paths: &HostPaths,
         worker_id: Option<String>,
     ) -> anyhow::Result<Self> {
+        if Self::local_baseline_is_authoritative(cwd)? {
+            return Self::from_project_root(cwd.to_path_buf());
+        }
         let identity_scope = Scope {
             root: cwd.to_path_buf(),
         };
@@ -809,9 +878,6 @@ impl Scope {
             })?;
             let route = canonical_route_for_identity(&host_paths, &cwd, &runtime.appserver_id)?;
             return Ok(Scope { root: route.root });
-        }
-        if cwd.join(".agent-collab").is_dir() {
-            return Self::from_project_root(cwd.to_path_buf());
         }
         anyhow::bail!("no .agent-collab found in inherited cwd {}", cwd.display())
     }
@@ -995,10 +1061,48 @@ mod tests {
         let worktree = canonical.join("playground/task-a");
         let state_root = root.join("host-state");
         std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::create_dir_all(worktree.join(".agent-collab")).unwrap();
         std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-a",
+                worktree.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::create_dir_all(worktree.join(".agent-collab")).unwrap();
+
         let canonical = canonical.canonicalize().unwrap();
+        let worktree = worktree.canonicalize().unwrap();
         let route = json!({
             "version": 1,
             "op": "register",
@@ -1046,6 +1150,319 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.root, canonical.canonicalize().unwrap());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scope_resolve_prefers_a_fresh_local_baseline_over_a_stale_identity_route() {
+        let root = test_root("scope-fresh-reset");
+        let project = root.join("project");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(project.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let identity_dir = state_root.join("identities/worker-a");
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::write(
+            identity_dir.join("identity.json"),
+            json!({
+                "worker_id": "worker-a",
+                "token": "token-a",
+                "runtime": {
+                    "agent_id": "worker-a",
+                    "runtime_id": "runtime-a",
+                    "appserver_id": "appserver-cli",
+                    "endpoint_generation": 1,
+                    "binding_id": "binding-a",
+                    "native_thread_id": "thread-a"
+                },
+                "transport": {
+                    "kind": "appserver",
+                    "endpoint": "unix:///tmp/test.sock",
+                    "namespace": "codex_tui",
+                    "thread_id": "thread-a",
+                    "capabilities": [],
+                    "self_check": "test"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let resolved =
+            Scope::resolve_from_cwd_with_host_paths(&project, &host_paths, Some("worker-a".into()))
+                .unwrap();
+
+        assert_eq!(resolved.root, project);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scope_resolve_preserves_a_nested_project_inside_a_linked_worktree() {
+        let root = test_root("scope-nested-worktree");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let nested = worktree.join("services/service-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-a",
+                worktree.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::create_dir_all(nested.join(".agent-collab")).unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let resolved = Scope::resolve_from_cwd_with_host_paths(&nested, &host_paths, None).unwrap();
+
+        assert_eq!(resolved.root, nested);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn read_only_route_resolution_preserves_non_cli_scope_from_a_linked_worktree() {
+        let root = test_root("read-only-worktree-route");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-a",
+                worktree.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let canonical = canonical.canonicalize().unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        let route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-vscode",
+            "project_scope": canonical,
+            "canonical_root": canonical,
+            "storage_root": canonical,
+            "registered_ms": 1
+        });
+        std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let resolved = canonical_route_for_cwd(&host_paths, &worktree).unwrap();
+
+        assert_eq!(resolved.root, canonical);
+        assert_eq!(resolved.app_scope_id.as_str(), "appserver-vscode");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn read_only_route_resolution_keeps_a_nested_project_inside_a_linked_worktree() {
+        let root = test_root("read-only-nested-worktree-route");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let nested = worktree.join("services/service-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-a",
+                worktree.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::create_dir_all(nested.join(".agent-collab")).unwrap();
+
+        let canonical = canonical.canonicalize().unwrap();
+        let nested = nested.canonicalize().unwrap();
+        let main_route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": canonical,
+            "canonical_root": canonical,
+            "storage_root": canonical,
+            "registered_ms": 1
+        });
+        let nested_route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": nested,
+            "canonical_root": nested,
+            "storage_root": nested,
+            "registered_ms": 2
+        });
+        std::fs::write(
+            state_root.join("routes.jsonl"),
+            format!("{main_route}\n{nested_route}\n"),
+        )
+        .unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let resolved = canonical_route_for_cwd(&host_paths, &nested).unwrap();
+
+        assert_eq!(resolved.root, nested);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn read_only_route_resolution_rejects_a_worktree_only_route() {
+        let root = test_root("read-only-worktree-only-route");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-a",
+                worktree.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::create_dir_all(worktree.join(".agent-collab")).unwrap();
+        let route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": worktree,
+            "canonical_root": worktree,
+            "storage_root": worktree,
+            "registered_ms": 1
+        });
+        std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let error = canonical_route_for_cwd(&host_paths, &worktree).unwrap_err();
+
+        assert!(error.to_string().contains("no registered Collab route"));
         std::fs::remove_dir_all(root).ok();
     }
 

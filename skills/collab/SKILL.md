@@ -596,15 +596,19 @@ route from the global Collab state by the same Codex sessionID/App Server
 thread, and the returned `project_root` is the canonical project root.
 
 Use `collab master status` for the authoritative live-master answer; `collab
-who` only lists registered peers. Do not run `appsdk init`, `collab init`,
-`collab worker recover`, or master promotion from a worktree, and do not
-report "no master" because `.agent-collab/` or a `who.master` field is absent.
-`collab context` failure is not a master-state query: if it fails with
-`token mismatch`, `PROJECT_SCOPE_UNKNOWN`, or another exact error, preserve the
-error, run `collab master status` separately, and report the registration
-problem to the live master. Do not infer "no master", recover by copying or
-editing identity/token state, or reset the project. If `master status` reports
-`master: null`, follow the explicit user-approved promotion protocol only.
+who` only lists registered peers. This query resolves the canonical route from
+the global Collab route state and does not require a worktree-local
+`.agent-collab/` or a new registration. Do not run `appsdk init`, `collab
+init`, `collab worker recover`, or master promotion from a worktree, and do
+not report "no master" because `.agent-collab/`, `collab context`, or a
+`who.master` field is absent or failed. If `collab context` fails with
+`token mismatch`, `PROJECT_SCOPE_UNKNOWN`, or another exact error, preserve
+that error, run `collab master status` separately, and report the
+registration problem to the live master. Do not infer "no master", recover by
+copying or editing identity/token state, or reset the project. Only
+`master status` returning `master: null` with no `recorded_unusable` entry
+means no live master; then follow the explicit user-approved promotion
+protocol.
 
 ## Subscribe to a future event
 
