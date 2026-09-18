@@ -4304,7 +4304,7 @@ fn appserver_agent_view(
     let latest_turn_status = thread
         .get("turns")
         .and_then(serde_json::Value::as_array)
-        .and_then(|turns| turns.last())
+        .and_then(|turns| turns.first())
         .and_then(|turn| turn.get("status"))
         .and_then(serde_json::Value::as_str);
     let latest_turn_error = thread

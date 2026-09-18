@@ -715,6 +715,10 @@ pub struct Scope {
 impl Scope {
     pub fn resolve() -> anyhow::Result<Self> {
         let cwd = std::env::current_dir()?;
+        // Validate the host endpoint while resolution is still fallible.
+        // The infallible compatibility accessors below are only used after
+        // this check (or by isolated unit fixtures).
+        HostPaths::resolve()?;
         if cwd.join(".agent-collab").is_dir() {
             return Self::from_project_root(cwd);
         }

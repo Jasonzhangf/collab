@@ -5893,7 +5893,10 @@ fn context_projects_appserver_thread_and_turn_state_without_guessing() {
                         "id": thread_id,
                         "status": {"type": thread_state, "activeFlags": active_flags},
                         "canAcceptDirectInput": thread_state == "idle",
-                        "turns": [{"status": turn_status}]
+                        "turns": [
+                            {"status": turn_status},
+                            {"status": "older"}
+                        ]
                     }
                 }))
             });
