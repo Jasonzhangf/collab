@@ -1448,14 +1448,14 @@ type RouteKey = (String, String);
 /// resident project's journal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HostRouteRecord {
-    version: u8,
-    op: String,
-    app_scope_id: String,
-    project_scope: String,
-    canonical_root: String,
-    storage_root: String,
-    registered_ms: i64,
+pub(crate) struct HostRouteRecord {
+    pub(crate) version: u8,
+    pub(crate) op: String,
+    pub(crate) app_scope_id: String,
+    pub(crate) project_scope: String,
+    pub(crate) canonical_root: String,
+    pub(crate) storage_root: String,
+    pub(crate) registered_ms: i64,
 }
 
 struct RuntimeRoute {
@@ -2415,7 +2415,7 @@ impl ProjectRuntimeManager {
     }
 }
 
-fn load_host_route_records(path: &Path) -> Result<Vec<HostRouteRecord>, String> {
+pub(crate) fn load_host_route_records(path: &Path) -> Result<Vec<HostRouteRecord>, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -2483,7 +2483,7 @@ fn load_host_route_records(path: &Path) -> Result<Vec<HostRouteRecord>, String> 
     Ok(records)
 }
 
-fn validate_host_route_record(
+pub(crate) fn validate_host_route_record(
     record: &HostRouteRecord,
 ) -> Result<(RouteKey, PathBuf, PathBuf), String> {
     if record.version != 1 || record.op != "register" {
@@ -2502,7 +2502,13 @@ fn validate_host_route_record(
             record.canonical_root
         )
     })?;
-    if root.to_string_lossy() != project_scope.as_str() {
+    let expected_root = std::fs::canonicalize(project_scope.as_str()).map_err(|error| {
+        format!(
+            "HOST_ROUTE_REPLAY_FAILED: canonical project scope {}: {error}",
+            project_scope.as_str()
+        )
+    })?;
+    if root != expected_root {
         return Err(
             "HOST_ROUTE_REPLAY_FAILED: route project scope does not match canonical root".into(),
         );
