@@ -523,6 +523,18 @@ fn cli_project_context(root: &std::path::Path) -> anyhow::Result<ProjectContext>
     )
 }
 
+fn unregistered_context() -> anyhow::Result<serde_json::Value> {
+    let cwd = std::env::current_dir()?;
+    let project_root = std::fs::canonicalize(&cwd)?;
+    Ok(json!({
+        "registered": false,
+        "project_root": project_root,
+        "cwd": cwd,
+        "next_action": "appsdk init .",
+        "truth": "exact process cwd; no project-local Collab state was read or created",
+    }))
+}
+
 fn command_envelope(scope: &Scope, ident: &Identity) -> anyhow::Result<proto::CommandEnvelope> {
     let runtime = runtime_for_request(ident)?;
     let route = scope.route_scope(runtime.appserver_id.clone())?;
@@ -1044,6 +1056,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Context { worker } => {
+            if !std::env::current_dir()?.join(".agent-collab").is_dir() {
+                out(&unregistered_context()?);
+                return Ok(());
+            }
             let scope = Scope::resolve()?;
             let ident = me(&scope, worker)?;
             let v: serde_json::Value = call_project(
@@ -1330,6 +1346,29 @@ mod tests {
         assert_eq!(context.app_scope_id.as_str(), identity::CLI_APP_SERVER_ID);
         assert_eq!(context.canonical_root, canonical.to_string_lossy());
         assert_eq!(context.project_scope.as_str(), canonical.to_string_lossy());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn unregistered_context_is_read_only_and_points_to_appsdk_init() {
+        let root = test_root("unregistered-context");
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let result = unregistered_context();
+        std::env::set_current_dir(previous).unwrap();
+
+        let context = result.unwrap();
+        assert_eq!(context["registered"], false);
+        assert_eq!(
+            context["project_root"],
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            context["cwd"],
+            root.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(context["next_action"], "appsdk init .");
+        assert!(!root.join(".agent-collab").exists());
         std::fs::remove_dir_all(root).ok();
     }
 
