@@ -2,8 +2,13 @@ use std::path::Path;
 use std::process::Command;
 
 fn run_context(root: &Path) -> std::process::Output {
+    run_context_with_args(root, &[])
+}
+
+fn run_context_with_args(root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_collab"))
         .arg("context")
+        .args(args)
         .current_dir(root)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
@@ -42,6 +47,58 @@ fn context_returns_structured_unregistered_without_side_effects() {
     assert_eq!(context["next_action"], "appsdk init .");
     assert!(!Path::new(&root).join(".agent-collab").exists());
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn explicit_worker_does_not_fall_back_to_another_thread_binding() {
+    let root = std::env::temp_dir().join(format!(
+        "collab-context-explicit-worker-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let other = root.join(".agent-collab/runs/worker-b");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("identity.json"),
+        r#"{
+  "worker_id": "worker-b",
+  "token": "token-b",
+  "runtime": {
+    "agent_id": "worker-b",
+    "runtime_id": "runtime-b",
+    "appserver_id": "appserver-cli",
+    "endpoint_generation": 1,
+    "binding_id": "binding-b",
+    "native_thread_id": "context-test-thread"
+  },
+  "transport": {
+    "kind": "appserver",
+    "endpoint": "unix:///tmp/test.sock",
+    "namespace": "codex_tui",
+    "thread_id": "context-test-thread",
+    "capabilities": [],
+    "self_check": "test"
+  }
+}"#,
+    )
+    .unwrap();
+
+    let output = run_context_with_args(&root, &["--worker", "worker-a"]);
+
+    assert!(
+        output.status.success(),
+        "context failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let context: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(context["registered"], false);
+    assert!(context["identity"].is_null());
+    assert_ne!(context["identity"]["worker_id"], "worker-b");
 
     std::fs::remove_dir_all(root).ok();
 }

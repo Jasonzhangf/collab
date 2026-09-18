@@ -482,7 +482,8 @@ pub fn load_existing(scope: &Scope, worker_id: Option<String>) -> anyhow::Result
             .ok()
             .filter(|value| !value.trim().is_empty())
     });
-    let requested = explicit_worker.or_else(|| {
+    let selected_explicitly = explicit_worker.is_some();
+    let requested = explicit_worker.clone().or_else(|| {
         thread_id
             .as_ref()
             .map(|thread_id| format!("codex-{thread_id}"))
@@ -493,11 +494,7 @@ pub fn load_existing(scope: &Scope, worker_id: Option<String>) -> anyhow::Result
     if let Some(identity) = read_identity(&identity_path(scope, &worker_id))? {
         return Ok(Some(identity));
     }
-    if std::env::var("COLLAB_WORKER")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .is_some()
-    {
+    if selected_explicitly {
         return Ok(None);
     }
     let Some(thread_id) = thread_id else {
