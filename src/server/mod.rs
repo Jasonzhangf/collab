@@ -7538,12 +7538,6 @@ fn validate_wire_runtime_binding(
             return Ok(());
         }
 
-        // A CLI process may lose its persisted runtime when its App Server
-        // thread is recreated.  Permit that one recovery shape to reach the Register
-        // owner, but do not treat the provisional identity as a capability for
-        // any other mutation.  Token and thread ownership are checked against
-        // the resident worker before the typed registrar can advance the
-        // binding generation.
         if let Req::Register {
             worker_id,
             token,
@@ -7551,7 +7545,18 @@ fn validate_wire_runtime_binding(
             ..
         } = req
         {
-            if is_provisional_cli_runtime(project_context, worker_id) {
+            let token_mismatch = {
+                let state = server.state.lock().unwrap();
+                state
+                    .workers
+                    .get(worker_id)
+                    .is_some_and(|worker| worker.token != *token)
+            };
+            // A CLI process may lose its persisted runtime when its App Server
+            // thread is recreated. Permit only that recovery shape or an
+            // authorized same-thread token rotation to bypass the normal actor
+            // check; same-token reconnects remain idempotent.
+            if is_provisional_cli_runtime(project_context, worker_id) || token_mismatch {
                 return validate_cli_register_rebind(
                     server,
                     project_context,
@@ -7595,33 +7600,6 @@ fn validate_cli_register_rebind(
             "RUNTIME_BINDING_REJECTED: worker token does not match the registered identity"
                 .to_owned()
         })?;
-        if worker.token != token {
-            let Some(candidate) = candidates
-                .as_ref()
-                .and_then(|candidates| candidates.appserver.as_ref())
-            else {
-                return Err(
-                    "RUNTIME_BINDING_REJECTED: CLI rebind requires an App Server candidate"
-                        .to_owned(),
-                );
-            };
-            if appserver_thread_owner(&state, &candidate.thread_id).as_deref() != Some(worker_id) {
-                return Err(
-                    "RUNTIME_BINDING_REJECTED: worker token does not match the registered identity"
-                        .to_owned(),
-                );
-            }
-        }
-        let worker_scope =
-            GlobalState::canonical_project_scope(Path::new(&worker.cwd)).map_err(|error| {
-                format!("RUNTIME_BINDING_REJECTED: worker cwd is not a project route: {error}")
-            })?;
-        if worker_scope != route_scope.project_scope_id {
-            return Err(
-                "RUNTIME_BINDING_REJECTED: worker cwd does not match the requested project route"
-                    .into(),
-            );
-        }
         let Some(project) = state.global.lookup_project_for_route(&route_scope) else {
             return Err(
                 "PROJECT_ROUTE_NOT_READY/UNSUPPORTED: worker has no registered runtime route"
@@ -7654,6 +7632,43 @@ fn validate_cli_register_rebind(
         binding
             .validate()
             .map_err(|error| format!("RUNTIME_BINDING_REJECTED: {error}"))?;
+        if worker.token != token {
+            let Some(candidate) = candidates
+                .as_ref()
+                .and_then(|candidates| candidates.appserver.as_ref())
+            else {
+                return Err(
+                    "RUNTIME_BINDING_REJECTED: CLI rebind requires an App Server candidate"
+                        .to_owned(),
+                );
+            };
+            let same_runtime_thread = is_provisional_cli_runtime(project_context, worker_id)
+                || project_context
+                    .runtime_context
+                    .as_ref()
+                    .is_some_and(|runtime| {
+                        runtime.agent_id == binding.agent_id
+                            && runtime.native_thread_id == binding.native_thread_id
+                    });
+            if appserver_thread_owner(&state, &candidate.thread_id).as_deref() != Some(worker_id)
+                || !same_runtime_thread
+            {
+                return Err(
+                    "RUNTIME_BINDING_REJECTED: worker token does not match the registered identity"
+                        .to_owned(),
+                );
+            }
+        }
+        let worker_scope =
+            GlobalState::canonical_project_scope(Path::new(&worker.cwd)).map_err(|error| {
+                format!("RUNTIME_BINDING_REJECTED: worker cwd is not a project route: {error}")
+            })?;
+        if worker_scope != route_scope.project_scope_id {
+            return Err(
+                "RUNTIME_BINDING_REJECTED: worker cwd does not match the requested project route"
+                    .into(),
+            );
+        }
     }
 
     let candidate = candidates
@@ -7789,9 +7804,19 @@ fn dispatch_with_route_context(
             cwd,
             candidates,
         } => {
-            let recover_existing = project_context
-                .as_ref()
-                .is_some_and(|context| is_provisional_cli_runtime(context, &worker_id));
+            let recover_existing = project_context.as_ref().is_some_and(|context| {
+                is_provisional_cli_runtime(context, &worker_id)
+                    || context.runtime_context.as_ref().is_some_and(|runtime| {
+                        runtime.agent_id.as_str() == worker_id
+                            && server
+                                .state
+                                .lock()
+                                .unwrap()
+                                .workers
+                                .get(&worker_id)
+                                .is_some_and(|worker| worker.token != token)
+                    })
+            });
             handle_register_with_app_scope_inner(
                 server,
                 worker_id,
@@ -12424,6 +12449,54 @@ mod host_route_registry_tests {
             new_token
         );
         assert!(!std::fs::read(&journal_path).unwrap().is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wire_worker_recover_rotates_a_lost_token_with_the_persisted_runtime() {
+        let (server, root, _) = test_server();
+        let app = crate::identity::CLI_APP_SERVER_ID;
+        let worker_id = "worker-recover-worker";
+        let old_token = "old-token-worker-recover-worker";
+        let new_token = "new-token-worker-recover-worker";
+        let first = dispatch_wire(
+            server.clone(),
+            Some(context_with_app(&root, app)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: old_token.into(),
+                cwd: root.display().to_string(),
+                candidates: test_candidates(&format!("thread-{worker_id}")),
+            },
+        )
+        .await;
+        assert!(first.ok, "{first:?}");
+        let persisted_runtime = runtime_for_registered(&server, &root, worker_id, app);
+
+        let recovered = dispatch_wire(
+            server.clone(),
+            Some(context_with_runtime(&root, app, &persisted_runtime)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: new_token.into(),
+                cwd: root.display().to_string(),
+                candidates: test_candidates(&format!("thread-{worker_id}")),
+            },
+        )
+        .await;
+        assert!(recovered.ok, "{recovered:?}");
+        assert_eq!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .workers
+                .get(worker_id)
+                .unwrap()
+                .token,
+            new_token
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
