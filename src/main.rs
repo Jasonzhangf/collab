@@ -443,10 +443,25 @@ fn me(scope: &Scope, worker: Option<String>) -> anyhow::Result<Identity> {
 fn ensure_registration(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::Value> {
     if ident.runtime.is_none() || ident.transport.is_none() {
         register(scope, ident)
+    } else if !persisted_runtime_matches_scope(scope, ident)? {
+        register(scope, ident)
     } else {
         runtime_for_request(ident)?;
         Ok(json!({"reused": true}))
     }
+}
+
+fn persisted_runtime_matches_scope(scope: &Scope, ident: &Identity) -> anyhow::Result<bool> {
+    let runtime = ident
+        .runtime
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("identity has no registered runtime binding"))?;
+    let host_paths = scope.host_paths()?;
+    let scope_root = std::fs::canonicalize(&scope.root)?;
+    Ok(
+        scope::canonical_route_for_identity(&host_paths, &scope.root, &runtime.appserver_id)
+            .is_ok_and(|route| route.root == scope_root),
+    )
 }
 
 fn runtime_for_request<'a>(ident: &'a Identity) -> anyhow::Result<&'a RuntimeIdentity> {
@@ -1428,6 +1443,20 @@ mod tests {
     #[test]
     fn ensure_registration_reuses_a_valid_runtime_without_rebinding() {
         let root = test_root("registration-reuse");
+        let state_root = root.join("global");
+        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::env::set_var(crate::scope::COLLAB_STATE_DIR_ENV, &state_root);
+        let route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": identity::CLI_APP_SERVER_ID,
+            "project_scope": root.canonicalize().unwrap(),
+            "canonical_root": root.canonicalize().unwrap(),
+            "storage_root": root.canonicalize().unwrap(),
+            "registered_ms": 1
+        });
+        std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
         let runtime = RuntimeIdentity::cli_adapter("worker-1").unwrap();
         let mut identity = identity_with_runtime(Some(runtime));
         identity.transport = Some(SelectedTransport {
@@ -1442,6 +1471,59 @@ mod tests {
         let response = ensure_registration(&Scope { root: root.clone() }, &mut identity).unwrap();
         assert_eq!(response, json!({"reused": true}));
         assert_eq!(serde_json::to_value(&identity).unwrap(), before);
+        std::env::remove_var(crate::scope::COLLAB_STATE_DIR_ENV);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ensure_registration_rebinds_a_thread_bound_to_another_project() {
+        let root = test_root("registration-rebind");
+        let old_root = root.join("old-project");
+        let new_root = root.join("new-project");
+        let state_root = root.join("global");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::create_dir_all(old_root.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(new_root.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::env::set_var(crate::scope::COLLAB_STATE_DIR_ENV, &state_root);
+        let route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": identity::CLI_APP_SERVER_ID,
+            "project_scope": old_root.canonicalize().unwrap(),
+            "canonical_root": old_root.canonicalize().unwrap(),
+            "storage_root": old_root.canonicalize().unwrap(),
+            "registered_ms": 1
+        });
+        std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
+        let runtime = RuntimeIdentity::cli_adapter("worker-1").unwrap();
+        let mut identity = identity_with_runtime(Some(runtime));
+        identity.transport = Some(SelectedTransport {
+            kind: TransportKind::AppServer,
+            endpoint: Some("unix:///tmp/codex.sock".into()),
+            namespace: Some("codex_tui".into()),
+            thread_id: Some("thread-worker-1".into()),
+            capabilities: vec!["send_message_to_thread".into()],
+            self_check: "test appserver".into(),
+        });
+
+        assert!(!persisted_runtime_matches_scope(
+            &Scope {
+                root: new_root.clone()
+            },
+            &identity
+        )
+        .unwrap());
+        assert!(persisted_runtime_matches_scope(
+            &Scope {
+                root: old_root.clone()
+            },
+            &identity
+        )
+        .unwrap());
+
+        std::env::remove_var(crate::scope::COLLAB_STATE_DIR_ENV);
         std::fs::remove_dir_all(root).ok();
     }
 
