@@ -37,7 +37,7 @@ Build from the reviewed current source, install both binaries with Cargo, then
 refresh the embedded Skill:
 
 ```sh
-cargo install --path . --force
+cargo install --locked --path . --force
 collab install-skills --target "$HOME/.agents/skills/collab" --force
 command -v collab
 command -v collab-mcp
@@ -238,7 +238,7 @@ mailbox, copy tokens, start a second daemon, or invent an owner. Use:
 collab migrate inspect
 → collab migrate plan
 → collab migrate apply          # admission freeze + deterministic snapshot
-→ cargo install --path . --force
+→ cargo install --locked --path . --force
 → collab down
 → collab up
 → collab worker recover         # each live App Server peer

@@ -32,7 +32,7 @@ history merely to make initialization look clean.
 Use the repository's install sequence from the reviewed current source:
 
 ```sh
-cargo install --path . --force
+cargo install --locked --path . --force
 collab install-skills --target "$HOME/.agents/skills/collab" --force
 ```
 

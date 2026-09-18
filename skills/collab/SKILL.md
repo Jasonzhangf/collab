@@ -33,7 +33,7 @@ versions.
 The canonical install sequence from the reviewed source is:
 
 ```sh
-cargo install --path . --force
+cargo install --locked --path . --force
 collab install-skills --target "$HOME/.agents/skills/collab" --force
 ```
 
