@@ -124,12 +124,16 @@ fn load_route_records(host_paths: &HostPaths) -> anyhow::Result<Vec<CanonicalPro
     let route_journal = host_paths.state_root().join("routes.jsonl");
     let mut records = Vec::new();
     for record in load_host_route_records(&route_journal).map_err(anyhow::Error::msg)? {
-        let canonical_root = std::fs::canonicalize(&record.canonical_root).map_err(|error| {
-            anyhow::anyhow!(
-                "cannot canonicalize route root {}: {error}",
-                record.canonical_root
-            )
-        })?;
+        let canonical_root = match std::fs::canonicalize(&record.canonical_root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "cannot canonicalize route root {}: {error}",
+                    record.canonical_root
+                ));
+            }
+        };
         if !canonical_root.join(".agent-collab").is_dir() {
             continue;
         }
@@ -1322,6 +1326,50 @@ mod tests {
         let host_paths = HostPaths::for_state_root(&state_root).unwrap();
         let app_scope = AppServerId::new("appserver-cli").unwrap();
         assert!(canonical_route_for_identity(&host_paths, &worktree, &app_scope).is_err());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn identity_route_ignores_missing_stale_root_and_keeps_current_route() {
+        let root = test_root("worktree-route-missing-root");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let missing = root.join("removed-worktree");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        let canonical = canonical.canonicalize().unwrap();
+
+        let stale = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": missing,
+            "canonical_root": missing,
+            "storage_root": missing,
+            "registered_ms": 1
+        });
+        let current = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": canonical,
+            "canonical_root": canonical,
+            "storage_root": canonical,
+            "registered_ms": 2
+        });
+        std::fs::write(
+            state_root.join("routes.jsonl"),
+            format!("{stale}\n{current}\n"),
+        )
+        .unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let app_scope = AppServerId::new("appserver-cli").unwrap();
+        let resolved = canonical_route_for_identity(&host_paths, &worktree, &app_scope).unwrap();
+        assert_eq!(resolved.root, canonical);
 
         std::fs::remove_dir_all(root).ok();
     }
