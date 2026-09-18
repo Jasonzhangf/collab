@@ -33,14 +33,18 @@ versions.
 The canonical install sequence from the reviewed source is:
 
 ```sh
-cargo install --locked --path . --force
-collab install-skills --target "$HOME/.agents/skills/collab" --force
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+cargo install --locked --path . --force --root "$cargo_home"
+"$cargo_home/bin/collab" install-skills --target "$HOME/.agents/skills/collab" --force
+"$cargo_home/bin/collab" --version
 ```
 
-Cargo writes `collab` and `collab-mcp` beside the active `cargo`; the second
-command refreshes the embedded Skill from the new binary. The install does not
-remove business source, Git history, `~/.collab/`, project-local
-`.agent-collab/`, AppSDK state, run notes, or shared evidence.
+The canonical pair is `$CARGO_HOME/bin/collab` and
+`$CARGO_HOME/bin/collab-mcp` (default `$HOME/.cargo/bin`). The sequence invokes
+the exact newly installed binary to refresh the embedded Skill, so an older
+PATH entry cannot write a stale Skill. The install does not remove business
+source, Git history, `~/.collab/`, project-local `.agent-collab/`, AppSDK
+state, run notes, or shared evidence.
 
 Legacy user-local copies are not removed automatically by this sequence.
 If an exact old copy must be retired, first prove it is Collab by running its
@@ -67,9 +71,10 @@ command -v collab-mcp
 collab status --all
 ```
 
-If the version or command path is stale after installation, rerun the two
-install commands once and refresh the shell command cache (`rehash` in zsh,
-`hash -r` in bash).
+If the version or command path is stale after installation, fix PATH or refresh
+the shell command cache (`rehash` in zsh, `hash -r` in bash), then verify that
+`command -v collab` and `command -v collab-mcp` resolve to the exact
+`$CARGO_HOME/bin` pair.
 Do not hand-copy binaries, leave a second managed entry, or select an older
 binary as a fallback.
 

@@ -37,19 +37,23 @@ Build from the reviewed current source, install both binaries with Cargo, then
 refresh the embedded Skill:
 
 ```sh
-cargo install --locked --path . --force
-collab install-skills --target "$HOME/.agents/skills/collab" --force
-command -v collab
-command -v collab-mcp
-collab --version
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+cargo install --locked --path . --force --root "$cargo_home"
+"$cargo_home/bin/collab" install-skills --target "$HOME/.agents/skills/collab" --force
+"$cargo_home/bin/collab" --version
+test -x "$cargo_home/bin/collab-mcp"
+test "$(command -v collab)" = "$cargo_home/bin/collab"
+test "$(command -v collab-mcp)" = "$cargo_home/bin/collab-mcp"
 ```
 
-This writes the canonical `collab` and `collab-mcp` beside the active Cargo
-bin directory and refreshes the globally discovered Skill. It does not remove
-legacy copies, restart the global daemon, or touch `~/.collab/`,
-project-local `.agent-collab/`, AppSDK state, business source, or evidence.
-An existing daemon may keep running the old binary until an explicitly
-authorized maintenance window.
+The canonical pair is `$CARGO_HOME/bin/collab` and
+`$CARGO_HOME/bin/collab-mcp` (default `$HOME/.cargo/bin`). The sequence invokes
+the exact newly installed binary to refresh the globally discovered Skill, so
+an older PATH entry cannot write its embedded Skill. It does not remove legacy
+copies, restart the global daemon, or touch `~/.collab/`, project-local
+`.agent-collab/`, AppSDK state, business source, or evidence. An existing
+daemon may keep running the old binary until an explicitly authorized
+maintenance window.
 
 ## Start and identity
 
