@@ -17,6 +17,12 @@ pub struct HostPaths {
     lock_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalProjectRoute {
+    pub root: PathBuf,
+    pub app_scope_id: AppServerId,
+}
+
 impl HostPaths {
     pub fn from_state_root(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let state_root = validate_host_path(root.as_ref().to_path_buf(), "host state root")?;
@@ -99,6 +105,111 @@ impl HostPaths {
 
     pub fn ensure_root(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.state_root)
+    }
+}
+
+/// Resolve the canonical registered project route for an execution worktree.
+///
+/// A Git worktree has no project-local `.agent-collab/` and therefore cannot
+/// own a peer identity. The host route journal is the only durable index that
+/// can map an execution cwd back to the registered canonical project root.
+/// This lookup is read-only and requires an exact filesystem ancestor; it
+/// never searches arbitrary parents or chooses a route by name.
+fn load_route_records(host_paths: &HostPaths) -> anyhow::Result<Vec<CanonicalProjectRoute>> {
+    let route_journal = host_paths.state_root().join("routes.jsonl");
+    let content = match std::fs::read_to_string(&route_journal) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            anyhow::bail!(
+                "cannot read host route journal {}: {error}",
+                route_journal.display()
+            )
+        }
+    };
+    if content.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !content.ends_with('\n') {
+        anyhow::bail!("host route journal must end with a newline");
+    }
+
+    let mut records = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            anyhow::bail!("host route journal contains an empty line");
+        }
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        let Some(canonical_root) = value
+            .get("canonical_root")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let root = match std::fs::canonicalize(canonical_root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                anyhow::bail!("cannot canonicalize route root {}: {error}", canonical_root)
+            }
+        };
+        let app_scope_id = value
+            .get("app_scope_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("host route record is missing app_scope_id"))?;
+        records.push(CanonicalProjectRoute {
+            root,
+            app_scope_id: AppServerId::new(app_scope_id.to_owned())?,
+        });
+    }
+    records.sort_by(|left, right| {
+        right
+            .root
+            .components()
+            .count()
+            .cmp(&left.root.components().count())
+            .then_with(|| left.root.cmp(&right.root))
+    });
+    Ok(records)
+}
+
+/// Resolve the canonical route bound to one registered peer identity.
+///
+/// The identity's App Server scope is authoritative. The caller's cwd may be
+/// a Git worktree, so it must be inside the route's canonical root but is not
+/// allowed to select a different project by itself.
+pub fn canonical_route_for_identity(
+    host_paths: &HostPaths,
+    cwd: &Path,
+    app_scope_id: &AppServerId,
+) -> anyhow::Result<CanonicalProjectRoute> {
+    let cwd = std::fs::canonicalize(cwd)?;
+    let mut matches = load_route_records(host_paths)?
+        .into_iter()
+        .filter(|route| {
+            &route.app_scope_id == app_scope_id
+                && (cwd == route.root || cwd.starts_with(&route.root))
+        })
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap()),
+        0 => anyhow::bail!(
+            "no registered Collab route matches app scope {} and contains cwd {}",
+            app_scope_id,
+            cwd.display()
+        ),
+        _ => {
+            let roots = matches
+                .iter()
+                .map(|route| route.root.display().to_string())
+                .collect::<Vec<_>>();
+            anyhow::bail!(
+                "multiple canonical Collab routes match app scope {} and contain cwd {}: {}",
+                app_scope_id,
+                cwd.display(),
+                roots.join(", ")
+            )
+        }
     }
 }
 
@@ -292,8 +403,7 @@ fn inherited_cwd_if_initialized(cwd: PathBuf) -> anyhow::Result<PathBuf> {
 }
 
 pub fn project_root() -> anyhow::Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
-    inherited_cwd_if_initialized(cwd)
+    Ok(Scope::resolve()?.root)
 }
 
 /// Resolve the exact destination for `collab init`. Initialization binds to
@@ -597,18 +707,30 @@ messages; resource release notifies only an exact active subscriber.
 "#;
 
 /// Scope guard used by every command except init.
+#[derive(Clone)]
 pub struct Scope {
     pub root: PathBuf,
 }
 
 impl Scope {
     pub fn resolve() -> anyhow::Result<Self> {
-        let scope = Self::from_project_root(project_root()?)?;
-        // Resolve and validate the host endpoint while the command still has
-        // a fallible boundary.  The infallible compatibility accessors below
-        // are only used after this check (or by isolated unit fixtures).
-        HostPaths::resolve()?;
-        Ok(scope)
+        let cwd = std::env::current_dir()?;
+        if cwd.join(".agent-collab").is_dir() {
+            return Self::from_project_root(cwd);
+        }
+        let identity_scope = Scope { root: cwd.clone() };
+        let Some(identity) = crate::identity::load_existing(&identity_scope, None)? else {
+            anyhow::bail!("no .agent-collab found in inherited cwd {}", cwd.display());
+        };
+        let Some(runtime) = identity.runtime.as_ref() else {
+            anyhow::bail!(
+                "persisted Collab identity {} has no registered runtime",
+                identity.worker_id
+            );
+        };
+        let host_paths = HostPaths::resolve()?;
+        let route = canonical_route_for_identity(&host_paths, &cwd, &runtime.appserver_id)?;
+        Ok(Scope { root: route.root })
     }
 
     fn from_project_root(root: PathBuf) -> anyhow::Result<Self> {
@@ -661,6 +783,7 @@ impl Scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -673,7 +796,6 @@ mod tests {
         ))
     }
 
-    #[test]
     #[test]
     fn init_scope_uses_unmarked_process_cwd() {
         let cwd = test_root("init-unmarked-cwd");
@@ -729,6 +851,118 @@ mod tests {
             registered.canonicalize().unwrap().to_string_lossy()
         );
         std::fs::remove_dir_all(parent).ok();
+    }
+
+    #[test]
+    fn identity_route_resolves_only_for_its_app_scope_and_contains_cwd() {
+        let root = test_root("worktree-route");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": canonical.canonicalize().unwrap(),
+            "canonical_root": canonical.canonicalize().unwrap(),
+            "storage_root": canonical.canonicalize().unwrap(),
+            "registered_ms": 1
+        });
+        std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let app_scope = AppServerId::new("appserver-cli").unwrap();
+        let resolved = canonical_route_for_identity(&host_paths, &worktree, &app_scope).unwrap();
+        assert_eq!(resolved.root, canonical.canonicalize().unwrap());
+        assert_eq!(resolved.app_scope_id.as_str(), "appserver-cli");
+        assert!(canonical_route_for_identity(
+            &host_paths,
+            &unrelated,
+            &AppServerId::new("appserver-cli").unwrap()
+        )
+        .is_err());
+        assert!(canonical_route_for_identity(
+            &host_paths,
+            &worktree,
+            &AppServerId::new("appserver-other").unwrap()
+        )
+        .is_err());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scope_resolve_reuses_identity_route_from_a_worktree() {
+        let root = test_root("scope-worktree-identity");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        let canonical = canonical.canonicalize().unwrap();
+        let route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": canonical,
+            "canonical_root": canonical,
+            "storage_root": canonical,
+            "registered_ms": 1
+        });
+        std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
+        let identity_dir = state_root.join("identities/worker-a");
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::write(
+            identity_dir.join("identity.json"),
+            json!({
+                "worker_id": "worker-a",
+                "token": "token-a",
+                "runtime": {
+                    "agent_id": "worker-a",
+                    "runtime_id": "runtime-a",
+                    "appserver_id": "appserver-cli",
+                    "endpoint_generation": 1,
+                    "binding_id": "binding-a",
+                    "native_thread_id": "thread-a"
+                },
+                "transport": {
+                    "kind": "appserver",
+                    "endpoint": "unix:///tmp/test.sock",
+                    "namespace": "codex_tui",
+                    "thread_id": "thread-a",
+                    "capabilities": [],
+                    "self_check": "test"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let previous_state = std::env::var_os(COLLAB_STATE_DIR_ENV);
+        let previous_thread = std::env::var_os("CODEX_THREAD_ID");
+        let previous_cwd = std::env::current_dir().unwrap();
+        std::env::set_var(COLLAB_STATE_DIR_ENV, &state_root);
+        std::env::set_var("CODEX_THREAD_ID", "thread-a");
+        std::env::set_current_dir(&worktree).unwrap();
+        let resolved = Scope::resolve().unwrap();
+        std::env::set_current_dir(previous_cwd).unwrap();
+        match previous_state {
+            Some(value) => std::env::set_var(COLLAB_STATE_DIR_ENV, value),
+            None => std::env::remove_var(COLLAB_STATE_DIR_ENV),
+        }
+        match previous_thread {
+            Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
+            None => std::env::remove_var("CODEX_THREAD_ID"),
+        }
+
+        assert_eq!(resolved.root, canonical);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

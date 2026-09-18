@@ -169,8 +169,22 @@ pub(crate) fn default_appserver_notification_sink() -> Arc<AppServerNotification
 
 fn default_appserver_thread_status() -> Arc<AppServerThreadStatus> {
     Arc::new(|transport, thread_id| {
-        crate::client::adapters::codex_app_server::read_thread_status(transport, thread_id)
-            .map_err(|error| error.to_string())
+        let mut status =
+            crate::client::adapters::codex_app_server::read_thread_status(transport, thread_id)
+                .map_err(|error| error.to_string())?;
+        match crate::client::adapters::codex_app_server::read_latest_turn_status(
+            transport, thread_id,
+        ) {
+            Ok(turns) => {
+                if let Some(data) = turns.get("data").and_then(serde_json::Value::as_array) {
+                    status["thread"]["turns"] = serde_json::Value::Array(data.clone());
+                }
+            }
+            Err(error) => {
+                status["thread"]["turn_status_error"] = json!(error.to_string());
+            }
+        }
+        Ok(status)
     })
 }
 
@@ -4251,6 +4265,63 @@ fn worker_identity_presence(server: &Server, worker: &WorkerRec) -> IdentityPres
     }
 }
 
+fn appserver_agent_view(
+    server: &Server,
+    worker: &WorkerRec,
+) -> (serde_json::Value, serde_json::Value) {
+    let Some(transport) = selected_transport_for_worker(worker) else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Some(thread_id) = transport.thread_id.as_deref() else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Ok(raw) = (server.appserver_thread_status)(&transport, thread_id) else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Some(thread) = raw.get("thread") else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Some(status) = thread.get("status").and_then(serde_json::Value::as_object) else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let Some(thread_state) = status.get("type").and_then(serde_json::Value::as_str) else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let active_flags = status
+        .get("activeFlags")
+        .and_then(serde_json::Value::as_array)
+        .map(|flags| {
+            flags
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let can_accept_direct_input = thread
+        .get("canAcceptDirectInput")
+        .and_then(serde_json::Value::as_bool);
+    let latest_turn_status = thread
+        .get("turns")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|turns| turns.last())
+        .and_then(|turn| turn.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let latest_turn_error = thread
+        .get("turn_status_error")
+        .and_then(serde_json::Value::as_str);
+    (
+        serde_json::json!({
+            "thread_state": thread_state,
+            "active_flags": active_flags,
+            "can_accept_direct_input": can_accept_direct_input,
+            "latest_turn_status": latest_turn_status,
+            "latest_turn_error": latest_turn_error,
+        }),
+        raw,
+    )
+}
+
 /// Decide whether a new managed child would starve an already registered peer.
 /// The caller must use the returned peer for the scope before creating a child.
 pub(crate) fn registered_idle_peer_for_admission(
@@ -6813,6 +6884,50 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         .collect();
     let managed = is_managed_subagent(&st, &worker_id);
     let presence = worker_identity_presence(server, worker);
+    let is_appserver = worker
+        .transport
+        .as_ref()
+        .is_some_and(|transport| transport.kind == TransportKind::AppServer);
+    let (agent, _raw) = if is_appserver {
+        appserver_agent_view(server, worker)
+    } else {
+        (serde_json::Value::Null, serde_json::Value::Null)
+    };
+    let role = if st.master_worker_id.as_deref() == Some(worker_id.as_str()) {
+        "master"
+    } else if managed {
+        "managed-subagent"
+    } else {
+        "worker"
+    };
+    let mut peers: Vec<_> = st
+        .workers
+        .values()
+        .map(|peer| {
+            let peer_presence = worker_identity_presence(server, peer);
+            json!({
+                "worker_id": peer.id,
+                "role": if st.master_worker_id.as_deref() == Some(peer.id.as_str()) {
+                    "master"
+                } else if is_managed_subagent(&st, &peer.id) {
+                    "managed-subagent"
+                } else {
+                    "worker"
+                },
+                "presence": match peer_presence {
+                    IdentityPresence::Present => "present",
+                    IdentityPresence::Missing => "missing",
+                    IdentityPresence::Unknown => "unknown",
+                },
+                "endpoint_live": peer_presence == IdentityPresence::Present,
+                "transport": peer.transport.as_ref().map(|transport| json!({
+                    "kind": transport.kind.as_str(),
+                    "thread_id": transport.thread_id,
+                })),
+            })
+        })
+        .collect();
+    peers.sort_by(|left, right| left["worker_id"].as_str().cmp(&right["worker_id"].as_str()));
     let transport = worker.transport.as_ref().map(|transport| {
         json!({
             "kind": transport.kind.as_str(),
@@ -6823,7 +6938,13 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         })
     });
     Resp::data(json!({
-        "identity": {"worker_id": worker.id, "kind": "peer", "transport": transport},
+        "project_root": server.root,
+        "identity": {
+            "worker_id": worker.id,
+            "kind": "peer",
+            "role": role,
+            "transport": transport,
+        },
         "liveness": {
             "live": presence == IdentityPresence::Present,
             "presence": match presence {
@@ -6833,7 +6954,9 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
             },
             "transport_kind": worker.transport.as_ref().map(|transport| transport.kind.as_str()),
         },
+        "agent": agent,
         "tasks": tasks,
+        "peers": peers,
         "inbox": {"unread": unread.len()},
         "next_actions": next_actions,
         "master": match live_master_id(server, &st) {
@@ -7060,22 +7183,48 @@ fn worker_status_summary_with_maps(
         .transport
         .as_ref()
         .is_some_and(|transport| transport.kind == TransportKind::AppServer);
-    let (ownership, identity_valid, agent_state) = if is_appserver {
+    let (ownership, identity_valid, agent_state, appserver) = if is_appserver {
         let ownership = endpoint_live.then_some(Ok(true));
         let identity_valid = endpoint_live;
-        // App Server verification proves the native route and queue methods,
-        // not the agent's current execution state.
-        let agent_state = match presence {
-            IdentityPresence::Present => "unknown",
-            IdentityPresence::Unknown => "unknown",
-            IdentityPresence::Missing => "absent",
+        let (agent_view, _raw) = appserver_agent_view(server, w);
+        let thread_state = agent_view
+            .get("thread_state")
+            .and_then(serde_json::Value::as_str);
+        let active_flags = agent_view
+            .get("active_flags")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let agent_state = match (presence, thread_state) {
+            (IdentityPresence::Missing, _) => "absent",
+            (IdentityPresence::Unknown, _) => "unknown",
+            (IdentityPresence::Present, Some("active"))
+                if active_flags.iter().any(|flag| flag == "waitingOnApproval") =>
+            {
+                "waiting_approval"
+            }
+            (IdentityPresence::Present, Some("active"))
+                if active_flags.iter().any(|flag| flag == "waitingOnUserInput") =>
+            {
+                "waiting_input"
+            }
+            (IdentityPresence::Present, Some("active")) => "working",
+            (IdentityPresence::Present, Some("idle")) => "idle",
+            (IdentityPresence::Present, Some("systemError")) => "system_error",
+            (IdentityPresence::Present, Some("notLoaded")) => "not_loaded",
+            _ => "unknown",
         };
-        (ownership, identity_valid, agent_state)
+        (ownership, identity_valid, agent_state, agent_view)
     } else {
         let ownership = None;
         let identity_valid = false;
         let agent_state = "absent";
-        (ownership, identity_valid, agent_state)
+        (
+            ownership,
+            identity_valid,
+            agent_state,
+            serde_json::Value::Null,
+        )
     };
     let unacked_notifications = msgs
         .values()
@@ -7129,6 +7278,7 @@ fn worker_status_summary_with_maps(
         "endpoint_live": (presence != IdentityPresence::Unknown).then_some(endpoint_live),
         "identity_valid": (presence != IdentityPresence::Unknown && ownership != Some(Err(()))).then_some(identity_valid),
         "agent_state": agent_state,
+        "appserver": appserver,
         "unacked_notifications": unacked_notifications,
         "pending_notifications": pending_notifications,
         "notifications_paused": notifications_paused,

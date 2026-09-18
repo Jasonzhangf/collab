@@ -32,7 +32,13 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
                 Ok(serde_json::json!({"accepted": true}))
             }),
             appserver_thread_status: Arc::new(|_, thread_id| {
-                Ok(serde_json::json!({"thread": {"id": thread_id, "status": "idle"}}))
+                Ok(serde_json::json!({
+                    "thread": {
+                        "id": thread_id,
+                        "status": {"type": "idle"},
+                        "canAcceptDirectInput": true
+                    }
+                }))
             }),
             appserver_thread_archive: Arc::new(|_, _| Ok(serde_json::json!({"archived": true}))),
             mailbox_notify: tokio::sync::Notify::new(),
@@ -5841,9 +5847,73 @@ fn context_is_read_only_and_does_not_consume_notifications() {
     assert_eq!(context.data["authority"]["must_obey_master"], false);
     assert_eq!(context.data["authority"]["may_decline_master_invite"], true);
     assert_eq!(context.data["inbox"]["unread"], 1);
+    assert_eq!(context.data["identity"]["role"], "worker");
+    assert_eq!(context.data["agent"]["thread_state"], "idle");
+    assert_eq!(context.data["agent"]["can_accept_direct_input"], true);
+    assert_eq!(context.data["peers"][0]["worker_id"], "peer");
     let state = server.state.lock().unwrap();
     assert_eq!(state.msgs[&message_id].state, "pending");
     drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn context_projects_appserver_thread_and_turn_state_without_guessing() {
+    let (mut server, root) = test_server();
+    let registration = register_appserver(&mut server, "state-peer", "thread-state-peer");
+    assert!(
+        registration.ok,
+        "{}",
+        registration.error.unwrap_or_default()
+    );
+    let mut server = Arc::new(server);
+
+    for (thread_state, active_flags, turn_status, expected) in [
+        ("idle", vec![], Some("completed"), "idle"),
+        ("active", vec![], Some("inProgress"), "working"),
+        (
+            "active",
+            vec!["waitingOnApproval"],
+            Some("inProgress"),
+            "waiting_approval",
+        ),
+        (
+            "active",
+            vec!["waitingOnUserInput"],
+            Some("inProgress"),
+            "waiting_input",
+        ),
+        ("systemError", vec![], Some("failed"), "system_error"),
+        ("notLoaded", vec![], None, "not_loaded"),
+    ] {
+        Arc::get_mut(&mut server).unwrap().appserver_thread_status =
+            Arc::new(move |_, thread_id| {
+                Ok(serde_json::json!({
+                    "thread": {
+                        "id": thread_id,
+                        "status": {"type": thread_state, "activeFlags": active_flags},
+                        "canAcceptDirectInput": thread_state == "idle",
+                        "turns": [{"status": turn_status}]
+                    }
+                }))
+            });
+        let context = handle_context(&server, "state-peer".into(), "token-state-peer".into());
+        assert_eq!(context.data["agent"]["thread_state"], thread_state);
+        assert_eq!(
+            context.data["agent"]["latest_turn_status"].as_str(),
+            turn_status
+        );
+        let status = dispatch(&server, Req::WorkerStatus { worker_id: None });
+        assert_eq!(status.data["workers"][0]["agent_state"], expected);
+    }
+
+    Arc::get_mut(&mut server).unwrap().appserver_thread_status =
+        Arc::new(|_, _| Err("ADAPTER_UNKNOWN: thread/read unavailable".into()));
+    let context = handle_context(&server, "state-peer".into(), "token-state-peer".into());
+    assert!(context.data["agent"].is_null());
+    let status = dispatch(&server, Req::WorkerStatus { worker_id: None });
+    assert_eq!(status.data["workers"][0]["agent_state"], "unknown");
+
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -6160,8 +6230,8 @@ fn worker_status_query_exposes_liveness_identity_and_notification_pressure() {
     assert_eq!(w["transport"]["thread_id"], "thread-test-status-worker");
     assert_eq!(w["endpoint_live"], true);
     assert_eq!(w["identity_valid"], true);
-    assert_eq!(w["agent_state"], "unknown");
-    assert_eq!(w["status"], "unknown");
+    assert_eq!(w["agent_state"], "idle");
+    assert_eq!(w["status"], "idle");
     assert_eq!(w["unacked_notifications"], 0);
     assert_eq!(w["notifications_paused"], false);
     std::fs::remove_dir_all(root).unwrap();
@@ -6184,8 +6254,8 @@ fn worker_status_query_exposes_appserver_liveness() {
     assert_eq!(w["transport"]["thread_id"], "thread-status-appserver");
     assert_eq!(w["endpoint_live"], true);
     assert_eq!(w["identity_valid"], true);
-    assert_eq!(w["agent_state"], "unknown");
-    assert_eq!(w["status"], "unknown");
+    assert_eq!(w["agent_state"], "idle");
+    assert_eq!(w["status"], "idle");
     std::fs::remove_dir_all(root).unwrap();
 }
 

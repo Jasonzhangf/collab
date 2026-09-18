@@ -654,7 +654,7 @@ register it.
 
 Do not load references for ordinary `sendmessage`, `msg`, or `inbox`.
 
-If any reference still describes 15-minute periodic worker liveness, that
-wording is deprecated and non-authoritative for the current v1 contract; the
-current rules are this SKILL, `docs/collab-v1-lifecycle.manifest.json`, and
-`docs/task-keepalive-plan.md`.
+The current v1 contract has no 15-minute periodic worker liveness. Worker and
+master liveness wake only on a supported timer/wake, direct message, or real
+external event. If any installed copy still contains the old wording, replace
+it from this SKILL and its references.

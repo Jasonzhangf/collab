@@ -532,6 +532,16 @@ fn unregistered_context(
         Some(scope) => scope.root.clone(),
         None => std::fs::canonicalize(&cwd)?,
     };
+    let looks_like_worktree = cwd.ancestors().any(|ancestor| {
+        ancestor
+            .file_name()
+            .is_some_and(|name| name == "playground")
+    });
+    let next_action = if looks_like_worktree {
+        "return to the canonical project main checkout and run collab context there"
+    } else {
+        "appsdk init ."
+    };
     Ok(json!({
         "registered": false,
         "project_root": project_root,
@@ -540,7 +550,7 @@ fn unregistered_context(
             "worker_id": identity.worker_id,
             "thread_id": identity.runtime.as_ref().and_then(|runtime| runtime.native_thread_id.as_ref()),
         })),
-        "next_action": "appsdk init .",
+        "next_action": next_action,
         "truth": "exact process cwd; context is read-only",
     }))
 }
@@ -1067,16 +1077,41 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Context { worker } => {
             let cwd = std::env::current_dir()?;
-            if !cwd.join(".agent-collab").is_dir() {
-                out(&unregistered_context(None, None)?);
-                return Ok(());
-            }
-            let scope = Scope::resolve()?;
-            let Some(ident) = identity::load_existing(&scope, worker)? else {
-                out(&unregistered_context(Some(&scope), None)?);
+            let host_paths = scope::HostPaths::resolve()?;
+            let local_scope = cwd
+                .join(".agent-collab")
+                .is_dir()
+                .then(|| Scope::resolve())
+                .transpose()?;
+            let identity_scope = local_scope
+                .clone()
+                .unwrap_or_else(|| Scope { root: cwd.clone() });
+            let Some(ident) = identity::load_existing(&identity_scope, worker)? else {
+                out(&unregistered_context(local_scope.as_ref(), None)?);
                 return Ok(());
             };
-            if ident.runtime.is_none() || ident.transport.is_none() {
+            let Some(runtime) = ident.runtime.as_ref() else {
+                out(&unregistered_context(local_scope.as_ref(), Some(&ident))?);
+                return Ok(());
+            };
+            let scope = if let Some(scope) = local_scope {
+                scope
+            } else {
+                let route =
+                    scope::canonical_route_for_identity(&host_paths, &cwd, &runtime.appserver_id);
+                let route = match route {
+                    Ok(route) => route,
+                    Err(error) => {
+                        anyhow::bail!(
+                            "cannot resolve persisted Collab identity {} from cwd {}: {error}",
+                            ident.worker_id,
+                            cwd.display()
+                        );
+                    }
+                };
+                Scope { root: route.root }
+            };
+            if ident.transport.is_none() {
                 out(&unregistered_context(Some(&scope), Some(&ident))?);
                 return Ok(());
             }

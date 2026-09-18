@@ -14,11 +14,13 @@ $COLLAB_STATE_DIR for isolated tests, else $HOME/.collab
   log.txt
 ```
 
-Each registered project keeps its own `.agent-collab/` reducer input,
-journal, mailbox, tasks, claims, identity bindings, and worktrees. It is
-project-local durable state, not a disposable cache and not the host-wide
-runtime socket. AppSDK governance has a separate truth owner and reset
-transaction; neither owner may delete or rewrite the other's state.
+Each registered project keeps its own `.agent-collab/` reducer input and
+project-scoped journal, mailbox projection, tasks, claims, bindings, and
+worktrees. It is project-local durable state, not a disposable cache and not
+the host-wide runtime socket. The global `~/.collab/` state owns the host
+socket, route table, and global identity/liveness records. AppSDK governance
+has a separate truth owner and reset transaction; neither owner may delete or
+rewrite the other's state.
 
 For a new or explicitly authorized clean project, do not treat an existing
 project-local `.appsdk/`, `.appsdk-control/`, or `.agent-collab/` directory as

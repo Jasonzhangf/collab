@@ -10,6 +10,7 @@ fn run_context_with_args(root: &Path, args: &[&str]) -> std::process::Output {
         .arg("context")
         .args(args)
         .current_dir(root)
+        .env("COLLAB_STATE_DIR", root.join("host-state"))
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .env("CODEX_THREAD_ID", "context-test-thread")
@@ -61,7 +62,7 @@ fn explicit_worker_does_not_fall_back_to_another_thread_binding() {
             .unwrap()
             .as_nanos()
     ));
-    let other = root.join(".agent-collab/runs/worker-b");
+    let other = root.join("host-state/identities/worker-b");
     std::fs::create_dir_all(&other).unwrap();
     std::fs::write(
         other.join("identity.json"),
@@ -131,6 +132,7 @@ fn context_does_not_register_an_initialized_project_without_an_identity() {
             .count(),
         0
     );
+    assert!(!root.join("host-state/identities").exists());
     assert!(!root.join(".agent-collab/server").exists());
 
     std::fs::remove_dir_all(root).ok();
