@@ -18,9 +18,65 @@ description: >
 
 # Collab
 
-Durable truth lives in the project server. App Server is the only registered
-transport and is selected by the server. Production projects use the globally
-installed Collab v1.
+Durable truth lives in the global Collab state root. App Server is the only
+registered transport and is selected by the server. Production projects use
+the globally installed Collab v1.
+
+## Current-version baseline
+
+Use only the current globally installed `collab` and `collab-mcp`. The
+`Cargo.toml` version is the source version; the installed binary's
+`collab --version` is the runtime version. An upgrade targets the current
+reviewed source and does not migrate, replay, or interpret older local
+versions.
+
+The canonical install sequence from the reviewed source is:
+
+```sh
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+cargo install --locked --path . --force --root "$cargo_home"
+"$cargo_home/bin/collab" install-skills --target "$HOME/.agents/skills/collab" --force
+"$cargo_home/bin/collab" --version
+```
+
+The canonical pair is `$CARGO_HOME/bin/collab` and
+`$CARGO_HOME/bin/collab-mcp` (default `$HOME/.cargo/bin`). The sequence invokes
+the exact newly installed binary to refresh the embedded Skill, so an older
+PATH entry cannot write a stale Skill. The install does not remove business
+source, Git history, `~/.collab/`, project-local `.agent-collab/`, AppSDK
+state, run notes, or shared evidence.
+
+Legacy user-local copies are not removed automatically by this sequence.
+If an exact old copy must be retired, first prove it is Collab by running its
+own `--version` (and for MCP, its `initialize` response), then remove only the
+verified pair. A path that cannot prove that identity is a collision: preserve
+it and report the exact path. Never delete `~/.local/bin/collab*` or
+`~/.local/lib/collab/*` merely because the pathname matches.
+
+Installing a new binary does not replace a running daemon. The global daemon
+may be serving other projects, so do not run `collab down` or `collab up`
+merely because the binary was upgraded. Keep the existing daemon running until
+an explicitly authorized maintenance window. In that window, use the
+controlled lifecycle and preserve PID/socket/identity/journal/mailbox evidence;
+never use a broad process kill or a second daemon.
+
+Before changing the installed binary, inspect the current source version,
+installed version, canonical paths, and daemon PID/socket:
+
+```sh
+cargo metadata --no-deps --format-version 1
+collab --version
+command -v collab
+command -v collab-mcp
+collab status --all
+```
+
+If the version or command path is stale after installation, fix PATH or refresh
+the shell command cache (`rehash` in zsh, `hash -r` in bash), then verify that
+`command -v collab` and `command -v collab-mcp` resolve to the exact
+`$CARGO_HOME/bin` pair.
+Do not hand-copy binaries, leave a second managed entry, or select an older
+binary as a fallback.
 
 ## One lifecycle loop
 
@@ -111,11 +167,14 @@ review, install, restart, or live-communication evidence.
 `.appsdk/` and `.appsdk-control/` are AppSDK-owned and are not removed by
 `collab reset`. The host-wide runtime truth remains `~/.collab/`
 (`server.sock`, `events.jsonl`, `log.txt`, and route state); project-local
-`.agent-collab/` is reducer input, not the global truth. Never manually
-remove `.agent-collab/server/journal.jsonl`, mailbox files, identity tokens,
-task records, or bindings to make status look clean. Never start a second
-daemon or use broad process kills. `collab ack` remains a compatibility
-operation; it is not a substitute for task close or identity recovery.
+`.agent-collab/` is reducer input and local durable data, not the global truth.
+For a new project or an explicitly authorized clean epoch, remove old
+project-local governance only through the owner's canonical reset/migration
+command. Never manually remove `.agent-collab/server/journal.jsonl`, mailbox
+files, identity tokens, task records, or bindings to make status look clean.
+Never start a second daemon or use broad process kills. `collab ack` remains a
+compatibility operation; it is not a substitute for task close or identity
+recovery.
 
 An AppSDK `reset-governance` or `appsdk init --fresh --discard-legacy` is not
 Collab reset/migration and must not remove `.agent-collab/`. AppSDK's reset owner

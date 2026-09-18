@@ -20,11 +20,46 @@ project-local durable state, not a disposable cache and not the host-wide
 runtime socket. AppSDK governance has a separate truth owner and reset
 transaction; neither owner may delete or rewrite the other's state.
 
+For a new or explicitly authorized clean project, do not treat an existing
+project-local `.appsdk/`, `.appsdk-control/`, or `.agent-collab/` directory as
+the new version's baseline. The current global binary is the only runtime
+baseline. AppSDK removal belongs to AppSDK's reset owner; Collab removal belongs
+to the Collab reset/migration owner. Do not migrate or replay legacy local
+history merely to make initialization look clean.
+
+## Version upgrade and local installation cleanup
+
+Use the repository's install sequence from the reviewed current source:
+
+```sh
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+cargo install --locked --path . --force --root "$cargo_home"
+"$cargo_home/bin/collab" install-skills --target "$HOME/.agents/skills/collab" --force
+"$cargo_home/bin/collab" --version
+```
+
+Cargo installs the verified release binaries under `$CARGO_HOME/bin`, and the
+exact new binary refreshes the embedded Skill. The sequence never removes
+`~/.collab/`, a project's `.agent-collab/`, AppSDK state, business source, or
+evidence. Legacy user-local copies are not removed automatically: first prove
+an exact copy is Collab from its own version response, then remove only that
+verified pair. Unverified path collisions remain untouched and must be
+reported.
+
+The global daemon can be shared by multiple projects. A binary upgrade alone
+does not authorize stopping or restarting it. Keep the existing daemon running
+unless an operator explicitly opens a maintenance window; then use only the
+official lifecycle and record the old/new binary version and digest, PID,
+socket, identity binding, and a live replay result. Never use `pkill`,
+`killall`, broad process matching, a second socket, or an older binary as a
+fallback.
+
 ## Formal v1 migration
 
 ```text
 inspect -> plan -> admission freeze -> snapshot
-        -> install reviewed binary -> controlled daemon restart
+        -> install reviewed binaries with cargo install
+        -> controlled daemon restart
         -> identity rebind -> verify -> resume
 ```
 
@@ -130,6 +165,8 @@ collab up
 - Use official lifecycle; never broad process-name kills.
 - Resolve exact project socket/cwd/PID/tasks/migration/journal/mailbox first.
 - Installing a binary does not replace a live daemon.
+- Do not restart the global daemon merely to pick up an upgraded binary while
+  other projects may still be using it. Schedule the maintenance explicitly.
 - Keep an explicitly stopped daemon down through implementation and review.
 - Restart only after reviewed source reaches verified latest main.
 - After restart prove one PID/socket, preserved durable state, identity rebind,
