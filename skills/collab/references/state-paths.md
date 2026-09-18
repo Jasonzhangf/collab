@@ -89,6 +89,10 @@ unless the operator explicitly chooses the owner's migration or reset route.
 - `collab who` and `collab status --all` are peer diagnostics, not setup steps
   and not a substitute for `collab master status`; `who` has no top-level
   `master` field.
+- A failed `collab context`, including `token mismatch`, is a registration
+  problem, not evidence that no live master exists. Query `collab master status`
+  independently. Only a returned `master: null` with no `recorded_unusable`
+  entry permits the explicit user-approved promotion path.
 
 ## Transport selection
 
@@ -111,3 +115,10 @@ state and never creates a route or identity.
 transport, endpoint liveness, presence, and role through `collab context`.
 Never edit `routes.jsonl`, `server.pid`, journal, mailbox, or identity files to
 make a registration appear healthy.
+
+If `collab context` fails with `token mismatch`, preserve the exact error and
+stop registration repair. Do not copy a global token into project state, edit
+an identity file, run a reset, or promote a peer. Check `collab master status`
+separately, report the exact context error to the live master, and use the
+migration/reset owner only when that owner explicitly decides the project-local
+control plane is unrecoverable.

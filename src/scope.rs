@@ -171,15 +171,34 @@ pub fn canonical_route_for_identity(
             &route.app_scope_id == app_scope_id && cwd.strip_prefix(&route.root).is_ok()
         })
         .collect::<Vec<_>>();
-    if matches.len() > 1 {
-        let main_root = git_main_worktree_root(&cwd)?;
-        matches.retain(|route| route.root == main_root);
+    let git_roots = git_worktree_roots_if_any(&cwd)?;
+    if let Some(git_roots) = &git_roots {
+        if matches
+            .iter()
+            .any(|route| route.root == git_roots.main_root)
+        {
+            matches.retain(|route| route.root == git_roots.main_root);
+        } else if matches
+            .iter()
+            .any(|route| route.root == git_roots.worktree_root)
+        {
+            // A linked worktree may not register its own route. When the
+            // route is rooted at the worktree itself, fail closed instead of
+            // treating it as a second project.
+            if git_roots.worktree_root != git_roots.main_root {
+                matches.retain(|route| route.root != git_roots.worktree_root);
+            }
+        }
     }
     match matches.len() {
         1 => Ok(matches.pop().unwrap()),
         0 => anyhow::bail!(
-            "no registered Collab route matches app scope {} and contains cwd {}",
+            "no registered Collab route matches app scope {} for the Git main worktree {} containing cwd {}",
             app_scope_id,
+            git_roots
+                .as_ref()
+                .map(|roots| roots.main_root.display().to_string())
+                .unwrap_or_else(|| "not detected".into()),
             cwd.display()
         ),
         _ => {
@@ -197,34 +216,65 @@ pub fn canonical_route_for_identity(
     }
 }
 
-fn git_main_worktree_root(cwd: &Path) -> anyhow::Result<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+struct GitWorktreeRoots {
+    main_root: PathBuf,
+    worktree_root: PathBuf,
+}
+
+fn git_worktree_roots_if_any(cwd: &Path) -> anyhow::Result<Option<GitWorktreeRoots>> {
+    let worktree_output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--show-toplevel"])
         .current_dir(cwd)
         .output()?;
-    if !output.status.success() {
+    if !worktree_output.status.success() {
+        let stderr = String::from_utf8_lossy(&worktree_output.stderr);
+        if stderr.contains("not a git repository") {
+            return Ok(None);
+        }
         anyhow::bail!(
-            "cannot resolve Git common directory from {}: {}",
+            "cannot resolve Git worktree root from {}: {}",
             cwd.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         );
     }
-    let common_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    if !common_dir.is_absolute() {
+    let worktree_root = PathBuf::from(String::from_utf8_lossy(&worktree_output.stdout).trim());
+    if !worktree_root.is_absolute() {
         anyhow::bail!(
-            "Git common directory is not absolute for {}: {}",
+            "Git worktree root is not absolute for {}: {}",
             cwd.display(),
-            common_dir.display()
+            worktree_root.display()
         );
     }
-    let common_dir = std::fs::canonicalize(&common_dir)?;
-    let main_root = common_dir.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Git common directory has no parent: {}",
-            common_dir.display()
-        )
-    })?;
-    Ok(std::fs::canonicalize(main_root)?)
+    let worktree_root = std::fs::canonicalize(worktree_root)?;
+
+    let worktrees_output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(cwd)
+        .output()?;
+    if !worktrees_output.status.success() {
+        anyhow::bail!(
+            "cannot list Git worktrees from {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&worktrees_output.stderr).trim()
+        );
+    }
+
+    let main_root = std::fs::canonicalize(
+        String::from_utf8_lossy(&worktrees_output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("worktree "))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Git worktree list has no worktree entry for {}",
+                    cwd.display()
+                )
+            })?,
+    )?;
+
+    Ok(Some(GitWorktreeRoots {
+        main_root,
+        worktree_root,
+    }))
 }
 
 fn apply_endpoint_overrides(
@@ -1068,6 +1118,322 @@ mod tests {
         let resolved = canonical_route_for_identity(&host_paths, &worktree, &app_scope).unwrap();
 
         assert_eq!(resolved.root, canonical);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn identity_route_rejects_a_worktree_only_route() {
+        let root = test_root("worktree-route-only");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-a",
+                worktree.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::create_dir_all(worktree.join(".agent-collab")).unwrap();
+        let worktree_route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": worktree,
+            "canonical_root": worktree,
+            "storage_root": worktree,
+            "registered_ms": 1
+        });
+        std::fs::write(
+            state_root.join("routes.jsonl"),
+            format!("{worktree_route}\n"),
+        )
+        .unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let app_scope = AppServerId::new("appserver-cli").unwrap();
+        let error = canonical_route_for_identity(&host_paths, &worktree, &app_scope).unwrap_err();
+
+        assert!(
+            error.to_string().contains("Git main worktree"),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn identity_route_selects_canonical_main_when_worktree_route_also_exists() {
+        let root = test_root("worktree-route-both");
+        let canonical = root.join("project");
+        let worktree = canonical.join("playground/task-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(canonical.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-a",
+                worktree.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&canonical)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let canonical = canonical.canonicalize().unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::create_dir_all(worktree.join(".agent-collab")).unwrap();
+        let canonical_route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": canonical,
+            "canonical_root": canonical,
+            "storage_root": canonical,
+            "registered_ms": 1
+        });
+        let worktree_route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": worktree,
+            "canonical_root": worktree,
+            "storage_root": worktree,
+            "registered_ms": 2
+        });
+        std::fs::write(
+            state_root.join("routes.jsonl"),
+            format!("{worktree_route}\n{canonical_route}\n"),
+        )
+        .unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let app_scope = AppServerId::new("appserver-cli").unwrap();
+        let resolved = canonical_route_for_identity(&host_paths, &worktree, &app_scope).unwrap();
+
+        assert_eq!(resolved.root, canonical);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn identity_route_preserves_a_nested_project_root() {
+        let root = test_root("nested-project-route");
+        let repository = root.join("repo");
+        let project = repository.join("services/service-a");
+        let worktree = project.join("playground/task-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(project.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-a",
+                worktree.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let project = project.canonicalize().unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::create_dir_all(worktree.join(".agent-collab")).unwrap();
+        let route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": project,
+            "canonical_root": project,
+            "storage_root": project,
+            "registered_ms": 1
+        });
+        std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let app_scope = AppServerId::new("appserver-cli").unwrap();
+        let resolved = canonical_route_for_identity(&host_paths, &worktree, &app_scope).unwrap();
+
+        assert_eq!(resolved.root, project);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn identity_route_preserves_a_submodule_root() {
+        let root = test_root("submodule-project-route");
+        let superproject = root.join("superproject");
+        let submodule = superproject.join("modules/service-a");
+        let state_root = root.join("host-state");
+        std::fs::create_dir_all(&submodule).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&superproject)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial superproject",
+            ])
+            .current_dir(&superproject)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&submodule)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Collab Test",
+                "-c",
+                "user.email=collab-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial submodule",
+            ])
+            .current_dir(&submodule)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                submodule.to_str().unwrap(),
+                "modules/service-a",
+            ])
+            .current_dir(&superproject)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let submodule = submodule.canonicalize().unwrap();
+        std::fs::create_dir_all(submodule.join(".agent-collab")).unwrap();
+        let route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": "appserver-cli",
+            "project_scope": submodule,
+            "canonical_root": submodule,
+            "storage_root": submodule,
+            "registered_ms": 1
+        });
+        std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
+
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let app_scope = AppServerId::new("appserver-cli").unwrap();
+        let resolved = canonical_route_for_identity(&host_paths, &submodule, &app_scope).unwrap();
+
+        assert_eq!(resolved.root, submodule);
         std::fs::remove_dir_all(root).ok();
     }
 
