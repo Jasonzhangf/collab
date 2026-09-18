@@ -402,8 +402,12 @@ Escalation routing is explicit:
   promoted peer has a live registered identity/transport before treating it as
   master. If a live master already exists, do not promote; only that master
   may `collab master delegate <peer>`. `appsdk init` alone never proves master
-  ownership; a missing or dead master transport means there is no live master, not
-  permission to invent one. Codex root is not Collab master.
+  ownership. Only `collab master status` proves whether a live master exists:
+  `master` with `endpoint_live=true` means a live master exists; only
+  `master: null` (with no `recorded_unusable` entry) means none exists. A
+  missing worktree-local `.agent-collab/`, a failed `collab context`, a token
+  mismatch, or a missing `who.master` field never proves there is no live
+  master and never authorizes promotion. Codex root is not Collab master.
 - If a blocker or wait cannot be executed locally after a real solution is
   found, report that solution to the live master immediately instead of
   silently waiting. Keep the durable wait/task state, continue any
@@ -595,8 +599,12 @@ Use `collab master status` for the authoritative live-master answer; `collab
 who` only lists registered peers. Do not run `appsdk init`, `collab init`,
 `collab worker recover`, or master promotion from a worktree, and do not
 report "no master" because `.agent-collab/` or a `who.master` field is absent.
-If route resolution fails, preserve the exact error and report it to the live
-master after resolving it from the canonical project root.
+`collab context` failure is not a master-state query: if it fails with
+`token mismatch`, `PROJECT_SCOPE_UNKNOWN`, or another exact error, preserve the
+error, run `collab master status` separately, and report the registration
+problem to the live master. Do not infer "no master", recover by copying or
+editing identity/token state, or reset the project. If `master status` reports
+`master: null`, follow the explicit user-approved promotion protocol only.
 
 ## Subscribe to a future event
 
