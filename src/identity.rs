@@ -1,5 +1,5 @@
 use crate::proto::{SelectedTransport, TransportKind};
-use crate::scope::{HostPaths, Scope};
+use crate::scope::{HostPaths, ProjectScopeId, Scope};
 use anyhow::Context;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -349,6 +349,8 @@ pub struct Identity {
     pub worker_id: String,
     pub token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_scope: Option<ProjectScopeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<SelectedTransport>,
@@ -405,6 +407,11 @@ pub fn persist_runtime(
         );
     }
     let mut updated = ident.clone();
+    updated.project_scope = Some(
+        scope
+            .route_scope(runtime.appserver_id.clone())?
+            .project_scope_id,
+    );
     updated.runtime = Some(runtime);
     persist_identity(scope, &updated)?;
     *ident = updated;
@@ -424,13 +431,18 @@ pub fn persist_registration(
 
 fn persist_registration_at(
     host_paths: &HostPaths,
-    _scope: &Scope,
+    scope: &Scope,
     ident: &mut Identity,
     runtime: RuntimeIdentity,
     transport: SelectedTransport,
 ) -> anyhow::Result<()> {
     validate_registration_transport(&transport, &runtime)?;
     let mut updated = ident.clone();
+    updated.project_scope = Some(
+        scope
+            .route_scope(runtime.appserver_id.clone())?
+            .project_scope_id,
+    );
     updated.runtime = Some(runtime);
     updated.transport = Some(transport);
     write_identity(&identity_path_at(host_paths, &updated.worker_id)?, &updated)?;
@@ -480,6 +492,16 @@ fn identities_by_native_thread_at(
                 .is_some_and(|thread_id| thread_id.as_str() == native_thread_id)
         })
         .collect())
+}
+
+/// Return every global identity currently bound to a native App Server
+/// thread. The caller decides how to fail closed on zero or multiple matches.
+pub(crate) fn identities_for_native_thread(
+    state_root: &Path,
+    native_thread_id: &str,
+) -> anyhow::Result<Vec<Identity>> {
+    let host_paths = HostPaths::for_state_root(state_root)?;
+    identities_by_native_thread_at(&host_paths, native_thread_id)
 }
 
 /// Load or create one Codex thread identity.
@@ -597,6 +619,7 @@ fn load_or_create_resolved_at(
     let ident = Identity {
         worker_id,
         token: hex(16),
+        project_scope: None,
         runtime: None,
         transport: None,
     };
@@ -948,6 +971,7 @@ mod tests {
         let mut identity = Identity {
             worker_id: "agent-1".into(),
             token: "token-1".into(),
+            project_scope: None,
             runtime: None,
             transport: None,
         };
@@ -977,6 +1001,51 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.runtime, Some(runtime));
         std::fs::remove_dir_all(state_root).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn persisted_registration_records_the_current_project_scope() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = test_root("ci-project-scope");
+        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
+        let state_root = root.join(".collab-state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let scope = test_scope(root.clone());
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let mut identity = Identity {
+            worker_id: "agent-1".into(),
+            token: "token-1".into(),
+            project_scope: None,
+            runtime: None,
+            transport: None,
+        };
+
+        persist_registration_at(
+            &host_paths,
+            &scope,
+            &mut identity,
+            runtime_identity(7, "binding-7"),
+            SelectedTransport {
+                kind: TransportKind::AppServer,
+                endpoint: Some("unix:///tmp/codex.sock".into()),
+                namespace: Some("codex_tui".into()),
+                thread_id: Some("thread-1".into()),
+                capabilities: vec!["send_message".into()],
+                self_check: "server verified".into(),
+            },
+        )
+        .unwrap();
+
+        let expected = scope
+            .route_scope(AppServerId::new("appserver-1").unwrap())
+            .unwrap()
+            .project_scope_id;
+        assert_eq!(identity.project_scope.as_ref(), Some(&expected));
+        let persisted = read_identity(&identity_path_at(&host_paths, "agent-1").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.project_scope.as_ref(), Some(&expected));
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -353,6 +353,29 @@ try {
     report.checks.context,
   );
 
+  const routeA = await runJson(collab, ["route", "resolve"], {
+    cwd: projectA,
+    env: envA,
+  });
+  const routeB = await runJson(collab, ["route", "resolve"], {
+    cwd: projectB,
+    env: envB,
+  });
+  report.checks.route_resolution = {
+    a: routeA,
+    b: routeB,
+  };
+  assert(
+    routeA.native_thread_id === threadA &&
+      routeB.native_thread_id === threadB &&
+      routeA.canonical_root === await realpath(projectA) &&
+      routeB.canonical_root === await realpath(projectB) &&
+      routeA.project_scope === routeA.canonical_root &&
+      routeB.project_scope === routeB.canonical_root,
+    "route resolve did not return the daemon-owned native thread bindings",
+    report.checks.route_resolution,
+  );
+
   const statusA = await runJson(collab, ["worker", "status", workerA], {
     cwd: projectA,
     env: envA,
@@ -435,6 +458,14 @@ try {
     cwd: masterWorktree,
     env: envA,
   });
+  const worktreeRoute = await runJson(collab, ["route", "resolve"], {
+    cwd: masterWorktree,
+    env: {
+      ...envA,
+      TMUX: "/tmp/tmux-e2e,1,0",
+      TMUX_PANE: "%1",
+    },
+  });
   const worktreeMaster = await runJson(collab, ["master", "status"], {
     cwd: masterWorktree,
     env: envA,
@@ -446,6 +477,7 @@ try {
   const worktreeWorkerA = workerById(worktreeWho, workerA);
   report.checks.worktree_master = {
     stale_route: canonicalMasterWorktree,
+    route: worktreeRoute,
     project_root: worktreeContext.project_root,
     worker_id: worktreeContext.identity?.worker_id,
     presence: worktreeContext.liveness?.presence,
@@ -454,6 +486,9 @@ try {
     who_worker: worktreeWorkerA,
   };
   assert(
+    worktreeRoute.native_thread_id === threadA &&
+      worktreeRoute.canonical_root === canonicalProjectA &&
+      worktreeRoute.project_scope === canonicalProjectA &&
     worktreeContext.project_root === canonicalProjectA &&
       worktreeContext.identity?.worker_id === workerA &&
       worktreeContext.liveness?.presence === "present" &&

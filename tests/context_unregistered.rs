@@ -1,21 +1,57 @@
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
+
+static NEXT_STATE: AtomicU64 = AtomicU64::new(0);
+
+fn start_route_not_found_daemon(state: &Path) -> JoinHandle<()> {
+    std::fs::create_dir_all(state).unwrap();
+    let socket = state.join("server.sock");
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(socket).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["op"], "RouteResolve");
+        assert!(request.get("project_context").is_none());
+        stream
+            .write_all(
+                br#"{"ok":false,"error":"ROUTE_RESOLVE_NOT_FOUND: no registered route","data":null}
+"#,
+            )
+            .unwrap();
+    })
+}
 
 fn run_context(root: &Path) -> std::process::Output {
     run_context_with_args(root, &[])
 }
 
 fn run_context_with_args(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_collab"))
+    let state = PathBuf::from("/tmp").join(format!(
+        "collab-u-{}-{}",
+        std::process::id(),
+        NEXT_STATE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let responder = start_route_not_found_daemon(&state);
+    let output = Command::new(env!("CARGO_BIN_EXE_collab"))
         .arg("context")
         .args(args)
         .current_dir(root)
-        .env("COLLAB_STATE_DIR", root.join("host-state"))
+        .env("COLLAB_STATE_DIR", &state)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .env("CODEX_THREAD_ID", "context-test-thread")
         .output()
-        .unwrap()
+        .unwrap();
+    responder.join().unwrap();
+    std::fs::remove_dir_all(state).ok();
+    output
 }
 
 #[test]

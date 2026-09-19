@@ -25,9 +25,10 @@ Usage:
   delete it.
 - `log.txt` is diagnostic output. Read it for exact errors; never use it as a
   source of truth for task or identity state.
-- `routes.jsonl` is the append-only host-wide registration table for app scopes
-  and project roots. Never hand-edit it. Stale or missing-root routes are
-  retired only through the Collab migration/reset owner.
+- `routes.jsonl` is the append-only host-wide admission/storage index for app
+  scopes and project roots. It is not a route selector. Never hand-edit it.
+  Stale or missing-root routes are retired only through the Collab
+  migration/reset owner.
 
 For an explicitly authorized legacy reset, use:
 
@@ -79,8 +80,10 @@ unless the operator explicitly chooses the owner's migration or reset route.
 - The current client is Codex only. Identity is bound to the Codex sessionID
   through the internal App Server native thread.
 - A Git worktree does not inherit `.agent-collab/`. In a worktree, resolve the
-  canonical project route from the global Collab state by the same Codex
-  sessionID/App Server thread; never register the worktree as a second peer or
+  canonical project route through the daemon's global-identity lookup for the
+  same Codex sessionID/App Server thread. The identity's current binding is
+  authoritative; historical routes are not candidates and `routes.jsonl` must
+  not be read to guess one. Never register the worktree as a second peer or
   create a second route.
 - Default role is `peer`; master is explicit and user-approved.
 - `collab context` is the single information endpoint for the current peer,

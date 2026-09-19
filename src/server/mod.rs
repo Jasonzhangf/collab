@@ -13,8 +13,8 @@ use crate::identity::{
     AgentId, AppServerId, BindingId, CommandId, NativeThreadId, OperationId, RuntimeId,
 };
 use crate::proto::{
-    CommandEnvelope, ProjectContext, Req, RequestEnvelope, Resp, SelectedTransport,
-    TransportCandidates, TransportKind, MSG_TYPES,
+    CommandEnvelope, ProjectContext, Req, RequestEnvelope, Resp, RouteResolution,
+    SelectedTransport, TransportCandidates, TransportKind, MSG_TYPES,
 };
 use crate::scope::{HostPaths, ProjectScopeId, RouteScope, Scope};
 use crate::server::presence::{append_log, IdentityPresence};
@@ -1492,6 +1492,7 @@ struct RuntimeRoute {
 struct ProjectRuntimeManager {
     host: Arc<Server>,
     host_root: PathBuf,
+    host_state_root: PathBuf,
     route_journal: PathBuf,
     routes: Mutex<std::collections::BTreeMap<RouteKey, RuntimeRoute>>,
     project_locks: Mutex<std::collections::BTreeMap<PathBuf, std::fs::File>>,
@@ -1764,6 +1765,7 @@ impl ProjectRuntimeManager {
         let manager = Arc::new(Self {
             host,
             host_root: PathBuf::from(host_root.as_str()),
+            host_state_root: host_paths.state_root().to_path_buf(),
             route_journal,
             routes: Mutex::new(routes),
             project_locks: Mutex::new(std::collections::BTreeMap::new()),
@@ -1810,6 +1812,113 @@ impl ProjectRuntimeManager {
             result.push(self.host.clone());
         }
         result
+    }
+
+    fn resolve_route_by_native_thread(
+        &self,
+        native_thread_id: &str,
+    ) -> Result<RouteResolution, String> {
+        let native_thread_id = NativeThreadId::new(native_thread_id.to_owned())
+            .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?;
+        let mut expected_workers = crate::identity::identities_for_native_thread(
+            &self.host_state_root,
+            native_thread_id.as_str(),
+        )
+        .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?;
+        let expected_worker = match expected_workers.len() {
+            0 => {
+                return Err(format!(
+                    "ROUTE_RESOLVE_NOT_FOUND: no global Collab identity is bound to App Server thread {}",
+                    native_thread_id
+                ));
+            }
+            1 => expected_workers.pop().unwrap(),
+            count => {
+                return Err(format!(
+                    "ROUTE_RESOLVE_AMBIGUOUS: App Server thread {native_thread_id} is bound to multiple global Collab identities: {count}"
+                ));
+            }
+        };
+        let expected_runtime = expected_worker.runtime.as_ref().ok_or_else(|| {
+            format!(
+                "ROUTE_RESOLVE_NOT_FOUND: global Collab identity {} has no runtime binding",
+                expected_worker.worker_id
+            )
+        })?;
+        let mut matches = Vec::new();
+        for runtime in self.runtimes() {
+            let state = runtime.state.lock().unwrap();
+            let Some(worker) = state.workers.get(&expected_worker.worker_id) else {
+                continue;
+            };
+            if worker.token != expected_worker.token {
+                continue;
+            }
+            for project in state.global.projects.values() {
+                for binding in project.runtime_bindings.values() {
+                    if binding.native_thread_id.as_ref() == Some(&native_thread_id)
+                        && expected_worker
+                            .project_scope
+                            .as_ref()
+                            .is_none_or(|scope| scope == &binding.project_scope)
+                        && binding.agent_id.as_str() == expected_worker.worker_id
+                        && binding.binding_id == expected_runtime.binding_id
+                        && binding.endpoint_generation == expected_runtime.endpoint_generation
+                        && binding.app_scope_id == expected_runtime.appserver_id
+                    {
+                        matches.push((
+                            runtime.root.clone(),
+                            runtime.storage_root.clone(),
+                            binding.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        match matches.len() {
+            0 => Err(format!(
+                "ROUTE_RESOLVE_NOT_FOUND: no registered Collab route is bound to App Server thread {native_thread_id}"
+            )),
+            1 => {
+                let (_canonical_root, storage_root, binding) = matches.pop().unwrap();
+                let canonical_root = binding.project_scope.as_str().to_owned();
+                let route = RouteResolution {
+                    app_scope_id: binding.app_scope_id,
+                    project_scope: binding.project_scope,
+                    canonical_root,
+                    storage_root: storage_root.to_string_lossy().into_owned(),
+                    agent_id: binding.agent_id,
+                    binding_id: binding.binding_id,
+                    endpoint_generation: binding.endpoint_generation,
+                    native_thread_id: binding.native_thread_id.ok_or_else(|| {
+                        "ROUTE_RESOLVE_INVALID: matched binding has no native App Server thread"
+                            .to_owned()
+                    })?,
+                };
+                route
+                    .validate()
+                    .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?;
+                Ok(route)
+            }
+            _ => {
+                let mut routes = matches
+                    .into_iter()
+                    .map(|(root, _storage_root, binding)| {
+                        format!(
+                            "{} ({}, {})",
+                            root.display(),
+                            binding.app_scope_id,
+                            binding.binding_id
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                routes.sort();
+                Err(format!(
+                    "ROUTE_RESOLVE_AMBIGUOUS: App Server thread {native_thread_id} is bound to multiple routes: {}",
+                    routes.join(", ")
+                ))
+            }
+        }
     }
 
     fn route_key(context: &ProjectContext) -> RouteKey {
@@ -7395,6 +7504,7 @@ fn mutation_blocked_during_migration(req: &Req) -> bool {
         | Req::WorkerClose { .. }
         | Req::ResetBindings { .. } => true,
         Req::Register { .. }
+        | Req::RouteResolve { .. }
         | Req::NotificationMethods
         | Req::NotificationStatus { .. }
         | Req::Inbox { .. }
@@ -8048,6 +8158,9 @@ fn dispatch_with_route_context(
             Resp::data(json!({"unread": items.len(), "messages": items}))
         }
         Req::Context { worker_id, token } => handle_context(server, worker_id, token),
+        Req::RouteResolve { .. } => {
+            Resp::err("RouteResolve is only handled by the host daemon connection path")
+        }
         Req::MsgStatus { msg_id } => {
             let st = server.state.lock().unwrap();
             let in_mem = st.msgs.get(&msg_id).cloned();
@@ -8468,7 +8581,7 @@ fn dispatch(server: &Arc<Server>, req: Req) -> Resp {
 }
 
 fn request_requires_project_context(req: &Req) -> bool {
-    !matches!(req, Req::Ping)
+    !matches!(req, Req::Ping | Req::RouteResolve { .. })
 }
 
 enum WireRoutePrincipal<'a> {
@@ -8849,6 +8962,30 @@ mod host_route_registry_tests {
         let mut context = context_with_app(root, app_scope);
         context.runtime_context = Some(runtime.clone());
         context
+    }
+
+    fn write_global_identity(
+        host_paths: &HostPaths,
+        worker_id: &str,
+        token: &str,
+        project_scope: Option<&crate::scope::ProjectScopeId>,
+        runtime: &RuntimeIdentity,
+    ) {
+        let path = host_paths
+            .state_root()
+            .join("identities")
+            .join(worker_id)
+            .join("identity.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut identity = serde_json::json!({
+            "worker_id": worker_id,
+            "token": token,
+            "runtime": runtime,
+        });
+        if let Some(project_scope) = project_scope {
+            identity["project_scope"] = serde_json::json!(project_scope);
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&identity).unwrap()).unwrap();
     }
 
     fn runtime_for_registered(
@@ -9336,6 +9473,302 @@ mod host_route_registry_tests {
         let runtimes = manager.runtimes();
         assert_eq!(runtimes.len(), 1);
         assert!(Arc::ptr_eq(&runtimes[0], &server));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_thread_route_resolution_returns_one_complete_typed_route() {
+        let (server, root, journal_path) = test_server();
+        let (historical_server, historical_root, _) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let registration = server
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .lookup_registration(
+                &GlobalState::canonical_project_scope(&root).unwrap(),
+                &AppServerId::new("app-route").unwrap(),
+            )
+            .is_some();
+        if !registration {
+            register_known_project_with_app(&server, &root, "app-route");
+        }
+        let binding = RuntimeBinding::new(
+            GlobalState::canonical_project_scope(&root).unwrap(),
+            AppServerId::new("app-route").unwrap(),
+            AgentId::new("agent-route").unwrap(),
+            RuntimeId::new("runtime-route").unwrap(),
+            BindingId::new("binding-route").unwrap(),
+            9,
+            Some(NativeThreadId::new("thread-route").unwrap()),
+        )
+        .unwrap();
+        server
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .bind_runtime(binding.clone())
+            .unwrap();
+        register_known_project_with_app(&historical_server, &historical_root, "app-route");
+        let historical_binding = RuntimeBinding::new(
+            GlobalState::canonical_project_scope(&historical_root).unwrap(),
+            AppServerId::new("app-route").unwrap(),
+            AgentId::new("agent-route").unwrap(),
+            RuntimeId::new("runtime-route").unwrap(),
+            BindingId::new("binding-route").unwrap(),
+            9,
+            Some(NativeThreadId::new("thread-route").unwrap()),
+        )
+        .unwrap();
+        historical_server
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .bind_runtime(historical_binding.clone())
+            .unwrap();
+        historical_server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: "agent-route".into(),
+                token: "historical-token".into(),
+                cwd: historical_root.to_string_lossy().into_owned(),
+                registered_ms: now_ms(),
+                transport: None,
+            },
+        }]);
+        manager.routes.lock().unwrap().insert(
+            (
+                historical_binding.app_scope_id.as_str().to_owned(),
+                historical_binding.project_scope.as_str().to_owned(),
+            ),
+            RuntimeRoute {
+                root: historical_root.clone(),
+                storage_root: historical_root.clone(),
+                runtime: Some(historical_server),
+            },
+        );
+        let runtime = RuntimeIdentity {
+            agent_id: binding.agent_id.clone(),
+            runtime_id: binding.runtime_id.clone(),
+            appserver_id: binding.app_scope_id.clone(),
+            endpoint_generation: binding.endpoint_generation,
+            binding_id: binding.binding_id.clone(),
+            native_thread_id: binding.native_thread_id.clone(),
+        };
+        write_global_identity(&host_paths, "agent-route", "token-route", None, &runtime);
+        server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: "agent-route".into(),
+                token: "token-route".into(),
+                cwd: root.to_string_lossy().into_owned(),
+                registered_ms: now_ms(),
+                transport: None,
+            },
+        }]);
+
+        let state_before = mutation_snapshot(&server);
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let route = manager
+            .resolve_route_by_native_thread("thread-route")
+            .unwrap();
+        assert_eq!(route.app_scope_id.as_str(), "app-route");
+        assert_eq!(
+            route.canonical_root,
+            root.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(route.storage_root, root.to_string_lossy());
+        assert_eq!(route.agent_id.as_str(), "agent-route");
+        assert_eq!(route.binding_id.as_str(), "binding-route");
+        assert_eq!(route.endpoint_generation, 9);
+        assert_eq!(route.native_thread_id.as_str(), "thread-route");
+        route.validate().unwrap();
+        assert_eq!(mutation_snapshot(&server), state_before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(historical_root).unwrap();
+    }
+
+    #[test]
+    fn native_thread_route_resolution_fails_closed_for_zero_or_duplicate_matches() {
+        let (server, root, _) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        register_known_project_with_app(&server, &root, "app-route");
+        let scope = GlobalState::canonical_project_scope(&root).unwrap();
+        let current = RuntimeBinding::new(
+            scope.clone(),
+            AppServerId::new("app-route").unwrap(),
+            AgentId::new("agent-current").unwrap(),
+            RuntimeId::new("runtime-current").unwrap(),
+            BindingId::new("binding-current").unwrap(),
+            1,
+            Some(NativeThreadId::new("thread-duplicate").unwrap()),
+        )
+        .unwrap();
+        let duplicate = RuntimeBinding::new(
+            scope.clone(),
+            AppServerId::new("app-route").unwrap(),
+            AgentId::new("agent-a").unwrap(),
+            RuntimeId::new("runtime-a").unwrap(),
+            BindingId::new("binding-a").unwrap(),
+            1,
+            Some(NativeThreadId::new("thread-duplicate").unwrap()),
+        )
+        .unwrap();
+        let second = RuntimeBinding::new(
+            scope,
+            AppServerId::new("app-route").unwrap(),
+            AgentId::new("agent-b").unwrap(),
+            RuntimeId::new("runtime-b").unwrap(),
+            BindingId::new("binding-b").unwrap(),
+            1,
+            Some(NativeThreadId::new("thread-duplicate").unwrap()),
+        )
+        .unwrap();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.global.bind_runtime(current.clone()).unwrap();
+            state.global.bind_runtime(duplicate).unwrap();
+            state.global.bind_runtime(second).unwrap();
+        }
+        write_global_identity(
+            &host_paths,
+            "agent-current",
+            "token-current",
+            Some(&current.project_scope),
+            &RuntimeIdentity {
+                agent_id: current.agent_id.clone(),
+                runtime_id: current.runtime_id.clone(),
+                appserver_id: current.app_scope_id.clone(),
+                endpoint_generation: current.endpoint_generation,
+                binding_id: current.binding_id.clone(),
+                native_thread_id: current.native_thread_id.clone(),
+            },
+        );
+        server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: "agent-current".into(),
+                token: "token-current".into(),
+                cwd: root.to_string_lossy().into_owned(),
+                registered_ms: now_ms(),
+                transport: None,
+            },
+        }]);
+
+        let missing = manager
+            .resolve_route_by_native_thread("thread-missing")
+            .unwrap_err();
+        assert!(missing.starts_with("ROUTE_RESOLVE_NOT_FOUND"), "{missing}");
+        let current = manager
+            .resolve_route_by_native_thread("thread-duplicate")
+            .unwrap();
+        assert_eq!(current.agent_id.as_str(), "agent-current");
+        assert_eq!(current.binding_id.as_str(), "binding-current");
+        write_global_identity(
+            &host_paths,
+            "agent-other",
+            "token-other",
+            None,
+            &RuntimeIdentity {
+                agent_id: AgentId::new("agent-other").unwrap(),
+                runtime_id: RuntimeId::new("runtime-other").unwrap(),
+                appserver_id: AppServerId::new("app-route").unwrap(),
+                endpoint_generation: 1,
+                binding_id: BindingId::new("binding-other").unwrap(),
+                native_thread_id: Some(NativeThreadId::new("thread-duplicate").unwrap()),
+            },
+        );
+        let ambiguous = manager
+            .resolve_route_by_native_thread("thread-duplicate")
+            .unwrap_err();
+        assert!(
+            ambiguous.starts_with("ROUTE_RESOLVE_AMBIGUOUS"),
+            "{ambiguous}"
+        );
+        for invalid in ["", "thread\ninvalid"] {
+            let error = manager.resolve_route_by_native_thread(invalid).unwrap_err();
+            assert!(error.starts_with("ROUTE_RESOLVE_INVALID"), "{error}");
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wire_route_resolution_is_context_free_and_read_only() {
+        let (server, root, journal_path) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        register_known_project_with_app(&server, &root, "app-wire-route");
+        let binding = RuntimeBinding::new(
+            GlobalState::canonical_project_scope(&root).unwrap(),
+            AppServerId::new("app-wire-route").unwrap(),
+            AgentId::new("agent-wire-route").unwrap(),
+            RuntimeId::new("runtime-wire-route").unwrap(),
+            BindingId::new("binding-wire-route").unwrap(),
+            3,
+            Some(NativeThreadId::new("thread-wire-route").unwrap()),
+        )
+        .unwrap();
+        server
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .bind_runtime(binding.clone())
+            .unwrap();
+        write_global_identity(
+            &host_paths,
+            "agent-wire-route",
+            "token-wire-route",
+            Some(&binding.project_scope),
+            &RuntimeIdentity {
+                agent_id: binding.agent_id.clone(),
+                runtime_id: binding.runtime_id.clone(),
+                appserver_id: binding.app_scope_id.clone(),
+                endpoint_generation: binding.endpoint_generation,
+                binding_id: binding.binding_id.clone(),
+                native_thread_id: binding.native_thread_id.clone(),
+            },
+        );
+        server.commit(&[Event::Registered {
+            worker: WorkerRec {
+                id: "agent-wire-route".into(),
+                token: "token-wire-route".into(),
+                cwd: root.to_string_lossy().into_owned(),
+                registered_ms: now_ms(),
+                transport: None,
+            },
+        }]);
+
+        assert!(validate_request_context(
+            &server,
+            &Req::RouteResolve {
+                native_thread_id: "thread-wire-route".into(),
+            },
+            None,
+        )
+        .is_ok());
+        let before = mutation_snapshot(&server);
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let (_, response) = dispatch_wire_routed(
+            manager,
+            None,
+            Req::RouteResolve {
+                native_thread_id: "thread-wire-route".into(),
+            },
+        )
+        .await;
+        assert!(response.ok, "{response:?}");
+        let route: RouteResolution = serde_json::from_value(response.data).unwrap();
+        assert_eq!(route.native_thread_id.as_str(), "thread-wire-route");
+        assert_eq!(route.app_scope_id.as_str(), "app-wire-route");
+        assert_eq!(mutation_snapshot(&server), before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -12847,6 +13280,18 @@ async fn dispatch_wire_routed(
     req: Req,
 ) -> (Arc<Server>, Resp) {
     match req {
+        Req::RouteResolve { native_thread_id } => {
+            let response = match manager.resolve_route_by_native_thread(&native_thread_id) {
+                Ok(route) => match serde_json::to_value(route) {
+                    Ok(value) => Resp::data(value),
+                    Err(error) => {
+                        Resp::err(format!("ROUTE_RESOLVE_INVALID: serialize route: {error}"))
+                    }
+                },
+                Err(error) => Resp::err(error),
+            };
+            (manager.host.clone(), response)
+        }
         Req::Poll {
             worker_id,
             token,

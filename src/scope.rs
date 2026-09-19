@@ -198,6 +198,22 @@ pub fn canonical_route_for_identity(
     }
 }
 
+/// Resolve a native App Server thread through the daemon-owned global binding.
+/// The request carries no project context: the daemon must select the unique
+/// route from its typed runtime state, never from this process cwd or a local
+/// route journal.
+pub fn route_for_native_thread(
+    host_paths: &HostPaths,
+    native_thread_id: &str,
+) -> anyhow::Result<CanonicalProjectRoute> {
+    let response = crate::client::resolve_route(&host_paths.socket_path(), native_thread_id)?;
+    let root = PathBuf::from(&response.canonical_root);
+    Ok(CanonicalProjectRoute {
+        root,
+        app_scope_id: response.app_scope_id,
+    })
+}
+
 /// Resolve the canonical registered project route for a read-only command.
 ///
 /// This lookup is deliberately identity-free so `master status` can answer
@@ -508,19 +524,16 @@ fn validate_project_root(root: PathBuf) -> anyhow::Result<PathBuf> {
     Ok(root)
 }
 
-/// The launching environment owns project scope. Every peer, including a
-/// Codex App Server thread, is bound to the exact process cwd. No caller may
-/// select a path and no ancestor is searched.
-fn inherited_cwd_if_initialized(cwd: PathBuf) -> anyhow::Result<PathBuf> {
-    if cwd.join(".agent-collab").is_dir() {
-        validate_project_root(cwd)
-    } else {
-        anyhow::bail!("no .agent-collab found in inherited cwd {}", cwd.display())
-    }
-}
-
 pub fn project_root() -> anyhow::Result<PathBuf> {
     Ok(Scope::resolve()?.root)
+}
+
+/// Resolve the project rooted at the process cwd for lifecycle commands.
+///
+/// Daemon start/stop and configuration commands own local lifecycle state.
+/// They must not follow `CODEX_THREAD_ID` to a different project route.
+pub fn lifecycle_project_root() -> anyhow::Result<PathBuf> {
+    validate_project_root(std::env::current_dir()?)
 }
 
 /// Resolve the exact destination for `collab init`. Initialization binds to
@@ -861,6 +874,21 @@ impl Scope {
         host_paths: &HostPaths,
         worker_id: Option<String>,
     ) -> anyhow::Result<Self> {
+        if let Some(thread_id) = std::env::var_os("CODEX_THREAD_ID")
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.trim().is_empty())
+        {
+            let route = route_for_native_thread(host_paths, &thread_id)?;
+            return Ok(Scope { root: route.root });
+        }
+        Self::resolve_from_cwd_without_thread(cwd, host_paths, worker_id)
+    }
+
+    fn resolve_from_cwd_without_thread(
+        cwd: &Path,
+        host_paths: &HostPaths,
+        worker_id: Option<String>,
+    ) -> anyhow::Result<Self> {
         if Self::local_baseline_is_authoritative(cwd)? {
             return Self::from_project_root(cwd.to_path_buf());
         }
@@ -1056,6 +1084,9 @@ mod tests {
 
     #[test]
     fn scope_resolve_reuses_identity_route_from_a_worktree() {
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let previous_thread = std::env::var_os("CODEX_THREAD_ID");
+        std::env::remove_var("CODEX_THREAD_ID");
         let root = test_root("scope-worktree-identity");
         let canonical = root.join("project");
         let worktree = canonical.join("playground/task-a");
@@ -1150,11 +1181,38 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.root, canonical.canonicalize().unwrap());
+        match previous_thread {
+            Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
+            None => std::env::remove_var("CODEX_THREAD_ID"),
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lifecycle_scope_uses_the_exact_cwd_without_requiring_a_baseline() {
+        let root = test_root("lifecycle-exact-cwd");
+        let initialized = root.join("initialized");
+        let uninitialized = root.join("uninitialized");
+        std::fs::create_dir_all(initialized.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&uninitialized).unwrap();
+
+        assert_eq!(
+            validate_project_root(initialized.clone()).unwrap(),
+            initialized
+        );
+        assert_eq!(
+            validate_project_root(uninitialized.clone()).unwrap(),
+            uninitialized
+        );
+
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scope_resolve_prefers_a_fresh_local_baseline_over_a_stale_identity_route() {
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let previous_thread = std::env::var_os("CODEX_THREAD_ID");
+        std::env::remove_var("CODEX_THREAD_ID");
         let root = test_root("scope-fresh-reset");
         let project = root.join("project");
         let state_root = root.join("host-state");
@@ -1195,11 +1253,18 @@ mod tests {
                 .unwrap();
 
         assert_eq!(resolved.root, project);
+        match previous_thread {
+            Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
+            None => std::env::remove_var("CODEX_THREAD_ID"),
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scope_resolve_preserves_a_nested_project_inside_a_linked_worktree() {
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let previous_thread = std::env::var_os("CODEX_THREAD_ID");
+        std::env::remove_var("CODEX_THREAD_ID");
         let root = test_root("scope-nested-worktree");
         let canonical = root.join("project");
         let worktree = canonical.join("playground/task-a");
@@ -1250,6 +1315,10 @@ mod tests {
         let resolved = Scope::resolve_from_cwd_with_host_paths(&nested, &host_paths, None).unwrap();
 
         assert_eq!(resolved.root, nested);
+        match previous_thread {
+            Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
+            None => std::env::remove_var("CODEX_THREAD_ID"),
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
