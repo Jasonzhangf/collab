@@ -1424,6 +1424,7 @@ mod tests {
         Identity {
             worker_id: "worker-1".into(),
             token: "token-1".into(),
+            project_scope: None,
             runtime,
             transport: None,
         }
