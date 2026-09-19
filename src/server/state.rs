@@ -1145,7 +1145,7 @@ impl State {
         !self
             .scheduler_admissions
             .values()
-            .any(|admission| admission.message_id == message_id && admission.status != "succeeded")
+            .any(|admission| admission.message_id == message_id && admission.status == "failed")
     }
 
     /// True when some other message is a reply to `msg`.

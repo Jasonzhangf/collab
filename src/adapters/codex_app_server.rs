@@ -294,7 +294,14 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
     let timeout = Duration::from_millis(DEFAULT_TIMEOUT_MS);
     let mut client = Client::connect(&socket_path, timeout)?;
     client.initialize()?;
-    let response = client.call("thread/read", json!({"threadId": thread_id.as_str()}))?;
+    let response = client
+        .call("thread/read", json!({"threadId": thread_id.as_str()}))
+        .map_err(|error| match error {
+            AdapterError::Unknown { detail, .. } if detail.contains("thread not found") => {
+                AdapterError::RouteUnavailable { detail }
+            }
+            error => error,
+        })?;
     let observed = response
         .pointer("/thread/id")
         .and_then(Value::as_str)
@@ -1095,6 +1102,63 @@ mod tests {
                 ..
             }
         ));
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
+    fn candidate_rejects_missing_appserver_thread_as_route_unavailable() {
+        let socket = std::env::temp_dir().join(format!(
+            "collab-missing-thread-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                .unwrap();
+            loop {
+                let payload = read_client_frame(&mut stream);
+                let request: Value = serde_json::from_slice(&payload).unwrap();
+                let Some(id) = request.get("id").cloned() else {
+                    continue;
+                };
+                let response = match request["method"].as_str().unwrap() {
+                    "initialize" => json!({"id": id, "result": {}}),
+                    "thread/read" => {
+                        json!({"id": id, "error": {"code": -32602, "message": "thread not found"}})
+                    }
+                    method => panic!("unexpected method after missing thread: {method}"),
+                };
+                stream
+                    .write_all(&encode_frame(0x1, &serde_json::to_vec(&response).unwrap()))
+                    .unwrap();
+                if request["method"] == "thread/read" {
+                    break;
+                }
+            }
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        let candidate = AppServerCandidate {
+            endpoint: format!("unix://{}", socket.display()),
+            namespace: "codex_tui".into(),
+            thread_id: "missing-thread".into(),
+        };
+        let error = verify_candidate(&candidate).unwrap_err();
+        assert!(matches!(error, AdapterError::RouteUnavailable { .. }));
+        assert!(error.to_string().contains("ADAPTER_ROUTE_UNAVAILABLE"));
         server.join().unwrap();
         std::fs::remove_file(socket).ok();
     }

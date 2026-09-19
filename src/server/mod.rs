@@ -2868,6 +2868,32 @@ fn attempt_appserver_notification_with_at(
     now: i64,
     deliver: &dyn Fn(&SelectedTransport, &str, &str, bool) -> Result<serde_json::Value, String>,
 ) -> bool {
+    attempt_appserver_notification_with_retry(
+        server,
+        message_id,
+        subscription_id,
+        recipient,
+        transport,
+        delay,
+        explicit,
+        now,
+        false,
+        deliver,
+    )
+}
+
+fn attempt_appserver_notification_with_retry(
+    server: &Server,
+    message_id: &str,
+    subscription_id: &str,
+    recipient: &str,
+    transport: &SelectedTransport,
+    delay: i64,
+    explicit: bool,
+    now: i64,
+    allow_retry: bool,
+    deliver: &dyn Fn(&SelectedTransport, &str, &str, bool) -> Result<serde_json::Value, String>,
+) -> bool {
     let mut state = server.state.lock().unwrap();
     let Some(seed_id) = state.msgs.get(message_id).map(|message| message.id.clone()) else {
         return false;
@@ -2909,7 +2935,7 @@ fn attempt_appserver_notification_with_at(
                     .unwrap_or_else(|| server.config.notifications.delay_ms(&sub.event))
                     == delay
                 && message.state == "pending"
-                && message.wake_attempt_count < MAX_WAKE_ATTEMPTS
+                && (allow_retry || message.wake_attempt_count < MAX_WAKE_ATTEMPTS)
                 && sub.worker_id == recipient
                 && subscription_matches_transport(sub, transport)
                 && sub.status == "armed"
@@ -3077,6 +3103,61 @@ fn attempt_notification_with_at(
 
 fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str) -> bool {
     attempt_notification_with_at(server, message_id, subscription_id, now_ms())
+}
+
+fn attempt_scheduler_notification(
+    server: &Server,
+    message_id: &str,
+    subscription_id: &str,
+) -> bool {
+    if !server.config.notifications.enabled {
+        return false;
+    }
+    let (recipient, transport, delay, explicit) = {
+        let state = server.state.lock().unwrap();
+        let Some(seed) = state.msgs.get(message_id) else {
+            return false;
+        };
+        let recipient = seed.to.clone();
+        let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
+            return false;
+        };
+        if subscription.worker_id != recipient {
+            return false;
+        }
+        let delay = state
+            .delivery_modes
+            .get(message_id)
+            .filter(|mode| mode.as_str() == "explicit-notification")
+            .map(|_| 0)
+            .unwrap_or_else(|| server.config.notifications.delay_ms(&subscription.event));
+        let Some(transport) = state
+            .workers
+            .get(&recipient)
+            .and_then(selected_transport_for_worker)
+        else {
+            return false;
+        };
+        if !subscription_matches_transport(subscription, &transport) {
+            return false;
+        }
+        let explicit = is_explicit_notification(&state, seed);
+        (recipient, transport, delay, explicit)
+    };
+    attempt_appserver_notification_with_retry(
+        server,
+        message_id,
+        subscription_id,
+        &recipient,
+        &transport,
+        delay,
+        explicit,
+        now_ms(),
+        true,
+        &|transport, text, message_id, explicit| {
+            (server.appserver_notification_sink)(transport, text, message_id, explicit)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -4871,46 +4952,88 @@ fn scheduler_admission_failed_response(
 }
 
 fn scheduler_dispatch_recover_pending(server: &Server, request_id: &str) -> Option<Resp> {
-    let (admission, task, subscription) = {
-        let mut state = server.state.lock().unwrap();
-        let Some(pending) = state
+    let pending = {
+        let state = server.state.lock().unwrap();
+        let pending = state
             .scheduler_admissions
             .get(request_id)
             .filter(|admission| admission.status == "pending")
-            .cloned()
-        else {
-            return None;
-        };
+            .cloned()?;
+        pending
+    };
+    let (admission, task, subscription) = {
+        let mut state = server.state.lock().unwrap();
         let Some(task) = state.tasks.get(&pending.task_id).cloned() else {
             return None;
         };
-        let audit = json!({
-            "request_id": pending.request_id,
-            "decision": pending.decision,
-            "worker_id": pending.worker_id,
-            "managed_subagent_id": pending.managed_subagent_id,
-            "message_id": pending.message_id,
-            "task_id": pending.task_id,
-            "status": "pending",
-            "recovery": true,
-        });
-        if let Some(error) =
-            scheduler_admission_audit_error(ensure_scheduler_admission_audit(server, &audit))
-        {
+        let message_state = state
+            .msgs
+            .get(&pending.message_id)
+            .map(|message| message.state.as_str())
+            .unwrap_or("missing");
+        if matches!(message_state, "read" | "delivered") {
             server.commit_locked(
                 &mut state,
                 &[Event::SchedulerAdmissionStatus {
                     request_id: request_id.into(),
-                    status: "failed".into(),
-                    error: Some(error.clone()),
+                    status: "succeeded".into(),
+                    error: None,
                     updated_ms: now_ms(),
                 }],
             );
-            let mut failed = pending;
-            failed.status = "failed".into();
-            failed.error = Some(error);
-            return Some(scheduler_admission_failed_response(&failed));
+            let admission = state.scheduler_admissions.get(request_id).cloned()?;
+            return Some(Resp::data(json!({
+                "request_id": admission.request_id,
+                "decision": admission.decision,
+                "admission": {
+                    "request_id": admission.request_id,
+                    "decision": admission.decision,
+                    "worker_id": admission.worker_id,
+                    "managed_subagent_id": admission.managed_subagent_id,
+                    "message_id": admission.message_id,
+                    "task_id": admission.task_id,
+                    "status": "succeeded",
+                },
+                "message_id": admission.message_id,
+                "task_id": admission.task_id,
+                "target": task.owner,
+                "status": task.status,
+                "managed_subagent_id": admission.managed_subagent_id,
+                "managed_subagent": admission
+                    .managed_subagent_id
+                    .as_ref()
+                    .map(|id| json!({"id": id, "worker_id": task.owner}))
+                    .unwrap_or(serde_json::Value::Null),
+                "notification": "already-consumed",
+                "recovered": true,
+            })));
         }
+        let admission = state.scheduler_admissions.get(request_id).cloned()?;
+        let subscription = state
+            .matching_subscription(&admission.worker_id, "direct-message", None, now_ms())
+            .cloned();
+        (admission, task, subscription)
+    };
+    let notified = subscription.as_ref().is_some_and(|subscription| {
+        attempt_scheduler_notification(server, &admission.message_id, &subscription.id)
+    });
+    if subscription.is_some() && !notified {
+        let error =
+            "scheduler dispatch notification was not accepted by the selected App Server route";
+        let mut state = server.state.lock().unwrap();
+        server.commit_locked(
+            &mut state,
+            &[Event::SchedulerAdmissionStatus {
+                request_id: request_id.into(),
+                status: "pending".into(),
+                error: Some(error.into()),
+                updated_ms: now_ms(),
+            }],
+        );
+        return Some(scheduler_notification_failed_response(&admission, error));
+    }
+    {
+        let mut state = server.state.lock().unwrap();
         server.commit_locked(
             &mut state,
             &[Event::SchedulerAdmissionStatus {
@@ -4920,19 +5043,19 @@ fn scheduler_dispatch_recover_pending(server: &Server, request_id: &str) -> Opti
                 updated_ms: now_ms(),
             }],
         );
-        let admission = state.scheduler_admissions.get(request_id).cloned()?;
-        let subscription = state
-            .matching_subscription(&admission.worker_id, "direct-message", None, now_ms())
-            .cloned();
-        (admission, task, subscription)
-    };
-    let notified = subscription.as_ref().is_some_and(|subscription| {
-        attempt_notification(server, &admission.message_id, &subscription.id)
-    });
+    }
     Some(Resp::data(json!({
         "request_id": admission.request_id,
         "decision": admission.decision,
-        "admission": admission,
+        "admission": {
+            "request_id": admission.request_id,
+            "decision": admission.decision,
+            "worker_id": admission.worker_id,
+            "managed_subagent_id": admission.managed_subagent_id,
+            "message_id": admission.message_id,
+            "task_id": admission.task_id,
+            "status": "succeeded",
+        },
         "message_id": admission.message_id,
         "task_id": admission.task_id,
         "target": task.owner,
@@ -4952,6 +5075,32 @@ fn scheduler_dispatch_recover_pending(server: &Server, request_id: &str) -> Opti
         },
         "recovered": true,
     })))
+}
+
+fn scheduler_notification_failed_response(
+    admission: &crate::server::state::SchedulerAdmissionRecord,
+    error: &str,
+) -> Resp {
+    Resp::err_data(
+        error,
+        json!({
+            "request_id": admission.request_id,
+            "reservation": true,
+            "decision": admission.decision,
+            "message_id": admission.message_id,
+            "task_id": admission.task_id,
+            "admission": {
+                "request_id": admission.request_id,
+                "decision": admission.decision,
+                "worker_id": admission.worker_id,
+                "managed_subagent_id": admission.managed_subagent_id,
+                "message_id": admission.message_id,
+                "task_id": admission.task_id,
+                "status": "pending",
+                "error": error,
+            },
+        }),
+    )
 }
 
 fn scheduler_dispatch_deduplicated(
@@ -5236,19 +5385,55 @@ pub(crate) fn handle_scheduler_dispatch(
                 }),
             );
         }
-        server.commit_locked(
-            &mut state,
-            &[Event::SchedulerAdmissionStatus {
-                request_id: request_id.clone(),
-                status: "succeeded".into(),
-                error: None,
-                updated_ms: now_ms(),
-            }],
-        );
         drop(state);
         let notified = subscription.as_ref().is_some_and(|subscription| {
             attempt_notification(server, &message_id, &subscription.id)
         });
+        if subscription.is_some() && !notified {
+            let admission_record = crate::server::state::SchedulerAdmissionRecord {
+                request_id: request_id.clone(),
+                decision: decision.into(),
+                worker_id: peer_id.clone(),
+                managed_subagent_id: managed_id.clone(),
+                message_id: message_id.clone(),
+                task_id: task_id.clone(),
+                status: "pending".into(),
+                error: None,
+                created_ms: now,
+                updated_ms: now,
+            };
+            {
+                let mut state = server.state.lock().unwrap();
+                server.commit_locked(
+                    &mut state,
+                    &[Event::SchedulerAdmissionStatus {
+                        request_id: request_id.clone(),
+                        status: "pending".into(),
+                        error: Some(
+                            "scheduler dispatch notification was not accepted by the selected App Server route"
+                                .into(),
+                        ),
+                        updated_ms: now_ms(),
+                    }],
+                );
+            }
+            return scheduler_notification_failed_response(
+                &admission_record,
+                "scheduler dispatch notification was not accepted by the selected App Server route",
+            );
+        }
+        {
+            let mut state = server.state.lock().unwrap();
+            server.commit_locked(
+                &mut state,
+                &[Event::SchedulerAdmissionStatus {
+                    request_id: request_id.clone(),
+                    status: "succeeded".into(),
+                    error: None,
+                    updated_ms: now_ms(),
+                }],
+            );
+        }
         admission["status"] = json!("succeeded");
         return Resp::data(json!({
             "request_id": request_id,
@@ -15110,6 +15295,113 @@ mod scheduler_admission_tests {
     }
 
     #[test]
+    fn scheduler_dispatch_notification_rejection_keeps_retryable_reservation() {
+        let (mut server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let reject_once = Arc::new(AtomicBool::new(true));
+        let reject_once_for_sink = reject_once.clone();
+        server.appserver_notification_sink = Arc::new(move |_, _, _, _| {
+            if reject_once_for_sink.swap(false, Ordering::SeqCst) {
+                Err("ADAPTER_UNKNOWN: rpc unknown: thread not found".into())
+            } else {
+                Ok(json!({"accepted": true}))
+            }
+        });
+        let server = Arc::new(server);
+        let request = || {
+            dispatch(
+                &server,
+                Req::Subagent {
+                    worker_id: "master".into(),
+                    token: "token-master".into(),
+                    command: crate::subagent::Action::Dispatch {
+                        request_id: "req-notify-rejected-1".into(),
+                        subject: "Rejected notification".into(),
+                        body: "Must not be assigned".into(),
+                        feature_id: None,
+                        worktree_path: None,
+                        branch: None,
+                        base_commit: None,
+                        priority: "p0".into(),
+                        next_step: None,
+                    },
+                    launch_env: Default::default(),
+                },
+            )
+        };
+
+        let first = request();
+        assert!(!first.ok, "{first:?}");
+        assert_eq!(first.data["reservation"], true);
+        assert_eq!(first.data["admission"]["status"], "pending");
+        assert!(first
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("notification was not accepted"));
+
+        let accepted = dispatch(
+            &server,
+            Req::TaskAccept {
+                worker_id: "peer".into(),
+                token: "token-peer".into(),
+                task_id: first.data["task_id"].as_str().unwrap().into(),
+            },
+        );
+        assert!(!accepted.ok, "{accepted:?}");
+        assert!(accepted
+            .error
+            .unwrap_or_default()
+            .contains("provenance is missing"));
+
+        let retry = request();
+        assert!(retry.ok, "{retry:?}");
+        assert_eq!(retry.data["recovered"], true);
+        assert_eq!(retry.data["task_id"], first.data["task_id"]);
+        assert_eq!(retry.data["message_id"], first.data["message_id"]);
+        assert_eq!(retry.data["admission"]["status"], "succeeded");
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.scheduler_admissions["req-notify-rejected-1"].status,
+            "succeeded"
+        );
+        assert_eq!(
+            state.scheduler_admissions["req-notify-rejected-1"]
+                .error
+                .as_deref(),
+            None
+        );
+        assert_eq!(
+            state.tasks["task-scheduler-req-notify-rejected-1"].status,
+            "assigned"
+        );
+        assert_eq!(
+            state.msgs["scheduler-req-notify-rejected-1"].wake_attempt_count,
+            2
+        );
+        drop(state);
+
+        let accepted = dispatch(
+            &server,
+            Req::TaskAccept {
+                worker_id: "peer".into(),
+                token: "token-peer".into(),
+                task_id: first.data["task_id"].as_str().unwrap().into(),
+            },
+        );
+        assert!(accepted.ok, "{accepted:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scheduler_dispatch_reuses_managed_child_and_deduplicates_request() {
         let (server, root) = test_server();
         register(&server, "master", "%master");
@@ -15391,7 +15683,13 @@ mod scheduler_admission_tests {
         let (mut server, root) = test_server();
         register(&server, "master", "%master");
         register(&server, "peer", "%peer");
-        server.config.notifications.enabled = false;
+        server.config.notifications.enabled = true;
+        assert!(server
+            .state
+            .lock()
+            .unwrap()
+            .notification_subscriptions
+            .contains_key("sub-default-direct-message-peer"));
         server.commit(&[Event::MasterAssigned {
             worker_id: "master".into(),
             assigned_by: "operator".into(),
@@ -15459,7 +15757,7 @@ mod scheduler_admission_tests {
         let (mut server, root) = test_server();
         register(&server, "master", "%master");
         register(&server, "peer", "%peer");
-        server.config.notifications.enabled = false;
+        server.config.notifications.enabled = true;
         server.commit(&[
             Event::MasterAssigned {
                 worker_id: "master".into(),
@@ -15605,9 +15903,10 @@ mod scheduler_admission_tests {
 
     #[test]
     fn scheduler_dispatch_concurrent_same_request_reserves_once() {
-        let (server, root) = test_server();
+        let (mut server, root) = test_server();
         register(&server, "master", "%master");
         register(&server, "peer", "%peer");
+        server.config.notifications.enabled = true;
         server.commit(&[Event::MasterAssigned {
             worker_id: "master".into(),
             assigned_by: "operator".into(),
