@@ -343,6 +343,36 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
             operation: "turn/start",
         });
     }
+    let steer = method_exists(
+        &mut client,
+        "turn/steer",
+        json!({
+            "threadId": "",
+            "expectedTurnId": "",
+            "input": [],
+        }),
+    )?;
+    if !steer {
+        return Err(AdapterError::CapabilityUnavailable {
+            endpoint: EndpointKind::Tui,
+            operation: "turn/steer",
+        });
+    }
+    let turns_list = method_exists(
+        &mut client,
+        "thread/turns/list",
+        json!({
+            "threadId": thread_id.as_str(),
+            "limit": 1,
+            "sortDirection": "desc",
+        }),
+    )?;
+    if !turns_list {
+        return Err(AdapterError::CapabilityUnavailable {
+            endpoint: EndpointKind::Tui,
+            operation: "thread/turns/list",
+        });
+    }
     let queue_wakeup = method_exists(
         &mut client,
         "thread/queue/add",
@@ -367,7 +397,7 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
             "wait_reply".into(),
         ],
         self_check:
-            "initialize, thread/read identity, turn/start, and thread/queue/add method probes passed"
+            "initialize, thread/read identity, turn/start, turn/steer, thread/turns/list, and thread/queue/add method probes passed"
                 .into(),
     })
 }
@@ -406,16 +436,38 @@ pub fn immediate_notify(
     })?;
     let mut client = Client::connect(&socket_path, Duration::from_millis(DEFAULT_TIMEOUT_MS))?;
     client.initialize()?;
-    let receipt = client.call(
-        "turn/start",
-        json!({
-            "threadId": thread_id.as_str(),
-            "input": [{"type": "text", "text": body}],
-            "clientUserMessageId": client_user_message_id,
-        }),
-    )?;
-    validate_immediate_receipt(&receipt)?;
-    Ok(receipt)
+    let status = thread_status(&mut client, thread_id.as_str())?;
+    let active_turn_id = match status.as_str() {
+        "active" => active_turn_id(&mut client, thread_id.as_str())?,
+        _ => None,
+    };
+    match notification_action(&status, active_turn_id)? {
+        NotificationAction::Steer(expected_turn_id) => {
+            let receipt = client.call(
+                "turn/steer",
+                json!({
+                    "threadId": thread_id.as_str(),
+                    "expectedTurnId": expected_turn_id,
+                    "input": [{"type": "text", "text": body, "text_elements": []}],
+                    "clientUserMessageId": client_user_message_id,
+                }),
+            )?;
+            validate_steer_receipt(&receipt, &expected_turn_id)?;
+            Ok(receipt)
+        }
+        NotificationAction::Start => {
+            let receipt = client.call(
+                "turn/start",
+                json!({
+                    "threadId": thread_id.as_str(),
+                    "input": [{"type": "text", "text": body}],
+                    "clientUserMessageId": client_user_message_id,
+                }),
+            )?;
+            validate_immediate_receipt(&receipt)?;
+            Ok(receipt)
+        }
+    }
 }
 
 /// Queue one background wake through a server-selected App Server transport.
@@ -570,6 +622,144 @@ fn endpoint_path(endpoint: &str) -> Result<PathBuf, AdapterError> {
         });
     }
     Ok(PathBuf::from(path))
+}
+
+fn thread_status(client: &mut Client, thread_id: &str) -> Result<String, AdapterError> {
+    let receipt = client.call("thread/read", json!({"threadId": thread_id}))?;
+    let observed = receipt
+        .pointer("/thread/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AdapterError::Unknown {
+            operation: "thread/read",
+            detail: "response is missing thread.id".into(),
+        })?;
+    if observed != thread_id {
+        return Err(AdapterError::Unknown {
+            operation: "thread/read",
+            detail: format!("thread identity mismatch: expected {thread_id}, observed {observed}"),
+        });
+    }
+    receipt
+        .pointer("/thread/status/type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| AdapterError::Unknown {
+            operation: "thread/read",
+            detail: "response is missing thread.status.type".into(),
+        })
+}
+
+fn active_turn_id(client: &mut Client, thread_id: &str) -> Result<Option<String>, AdapterError> {
+    let page = client.call(
+        "thread/turns/list",
+        json!({
+            "threadId": thread_id,
+            "limit": 100,
+            "sortDirection": "desc",
+        }),
+    )?;
+    active_turn_id_from_page(&page)
+}
+
+fn active_turn_id_from_page(page: &Value) -> Result<Option<String>, AdapterError> {
+    let turns =
+        page.get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AdapterError::Unknown {
+                operation: "thread/turns/list",
+                detail: "response is missing data array".into(),
+            })?;
+    let mut active = Vec::new();
+    for (index, turn) in turns.iter().enumerate() {
+        if turn.get("status").and_then(Value::as_str) != Some("inProgress") {
+            continue;
+        }
+        let turn_id = turn
+            .get("id")
+            .ok_or_else(|| AdapterError::Unknown {
+                operation: "turn/steer",
+                detail: format!("inProgress turn at data[{index}] is missing id"),
+            })?
+            .as_str()
+            .ok_or_else(|| AdapterError::Unknown {
+                operation: "turn/steer",
+                detail: format!("inProgress turn at data[{index}] id must be a JSON string"),
+            })?;
+        if turn_id.trim().is_empty() {
+            return Err(AdapterError::Unknown {
+                operation: "turn/steer",
+                detail: format!("inProgress turn at data[{index}] id must be non-empty after trim"),
+            });
+        }
+        if turn_id.chars().any(char::is_whitespace) {
+            return Err(AdapterError::Unknown {
+                operation: "turn/steer",
+                detail: format!("inProgress turn at data[{index}] id must not contain whitespace"),
+            });
+        }
+        active.push(turn_id);
+    }
+    match active.len() {
+        0 => Ok(None),
+        1 => {
+            let turn_id = active.remove(0);
+            Ok(Some(turn_id.to_owned()))
+        }
+        _ => Err(AdapterError::Unknown {
+            operation: "turn/steer",
+            detail: format!(
+                "STEER_ACTIVE_TURN_AMBIGUOUS: recipient has {} inProgress turns",
+                active.len()
+            ),
+        }),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NotificationAction {
+    Start,
+    Steer(String),
+}
+
+fn notification_action(
+    thread_status: &str,
+    active_turn_id: Option<String>,
+) -> Result<NotificationAction, AdapterError> {
+    match thread_status {
+        "active" => Ok(match active_turn_id {
+            Some(turn_id) => NotificationAction::Steer(turn_id),
+            None => NotificationAction::Start,
+        }),
+        "idle" | "notLoaded" => Ok(NotificationAction::Start),
+        status => Err(AdapterError::Unknown {
+            operation: "thread/read",
+            detail: format!(
+                "AUTO_NOTIFY_UNSUPPORTED_THREAD_STATUS: cannot deliver to thread status {status}"
+            ),
+        }),
+    }
+}
+
+fn validate_steer_receipt(receipt: &Value, expected_turn_id: &str) -> Result<(), AdapterError> {
+    let turn_id = receipt
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AdapterError::Unknown {
+            operation: "turn/steer",
+            detail: "response is missing turnId".into(),
+        })?;
+    if turn_id != expected_turn_id {
+        return Err(AdapterError::Unknown {
+            operation: "turn/steer",
+            detail: format!(
+                "turn identity mismatch: expected {expected_turn_id}, observed {turn_id}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_immediate_receipt(receipt: &Value) -> Result<(), AdapterError> {
@@ -952,6 +1142,16 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
+    fn assert_malformed_active_turn(page: Value, expected_detail: &str) {
+        match active_turn_id_from_page(&page).unwrap_err() {
+            AdapterError::Unknown { operation, detail } => {
+                assert_eq!(operation, "turn/steer");
+                assert!(detail.contains(expected_detail), "{detail}");
+            }
+            error => panic!("expected AdapterError::Unknown, got {error:?}"),
+        }
+    }
+
     #[test]
     fn frame_round_trip_uses_masked_client_frames() {
         let frame = encode_frame(0x1, b"hello");
@@ -1033,6 +1233,8 @@ mod tests {
             .iter()
             .any(|capability| capability == "queue_wakeup"));
         assert!(selected.self_check.contains("turn/start"));
+        assert!(selected.self_check.contains("turn/steer"));
+        assert!(selected.self_check.contains("thread/turns/list"));
         assert!(selected.self_check.contains("thread/queue/add"));
     }
 
@@ -1040,7 +1242,9 @@ mod tests {
     fn candidate_rejects_appserver_without_queue_wakeup_method() {
         let socket =
             std::env::temp_dir().join(format!("collab-queue-probe-{}.sock", std::process::id()));
-        let listener = UnixListener::bind(&socket).unwrap();
+        let Some(listener) = bind_test_socket(&socket) else {
+            return;
+        };
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = Vec::new();
@@ -1069,6 +1273,12 @@ mod tests {
                     }
                     "turn/start" => {
                         json!({"id": id, "error": {"code": -32600, "message": "invalid params"}})
+                    }
+                    "turn/steer" => {
+                        json!({"id": id, "error": {"code": -32600, "message": "invalid params"}})
+                    }
+                    "thread/turns/list" => {
+                        json!({"id": id, "result": {"data": []}})
                     }
                     "thread/queue/add" => {
                         let response = json!({
@@ -1164,6 +1374,83 @@ mod tests {
     }
 
     #[test]
+    fn candidate_rejects_appserver_without_steer_or_turns_list_methods() {
+        for missing_method in ["turn/steer", "thread/turns/list"] {
+            let socket = std::env::temp_dir().join(format!(
+                "collab-candidate-method-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let Some(listener) = bind_test_socket(&socket) else {
+                return;
+            };
+            let missing_method = missing_method.to_string();
+            let server_missing_method = missing_method.clone();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                handshake(&mut stream);
+                loop {
+                    let payload = read_client_frame(&mut stream);
+                    let request: Value = serde_json::from_slice(&payload).unwrap();
+                    let Some(id) = request.get("id").cloned() else {
+                        continue;
+                    };
+                    let method = request["method"].as_str().unwrap();
+                    let response = if method == server_missing_method {
+                        json!({"id": id, "error": {"code": -32601, "message": "unsupported"}})
+                    } else {
+                        match method {
+                            "initialize" => json!({"id": id, "result": {}}),
+                            "thread/read" => {
+                                json!({"id": id, "result": {"thread": {"id": "thread-1"}}})
+                            }
+                            "thread/items/list" => {
+                                json!({"id": id, "error": {"code": -32601, "message": "unsupported"}})
+                            }
+                            "turn/start" | "turn/steer" | "thread/queue/add" => {
+                                json!({"id": id, "error": {"code": -32600, "message": "invalid params"}})
+                            }
+                            "thread/turns/list" => {
+                                json!({"id": id, "result": {"data": []}})
+                            }
+                            _ => unreachable!("{method}"),
+                        }
+                    };
+                    stream
+                        .write_all(&encode_frame(0x1, &serde_json::to_vec(&response).unwrap()))
+                        .unwrap();
+                    if method == server_missing_method {
+                        break;
+                    }
+                }
+                stream.shutdown(Shutdown::Both).ok();
+            });
+
+            let candidate = AppServerCandidate {
+                endpoint: format!("unix://{}", socket.display()),
+                namespace: "codex_tui".into(),
+                thread_id: "thread-1".into(),
+            };
+            let error = verify_candidate(&candidate).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    AdapterError::CapabilityUnavailable {
+                        operation,
+                        ..
+                    } if *operation == missing_method
+                ),
+                "{missing_method}: {error}"
+            );
+            server.join().unwrap();
+            std::fs::remove_file(socket).ok();
+        }
+    }
+
+    #[test]
     fn immediate_receipt_requires_turn_identity_and_protocol_status() {
         validate_immediate_receipt(&json!({
             "turn": {"id": "turn-1", "status": "inProgress"}
@@ -1184,27 +1471,530 @@ mod tests {
         }
     }
 
+    #[test]
+    fn steer_receipt_requires_matching_turn_identity() {
+        validate_steer_receipt(&json!({"turnId": "turn-1"}), "turn-1").unwrap();
+
+        for malformed in [
+            json!({}),
+            json!({"turnId": ""}),
+            json!({"turnId": "turn-2"}),
+            json!({"turnId": "bad turn"}),
+        ] {
+            assert!(
+                validate_steer_receipt(&malformed, "turn-1").is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_turn_selection_only_accepts_in_progress_turns() {
+        assert_eq!(
+            active_turn_id_from_page(&json!({
+                "data": [{"id": "turn-active", "status": "inProgress"}]
+            }))
+            .unwrap()
+            .as_deref(),
+            Some("turn-active")
+        );
+        assert_eq!(
+            active_turn_id_from_page(&json!({
+                "data": [{"id": "turn-interrupted", "status": "interrupted"}]
+            }))
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            active_turn_id_from_page(&json!({
+                "data": [
+                    {"id": "turn-interrupted", "status": "interrupted"},
+                    {"id": "turn-completed", "status": "completed"}
+                ]
+            }))
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn active_turn_selection_rejects_missing_id() {
+        assert_malformed_active_turn(
+            json!({"data": [{"status": "inProgress"}]}),
+            "data[0] is missing id",
+        );
+    }
+
+    #[test]
+    fn active_turn_selection_rejects_non_string_id() {
+        assert_malformed_active_turn(
+            json!({"data": [{"id": 7, "status": "inProgress"}]}),
+            "data[0] id must be a JSON string",
+        );
+    }
+
+    #[test]
+    fn active_turn_selection_rejects_empty_id() {
+        for id in ["", "   "] {
+            assert_malformed_active_turn(
+                json!({"data": [{"id": id, "status": "inProgress"}]}),
+                "data[0] id must be non-empty after trim",
+            );
+        }
+    }
+
+    #[test]
+    fn active_turn_selection_rejects_whitespace_containing_id() {
+        assert_malformed_active_turn(
+            json!({"data": [{"id": "turn active", "status": "inProgress"}]}),
+            "data[0] id must not contain whitespace",
+        );
+    }
+
+    #[test]
+    fn active_turn_selection_handles_valid_zero_and_multiple_turns() {
+        assert_eq!(
+            active_turn_id_from_page(&json!({"data": []})).unwrap(),
+            None
+        );
+        assert_eq!(
+            active_turn_id_from_page(&json!({
+                "data": [{"id": "turn-active", "status": "inProgress"}]
+            }))
+            .unwrap()
+            .as_deref(),
+            Some("turn-active")
+        );
+        let error = active_turn_id_from_page(&json!({
+            "data": [
+                {"id": "turn-1", "status": "inProgress"},
+                {"id": "turn-2", "status": "inProgress"}
+            ]
+        }))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("STEER_ACTIVE_TURN_AMBIGUOUS"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn notification_action_uses_turn_start_when_active_has_no_in_progress_turn() {
+        assert_eq!(
+            notification_action("active", None).unwrap(),
+            NotificationAction::Start
+        );
+        assert_eq!(
+            notification_action("active", Some("turn-active".into())).unwrap(),
+            NotificationAction::Steer("turn-active".into())
+        );
+        assert_eq!(
+            notification_action("idle", None).unwrap(),
+            NotificationAction::Start
+        );
+        assert_eq!(
+            notification_action("notLoaded", None).unwrap(),
+            NotificationAction::Start
+        );
+        for status in ["systemError", "unknown", ""] {
+            let error = notification_action(status, None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("AUTO_NOTIFY_UNSUPPORTED_THREAD_STATUS"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_interrupted_only_and_in_progress_turn_actions_are_explicit() {
+        let interrupted_only = active_turn_id_from_page(&json!({
+            "data": [{"id": "turn-interrupted", "status": "interrupted"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            notification_action("active", interrupted_only).unwrap(),
+            NotificationAction::Start
+        );
+
+        let active = active_turn_id_from_page(&json!({
+            "data": [{"id": "turn-active", "status": "inProgress"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            notification_action("active", active).unwrap(),
+            NotificationAction::Steer("turn-active".into())
+        );
+    }
+
+    #[test]
+    fn immediate_notify_routes_active_thread_to_steer() {
+        let socket = temp_socket("notify-active");
+        let Some(listener) = bind_test_socket(&socket) else {
+            return;
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handshake(&mut stream);
+            initialize(&mut stream);
+            let read_id = next_request_id(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": read_id,
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "active", "activeFlags": []}
+                        }
+                    }
+                }),
+            );
+            let turns_id = next_request_id(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": turns_id,
+                    "result": {
+                        "data": [
+                            {"id": "turn-active", "status": "inProgress", "items": []}
+                        ]
+                    }
+                }),
+            );
+            let request = next_request(&mut stream);
+            assert_eq!(request["method"], "turn/steer");
+            assert_eq!(request["params"]["threadId"], "thread-1");
+            assert_eq!(request["params"]["expectedTurnId"], "turn-active");
+            assert_eq!(request["params"]["clientUserMessageId"], "message-active");
+            respond(
+                &mut stream,
+                json!({"id": request["id"], "result": {"turnId": "turn-active"}}),
+            );
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        let receipt = immediate_notify(
+            &selected_transport(&socket),
+            "notify body",
+            "message-active",
+        )
+        .unwrap();
+        assert_eq!(receipt["turnId"], "turn-active");
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
+    fn immediate_notify_starts_active_thread_with_only_interrupted_turn() {
+        let socket = temp_socket("notify-interrupted");
+        let Some(listener) = bind_test_socket(&socket) else {
+            return;
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handshake(&mut stream);
+            initialize(&mut stream);
+            let read_id = next_request_id(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": read_id,
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "active", "activeFlags": []}
+                        }
+                    }
+                }),
+            );
+            let turns_id = next_request_id(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": turns_id,
+                    "result": {
+                        "data": [
+                            {"id": "turn-interrupted", "status": "interrupted", "items": []}
+                        ]
+                    }
+                }),
+            );
+            let request = next_request(&mut stream);
+            assert_eq!(request["method"], "turn/start");
+            assert_eq!(request["params"]["threadId"], "thread-1");
+            assert_eq!(
+                request["params"]["clientUserMessageId"],
+                "message-interrupted"
+            );
+            respond(
+                &mut stream,
+                json!({
+                    "id": request["id"],
+                    "result": {
+                        "turn": {"id": "turn-started", "status": "inProgress", "items": []}
+                    }
+                }),
+            );
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        let receipt = immediate_notify(
+            &selected_transport(&socket),
+            "notify body",
+            "message-interrupted",
+        )
+        .unwrap();
+        assert_eq!(receipt["turn"]["id"], "turn-started");
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
+    fn immediate_notify_rejects_multiple_in_progress_turns() {
+        let socket = temp_socket("notify-multiple-active");
+        let Some(listener) = bind_test_socket(&socket) else {
+            return;
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handshake(&mut stream);
+            initialize(&mut stream);
+            let read_id = next_request_id(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": read_id,
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "active", "activeFlags": []}
+                        }
+                    }
+                }),
+            );
+            let turns_id = next_request_id(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": turns_id,
+                    "result": {
+                        "data": [
+                            {"id": "turn-1", "status": "inProgress", "items": []},
+                            {"id": "turn-2", "status": "inProgress", "items": []}
+                        ]
+                    }
+                }),
+            );
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        let error = immediate_notify(
+            &selected_transport(&socket),
+            "notify body",
+            "message-multiple-active",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("STEER_ACTIVE_TURN_AMBIGUOUS"),
+            "{error}"
+        );
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
+    fn immediate_notify_routes_idle_and_not_loaded_threads_to_turn_start() {
+        for status in ["idle", "notLoaded"] {
+            let socket = temp_socket("notify-start");
+            let Some(listener) = bind_test_socket(&socket) else {
+                return;
+            };
+            let status = status.to_string();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                handshake(&mut stream);
+                initialize(&mut stream);
+                let read_id = next_request_id(&mut stream);
+                respond(
+                    &mut stream,
+                    json!({
+                        "id": read_id,
+                        "result": {
+                            "thread": {
+                                "id": "thread-1",
+                                "status": {"type": status}
+                            }
+                        }
+                    }),
+                );
+                let request = next_request(&mut stream);
+                assert_eq!(request["method"], "turn/start");
+                assert_eq!(request["params"]["threadId"], "thread-1");
+                respond(
+                    &mut stream,
+                    json!({
+                        "id": request["id"],
+                        "result": {
+                            "turn": {"id": "turn-started", "status": "inProgress", "items": []}
+                        }
+                    }),
+                );
+                stream.shutdown(Shutdown::Both).ok();
+            });
+
+            immediate_notify(&selected_transport(&socket), "notify body", "message-start").unwrap();
+            server.join().unwrap();
+            std::fs::remove_file(socket).ok();
+        }
+    }
+
+    #[test]
+    fn immediate_notify_rejects_queued_submission_as_success() {
+        let socket = temp_socket("notify-queued");
+        let Some(listener) = bind_test_socket(&socket) else {
+            return;
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handshake(&mut stream);
+            initialize(&mut stream);
+            let read_id = next_request_id(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": read_id,
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "idle"}
+                        }
+                    }
+                }),
+            );
+            let request = next_request(&mut stream);
+            assert_eq!(request["method"], "turn/start");
+            respond(
+                &mut stream,
+                json!({
+                    "id": request["id"],
+                    "result": {
+                        "queuedSubmission": {"id": "queue-1"}
+                    }
+                }),
+            );
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        assert!(immediate_notify(
+            &selected_transport(&socket),
+            "notify body",
+            "message-queued"
+        )
+        .is_err());
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    fn selected_transport(socket: &Path) -> SelectedTransport {
+        SelectedTransport {
+            kind: TransportKind::AppServer,
+            endpoint: Some(format!("unix://{}", socket.display())),
+            namespace: Some("codex_tui".into()),
+            thread_id: Some("thread-1".into()),
+            capabilities: vec!["send_message_to_thread".into()],
+            self_check: "test".into(),
+        }
+    }
+
+    fn temp_socket(tag: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "collab-{tag}-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn bind_test_socket(socket: &Path) -> Option<UnixListener> {
+        match UnixListener::bind(socket) {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "SKIP socket integration assertion: sandbox denied unix socket bind at {}",
+                    socket.display()
+                );
+                None
+            }
+            Err(error) => panic!("bind {}: {error}", socket.display()),
+        }
+    }
+
+    fn handshake(stream: &mut UnixStream) {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .unwrap();
+    }
+
+    fn initialize(stream: &mut UnixStream) {
+        let request = next_request(stream);
+        assert_eq!(request["method"], "initialize");
+        respond(stream, json!({"id": request["id"], "result": {}}));
+        let initialized = read_client_frame(stream);
+        let initialized: Value = serde_json::from_slice(&initialized).unwrap();
+        assert_eq!(initialized["method"], "initialized");
+    }
+
+    fn next_request(stream: &mut UnixStream) -> Value {
+        serde_json::from_slice(&read_client_frame(stream)).unwrap()
+    }
+
+    fn next_request_id(stream: &mut UnixStream) -> Value {
+        next_request(stream)["id"].clone()
+    }
+
+    fn respond(stream: &mut UnixStream, value: Value) {
+        stream
+            .write_all(&encode_frame(0x1, &serde_json::to_vec(&value).unwrap()))
+            .unwrap();
+    }
+
     fn read_client_frame(stream: &mut UnixStream) -> Vec<u8> {
+        try_read_client_frame(stream).unwrap()
+    }
+
+    fn try_read_client_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
         let mut header = [0_u8; 2];
-        stream.read_exact(&mut header).unwrap();
+        stream.read_exact(&mut header)?;
         let masked = header[1] & 0x80 != 0;
         let mut length = (header[1] & 0x7f) as usize;
         if length == 126 {
             let mut bytes = [0_u8; 2];
-            stream.read_exact(&mut bytes).unwrap();
+            stream.read_exact(&mut bytes)?;
             length = u16::from_be_bytes(bytes) as usize;
         }
         let mut mask = [0_u8; 4];
         if masked {
-            stream.read_exact(&mut mask).unwrap();
+            stream.read_exact(&mut mask)?;
         }
         let mut payload = vec![0_u8; length];
-        stream.read_exact(&mut payload).unwrap();
+        stream.read_exact(&mut payload)?;
         if masked {
             for (index, byte) in payload.iter_mut().enumerate() {
                 *byte ^= mask[index % 4];
             }
         }
-        payload
+        Ok(payload)
     }
 }
