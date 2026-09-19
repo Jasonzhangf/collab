@@ -163,7 +163,7 @@ pub struct RouteResolution {
 impl RouteResolution {
     pub fn validate(&self) -> anyhow::Result<()> {
         crate::identity::validate_id_for_protocol(self.app_scope_id.as_str())?;
-        crate::identity::validate_id_for_protocol(self.project_scope.as_str())?;
+        self.project_scope.validate()?;
         crate::identity::validate_id_for_protocol(self.agent_id.as_str())?;
         crate::identity::validate_id_for_protocol(self.binding_id.as_str())?;
         crate::identity::validate_id_for_protocol(self.native_thread_id.as_str())?;
@@ -716,6 +716,34 @@ mod tests {
         let decoded: RouteResolution = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, route);
         decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn route_resolution_accepts_long_registered_project_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "collab-long-route-resolution-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut long_root = root.clone();
+        for index in 0..24 {
+            long_root = long_root.join(format!("segment-{index:02}-abcdef"));
+        }
+        std::fs::create_dir_all(&long_root).unwrap();
+        let canonical_root = long_root.canonicalize().unwrap();
+        let project_scope =
+            ProjectScopeId::new(canonical_root.to_string_lossy().into_owned()).unwrap();
+        assert!(project_scope.as_str().len() > 256);
+
+        let mut route = registered_route();
+        route.project_scope = project_scope;
+        route.canonical_root = canonical_root.to_string_lossy().into_owned();
+        route.validate().unwrap();
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
