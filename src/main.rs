@@ -473,6 +473,13 @@ fn persisted_runtime_matches_scope(scope: &Scope, ident: &Identity) -> anyhow::R
         .ok_or_else(|| anyhow::anyhow!("identity has no registered runtime binding"))?;
     let host_paths = scope.host_paths()?;
     let scope_root = std::fs::canonicalize(&scope.root)?;
+    if ident
+        .project_scope
+        .as_ref()
+        .is_none_or(|project_scope| project_scope.as_str() != scope_root.to_string_lossy())
+    {
+        return Ok(false);
+    }
     Ok(
         scope::canonical_route_for_identity(&host_paths, &scope.root, &runtime.appserver_id)
             .is_ok_and(|route| route.root == scope_root),
@@ -1508,6 +1515,12 @@ mod tests {
         std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
         let runtime = RuntimeIdentity::cli_adapter("worker-1").unwrap();
         let mut identity = identity_with_runtime(Some(runtime));
+        identity.project_scope = Some(
+            Scope { root: root.clone() }
+                .route_scope(identity::AppServerId::new(identity::CLI_APP_SERVER_ID).unwrap())
+                .unwrap()
+                .project_scope_id,
+        );
         identity.transport = Some(SelectedTransport {
             kind: TransportKind::AppServer,
             endpoint: Some("unix:///tmp/codex.sock".into()),
@@ -1520,6 +1533,35 @@ mod tests {
         let response = ensure_registration(&Scope { root: root.clone() }, &mut identity).unwrap();
         assert_eq!(response, json!({"reused": true}));
         assert_eq!(serde_json::to_value(&identity).unwrap(), before);
+        std::env::remove_var(crate::scope::COLLAB_STATE_DIR_ENV);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn legacy_identity_without_project_scope_requires_registration() {
+        let _guard = crate::scope::TEST_ENV_LOCK.lock().unwrap();
+        let root = test_root("registration-legacy-scope");
+        let state_root = root.join("global");
+        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::env::set_var(crate::scope::COLLAB_STATE_DIR_ENV, &state_root);
+        let route = json!({
+            "version": 1,
+            "op": "register",
+            "app_scope_id": identity::CLI_APP_SERVER_ID,
+            "project_scope": root.canonicalize().unwrap(),
+            "canonical_root": root.canonicalize().unwrap(),
+            "storage_root": root.canonicalize().unwrap(),
+            "registered_ms": 1
+        });
+        std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
+        let runtime = RuntimeIdentity::cli_adapter("worker-1").unwrap();
+        let identity = identity_with_runtime(Some(runtime));
+
+        assert!(
+            !persisted_runtime_matches_scope(&Scope { root: root.clone() }, &identity).unwrap()
+        );
+
         std::env::remove_var(crate::scope::COLLAB_STATE_DIR_ENV);
         std::fs::remove_dir_all(root).ok();
     }
@@ -1549,6 +1591,14 @@ mod tests {
         std::fs::write(state_root.join("routes.jsonl"), format!("{route}\n")).unwrap();
         let runtime = RuntimeIdentity::cli_adapter("worker-1").unwrap();
         let mut identity = identity_with_runtime(Some(runtime));
+        identity.project_scope = Some(
+            Scope {
+                root: old_root.clone(),
+            }
+            .route_scope(identity::AppServerId::new(identity::CLI_APP_SERVER_ID).unwrap())
+            .unwrap()
+            .project_scope_id,
+        );
         identity.transport = Some(SelectedTransport {
             kind: TransportKind::AppServer,
             endpoint: Some("unix:///tmp/codex.sock".into()),
