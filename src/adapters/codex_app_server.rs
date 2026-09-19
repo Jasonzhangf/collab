@@ -671,23 +671,40 @@ fn active_turn_id_from_page(page: &Value) -> Result<Option<String>, AdapterError
                 operation: "thread/turns/list",
                 detail: "response is missing data array".into(),
             })?;
-    let mut active = turns
-        .iter()
-        .filter_map(|turn| match turn.get("status").and_then(Value::as_str) {
-            Some("inProgress") => turn.get("id").and_then(Value::as_str),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut active = Vec::new();
+    for (index, turn) in turns.iter().enumerate() {
+        if turn.get("status").and_then(Value::as_str) != Some("inProgress") {
+            continue;
+        }
+        let turn_id = turn
+            .get("id")
+            .ok_or_else(|| AdapterError::Unknown {
+                operation: "turn/steer",
+                detail: format!("inProgress turn at data[{index}] is missing id"),
+            })?
+            .as_str()
+            .ok_or_else(|| AdapterError::Unknown {
+                operation: "turn/steer",
+                detail: format!("inProgress turn at data[{index}] id must be a JSON string"),
+            })?;
+        if turn_id.trim().is_empty() {
+            return Err(AdapterError::Unknown {
+                operation: "turn/steer",
+                detail: format!("inProgress turn at data[{index}] id must be non-empty after trim"),
+            });
+        }
+        if turn_id.chars().any(char::is_whitespace) {
+            return Err(AdapterError::Unknown {
+                operation: "turn/steer",
+                detail: format!("inProgress turn at data[{index}] id must not contain whitespace"),
+            });
+        }
+        active.push(turn_id);
+    }
     match active.len() {
         0 => Ok(None),
         1 => {
             let turn_id = active.remove(0);
-            if turn_id.trim().is_empty() || turn_id.chars().any(char::is_whitespace) {
-                return Err(AdapterError::Unknown {
-                    operation: "turn/steer",
-                    detail: "response returned an invalid active turn id".into(),
-                });
-            }
             Ok(Some(turn_id.to_owned()))
         }
         _ => Err(AdapterError::Unknown {
@@ -1125,6 +1142,16 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
+    fn assert_malformed_active_turn(page: Value, expected_detail: &str) {
+        match active_turn_id_from_page(&page).unwrap_err() {
+            AdapterError::Unknown { operation, detail } => {
+                assert_eq!(operation, "turn/steer");
+                assert!(detail.contains(expected_detail), "{detail}");
+            }
+            error => panic!("expected AdapterError::Unknown, got {error:?}"),
+        }
+    }
+
     #[test]
     fn frame_round_trip_uses_masked_client_frames() {
         let frame = encode_frame(0x1, b"hello");
@@ -1487,6 +1514,67 @@ mod tests {
             }))
             .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn active_turn_selection_rejects_missing_id() {
+        assert_malformed_active_turn(
+            json!({"data": [{"status": "inProgress"}]}),
+            "data[0] is missing id",
+        );
+    }
+
+    #[test]
+    fn active_turn_selection_rejects_non_string_id() {
+        assert_malformed_active_turn(
+            json!({"data": [{"id": 7, "status": "inProgress"}]}),
+            "data[0] id must be a JSON string",
+        );
+    }
+
+    #[test]
+    fn active_turn_selection_rejects_empty_id() {
+        for id in ["", "   "] {
+            assert_malformed_active_turn(
+                json!({"data": [{"id": id, "status": "inProgress"}]}),
+                "data[0] id must be non-empty after trim",
+            );
+        }
+    }
+
+    #[test]
+    fn active_turn_selection_rejects_whitespace_containing_id() {
+        assert_malformed_active_turn(
+            json!({"data": [{"id": "turn active", "status": "inProgress"}]}),
+            "data[0] id must not contain whitespace",
+        );
+    }
+
+    #[test]
+    fn active_turn_selection_handles_valid_zero_and_multiple_turns() {
+        assert_eq!(
+            active_turn_id_from_page(&json!({"data": []})).unwrap(),
+            None
+        );
+        assert_eq!(
+            active_turn_id_from_page(&json!({
+                "data": [{"id": "turn-active", "status": "inProgress"}]
+            }))
+            .unwrap()
+            .as_deref(),
+            Some("turn-active")
+        );
+        let error = active_turn_id_from_page(&json!({
+            "data": [
+                {"id": "turn-1", "status": "inProgress"},
+                {"id": "turn-2", "status": "inProgress"}
+            ]
+        }))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("STEER_ACTIVE_TURN_AMBIGUOUS"),
+            "{error}"
         );
     }
 
