@@ -577,6 +577,50 @@ pub struct State {
 }
 
 impl State {
+    pub(crate) fn restore_unique_current_thread_routes_from_bindings(
+        &mut self,
+    ) -> Result<(), String> {
+        let mut bindings = self
+            .global
+            .projects
+            .values()
+            .flat_map(|project| project.runtime_bindings.values())
+            .filter(|binding| binding.native_thread_id.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        bindings.sort_by(|left, right| {
+            left.native_thread_id
+                .as_ref()
+                .map(|thread| thread.as_str())
+                .cmp(
+                    &right
+                        .native_thread_id
+                        .as_ref()
+                        .map(|thread| thread.as_str()),
+                )
+        });
+        let mut recovered = self.global.clone();
+        for binding in bindings {
+            let thread = binding.native_thread_id.clone().unwrap();
+            if let Some(existing) = recovered.lookup_current_thread_route(&thread) {
+                if existing == &binding {
+                    continue;
+                }
+                return Err(format!(
+                    "journal replay rejected ambiguous current thread route {thread}"
+                ));
+            }
+            recovered
+                .set_current_thread_route(binding)
+                .map_err(|error| {
+                    format!("journal replay rejected current thread route: {error}")
+                })?;
+        }
+        recovered.set_counters(self.sequence, self.revision);
+        self.global = recovered;
+        Ok(())
+    }
+
     /// Keep the typed projection on the daemon journal's version axis.  The
     /// resident reducer is the only owner of these counters; the nested
     /// global state mirrors them for typed CAS and receipts.
@@ -1230,6 +1274,20 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{AgentId, AppServerId, BindingId, NativeThreadId, RuntimeId};
+    use crate::scope::ProjectScopeId;
+    use crate::server::global_state::{ProjectRegistration, RuntimeBinding};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static REPLAY_TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn replay_test_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "collab-route-replay-{label}-{}-{}",
+            std::process::id(),
+            REPLAY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     #[test]
@@ -1433,6 +1491,109 @@ mod tests {
         assert_eq!(replayed.worktree_bindings["binding-task-1"], binding);
         assert_eq!(state.command_receipts, replayed.command_receipts);
         assert_eq!(state.worktree_bindings, replayed.worktree_bindings);
+    }
+
+    #[test]
+    fn runtime_binding_replay_restores_the_unique_current_thread_route() {
+        let root = replay_test_root("unique");
+        let journal = root.join(".agent-collab/server/journal.jsonl");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let scope = ProjectScopeId::new("/replay-project").unwrap();
+        let registration =
+            ProjectRegistration::new(scope.clone(), AppServerId::new("appserver-cli").unwrap())
+                .unwrap();
+        let binding = RuntimeBinding::new(
+            scope,
+            AppServerId::new("appserver-cli").unwrap(),
+            AgentId::new("agent-replay").unwrap(),
+            RuntimeId::new("runtime-replay").unwrap(),
+            BindingId::new("binding-replay").unwrap(),
+            4,
+            Some(NativeThreadId::new("thread-replay").unwrap()),
+        )
+        .unwrap();
+        let events = vec![
+            Event::GlobalProjectRegistered { registration },
+            Event::GlobalRuntimeBound {
+                binding: binding.clone(),
+            },
+        ];
+        let body = events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&journal, format!("{body}\n")).unwrap();
+        let replayed = crate::server::replay(&root).unwrap();
+        assert_eq!(
+            replayed
+                .global
+                .lookup_current_thread_route(binding.native_thread_id.as_ref().unwrap()),
+            Some(&binding)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_binding_replay_rejects_ambiguous_current_thread_routes() {
+        let root = replay_test_root("ambiguous");
+        let journal = root.join(".agent-collab/server/journal.jsonl");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let first_scope = ProjectScopeId::new("/replay-project-a").unwrap();
+        let second_scope = ProjectScopeId::new("/replay-project-b").unwrap();
+        let first = RuntimeBinding::new(
+            first_scope.clone(),
+            AppServerId::new("appserver-cli").unwrap(),
+            AgentId::new("agent-a").unwrap(),
+            RuntimeId::new("runtime-a").unwrap(),
+            BindingId::new("binding-a").unwrap(),
+            1,
+            Some(NativeThreadId::new("thread-shared").unwrap()),
+        )
+        .unwrap();
+        let second = RuntimeBinding::new(
+            second_scope.clone(),
+            AppServerId::new("appserver-cli").unwrap(),
+            AgentId::new("agent-b").unwrap(),
+            RuntimeId::new("runtime-b").unwrap(),
+            BindingId::new("binding-b").unwrap(),
+            1,
+            Some(NativeThreadId::new("thread-shared").unwrap()),
+        )
+        .unwrap();
+        let events = vec![
+            Event::GlobalProjectRegistered {
+                registration: ProjectRegistration::new(
+                    first_scope,
+                    AppServerId::new("appserver-cli").unwrap(),
+                )
+                .unwrap(),
+            },
+            Event::GlobalProjectRegistered {
+                registration: ProjectRegistration::new(
+                    second_scope,
+                    AppServerId::new("appserver-cli").unwrap(),
+                )
+                .unwrap(),
+            },
+            Event::GlobalRuntimeBound { binding: first },
+            Event::GlobalRuntimeBound { binding: second },
+        ];
+        let body = events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&journal, format!("{body}\n")).unwrap();
+        let error = crate::server::replay(&root)
+            .err()
+            .expect("ambiguous replay must fail")
+            .to_string();
+        assert!(
+            error.contains("ambiguous current thread route thread-shared"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
