@@ -545,8 +545,7 @@ pub fn project_root() -> anyhow::Result<PathBuf> {
 /// They must not follow `CODEX_THREAD_ID` to a different project route.
 pub fn lifecycle_project_root() -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
-    let host_paths = HostPaths::resolve()?;
-    Scope::resolve_from_cwd_without_thread(&cwd, &host_paths, None).map(|scope| scope.root)
+    inherited_cwd_if_initialized(cwd)
 }
 
 /// Resolve the exact destination for `collab init`. Initialization binds to
@@ -1198,6 +1197,29 @@ mod tests {
             Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
             None => std::env::remove_var("CODEX_THREAD_ID"),
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lifecycle_scope_requires_an_exact_local_baseline() {
+        let root = test_root("lifecycle-exact-cwd");
+        let initialized = root.join("initialized");
+        let uninitialized = root.join("uninitialized");
+        std::fs::create_dir_all(initialized.join(".agent-collab")).unwrap();
+        std::fs::create_dir_all(&uninitialized).unwrap();
+
+        assert_eq!(
+            inherited_cwd_if_initialized(initialized.clone()).unwrap(),
+            initialized
+        );
+        let error = inherited_cwd_if_initialized(uninitialized.clone()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no .agent-collab found in inherited cwd"),
+            "{error}"
+        );
+
         std::fs::remove_dir_all(root).ok();
     }
 
