@@ -7058,40 +7058,58 @@ fn task_view(state: &State, task: &TaskRec) -> serde_json::Value {
     })
 }
 
+fn daemon_context_view(server: &Server) -> serde_json::Value {
+    let Ok(host_paths) = HostPaths::resolve() else {
+        return json!({
+            "pid": std::process::id(),
+            "socket": null,
+            "live": true,
+            "reason": "this daemon served the request, but its host state path is unavailable",
+            "storage_root": server.storage_root,
+        });
+    };
+    json!({
+        "pid": std::process::id(),
+        "socket": host_paths.socket_path(),
+        "live": true,
+        "storage_root": server.storage_root,
+    })
+}
+
 fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
     let st = server.state.lock().unwrap();
     if let Err(e) = verify(&st, &worker_id, &token) {
         return e;
     }
-    let Some(worker) = st.workers.get(&worker_id) else {
+    let Some(worker) = st.workers.get(&worker_id).cloned() else {
         return Resp::err(format!("worker {} not registered", worker_id));
     };
-    let tasks: Vec<serde_json::Value> = st
+    let mut tasks: Vec<serde_json::Value> = st
         .tasks
         .values()
         .filter(|task| task.owner == worker_id)
         .map(|task| task_view(&st, task))
         .collect();
+    tasks.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
     let unread: Vec<&Message> = st.inbox_of(&worker_id);
-    let next_actions: Vec<String> = tasks
+    let unread_count = unread.len();
+    let inbox_messages: Vec<serde_json::Value> = unread
         .iter()
-        .filter_map(|task| {
-            task.get("next_step")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
+        .rev()
+        .take(20)
+        .map(|message| {
+            json!({
+                "id": message.id,
+                "from": message.from,
+                "type": message.mtype,
+                "subject": message.subject,
+                "state": message.state,
+                "created_at": iso(message.created_ms),
+                "body": message.body,
+            })
         })
         .collect();
     let managed = is_managed_subagent(&st, &worker_id);
-    let presence = worker_identity_presence(server, worker);
-    let is_appserver = worker
-        .transport
-        .as_ref()
-        .is_some_and(|transport| transport.kind == TransportKind::AppServer);
-    let (agent, _raw) = if is_appserver {
-        appserver_agent_view(server, worker)
-    } else {
-        (serde_json::Value::Null, serde_json::Value::Null)
-    };
     let role = if st.master_worker_id.as_deref() == Some(worker_id.as_str()) {
         "master"
     } else if managed {
@@ -7099,34 +7117,90 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
     } else {
         "worker"
     };
-    let mut peers: Vec<_> = st
+    let worktrees: Vec<serde_json::Value> = {
+        let mut worktrees = st
+            .worktree_bindings
+            .values()
+            .filter(|binding| binding.owner_agent_id == worker_id)
+            .map(|binding| {
+                let task = st.tasks.get(&binding.task_id);
+                json!({
+                    "task_id": binding.task_id,
+                    "owner": binding.owner_agent_id,
+                    "branch": task.and_then(|task| task.branch.clone()),
+                    "path": binding.worktree_root,
+                    "base_commit": binding.base_commit,
+                    "status": task.map(|task| task.status.as_str()).unwrap_or("unknown"),
+                    "cleanup": task.map(|task| task_view(&st, task)["cleanup"].clone()),
+                })
+            })
+            .collect::<Vec<_>>();
+        worktrees.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+        worktrees
+    };
+    let subscriptions: Vec<serde_json::Value> = {
+        let mut subscriptions = st
+            .notification_subscriptions
+            .values()
+            .filter(|subscription| subscription.worker_id == worker_id)
+            .collect::<Vec<_>>();
+        subscriptions.sort_by_key(|subscription| (subscription.created_ms, &subscription.id));
+        subscriptions
+            .into_iter()
+            .map(|subscription| {
+                serde_json::to_value(subscription).unwrap_or(serde_json::Value::Null)
+            })
+            .collect()
+    };
+    let mut peer_snapshots: Vec<_> = st
         .workers
         .values()
         .map(|peer| {
-            let peer_presence = worker_identity_presence(server, peer);
+            let peer_role = if st.master_worker_id.as_deref() == Some(peer.id.as_str()) {
+                "master"
+            } else if is_managed_subagent(&st, &peer.id) {
+                "managed-subagent"
+            } else {
+                "worker"
+            };
+            (peer.clone(), peer_role)
+        })
+        .collect();
+    peer_snapshots.sort_by(|left, right| left.0.id.cmp(&right.0.id));
+    let master_worker_id = st.master_worker_id.clone();
+    let master_assigned_by = st.master_assigned_by.clone();
+    let master_approval = st.master_approval.clone();
+    let master_assigned_ms = st.master_assigned_ms;
+    let master_wake = st.master_wake.clone();
+    drop(st);
+
+    let presence = worker_identity_presence(server, &worker);
+    let is_appserver = worker
+        .transport
+        .as_ref()
+        .is_some_and(|transport| transport.kind == TransportKind::AppServer);
+    let (agent, _raw) = if is_appserver {
+        appserver_agent_view(server, &worker)
+    } else {
+        (serde_json::Value::Null, serde_json::Value::Null)
+    };
+    let peers: Vec<_> = peer_snapshots
+        .into_iter()
+        .map(|(peer, peer_role)| {
+            let peer_presence = worker_identity_presence(server, &peer);
             json!({
                 "worker_id": peer.id,
-                "role": if st.master_worker_id.as_deref() == Some(peer.id.as_str()) {
-                    "master"
-                } else if is_managed_subagent(&st, &peer.id) {
-                    "managed-subagent"
-                } else {
-                    "worker"
-                },
+                "id": peer.id,
+                "role": peer_role,
                 "presence": match peer_presence {
                     IdentityPresence::Present => "present",
                     IdentityPresence::Missing => "missing",
                     IdentityPresence::Unknown => "unknown",
                 },
                 "endpoint_live": peer_presence == IdentityPresence::Present,
-                "transport": peer.transport.as_ref().map(|transport| json!({
-                    "kind": transport.kind.as_str(),
-                    "thread_id": transport.thread_id,
-                })),
             })
         })
         .collect();
-    peers.sort_by(|left, right| left["worker_id"].as_str().cmp(&right["worker_id"].as_str()));
     let transport = worker.transport.as_ref().map(|transport| {
         json!({
             "kind": transport.kind.as_str(),
@@ -7136,7 +7210,70 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
             "self_check": transport.self_check,
         })
     });
+    let registration = json!({
+        "status": "registered",
+        "project_root": server.root,
+        "worker_id": worker.id,
+        "cwd": worker.cwd,
+        "registered_at": iso(worker.registered_ms),
+    });
+    let master_peer = master_worker_id
+        .as_deref()
+        .and_then(|id| peers.iter().find(|peer| peer["worker_id"] == id));
+    let master_presence = master_peer
+        .and_then(|peer| peer["presence"].as_str())
+        .unwrap_or("missing");
+    let assignment_view = |endpoint_live: bool| {
+        master_worker_id.as_ref().map(|id| {
+            json!({
+                "worker_id": id,
+                "endpoint_live": endpoint_live,
+                "assigned_by": master_assigned_by,
+                "approval": master_approval,
+                "assigned_ms": master_assigned_ms,
+                "master_wake": master_wake,
+            })
+        })
+    };
+    let (master, recorded_unusable) = match (master_worker_id.as_ref(), master_presence) {
+        (None, _) => (serde_json::Value::Null, serde_json::Value::Null),
+        (Some(_), "present") => (
+            assignment_view(true).unwrap_or(serde_json::Value::Null),
+            serde_json::Value::Null,
+        ),
+        (Some(_), "unknown") => (
+            json!({
+                "status": "unknown",
+                "error": "master identity is unknown; defer authority changes until transport probes succeed",
+            }),
+            assignment_view(false).unwrap_or(serde_json::Value::Null),
+        ),
+        (Some(_), _) => (
+            serde_json::Value::Null,
+            assignment_view(false).unwrap_or(serde_json::Value::Null),
+        ),
+    };
+    let mut next_actions: Vec<String> = tasks
+        .iter()
+        .filter_map(|task| {
+            task.get("next_step")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    if next_actions.is_empty() {
+        if master["worker_id"].as_str() == Some(worker_id.as_str()) {
+            next_actions
+                .push("run `appsdk longhorizon show` and keep eligible workers loaded".into());
+        } else {
+            next_actions
+                .push("no assigned task action; remain available for an explicit dispatch".into());
+        }
+    }
     Resp::data(json!({
+        "schema_version": 1,
+        "registration": registration,
+        "registered": true,
         "project_root": server.root,
         "identity": {
             "worker_id": worker.id,
@@ -7152,22 +7289,28 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
                 IdentityPresence::Unknown => "unknown",
             },
             "transport_kind": worker.transport.as_ref().map(|transport| transport.kind.as_str()),
+            "endpoint": worker.transport.as_ref().and_then(|transport| transport.endpoint.as_deref()),
+            "self_check": worker.transport.as_ref().map(|transport| transport.self_check.clone()),
         },
         "agent": agent,
         "tasks": tasks,
+        "worktrees": worktrees,
+        "subscriptions": subscriptions,
         "peers": peers,
-        "inbox": {"unread": unread.len()},
-        "next_actions": next_actions,
-        "master": match live_master_id(server, &st) {
-            Ok(master) => master.map(|id| json!({"worker_id": id})),
-            Err(error) => Some(json!({"status": "unknown", "error": error})),
+        "inbox": {
+            "unread": unread_count,
+            "messages": inbox_messages,
         },
+        "daemon": daemon_context_view(server),
+        "next_actions": next_actions,
+        "master": master,
+        "recorded_unusable": recorded_unusable,
         "authority": {
             "managed_subagent": managed,
             "must_obey_master": managed,
             "may_decline_master_invite": !managed,
         },
-        "truth": "server journal and mailbox; selected transport is wake-only",
+        "truth": "server journal, mailbox, and live App Server probes; context is read-only",
     }))
 }
 

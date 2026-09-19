@@ -565,30 +565,70 @@ fn unregistered_context(
     identity: Option<&Identity>,
 ) -> anyhow::Result<serde_json::Value> {
     let cwd = std::env::current_dir()?;
+    let canonical_cwd = std::fs::canonicalize(&cwd)?;
     let project_root = match scope {
         Some(scope) => scope.root.clone(),
-        None => std::fs::canonicalize(&cwd)?,
+        None => canonical_cwd.clone(),
     };
-    let looks_like_worktree = cwd.ancestors().any(|ancestor| {
+    let looks_like_worktree = canonical_cwd.ancestors().any(|ancestor| {
         ancestor
             .file_name()
             .is_some_and(|name| name == "playground")
     });
     let next_action = if looks_like_worktree {
-        "return to the canonical project main checkout and run collab context there"
+        "return to the canonical project main checkout and run `appsdk init .`"
     } else {
         "appsdk init ."
     };
     Ok(json!({
+        "schema_version": 1,
+        "registration": {
+            "status": "unregistered",
+            "project_root": project_root,
+            "action": next_action,
+        },
         "registered": false,
         "project_root": project_root,
-        "cwd": cwd,
+        "cwd": canonical_cwd,
         "identity": identity.map(|identity| json!({
             "worker_id": identity.worker_id,
+            "kind": "peer",
+            "role": "unregistered",
+            "transport": serde_json::Value::Null,
             "thread_id": identity.runtime.as_ref().and_then(|runtime| runtime.native_thread_id.as_ref()),
         })),
         "next_action": next_action,
-        "truth": "exact process cwd; context is read-only",
+        "next_actions": [next_action],
+        "daemon": {
+            "pid": null,
+            "socket": null,
+            "live": false,
+            "reason": "project is not registered; daemon state is unavailable",
+        },
+        "liveness": {
+            "live": false,
+            "presence": "unregistered",
+            "transport_kind": serde_json::Value::Null,
+            "endpoint": serde_json::Value::Null,
+            "self_check": serde_json::Value::Null,
+        },
+        "agent": serde_json::Value::Null,
+        "master": {
+            "status": "unknown",
+            "reason": "peer_unregistered",
+        },
+        "recorded_unusable": serde_json::Value::Null,
+        "peers": [],
+        "tasks": [],
+        "worktrees": [],
+        "subscriptions": [],
+        "inbox": {"unread": 0, "messages": []},
+        "authority": {
+            "managed_subagent": false,
+            "must_obey_master": false,
+            "may_decline_master_invite": false,
+        },
+        "truth": "exact process cwd; context is read-only; no registration was created",
     }))
 }
 

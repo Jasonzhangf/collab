@@ -82,8 +82,66 @@ fn context_returns_structured_unregistered_without_side_effects() {
     );
     assert_eq!(context["cwd"], expected_root.to_string_lossy().as_ref());
     assert_eq!(context["next_action"], "appsdk init .");
+    assert_eq!(context["schema_version"], 1);
+    assert_eq!(context["registration"]["status"], "unregistered");
+    assert_eq!(
+        context["next_actions"],
+        serde_json::json!(["appsdk init ."])
+    );
+    assert_eq!(context["liveness"]["presence"], "unregistered");
+    assert_eq!(context["liveness"]["live"], false);
+    assert!(context["agent"].is_null());
+    assert_eq!(context["tasks"], serde_json::json!([]));
+    assert_eq!(context["peers"], serde_json::json!([]));
+    assert_eq!(context["worktrees"], serde_json::json!([]));
+    assert_eq!(context["subscriptions"], serde_json::json!([]));
+    assert_eq!(context["inbox"]["unread"], 0);
+    assert_eq!(context["master"]["status"], "unknown");
+    assert_eq!(context["master"]["reason"], "peer_unregistered");
+    assert_eq!(context["authority"]["managed_subagent"], false);
+    assert_eq!(context["authority"]["must_obey_master"], false);
+    assert_eq!(context["authority"]["may_decline_master_invite"], false);
     assert!(!Path::new(&root).join(".agent-collab").exists());
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn context_from_unregistered_worktree_points_directly_to_main_tree_initialization() {
+    let root = std::env::temp_dir().join(format!(
+        "collab-context-worktree-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let worktree = root.join("playground/context-candidate");
+    std::fs::create_dir_all(&worktree).unwrap();
+
+    let output = run_context(&worktree);
+
+    assert!(
+        output.status.success(),
+        "context failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let context: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(context["registered"], false);
+    assert_eq!(
+        context["next_action"],
+        "return to the canonical project main checkout and run `appsdk init .`"
+    );
+    assert_eq!(
+        context["next_actions"],
+        serde_json::json!([
+            "return to the canonical project main checkout and run `appsdk init .`"
+        ])
+    );
+    assert_eq!(context["master"]["status"], "unknown");
+    assert_eq!(context["master"]["reason"], "peer_unregistered");
+    assert!(!worktree.join(".agent-collab").exists());
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -162,6 +220,12 @@ fn context_does_not_register_an_initialized_project_without_an_identity() {
     let context: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(context["registered"], false);
     assert_eq!(context["next_action"], "appsdk init .");
+    assert_eq!(
+        context["next_actions"],
+        serde_json::json!(["appsdk init ."])
+    );
+    assert_eq!(context["liveness"]["presence"], "unregistered");
+    assert_eq!(context["master"]["status"], "unknown");
     assert_eq!(
         std::fs::read_dir(root.join(".agent-collab/runs"))
             .unwrap()
