@@ -3114,7 +3114,7 @@ fn attempt_scheduler_notification(
     if !server.config.notifications.enabled {
         return SchedulerNotificationAttempt::Unavailable;
     }
-    {
+    let claim_ms = {
         let mut state = server.state.lock().unwrap();
         let Some(admission) = state.scheduler_admissions.get(request_id) else {
             return SchedulerNotificationAttempt::Unavailable;
@@ -3126,16 +3126,18 @@ fn attempt_scheduler_notification(
         } else if admission.status != "pending" {
             return SchedulerNotificationAttempt::Unavailable;
         }
+        let claim_ms = now_ms();
         server.commit_locked(
             &mut state,
             &[Event::SchedulerAdmissionStatus {
                 request_id: request_id.into(),
                 status: "notifying".into(),
                 error: None,
-                updated_ms: now_ms(),
+                updated_ms: claim_ms,
             }],
         );
-    }
+        claim_ms
+    };
     let delivery = {
         let state = server.state.lock().unwrap();
         state.msgs.get(message_id).and_then(|seed| {
@@ -3166,7 +3168,7 @@ fn attempt_scheduler_notification(
         })
     };
     let Some((recipient, transport, delay, explicit)) = delivery else {
-        clear_scheduler_notification_claim(server, request_id);
+        clear_scheduler_notification_claim(server, request_id, claim_ms);
         return SchedulerNotificationAttempt::Rejected;
     };
     let notified = attempt_appserver_notification_with_retry(
@@ -3185,18 +3187,20 @@ fn attempt_scheduler_notification(
     );
     if notified {
         let mut state = server.state.lock().unwrap();
-        server.commit_locked(
-            &mut state,
-            &[Event::SchedulerAdmissionStatus {
-                request_id: request_id.into(),
-                status: "succeeded".into(),
-                error: None,
-                updated_ms: now_ms(),
-            }],
-        );
+        if scheduler_notification_claim_is_current(&state, request_id, claim_ms) {
+            server.commit_locked(
+                &mut state,
+                &[Event::SchedulerAdmissionStatus {
+                    request_id: request_id.into(),
+                    status: "succeeded".into(),
+                    error: None,
+                    updated_ms: now_ms(),
+                }],
+            );
+        }
         SchedulerNotificationAttempt::Accepted
     } else {
-        clear_scheduler_notification_claim(server, request_id);
+        clear_scheduler_notification_claim(server, request_id, claim_ms);
         SchedulerNotificationAttempt::Rejected
     }
 }
@@ -3209,13 +3213,22 @@ enum SchedulerNotificationAttempt {
     Unavailable,
 }
 
-fn clear_scheduler_notification_claim(server: &Server, request_id: &str) {
+fn scheduler_notification_claim_is_current(state: &State, request_id: &str, claim_ms: i64) -> bool {
+    state
+        .scheduler_admissions
+        .get(request_id)
+        .is_some_and(|admission| {
+            admission.status == "notifying" && admission.updated_ms == claim_ms
+        })
+}
+
+fn clear_scheduler_notification_claim(server: &Server, request_id: &str, claim_ms: i64) {
     let mut state = server.state.lock().unwrap();
-    let Some(admission) = state.scheduler_admissions.get(request_id) else {
-        return;
-    };
-    if admission.status == "notifying" {
-        let error = admission.error.clone();
+    if scheduler_notification_claim_is_current(&state, request_id, claim_ms) {
+        let error = state
+            .scheduler_admissions
+            .get(request_id)
+            .and_then(|admission| admission.error.clone());
         server.commit_locked(
             &mut state,
             &[Event::SchedulerAdmissionStatus {
@@ -16264,6 +16277,75 @@ mod scheduler_admission_tests {
         assert_eq!(
             state.scheduler_admissions["req-stale-notifying"].status,
             "succeeded"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_attempt_cannot_clear_newer_notification_claim() {
+        let (mut server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.config.notifications.enabled = true;
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let server = Arc::new(server);
+        let first = dispatch(
+            &server,
+            Req::Subagent {
+                worker_id: "master".into(),
+                token: "token-master".into(),
+                command: crate::subagent::Action::Dispatch {
+                    request_id: "req-stale-owner".into(),
+                    subject: "Stale owner".into(),
+                    body: "Old attempt must not clear a newer claim".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p1".into(),
+                    next_step: None,
+                },
+                launch_env: Default::default(),
+            },
+        );
+        assert!(first.ok, "{first:?}");
+
+        let old_claim = now_ms() - state::REQUEST_COOLDOWN_MS - 1;
+        {
+            let mut state = server.state.lock().unwrap();
+            server.commit_locked(
+                &mut state,
+                &[Event::SchedulerAdmissionStatus {
+                    request_id: "req-stale-owner".into(),
+                    status: "notifying".into(),
+                    error: None,
+                    updated_ms: old_claim,
+                }],
+            );
+        }
+        {
+            let mut state = server.state.lock().unwrap();
+            server.commit_locked(
+                &mut state,
+                &[Event::SchedulerAdmissionStatus {
+                    request_id: "req-stale-owner".into(),
+                    status: "notifying".into(),
+                    error: None,
+                    updated_ms: old_claim + 1,
+                }],
+            );
+        }
+        clear_scheduler_notification_claim(&server, "req-stale-owner", old_claim);
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.scheduler_admissions["req-stale-owner"].status,
+            "notifying"
         );
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
