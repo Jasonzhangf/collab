@@ -312,8 +312,8 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
         });
     }
     // Item history is a diagnostic capability, not a registration or wake
-    // requirement. Some App Server builds expose thread/read and turn/start but
-    // return method-not-found for items/list; that must not block peer
+    // requirement. Some App Server builds expose thread/read and notification
+    // methods but return method-not-found for items/list; that must not block peer
     // registration. Snapshot calls still fail explicitly if the method is
     // unavailable.
     let _items_available = method_exists(
@@ -325,15 +325,26 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
             "sortDirection": "desc",
         }),
     )?;
-    let send_message = method_exists(
+    let immediate_notify = method_exists(
         &mut client,
         "turn/start",
         json!({"threadId": "", "input": []}),
     )?;
-    if !send_message {
+    if !immediate_notify {
         return Err(AdapterError::CapabilityUnavailable {
             endpoint: EndpointKind::Tui,
             operation: "turn/start",
+        });
+    }
+    let queue_wakeup = method_exists(
+        &mut client,
+        "thread/queue/add",
+        json!({"threadId": "", "input": []}),
+    )?;
+    if !queue_wakeup {
+        return Err(AdapterError::CapabilityUnavailable {
+            endpoint: EndpointKind::Tui,
+            operation: "thread/queue/add",
         });
     }
     Ok(SelectedTransport {
@@ -345,9 +356,12 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
             "session_status".into(),
             "read_thread".into(),
             "send_message_to_thread".into(),
+            "queue_wakeup".into(),
             "wait_reply".into(),
         ],
-        self_check: "initialize, thread/read identity, and turn/start method probe passed".into(),
+        self_check:
+            "initialize, thread/read identity, turn/start, and thread/queue/add method probes passed"
+                .into(),
     })
 }
 
@@ -1007,7 +1021,82 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| capability == "send_message_to_thread"));
+        assert!(selected
+            .capabilities
+            .iter()
+            .any(|capability| capability == "queue_wakeup"));
         assert!(selected.self_check.contains("turn/start"));
+        assert!(selected.self_check.contains("thread/queue/add"));
+    }
+
+    #[test]
+    fn candidate_rejects_appserver_without_queue_wakeup_method() {
+        let socket =
+            std::env::temp_dir().join(format!("collab-queue-probe-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                .unwrap();
+            loop {
+                let payload = read_client_frame(&mut stream);
+                let request: Value = serde_json::from_slice(&payload).unwrap();
+                let Some(id) = request.get("id").cloned() else {
+                    continue;
+                };
+                let method = request["method"].as_str().unwrap();
+                let response = match method {
+                    "initialize" => json!({"id": id, "result": {}}),
+                    "thread/read" => {
+                        json!({"id": id, "result": {"thread": {"id": "thread-1"}}})
+                    }
+                    "thread/items/list" => {
+                        json!({"id": id, "error": {"code": -32601, "message": "unsupported"}})
+                    }
+                    "turn/start" => {
+                        json!({"id": id, "error": {"code": -32600, "message": "invalid params"}})
+                    }
+                    "thread/queue/add" => {
+                        let response = json!({
+                            "id": id,
+                            "error": {"code": -32601, "message": "unsupported"}
+                        });
+                        stream
+                            .write_all(&encode_frame(0x1, &serde_json::to_vec(&response).unwrap()))
+                            .unwrap();
+                        break;
+                    }
+                    _ => unreachable!("{method}"),
+                };
+                stream
+                    .write_all(&encode_frame(0x1, &serde_json::to_vec(&response).unwrap()))
+                    .unwrap();
+            }
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        let candidate = AppServerCandidate {
+            endpoint: format!("unix://{}", socket.display()),
+            namespace: "codex_tui".into(),
+            thread_id: "thread-1".into(),
+        };
+        let error = verify_candidate(&candidate).unwrap_err();
+        assert!(matches!(
+            error,
+            AdapterError::CapabilityUnavailable {
+                operation: "thread/queue/add",
+                ..
+            }
+        ));
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
     }
 
     #[test]
