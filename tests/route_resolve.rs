@@ -51,6 +51,18 @@ fn run_route(fixture: &Fixture, cwd: &Path, thread_id: &str, tmux: bool) -> Outp
     command.output().unwrap()
 }
 
+fn run_up(fixture: &Fixture, cwd: &Path, thread_id: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_collab"))
+        .arg("up")
+        .current_dir(cwd)
+        .env("COLLAB_STATE_DIR", &fixture.state)
+        .env("CODEX_THREAD_ID", thread_id)
+        .env_remove("COLLAB_SOCKET_PATH")
+        .env_remove("COLLAB_HOST_SOCKET")
+        .output()
+        .unwrap()
+}
+
 fn start_route_daemon(
     fixture: &Fixture,
     thread_id: &str,
@@ -137,4 +149,44 @@ fn route_resolve_without_thread_identity_fails_explicitly() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("route resolve requires --native-thread-id or CODEX_THREAD_ID"));
+}
+
+#[test]
+fn lifecycle_up_initializes_the_exact_cwd_instead_of_following_a_thread_route() {
+    let fixture = Fixture::new("up-cwd");
+    let canonical = fixture.root.join("appsdk-main");
+    let current = fixture.root.join("uninitialized-project");
+    std::fs::create_dir_all(&canonical).unwrap();
+    std::fs::create_dir_all(&current).unwrap();
+
+    let output = run_up(&fixture, &current, "thread-global");
+
+    assert!(
+        output.status.success(),
+        "up failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["ok"], true);
+    assert_eq!(
+        receipt["server"],
+        fixture.state.join("server.sock").to_string_lossy().as_ref()
+    );
+    assert!(current.join(".agent-collab").is_dir());
+    assert!(!canonical.join(".agent-collab").exists());
+
+    let down = Command::new(env!("CARGO_BIN_EXE_collab"))
+        .arg("down")
+        .current_dir(&current)
+        .env("COLLAB_STATE_DIR", &fixture.state)
+        .env("CODEX_THREAD_ID", "thread-global")
+        .env_remove("COLLAB_SOCKET_PATH")
+        .env_remove("COLLAB_HOST_SOCKET")
+        .output()
+        .unwrap();
+    assert!(
+        down.status.success(),
+        "down failed: {}",
+        String::from_utf8_lossy(&down.stderr)
+    );
 }
