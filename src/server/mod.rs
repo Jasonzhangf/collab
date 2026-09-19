@@ -7121,6 +7121,7 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         let mut worktrees = st
             .worktree_bindings
             .values()
+            .filter(|binding| binding.owner_agent_id == worker_id)
             .map(|binding| {
                 let task = st.tasks.get(&binding.task_id);
                 json!({
@@ -7155,13 +7156,6 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
         .workers
         .values()
         .map(|peer| {
-            let mut peer_tasks = st
-                .tasks
-                .values()
-                .filter(|task| task.owner == peer.id)
-                .map(|task| task_view(&st, task))
-                .collect::<Vec<_>>();
-            peer_tasks.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
             let peer_role = if st.master_worker_id.as_deref() == Some(peer.id.as_str()) {
                 "master"
             } else if is_managed_subagent(&st, &peer.id) {
@@ -7169,7 +7163,7 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
             } else {
                 "worker"
             };
-            (peer.clone(), peer_role, peer_tasks)
+            (peer.clone(), peer_role)
         })
         .collect();
     peer_snapshots.sort_by(|left, right| left.0.id.cmp(&right.0.id));
@@ -7192,17 +7186,8 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
     };
     let peers: Vec<_> = peer_snapshots
         .into_iter()
-        .map(|(peer, peer_role, peer_tasks)| {
+        .map(|(peer, peer_role)| {
             let peer_presence = worker_identity_presence(server, &peer);
-            let peer_agent = if peer
-                .transport
-                .as_ref()
-                .is_some_and(|transport| transport.kind == TransportKind::AppServer)
-            {
-                appserver_agent_view(server, &peer).0
-            } else {
-                serde_json::Value::Null
-            };
             json!({
                 "worker_id": peer.id,
                 "id": peer.id,
@@ -7213,15 +7198,6 @@ fn handle_context(server: &Server, worker_id: String, token: String) -> Resp {
                     IdentityPresence::Unknown => "unknown",
                 },
                 "endpoint_live": peer_presence == IdentityPresence::Present,
-                "transport": peer.transport.as_ref().map(|transport| json!({
-                    "kind": transport.kind.as_str(),
-                    "endpoint": transport.endpoint,
-                    "namespace": transport.namespace,
-                    "thread_id": transport.thread_id,
-                    "self_check": transport.self_check,
-                })),
-                "agent": peer_agent,
-                "tasks": peer_tasks,
             })
         })
         .collect();

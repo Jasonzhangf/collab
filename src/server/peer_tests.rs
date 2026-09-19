@@ -5823,7 +5823,38 @@ fn accepted_task_can_return_to_rework_and_redeliver() {
 fn context_is_read_only_and_does_not_consume_notifications() {
     let (server, root) = test_server();
     register(&server, "peer", "%peer");
-    assert!(create_task(&server, "peer", "task", "feature").ok);
+    register(&server, "peer-two", "%peer-two");
+    std::fs::create_dir_all(root.join("playground")).unwrap();
+    assert!(
+        handle_task_register(
+            &server,
+            "peer".into(),
+            "token-peer".into(),
+            "task".into(),
+            None,
+            Some("feature".into()),
+            Some("./playground/peer-task".into()),
+            Some("peer-branch".into()),
+            Some("peer-base".into()),
+            default_priority(),
+        )
+        .ok
+    );
+    assert!(
+        handle_task_register(
+            &server,
+            "peer-two".into(),
+            "token-peer-two".into(),
+            "other-task".into(),
+            None,
+            Some("other-feature".into()),
+            Some("./playground/other-task".into()),
+            Some("other-branch".into()),
+            Some("other-base".into()),
+            default_priority(),
+        )
+        .ok
+    );
     let message_id = "notification".to_string();
     server.commit(&[Event::Sent {
         msg: Message {
@@ -5859,9 +5890,17 @@ fn context_is_read_only_and_does_not_consume_notifications() {
     assert_eq!(context.data["identity"]["role"], "worker");
     assert_eq!(context.data["agent"]["thread_state"], "idle");
     assert_eq!(context.data["agent"]["can_accept_direct_input"], true);
-    assert_eq!(context.data["peers"][0]["worker_id"], "peer");
-    assert_eq!(context.data["peers"][0]["tasks"][0]["id"], "task");
-    assert!(context.data["worktrees"].is_array());
+    assert_eq!(context.data["tasks"][0]["id"], "task");
+    assert_eq!(context.data["worktrees"].as_array().unwrap().len(), 1);
+    assert_eq!(context.data["worktrees"][0]["task_id"], "task");
+    for peer in context.data["peers"].as_array().unwrap() {
+        assert!(peer.get("tasks").is_none());
+        assert!(peer.get("transport").is_none());
+        assert!(peer.get("agent").is_none());
+    }
+    assert!(!context.data.to_string().contains("other-task"));
+    assert!(!context.data.to_string().contains("other-branch"));
+    assert!(!context.data.to_string().contains("other-base"));
     assert!(context.data["subscriptions"].is_array());
     assert_eq!(context.data["daemon"]["live"], true);
     assert_eq!(
