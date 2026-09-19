@@ -55,7 +55,7 @@
   "verification_gates": [
     "cargo fmt --check",
     "cargo test",
-    "cargo build --release",
+    "scripts/build-collab.sh",
     "isolated-appserver-blackbox",
     "isolated-migration-replay-blackbox",
     "independent-review"

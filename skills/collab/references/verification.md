@@ -3,22 +3,25 @@
 Read this for Collab source changes, release, install, restart, or protocol
 verification—not ordinary command use.
 
-Every Cargo build automatically increments the ignored local build counter;
-there is no manual patch bump. Verify the semantic source baseline, release
-build version, installed binary versions, canonical command paths, and
-refreshed embedded Skill byte-for-byte. Refresh the Skill with the exact
-`$CARGO_HOME/bin/collab` binary, not a bare command that may resolve an older
-PATH entry. Remove only legacy copies whose binary identity proves they are
-matching Collab artifacts, then validate the new baseline only: do not migrate
-or replay old local control-plane history. Installing a binary does not restart
-the global daemon. A daemon restart is a separate, explicitly authorized
-maintenance operation with PID/socket, identity, journal/mailbox, and
-live-replay evidence.
+Every official release compile uses `scripts/build-collab.sh`, which increments
+the host-global `~/.collab/build-version` counter under one lock; there is no
+manual patch bump. Direct release builds fail with an instruction to use that
+entry. Use `scripts/install-global-collab.sh` so the release candidate is built
+once and the exact candidate bytes are installed. Verify the semantic source
+baseline, release build version, installed binary versions, canonical command
+paths, and refreshed embedded Skill byte-for-byte. Refresh the Skill with the
+exact `$CARGO_HOME/bin/collab` binary, not a bare command that may resolve an
+older PATH entry. Remove only legacy copies whose binary identity proves they
+are matching Collab artifacts, then validate the new baseline only: do not
+migrate or replay old local control-plane history. Installing a binary does
+not restart the global daemon. A daemon restart is a separate, explicitly
+authorized maintenance operation with PID/socket, identity, journal/mailbox,
+and live-replay evidence.
 
 Before review, prove the affected subset and every changed invariant:
 
 - architecture/resource/function/verification gates;
-- format, unit/state-machine tests, release build;
+- format, unit/state-machine tests, `scripts/build-collab.sh`;
 - isolated real two-peer App Server blackbox in a disposable project when an
   App Server capability is available. Never inject a test notice into an existing
   production project, transport, or Agent conversation;

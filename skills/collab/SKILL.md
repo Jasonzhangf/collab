@@ -25,21 +25,22 @@ the globally installed Collab v1.
 ## Current-version baseline
 
 Use only the current globally installed `collab` and `collab-mcp`. The
-`Cargo.toml` version is the semantic source baseline; every Cargo build
-increments the ignored local build counter, and the installed binary's
-`collab --version` reports `0.2.NNNN` as the runtime build version. An upgrade
+`Cargo.toml` version is the semantic source baseline; every official release
+compile uses `scripts/build-collab.sh`, which increments the host-global
+`~/.collab/build-version` counter under one lock. The installed binary's
+`collab --version` reports `0.2.NNNN` as the runtime build version. Direct
+release builds fail with an instruction to use the official entry. An upgrade
 targets the current reviewed source and does not migrate, replay, or interpret
 older local versions.
 
 The canonical install sequence from the reviewed source is:
 
 ```sh
-cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-cargo install --locked --path . --force --root "$cargo_home"
-"$cargo_home/bin/collab" install-skills --target "$HOME/.agents/skills/collab" --force
-"$cargo_home/bin/collab" --version
+scripts/install-global-collab.sh
 ```
 
+The installer performs one release build and installs those exact candidate
+bytes; it does not run a second build with another auto-incremented version.
 The canonical pair is `$CARGO_HOME/bin/collab` and
 `$CARGO_HOME/bin/collab-mcp` (default `$HOME/.cargo/bin`). The sequence invokes
 the exact newly installed binary to refresh the embedded Skill, so an older

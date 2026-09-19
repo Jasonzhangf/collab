@@ -34,19 +34,16 @@ history merely to make initialization look clean.
 Use the repository's install sequence from the reviewed current source:
 
 ```sh
-cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-cargo install --locked --path . --force --root "$cargo_home"
-"$cargo_home/bin/collab" install-skills --target "$HOME/.agents/skills/collab" --force
-"$cargo_home/bin/collab" --version
+scripts/install-global-collab.sh
 ```
 
-Cargo installs the verified release binaries under `$CARGO_HOME/bin`, and the
-exact new binary refreshes the embedded Skill. The sequence never removes
-`~/.collab/`, a project's `.agent-collab/`, AppSDK state, business source, or
-evidence. Legacy user-local copies are not removed automatically: first prove
-an exact copy is Collab from its own version response, then remove only that
-verified pair. Unverified path collisions remain untouched and must be
-reported.
+The installer performs one versioned release build and installs those exact
+binaries under `$CARGO_HOME/bin`; the exact new binary refreshes the embedded
+Skill. It never removes `~/.collab/`, a project's `.agent-collab/`, AppSDK
+state, business source, or evidence. Legacy user-local copies are not removed
+automatically: first prove an exact copy is Collab from its own version
+response, then remove only that verified pair. Unverified path collisions
+remain untouched and must be reported.
 
 The global daemon can be shared by multiple projects. A binary upgrade alone
 does not authorize stopping or restarting it. Keep the existing daemon running
@@ -60,7 +57,7 @@ fallback.
 
 ```text
 inspect -> plan -> admission freeze -> snapshot
-        -> install reviewed binaries with cargo install
+        -> install reviewed binaries with scripts/install-global-collab.sh
         -> controlled daemon restart
         -> identity rebind -> verify -> resume
 ```

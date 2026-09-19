@@ -1,7 +1,5 @@
 /target
 *.log
-.collab-build-version
-.collab-build-version.lock
 
 # Project-local runtime state and detached daemon output.
 .agent-collab/

@@ -721,7 +721,7 @@ impl Client {
                 "clientInfo": {
                     "name": "collab",
                     "title": "Collab",
-                    "version": env!("CARGO_PKG_VERSION")
+                    "version": env!("COLLAB_VERSION")
                 },
                 "capabilities": {"experimentalApi": true}
             }),

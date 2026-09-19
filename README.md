@@ -33,23 +33,20 @@ one maintenance action.
 
 ## Install
 
-Build from the reviewed current source, install both binaries with Cargo, then
+Build once from the reviewed current source, install those exact binaries, then
 refresh the embedded Skill:
 
 ```sh
-cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-cargo install --locked --path . --force --root "$cargo_home"
-"$cargo_home/bin/collab" install-skills --target "$HOME/.agents/skills/collab" --force
-"$cargo_home/bin/collab" --version
-test -x "$cargo_home/bin/collab-mcp"
-test "$(command -v collab)" = "$cargo_home/bin/collab"
-test "$(command -v collab-mcp)" = "$cargo_home/bin/collab-mcp"
+scripts/install-global-collab.sh
 ```
 
-The Cargo package baseline is `0.2.0`. Every Cargo build runs `build.rs` and
-increments the ignored local build counter, so the built binary reports
-`0.2.0001`, `0.2.0002`, and so on. The counter is build identity, not tracked
-source state; a fresh checkout starts again at `0.2.0001`.
+The Cargo package baseline is `0.2.0`. Every official release compile uses
+`scripts/build-collab.sh`, which increments the host-global
+`~/.collab/build-version` counter under one lock before building. Release
+builds therefore report `0.2.0001`, `0.2.0002`, and so on across worktrees.
+Direct release builds fail with an instruction to use the official entry.
+The installer performs one such build and installs those exact bytes; it does
+not rebuild with a second version.
 
 The canonical pair is `$CARGO_HOME/bin/collab` and
 `$CARGO_HOME/bin/collab-mcp` (default `$HOME/.cargo/bin`). The sequence invokes
@@ -247,7 +244,7 @@ mailbox, copy tokens, start a second daemon, or invent an owner. Use:
 collab migrate inspect
 → collab migrate plan
 → collab migrate apply          # admission freeze + deterministic snapshot
-→ cargo install --locked --path . --force
+→ scripts/install-global-collab.sh
 → collab down
 → collab up
 → collab worker recover         # each live App Server peer
