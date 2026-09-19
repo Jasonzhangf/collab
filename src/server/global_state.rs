@@ -1000,6 +1000,8 @@ pub struct GlobalState {
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectState>,
     #[serde(default)]
+    pub current_thread_routes: BTreeMap<String, RuntimeBinding>,
+    #[serde(default)]
     pub command_receipts: BTreeMap<String, CommandReceipt>,
     #[serde(default)]
     pub migration_commit_evidence: BTreeMap<String, MigrationCommitEvidence>,
@@ -1021,6 +1023,7 @@ impl GlobalState {
             sequence: 0,
             revision: 0,
             projects: BTreeMap::new(),
+            current_thread_routes: BTreeMap::new(),
             command_receipts: BTreeMap::new(),
             migration_commit_evidence: BTreeMap::new(),
         })
@@ -1050,6 +1053,20 @@ impl GlobalState {
                 return Err(StateError::Invariant(format!(
                     "project key {scope_key} does not match scope {}",
                     project.project_scope.as_str()
+                )));
+            }
+        }
+
+        for (thread_key, binding) in &self.current_thread_routes {
+            binding.validate()?;
+            let Some(native_thread_id) = binding.native_thread_id.as_ref() else {
+                return Err(StateError::Invariant(format!(
+                    "current thread route {thread_key} has no native thread id"
+                )));
+            };
+            if thread_key != native_thread_id.as_str() {
+                return Err(StateError::Invariant(format!(
+                    "current thread route key {thread_key} does not match native thread {native_thread_id}"
                 )));
             }
         }
@@ -1387,6 +1404,43 @@ impl GlobalState {
         self.lookup_project_for_route(route_scope)
             .and_then(|project| project.lookup_binding(binding_id))
             .filter(|binding| binding.app_scope_id == route_scope.app_scope_id)
+    }
+
+    pub fn lookup_current_thread_route(
+        &self,
+        native_thread_id: &NativeThreadId,
+    ) -> Option<&RuntimeBinding> {
+        self.current_thread_routes.get(native_thread_id.as_str())
+    }
+
+    /// Advance the one current route for a native App Server thread.
+    ///
+    /// Runtime history remains in `projects`; this index is the only route
+    /// selector and retires the prior thread entry for the same binding.
+    pub fn set_current_thread_route(
+        &mut self,
+        binding: RuntimeBinding,
+    ) -> Result<StateVersion, StateError> {
+        binding.validate()?;
+        let native_thread_id = binding.native_thread_id.clone().ok_or_else(|| {
+            StateError::invalid("current thread route", "requires a native thread id")
+        })?;
+        if self
+            .current_thread_routes
+            .get(native_thread_id.as_str())
+            .is_some_and(|existing| existing == &binding)
+        {
+            return Ok(self.version());
+        }
+        self.mutate(|next| {
+            next.current_thread_routes.retain(|_, existing| {
+                existing.route_scope() != binding.route_scope()
+                    || existing.binding_id != binding.binding_id
+            });
+            next.current_thread_routes
+                .insert(native_thread_id.as_str().to_owned(), binding);
+            Ok(())
+        })
     }
 
     pub fn lookup_master_grant_for(

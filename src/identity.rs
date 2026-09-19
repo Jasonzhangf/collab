@@ -457,13 +457,6 @@ fn read_identity(path: &std::path::Path) -> anyhow::Result<Option<Identity>> {
     Ok(Some(serde_json::from_str(&std::fs::read_to_string(path)?)?))
 }
 
-fn identities_by_native_thread(
-    _scope: &Scope,
-    native_thread_id: &str,
-) -> anyhow::Result<Vec<Identity>> {
-    identities_by_native_thread_at(&HostPaths::resolve()?, native_thread_id)
-}
-
 fn identities_by_native_thread_at(
     host_paths: &HostPaths,
     native_thread_id: &str,
@@ -492,16 +485,6 @@ fn identities_by_native_thread_at(
                 .is_some_and(|thread_id| thread_id.as_str() == native_thread_id)
         })
         .collect())
-}
-
-/// Return every global identity currently bound to a native App Server
-/// thread. The caller decides how to fail closed on zero or multiple matches.
-pub(crate) fn identities_for_native_thread(
-    state_root: &Path,
-    native_thread_id: &str,
-) -> anyhow::Result<Vec<Identity>> {
-    let host_paths = HostPaths::for_state_root(state_root)?;
-    identities_by_native_thread_at(&host_paths, native_thread_id)
 }
 
 /// Load or create one Codex thread identity.
