@@ -25,10 +25,11 @@ the globally installed Collab v1.
 ## Current-version baseline
 
 Use only the current globally installed `collab` and `collab-mcp`. The
-`Cargo.toml` version is the source version; the installed binary's
-`collab --version` is the runtime version. An upgrade targets the current
-reviewed source and does not migrate, replay, or interpret older local
-versions.
+`Cargo.toml` version is the semantic source baseline; every Cargo build
+increments the ignored local build counter, and the installed binary's
+`collab --version` reports `0.2.NNNN` as the runtime build version. An upgrade
+targets the current reviewed source and does not migrate, replay, or interpret
+older local versions.
 
 The canonical install sequence from the reviewed source is:
 

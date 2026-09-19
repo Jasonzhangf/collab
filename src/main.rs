@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Parser)]
 #[command(
     name = "collab",
-    version,
+    version = env!("COLLAB_VERSION"),
     about = "Project-local coordination for multi-agent work"
 )]
 struct Cli {

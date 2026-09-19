@@ -478,7 +478,7 @@ fn handle(req: &Value) -> Option<Value> {
                 .unwrap_or("2024-11-05");
             response(
                 &id,
-                json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"collab","version":env!("CARGO_PKG_VERSION")}}),
+                json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"collab","version":env!("COLLAB_VERSION")}}),
             )
         }
         "ping" => response(&id, json!({})),

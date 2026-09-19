@@ -46,6 +46,11 @@ test "$(command -v collab)" = "$cargo_home/bin/collab"
 test "$(command -v collab-mcp)" = "$cargo_home/bin/collab-mcp"
 ```
 
+The Cargo package baseline is `0.2.0`. Every Cargo build runs `build.rs` and
+increments the ignored local build counter, so the built binary reports
+`0.2.0001`, `0.2.0002`, and so on. The counter is build identity, not tracked
+source state; a fresh checkout starts again at `0.2.0001`.
+
 The canonical pair is `$CARGO_HOME/bin/collab` and
 `$CARGO_HOME/bin/collab-mcp` (default `$HOME/.cargo/bin`). The sequence invokes
 the exact newly installed binary to refresh the globally discovered Skill, so
