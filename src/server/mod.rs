@@ -3107,23 +3107,49 @@ fn attempt_notification(server: &Server, message_id: &str, subscription_id: &str
 
 fn attempt_scheduler_notification(
     server: &Server,
+    request_id: &str,
     message_id: &str,
     subscription_id: &str,
-) -> bool {
+) -> SchedulerNotificationAttempt {
     if !server.config.notifications.enabled {
-        return false;
+        return SchedulerNotificationAttempt::Unavailable;
+    }
+    {
+        let mut state = server.state.lock().unwrap();
+        let Some(admission) = state.scheduler_admissions.get(request_id) else {
+            return SchedulerNotificationAttempt::Unavailable;
+        };
+        if admission.status == "notifying" {
+            if now_ms().saturating_sub(admission.updated_ms) < state::REQUEST_COOLDOWN_MS {
+                return SchedulerNotificationAttempt::InFlight;
+            }
+        } else if admission.status != "pending" {
+            return SchedulerNotificationAttempt::Unavailable;
+        }
+        server.commit_locked(
+            &mut state,
+            &[Event::SchedulerAdmissionStatus {
+                request_id: request_id.into(),
+                status: "notifying".into(),
+                error: None,
+                updated_ms: now_ms(),
+            }],
+        );
     }
     let (recipient, transport, delay, explicit) = {
         let state = server.state.lock().unwrap();
         let Some(seed) = state.msgs.get(message_id) else {
-            return false;
+            clear_scheduler_notification_claim(server, request_id);
+            return SchedulerNotificationAttempt::Rejected;
         };
         let recipient = seed.to.clone();
         let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
-            return false;
+            clear_scheduler_notification_claim(server, request_id);
+            return SchedulerNotificationAttempt::Rejected;
         };
         if subscription.worker_id != recipient {
-            return false;
+            clear_scheduler_notification_claim(server, request_id);
+            return SchedulerNotificationAttempt::Rejected;
         }
         let delay = state
             .delivery_modes
@@ -3136,15 +3162,17 @@ fn attempt_scheduler_notification(
             .get(&recipient)
             .and_then(selected_transport_for_worker)
         else {
-            return false;
+            clear_scheduler_notification_claim(server, request_id);
+            return SchedulerNotificationAttempt::Rejected;
         };
         if !subscription_matches_transport(subscription, &transport) {
-            return false;
+            clear_scheduler_notification_claim(server, request_id);
+            return SchedulerNotificationAttempt::Rejected;
         }
         let explicit = is_explicit_notification(&state, seed);
         (recipient, transport, delay, explicit)
     };
-    attempt_appserver_notification_with_retry(
+    let notified = attempt_appserver_notification_with_retry(
         server,
         message_id,
         subscription_id,
@@ -3157,7 +3185,50 @@ fn attempt_scheduler_notification(
         &|transport, text, message_id, explicit| {
             (server.appserver_notification_sink)(transport, text, message_id, explicit)
         },
-    )
+    );
+    if notified {
+        let mut state = server.state.lock().unwrap();
+        server.commit_locked(
+            &mut state,
+            &[Event::SchedulerAdmissionStatus {
+                request_id: request_id.into(),
+                status: "succeeded".into(),
+                error: None,
+                updated_ms: now_ms(),
+            }],
+        );
+        SchedulerNotificationAttempt::Accepted
+    } else {
+        clear_scheduler_notification_claim(server, request_id);
+        SchedulerNotificationAttempt::Rejected
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerNotificationAttempt {
+    Accepted,
+    Rejected,
+    InFlight,
+    Unavailable,
+}
+
+fn clear_scheduler_notification_claim(server: &Server, request_id: &str) {
+    let mut state = server.state.lock().unwrap();
+    let Some(admission) = state.scheduler_admissions.get(request_id) else {
+        return;
+    };
+    if admission.status == "notifying" {
+        let error = admission.error.clone();
+        server.commit_locked(
+            &mut state,
+            &[Event::SchedulerAdmissionStatus {
+                request_id: request_id.into(),
+                status: "pending".into(),
+                error,
+                updated_ms: now_ms(),
+            }],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5014,35 +5085,26 @@ fn scheduler_dispatch_recover_pending(server: &Server, request_id: &str) -> Opti
             .cloned();
         (admission, task, subscription)
     };
-    let notified = subscription.as_ref().is_some_and(|subscription| {
-        attempt_scheduler_notification(server, &admission.message_id, &subscription.id)
+    let notification_attempt = subscription.as_ref().map(|subscription| {
+        attempt_scheduler_notification(server, request_id, &admission.message_id, &subscription.id)
     });
+    if notification_attempt == Some(SchedulerNotificationAttempt::InFlight) {
+        return Some(Resp::err_data(
+            "scheduler dispatch notification is already in flight; retry with the same request_id",
+            json!({
+                "request_id": admission.request_id,
+                "reservation": true,
+                "decision": admission.decision,
+                "message_id": admission.message_id,
+                "task_id": admission.task_id,
+            }),
+        ));
+    }
+    let notified = notification_attempt == Some(SchedulerNotificationAttempt::Accepted);
     if subscription.is_some() && !notified {
         let error =
             "scheduler dispatch notification was not accepted by the selected App Server route";
-        let mut state = server.state.lock().unwrap();
-        server.commit_locked(
-            &mut state,
-            &[Event::SchedulerAdmissionStatus {
-                request_id: request_id.into(),
-                status: "pending".into(),
-                error: Some(error.into()),
-                updated_ms: now_ms(),
-            }],
-        );
         return Some(scheduler_notification_failed_response(&admission, error));
-    }
-    {
-        let mut state = server.state.lock().unwrap();
-        server.commit_locked(
-            &mut state,
-            &[Event::SchedulerAdmissionStatus {
-                request_id: request_id.into(),
-                status: "succeeded".into(),
-                error: None,
-                updated_ms: now_ms(),
-            }],
-        );
     }
     Some(Resp::data(json!({
         "request_id": admission.request_id,
@@ -5117,6 +5179,18 @@ fn scheduler_dispatch_deduplicated(
         }
         if admission.status == "pending" {
             return None;
+        }
+        if admission.status == "notifying" {
+            return Some(Resp::err_data(
+                "scheduler dispatch notification is already in flight; retry with the same request_id",
+                json!({
+                    "request_id": admission.request_id,
+                    "reservation": true,
+                    "decision": admission.decision,
+                    "message_id": admission.message_id,
+                    "task_id": admission.task_id,
+                }),
+            ));
         }
     }
     let (Some(message), Some(task)) = (
@@ -5386,9 +5460,22 @@ pub(crate) fn handle_scheduler_dispatch(
             );
         }
         drop(state);
-        let notified = subscription.as_ref().is_some_and(|subscription| {
-            attempt_notification(server, &message_id, &subscription.id)
+        let notification_attempt = subscription.as_ref().map(|subscription| {
+            attempt_scheduler_notification(server, &request_id, &message_id, &subscription.id)
         });
+        if notification_attempt == Some(SchedulerNotificationAttempt::InFlight) {
+            return Resp::err_data(
+                "scheduler dispatch notification is already in flight; retry with the same request_id",
+                json!({
+                    "request_id": request_id,
+                    "reservation": true,
+                    "decision": decision,
+                    "message_id": message_id,
+                    "task_id": task_id,
+                }),
+            );
+        }
+        let notified = notification_attempt == Some(SchedulerNotificationAttempt::Accepted);
         if subscription.is_some() && !notified {
             let admission_record = crate::server::state::SchedulerAdmissionRecord {
                 request_id: request_id.clone(),
@@ -5402,36 +5489,9 @@ pub(crate) fn handle_scheduler_dispatch(
                 created_ms: now,
                 updated_ms: now,
             };
-            {
-                let mut state = server.state.lock().unwrap();
-                server.commit_locked(
-                    &mut state,
-                    &[Event::SchedulerAdmissionStatus {
-                        request_id: request_id.clone(),
-                        status: "pending".into(),
-                        error: Some(
-                            "scheduler dispatch notification was not accepted by the selected App Server route"
-                                .into(),
-                        ),
-                        updated_ms: now_ms(),
-                    }],
-                );
-            }
             return scheduler_notification_failed_response(
                 &admission_record,
                 "scheduler dispatch notification was not accepted by the selected App Server route",
-            );
-        }
-        {
-            let mut state = server.state.lock().unwrap();
-            server.commit_locked(
-                &mut state,
-                &[Event::SchedulerAdmissionStatus {
-                    request_id: request_id.clone(),
-                    status: "succeeded".into(),
-                    error: None,
-                    updated_ms: now_ms(),
-                }],
             );
         }
         admission["status"] = json!("succeeded");
@@ -14890,8 +14950,8 @@ mod scheduler_admission_tests {
     use crate::server::peer_tests::{register, test_server};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -15943,8 +16003,23 @@ mod scheduler_admission_tests {
         let second = request(Arc::clone(&server), Arc::clone(&barrier));
         let first = first.join().unwrap();
         let second = second.join().unwrap();
-        assert!(first.ok, "{first:?}");
-        assert!(second.ok, "{second:?}");
+        let completed = [&first, &second].into_iter().filter(|resp| resp.ok).count();
+        assert_eq!(
+            completed, 1,
+            "one request must complete the assignment: {first:?} {second:?}"
+        );
+        let in_flight = [&first, &second]
+            .into_iter()
+            .find(|resp| !resp.ok)
+            .expect("one request must observe the in-flight claim");
+        assert!(
+            in_flight
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("already in flight")),
+            "{in_flight:?}"
+        );
+        assert_eq!(in_flight.data["reservation"], true);
         assert_eq!(first.data["task_id"], second.data["task_id"]);
         assert_eq!(first.data["message_id"], second.data["message_id"]);
         assert!(["use-registered-peer", "deduplicated"]
@@ -15960,6 +16035,102 @@ mod scheduler_admission_tests {
         );
         assert_eq!(
             state.scheduler_admissions["req-concurrent-1"].status,
+            "succeeded"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_dispatch_concurrent_retry_notifies_once() {
+        let (mut server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.config.notifications.enabled = true;
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let sink_calls = Arc::new(AtomicUsize::new(0));
+        let sink_calls_for_sink = Arc::clone(&sink_calls);
+        let sink_gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let sink_gate_for_sink = Arc::clone(&sink_gate);
+        server.appserver_notification_sink = Arc::new(move |_, _, _, _| {
+            let call = sink_calls_for_sink.fetch_add(1, Ordering::SeqCst) + 1;
+            let (lock, ready) = &*sink_gate_for_sink;
+            let mut entered = lock.lock().unwrap();
+            *entered = (*entered).max(call);
+            if call == 1 {
+                let _ = ready
+                    .wait_timeout_while(entered, Duration::from_millis(500), |seen| *seen < 2)
+                    .unwrap();
+            } else {
+                ready.notify_all();
+            }
+            Ok(json!({"accepted": true}))
+        });
+        let server = Arc::new(server);
+        let barrier = Arc::new(Barrier::new(2));
+        let request = |server: Arc<Server>, barrier: Arc<Barrier>| {
+            thread::spawn(move || {
+                barrier.wait();
+                dispatch(
+                    &server,
+                    Req::Subagent {
+                        worker_id: "master".into(),
+                        token: "token-master".into(),
+                        command: crate::subagent::Action::Dispatch {
+                            request_id: "req-concurrent-notify-1".into(),
+                            subject: "Concurrent notification".into(),
+                            body: "Notify exactly once".into(),
+                            feature_id: None,
+                            worktree_path: None,
+                            branch: None,
+                            base_commit: None,
+                            priority: "p1".into(),
+                            next_step: None,
+                        },
+                        launch_env: Default::default(),
+                    },
+                )
+            })
+        };
+        let first = request(Arc::clone(&server), Arc::clone(&barrier));
+        let second = request(Arc::clone(&server), Arc::clone(&barrier));
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+
+        assert_eq!(
+            sink_calls.load(Ordering::SeqCst),
+            1,
+            "concurrent retry must trigger exactly one AppServer notification sink call"
+        );
+        let completed = [&first, &second].into_iter().filter(|resp| resp.ok).count();
+        assert_eq!(
+            completed, 1,
+            "one request must own the notification: {first:?} {second:?}"
+        );
+        let in_flight = [&first, &second]
+            .into_iter()
+            .find(|resp| !resp.ok)
+            .expect("one request must observe the in-flight claim");
+        assert!(
+            in_flight
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("already in flight")),
+            "{in_flight:?}"
+        );
+        assert_eq!(in_flight.data["reservation"], true);
+        assert_eq!(first.data["task_id"], second.data["task_id"]);
+        assert_eq!(first.data["message_id"], second.data["message_id"]);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.msgs.len(), 1);
+        assert_eq!(
+            state.scheduler_admissions["req-concurrent-notify-1"].status,
             "succeeded"
         );
         drop(state);
