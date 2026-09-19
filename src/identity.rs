@@ -535,31 +535,29 @@ pub(crate) fn load_existing_at(
             .filter(|value| !value.trim().is_empty())
     });
     let selected_explicitly = explicit_worker.is_some();
-    let requested = explicit_worker.clone().or_else(|| {
+    if !selected_explicitly {
+        if let Some(thread_id) = thread_id.as_deref() {
+            let mut matches = identities_by_native_thread_at(host_paths, thread_id)?;
+            match matches.len() {
+                1 => return Ok(matches.pop()),
+                0 => {}
+                count => anyhow::bail!(
+                    "multiple persisted Collab identities are bound to App Server thread {thread_id}: {count}"
+                ),
+            }
+        }
+    }
+    let Some(worker_id) = explicit_worker.or_else(|| {
         thread_id
             .as_ref()
             .map(|thread_id| format!("codex-{thread_id}"))
-    });
-    let Some(worker_id) = requested else {
+    }) else {
         return Ok(None);
     };
     if let Some(identity) = read_identity(&identity_path_at(host_paths, &worker_id)?)? {
         return Ok(Some(identity));
     }
-    if selected_explicitly {
-        return Ok(None);
-    }
-    let Some(thread_id) = thread_id else {
-        return Ok(None);
-    };
-    let mut matches = identities_by_native_thread_at(host_paths, &thread_id)?;
-    match matches.len() {
-        1 => Ok(Some(matches.remove(0))),
-        0 => Ok(None),
-        count => anyhow::bail!(
-            "multiple persisted Collab identities are bound to App Server thread {thread_id}: {count}"
-        ),
-    }
+    Ok(None)
 }
 
 /// Load or create the identity used by `collab init`. Initialization binds to
@@ -711,6 +709,63 @@ mod tests {
         assert_eq!(resolved.token, identity.token);
         assert_eq!(resolved.runtime, identity.runtime);
         assert_eq!(resolved.transport, identity.transport);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn existing_identity_prefers_the_global_thread_binding_over_a_stale_alias() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = test_root("ci-existing-thread-authority");
+        let state_root = root.join("global");
+        std::fs::create_dir_all(root.join(".agent-collab")).unwrap();
+        let scope = test_scope(root.clone());
+        let host_paths = HostPaths::for_state_root(&state_root).unwrap();
+        let mut authoritative =
+            load_or_create_resolved_at(&host_paths, &scope, Some("authoritative".into())).unwrap();
+        let mut runtime = runtime_identity(7, "binding-authoritative");
+        runtime.native_thread_id = Some(NativeThreadId::new("thread-current").unwrap());
+        persist_registration_at(
+            &host_paths,
+            &scope,
+            &mut authoritative,
+            runtime,
+            SelectedTransport {
+                kind: TransportKind::AppServer,
+                endpoint: Some("unix:///tmp/codex.sock".into()),
+                namespace: Some("codex_tui".into()),
+                thread_id: Some("thread-current".into()),
+                capabilities: vec!["send_message".into()],
+                self_check: "ok".into(),
+            },
+        )
+        .unwrap();
+        write_identity(
+            &identity_path_at(&host_paths, "codex-thread-current").unwrap(),
+            &Identity {
+                worker_id: "stale-alias".into(),
+                token: "stale-token".into(),
+                project_scope: None,
+                runtime: None,
+                transport: None,
+            },
+        )
+        .unwrap();
+
+        let previous_thread = std::env::var_os("CODEX_THREAD_ID");
+        let previous_worker = std::env::var_os("COLLAB_WORKER");
+        std::env::set_var("CODEX_THREAD_ID", "thread-current");
+        std::env::remove_var("COLLAB_WORKER");
+        let resolved = load_existing_at(&host_paths, &scope, None).unwrap();
+        match previous_thread {
+            Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
+            None => std::env::remove_var("CODEX_THREAD_ID"),
+        }
+        match previous_worker {
+            Some(value) => std::env::set_var("COLLAB_WORKER", value),
+            None => std::env::remove_var("COLLAB_WORKER"),
+        }
+
+        assert_eq!(resolved.unwrap().worker_id, "authoritative");
         std::fs::remove_dir_all(root).ok();
     }
 

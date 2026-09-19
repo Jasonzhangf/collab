@@ -5843,17 +5843,59 @@ fn context_is_read_only_and_does_not_consume_notifications() {
 
     let context = handle_context(&server, "peer".into(), "token-peer".into());
     assert!(context.ok);
+    assert_eq!(context.data["schema_version"], 1);
+    assert_eq!(context.data["registered"], true);
+    assert_eq!(context.data["registration"]["status"], "registered");
     assert!(context.data["master"].is_null());
+    assert!(context.data["recorded_unusable"].is_null());
     assert_eq!(context.data["authority"]["must_obey_master"], false);
     assert_eq!(context.data["authority"]["may_decline_master_invite"], true);
     assert_eq!(context.data["inbox"]["unread"], 1);
+    assert_eq!(context.data["inbox"]["messages"][0]["id"], message_id);
+    assert_eq!(
+        context.data["inbox"]["messages"][0]["body"],
+        "RESOURCE_RELEASED task=task"
+    );
     assert_eq!(context.data["identity"]["role"], "worker");
     assert_eq!(context.data["agent"]["thread_state"], "idle");
     assert_eq!(context.data["agent"]["can_accept_direct_input"], true);
     assert_eq!(context.data["peers"][0]["worker_id"], "peer");
+    assert_eq!(context.data["peers"][0]["tasks"][0]["id"], "task");
+    assert!(context.data["worktrees"].is_array());
+    assert!(context.data["subscriptions"].is_array());
+    assert_eq!(context.data["daemon"]["live"], true);
+    assert_eq!(
+        context.data["daemon"]["pid"],
+        serde_json::json!(std::process::id())
+    );
     let state = server.state.lock().unwrap();
     assert_eq!(state.msgs[&message_id].state, "pending");
     drop(state);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn context_gives_an_idle_master_one_canonical_scheduling_action() {
+    let (server, root) = test_server();
+    register(&server, "master", "%master");
+    server.commit(&[Event::MasterAssigned {
+        worker_id: "master".into(),
+        assigned_by: "operator".into(),
+        approval: Some("user-approved".into()),
+        assigned_ms: now_ms(),
+    }]);
+
+    let context = handle_context(&server, "master".into(), "token-master".into());
+
+    assert!(context.ok, "{}", context.error.unwrap_or_default());
+    assert_eq!(context.data["identity"]["role"], "master");
+    assert_eq!(context.data["master"]["worker_id"], "master");
+    assert_eq!(context.data["master"]["endpoint_live"], true);
+    assert!(context.data["recorded_unusable"].is_null());
+    assert_eq!(
+        context.data["next_actions"],
+        serde_json::json!(["run `appsdk longhorizon show` and keep eligible workers loaded"])
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
