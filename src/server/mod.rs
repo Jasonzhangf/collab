@@ -14279,6 +14279,7 @@ fn replay_from_journal(_root: &Path, journal: &Path) -> anyhow::Result<State> {
     let mut seen_command_ids = std::collections::HashSet::new();
     let mut seen_operation_ids = std::collections::HashMap::new();
     let mut convert_root = false;
+    let mut saw_current_thread_route = false;
     for (index, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -14299,6 +14300,9 @@ fn replay_from_journal(_root: &Path, journal: &Path) -> anyhow::Result<State> {
             convert_root = true;
         }
         for event in line_events {
+            if matches!(event, Event::GlobalCurrentThreadRouteSet { .. }) {
+                saw_current_thread_route = true;
+            }
             if let Event::CommandStarted {
                 command_id,
                 operation_id,
@@ -14387,6 +14391,10 @@ fn replay_from_journal(_root: &Path, journal: &Path) -> anyhow::Result<State> {
         anyhow::bail!(
             "journal replay failed: incomplete command {command_id}; completion marker missing"
         );
+    }
+    if !saw_current_thread_route {
+        st.restore_unique_current_thread_routes_from_bindings()
+            .map_err(|error| anyhow::anyhow!("journal replay failed: {error}"))?;
     }
     st.global.validate().map_err(|error| {
         anyhow::anyhow!("journal replay failed: global state validation: {error}")
