@@ -409,7 +409,7 @@ mod tests {
                         self_check: "test appserver".into(),
                     })
                 }),
-                appserver_notification_sink: Arc::new(|_, _, _| {
+                appserver_notification_sink: Arc::new(|_, _, _, _| {
                     Ok(serde_json::json!({"accepted": true}))
                 }),
                 appserver_thread_status: Arc::new(|_, thread_id| {
@@ -1154,7 +1154,7 @@ mod tests {
         let (mut server, root) = test_server();
         Arc::get_mut(&mut server)
             .unwrap()
-            .appserver_notification_sink = Arc::new(|_, _, _| Err("test sink rejected".into()));
+            .appserver_notification_sink = Arc::new(|_, _, _, _| Err("test sink rejected".into()));
         register(&server, "owner");
         let subscription_id = subscribe(&server, "owner", "direct-message", None, None);
         let message_id = bind_message_with_type(

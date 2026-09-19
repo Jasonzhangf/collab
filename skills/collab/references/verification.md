@@ -29,8 +29,9 @@ Before review, prove the affected subset and every changed invariant:
 - all pending eligible messages coalesce after 60 seconds into one attempt;
 - failed wake and daemon restart never replay an attempted batch;
 - one ID/subject/original-body delivery preserves a reusable direct-message
-  lease and records one accepted delivery event; App Server proves the native
-  queue accepted the bounded preview;
+  lease and records one accepted delivery event; explicit `sendmessage` proves
+  native `turn/start` accepted the bounded preview, while daemon wakeup and
+  long-horizon notifications use `thread/queue/add`;
 - successful resource/deadline/async-result delivery consumes exactly one
   matching one-shot subscription;
 - release clears obsolete wait state and does not wake an unsubscribed Agent;

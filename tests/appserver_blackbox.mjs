@@ -183,7 +183,7 @@ try {
   }
 
   const marker = `collab-blackbox-${Date.now()}`;
-  const queued = await client.call("thread/queue/add", {
+  const started = await client.call("turn/start", {
     threadId: firstId,
     input: [{ type: "text", text: marker }],
     clientUserMessageId: marker,
@@ -191,7 +191,7 @@ try {
   const firstRead = await client.call("thread/read", { threadId: firstId });
   const secondRead = await client.call("thread/read", { threadId: secondId });
   if (firstRead.thread.id !== firstId || secondRead.thread.id !== secondId) {
-    throw new Error("thread identity changed after queue/add");
+    throw new Error("thread identity changed after turn/start");
   }
   let itemsProbe;
   try {
@@ -216,12 +216,12 @@ try {
         socket,
         first_thread_id: firstId,
         second_thread_id: secondId,
-        queue_add: queued,
+        turn_start: started,
         first_status: firstRead.thread.status,
         second_status: secondRead.thread.status,
         items_probe: itemsProbe,
         accepted_semantics:
-          "thread/queue/add accepted is transport acceptance only, not execution or reply",
+          "turn/start accepted the immediate notification; execution and reply are observed separately",
       },
       null,
       2,

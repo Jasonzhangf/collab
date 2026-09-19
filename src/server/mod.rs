@@ -148,7 +148,7 @@ const LEGACY_HOST_DAEMON_LOCK_PATH: &str = "/tmp/collab-host.lock";
 type AppServerCandidateCheck =
     dyn Fn(&crate::proto::AppServerCandidate) -> Result<SelectedTransport, String> + Send + Sync;
 type AppServerNotificationSink =
-    dyn Fn(&SelectedTransport, &str, &str) -> Result<serde_json::Value, String> + Send + Sync;
+    dyn Fn(&SelectedTransport, &str, &str, bool) -> Result<serde_json::Value, String> + Send + Sync;
 type AppServerThreadStatus =
     dyn Fn(&SelectedTransport, &str) -> Result<serde_json::Value, String> + Send + Sync;
 type AppServerThreadArchive =
@@ -161,9 +161,13 @@ fn default_appserver_candidate_check() -> Arc<AppServerCandidateCheck> {
 }
 
 pub(crate) fn default_appserver_notification_sink() -> Arc<AppServerNotificationSink> {
-    Arc::new(|transport, body, message_id| {
-        crate::client::adapters::queue_add(transport, body, message_id)
-            .map_err(|error| error.to_string())
+    Arc::new(|transport, body, message_id, explicit| {
+        let result = if explicit {
+            crate::client::adapters::immediate_notify(transport, body, message_id)
+        } else {
+            crate::client::adapters::queue_wakeup(transport, body, message_id)
+        };
+        result.map_err(|error| error.to_string())
     })
 }
 
@@ -2862,7 +2866,7 @@ fn attempt_appserver_notification_with_at(
     delay: i64,
     explicit: bool,
     now: i64,
-    deliver: &dyn Fn(&SelectedTransport, &str, &str) -> Result<serde_json::Value, String>,
+    deliver: &dyn Fn(&SelectedTransport, &str, &str, bool) -> Result<serde_json::Value, String>,
 ) -> bool {
     let mut state = server.state.lock().unwrap();
     let Some(seed_id) = state.msgs.get(message_id).map(|message| message.id.clone()) else {
@@ -2969,8 +2973,18 @@ fn attempt_appserver_notification_with_at(
         transport,
         &text,
         &format!("collab-notification-{}", first.1),
+        explicit,
     ) {
-        Ok(_) => true,
+        Ok(receipt) => {
+            append_log(
+                &server.log_path(),
+                &format!(
+                    "APPSERVER_NOTIFICATION_ACCEPTED recipient={recipient} message={} explicit={explicit} receipt={receipt}",
+                    seed_id
+                ),
+            );
+            true
+        }
         Err(error) => {
             append_log(
                 &server.log_path(),
@@ -3055,8 +3069,8 @@ fn attempt_notification_with_at(
         delay,
         explicit,
         now,
-        &|transport, text, message_id| {
-            (server.appserver_notification_sink)(transport, text, message_id)
+        &|transport, text, message_id, explicit| {
+            (server.appserver_notification_sink)(transport, text, message_id, explicit)
         },
     )
 }
@@ -3103,7 +3117,7 @@ mod notification_batch_tests {
                         self_check: "test appserver".into(),
                     })
                 }),
-                appserver_notification_sink: Arc::new(|_, _, _| {
+                appserver_notification_sink: Arc::new(|_, _, _, _| {
                     Ok(serde_json::json!({"accepted": true}))
                 }),
                 appserver_thread_status: Arc::new(|_, thread_id| {
@@ -3211,7 +3225,7 @@ mod notification_batch_tests {
             let delivered = Arc::clone(&delivered);
             Arc::get_mut(&mut server)
                 .expect("unique test server")
-                .appserver_notification_sink = Arc::new(move |_, text, _| {
+                .appserver_notification_sink = Arc::new(move |_, text, _, _| {
                 delivered.lock().unwrap().push(text.to_string());
                 Ok(serde_json::json!({"accepted": true}))
             });
@@ -3266,7 +3280,7 @@ mod notification_batch_tests {
             let delivered = Arc::clone(&delivered);
             Arc::get_mut(&mut server)
                 .expect("unique test server")
-                .appserver_notification_sink = Arc::new(move |_, text, _| {
+                .appserver_notification_sink = Arc::new(move |_, text, _, _| {
                 delivered.lock().unwrap().push(text.to_string());
                 Ok(serde_json::json!({"accepted": true}))
             });
@@ -3323,8 +3337,8 @@ mod notification_batch_tests {
             let delivered = Arc::clone(&delivered);
             Arc::get_mut(&mut server)
                 .expect("unique test server")
-                .appserver_notification_sink = Arc::new(move |_, text, _| {
-                delivered.lock().unwrap().push(text.to_string());
+                .appserver_notification_sink = Arc::new(move |_, text, _, explicit| {
+                delivered.lock().unwrap().push((explicit, text.to_string()));
                 Ok(serde_json::json!({"accepted": true}))
             });
         }
@@ -3334,9 +3348,16 @@ mod notification_batch_tests {
             &subscription_id,
             now,
         ));
-        let text = delivered.lock().unwrap().join("\n");
+        let delivered_snapshot = delivered.lock().unwrap();
+        assert_eq!(delivered_snapshot.len(), 1);
+        assert!(
+            delivered_snapshot[0].0,
+            "explicit sendmessage must use immediate notify"
+        );
+        let text = &delivered_snapshot[0].1;
         assert!(text.contains("explicit-notice"));
         assert!(!text.contains("automatic-notice"));
+        drop(delivered_snapshot);
         let state = server.state.lock().unwrap();
         assert_eq!(state.msgs["explicit-notice"].state, "pending");
         assert_eq!(state.msgs["explicit-notice"].wake_attempt_count, 1);
@@ -3348,11 +3369,10 @@ mod notification_batch_tests {
             &subscription_id,
             now,
         ));
+        let delivered = delivered.lock().unwrap();
         assert!(delivered
-            .lock()
-            .unwrap()
             .iter()
-            .any(|text| { text.contains("automatic-notice") }));
+            .any(|(explicit, text)| { !explicit && text.contains("automatic-notice") }));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3409,7 +3429,7 @@ mod notification_batch_tests {
 
         Arc::get_mut(&mut server)
             .expect("unique test server")
-            .appserver_notification_sink = Arc::new(|_, _, _| Err("test sink rejected".into()));
+            .appserver_notification_sink = Arc::new(|_, _, _, _| Err("test sink rejected".into()));
         assert!(!attempt_notification_with_at(
             &server,
             "reserved-once",
@@ -3489,7 +3509,7 @@ pub(crate) fn attempt_notification_with_default(
         delay,
         explicit,
         now_ms(),
-        &|transport, text, _| {
+        &|transport, text, _, _| {
             let target = transport.thread_id.as_deref().unwrap_or("appserver");
             if !can_receive(target) {
                 return Err("test can_receive returned false".into());
@@ -8893,7 +8913,7 @@ mod host_route_registry_tests {
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
             appserver_candidate_check: Arc::new(|candidate| Ok(verified_appserver(candidate))),
-            appserver_notification_sink: Arc::new(|_, _, _| {
+            appserver_notification_sink: Arc::new(|_, _, _, _| {
                 Ok(serde_json::json!({"accepted": true}))
             }),
             appserver_thread_status: Arc::new(|_, thread_id| {
@@ -8915,7 +8935,7 @@ mod host_route_registry_tests {
 
     fn with_appserver_notification_sink(
         server: &mut Arc<Server>,
-        sink: impl Fn(&SelectedTransport, &str, &str) -> Result<serde_json::Value, String>
+        sink: impl Fn(&SelectedTransport, &str, &str, bool) -> Result<serde_json::Value, String>
             + Send
             + Sync
             + 'static,
@@ -9142,12 +9162,12 @@ mod host_route_registry_tests {
     }
 
     #[test]
-    fn appserver_notification_queue_acceptance_stays_pending_and_unread() {
+    fn appserver_notification_turn_acceptance_stays_pending_and_unread() {
         let (mut server, root, _) = test_server();
         with_appserver_check(&mut server, |candidate| Ok(verified_appserver(candidate)));
         let sink_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sink_called_for_server = sink_called.clone();
-        with_appserver_notification_sink(&mut server, move |_, _, _| {
+        with_appserver_notification_sink(&mut server, move |_, _, _, _| {
             sink_called_for_server.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(serde_json::json!({"accepted": true}))
         });
@@ -9224,13 +9244,13 @@ mod host_route_registry_tests {
             0,
             true,
             now_ms(),
-            &|transport, text, message_id| {
-                (server.appserver_notification_sink)(transport, text, message_id)
+            &|transport, text, message_id, explicit| {
+                (server.appserver_notification_sink)(transport, text, message_id, explicit)
             },
         );
         assert!(
             attempted,
-            "the server-selected endpoint accepted the queue write"
+            "the server-selected endpoint accepted turn/start"
         );
         assert!(
             sink_called.load(std::sync::atomic::Ordering::Relaxed),
@@ -9240,7 +9260,7 @@ mod host_route_registry_tests {
         assert_eq!(state.msgs[&message_id].state, "pending");
         assert_eq!(
             state.msgs[&message_id].wake_attempt_count, 1,
-            "queue acceptance records one wake attempt"
+            "turn/start acceptance records one notification attempt"
         );
         assert_ne!(state.msgs[&message_id].state, "delivered");
         assert_ne!(state.msgs[&message_id].state, "read");
@@ -10419,7 +10439,7 @@ mod host_route_registry_tests {
     async fn manager_cross_project_appserver_masters_send_and_reject_forged_source_evidence() {
         let (mut server, host_root, _) = test_server();
         with_appserver_check(&mut server, |candidate| Ok(verified_appserver(candidate)));
-        with_appserver_notification_sink(&mut server, |_, _, _| Ok(json!({"queued": true})));
+        with_appserver_notification_sink(&mut server, |_, _, _, _| Ok(json!({"queued": true})));
 
         let project_a = host_root.with_file_name(format!(
             "{}-cross-project-a",
@@ -13982,7 +14002,7 @@ mod reducer_binding_tests {
                     self_check: "test appserver".into(),
                 })
             }),
-            appserver_notification_sink: Arc::new(|_, _, _| {
+            appserver_notification_sink: Arc::new(|_, _, _, _| {
                 Ok(serde_json::json!({"accepted": true}))
             }),
             appserver_thread_status: Arc::new(|_, thread_id| {

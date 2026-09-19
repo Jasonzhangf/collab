@@ -502,7 +502,7 @@ fn launch(
             .context("child registration receipt did not contain its runtime binding")?;
     crate::identity::persist_registration(&scope, &mut ident, runtime, transport.clone())
         .context("cannot persist child runtime binding")?;
-    crate::client::adapters::codex_app_server::queue_add(
+    crate::client::adapters::codex_app_server::immediate_notify(
         &transport,
         &prompt,
         &format!("collab-subagent-start-{}", record.id),

@@ -149,6 +149,7 @@ function createClient(connection) {
   let buffer = connection.buffer;
   let nextId = 1;
   const pending = new Map();
+  const notifications = [];
   connection.stream.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
     for (;;) {
@@ -157,11 +158,14 @@ function createClient(connection) {
       buffer = frame.rest;
       if (frame.opcode !== 0x1) continue;
       const value = JSON.parse(frame.payload.toString());
-      if (typeof value.id !== "number" || !pending.has(value.id)) continue;
-      const { resolve, reject } = pending.get(value.id);
-      pending.delete(value.id);
-      if (value.error) reject(new Error(JSON.stringify(value.error)));
-      else resolve(value.result);
+      if (typeof value.id === "number" && pending.has(value.id)) {
+        const { resolve, reject } = pending.get(value.id);
+        pending.delete(value.id);
+        if (value.error) reject(new Error(JSON.stringify(value.error)));
+        else resolve(value.result);
+      } else if (value.method) {
+        notifications.push(value);
+      }
     }
   });
   return {
@@ -175,6 +179,7 @@ function createClient(connection) {
     notify(method, params) {
       connection.stream.write(encodeFrame({ method, params }));
     },
+    notifications,
     close() {
       connection.stream.end();
     },
@@ -257,12 +262,58 @@ function assert(condition, message, detail) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function workerById(status, workerId) {
   return (status.workers || []).find((worker) => worker.id === workerId);
 }
 
 function messageBody(message) {
   return String(message.body || "");
+}
+
+function notificationThreadId(notification) {
+  return (
+    notification?.params?.threadId ||
+    notification?.params?.thread_id ||
+    notification?.params?.thread?.id ||
+    null
+  );
+}
+
+async function waitForThreadActivity(
+  client,
+  threadId,
+  notificationStartIndex,
+  timeoutMs = 10_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastNotification = null;
+  while (Date.now() < deadline) {
+    const notification = client.notifications
+      .slice(notificationStartIndex)
+      .find((candidate) => {
+      const candidateThreadId = notificationThreadId(candidate);
+      if (candidateThreadId !== threadId) return false;
+      return (
+        candidate.method === "turn/started" ||
+        candidate.method === "thread/status/changed" ||
+        candidate.method === "turn/completed"
+      );
+      });
+    if (notification) {
+      return notification;
+    }
+    lastNotification = client.notifications.at(-1) || null;
+    await sleep(100);
+  }
+  throw new Error(
+    `target AppServer activity notification did not arrive within ${timeoutMs}ms: ${JSON.stringify(
+      lastNotification,
+    )}`,
+  );
 }
 
 let appClient;
@@ -502,6 +553,7 @@ try {
   );
 
   const marker = `cross-project-${Date.now()}`;
+  const notificationStartIndex = appClient.notifications.length;
   const sent = await runJson(
     collab,
     [
@@ -520,9 +572,24 @@ try {
   assert(
     sent.durable === true &&
       sent.cross_project === true &&
-      sent.notification !== "PROJECT_ROUTE_NOT_READY",
-    "cross-project send was not durable",
+      sent.notification === "sent",
+    "cross-project send was not accepted by the target AppServer",
     sent,
+  );
+  const targetActivity = await waitForThreadActivity(
+    appClient,
+    threadB,
+    notificationStartIndex,
+  );
+  assert(
+    targetActivity.method === "turn/started" ||
+      targetActivity.method === "thread/status/changed" ||
+      targetActivity.method === "turn/completed",
+    "cross-project send did not start or steer the target AppServer thread",
+    {
+      activity: targetActivity,
+      sent,
+    },
   );
   const inbox = await runJson(collab, ["inbox"], { cwd: projectB, env: envB });
   const recv = await runJson(collab, ["recv", "--timeout", "0"], {
@@ -539,6 +606,7 @@ try {
     inbox_count: inbox.unread,
     recv_count: recv.count,
     received_marker: marker,
+    target_activity: targetActivity,
   };
 
   const replayMarker = `cross-project-replay-${Date.now()}`;

@@ -9,7 +9,7 @@
 
 pub mod codex_app_server;
 
-pub use codex_app_server::{candidate_from_env, queue_add, verify_candidate};
+pub use codex_app_server::{candidate_from_env, immediate_notify, queue_wakeup, verify_candidate};
 
 use crate::identity::{BindingId, RuntimeIdentity, TurnId};
 use crate::proto::{CommandEnvelope, Req, RequestEnvelope};

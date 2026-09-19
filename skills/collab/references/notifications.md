@@ -67,10 +67,11 @@ collab notify unsubscribe <subscription-id>
   task, wait-timeout, or scheduling blocker is P1 operational work and must not be
   reclassified as a P0 interrupt by subject text alone.
 - One safe preview contains notification ID, abbreviated subject, and one-line
-  original body. Control characters are escaped. App Server delivery means
-  `thread/queue/add` accepted the bounded preview; that acceptance is not
-  execution, read, or reply. The selected App Server thread owns the bounded
-  queue operation.
+  original body. Control characters are escaped. An explicit
+  `collab sendmessage` is delivered through App Server `turn/start`, which
+  starts or steers the target turn. Daemon-generated wakeup and long-horizon
+  notifications use `thread/queue/add`; queue acceptance is not execution,
+  read, or reply. The server owns both operation choices.
 - Full subject/body remains in the mailbox without a matching subscription.
   This outcome is not a sender-selected `mailbox-only` mode.
 - A failed/lost/delayed/duplicate wake never rolls back mailbox truth or counts
