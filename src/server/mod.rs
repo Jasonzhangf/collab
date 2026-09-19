@@ -309,6 +309,17 @@ pub(crate) fn inject_task_register_journal_fault(fault: TaskRegisterJournalFault
     TASK_REGISTER_JOURNAL_FAULT.with(|injected| injected.set(fault as u8));
 }
 
+#[cfg(test)]
+thread_local! {
+    static CURRENT_THREAD_ROUTE_JOURNAL_FAULT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_current_thread_route_journal_fault() {
+    CURRENT_THREAD_ROUTE_JOURNAL_FAULT.with(|injected| injected.set(true));
+}
+
 #[derive(Clone, Copy)]
 enum CommandJournalPhase {
     Start,
@@ -1132,8 +1143,28 @@ impl Server {
             });
         #[cfg(not(test))]
         let (task_register_append_fault, task_register_sync_fault) = (false, false);
+        #[cfg(test)]
+        let current_thread_route_append_fault =
+            CURRENT_THREAD_ROUTE_JOURNAL_FAULT.with(|injected| {
+                let has_current_thread_route = evs
+                    .iter()
+                    .any(|event| matches!(event, Event::GlobalCurrentThreadRouteSet { .. }));
+                if has_current_thread_route && injected.get() {
+                    injected.set(false);
+                    true
+                } else {
+                    false
+                }
+            });
+        #[cfg(not(test))]
+        let current_thread_route_append_fault = false;
         if append_fault {
             let message = "injected subagent journal append failure".to_string();
+            st.journal_poison = Some(message.clone());
+            return Err(notification_contract::JournalError::Append(message));
+        }
+        if current_thread_route_append_fault {
+            let message = "injected current thread route journal append failure".to_string();
             st.journal_poison = Some(message.clone());
             return Err(notification_contract::JournalError::Append(message));
         }
@@ -1496,7 +1527,6 @@ struct RuntimeRoute {
 struct ProjectRuntimeManager {
     host: Arc<Server>,
     host_root: PathBuf,
-    host_state_root: PathBuf,
     route_journal: PathBuf,
     routes: Mutex<std::collections::BTreeMap<RouteKey, RuntimeRoute>>,
     project_locks: Mutex<std::collections::BTreeMap<PathBuf, std::fs::File>>,
@@ -1769,7 +1799,6 @@ impl ProjectRuntimeManager {
         let manager = Arc::new(Self {
             host,
             host_root: PathBuf::from(host_root.as_str()),
-            host_state_root: host_paths.state_root().to_path_buf(),
             route_journal,
             routes: Mutex::new(routes),
             project_locks: Mutex::new(std::collections::BTreeMap::new()),
@@ -1824,104 +1853,136 @@ impl ProjectRuntimeManager {
     ) -> Result<RouteResolution, String> {
         let native_thread_id = NativeThreadId::new(native_thread_id.to_owned())
             .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?;
-        let mut expected_workers = crate::identity::identities_for_native_thread(
-            &self.host_state_root,
-            native_thread_id.as_str(),
-        )
-        .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?;
-        let expected_worker = match expected_workers.len() {
-            0 => {
-                return Err(format!(
-                    "ROUTE_RESOLVE_NOT_FOUND: no global Collab identity is bound to App Server thread {}",
-                    native_thread_id
-                ));
-            }
-            1 => expected_workers.pop().unwrap(),
-            count => {
-                return Err(format!(
-                    "ROUTE_RESOLVE_AMBIGUOUS: App Server thread {native_thread_id} is bound to multiple global Collab identities: {count}"
-                ));
-            }
+        let binding = self
+            .host
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .lookup_current_thread_route(&native_thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "ROUTE_RESOLVE_NOT_FOUND: no registered Collab route is bound to App Server thread {native_thread_id}"
+                )
+            })?;
+        let key = (
+            binding.app_scope_id.as_str().to_owned(),
+            binding.project_scope.as_str().to_owned(),
+        );
+        let (storage_root, runtime) = {
+            let routes = self.routes.lock().unwrap();
+            let route = routes.get(&key).ok_or_else(|| {
+                format!(
+                    "ROUTE_RESOLVE_INVALID: current route state for App Server thread {native_thread_id} references an unknown route"
+                )
+            })?;
+            let runtime = route.runtime.clone().ok_or_else(|| {
+                format!(
+                    "ROUTE_RESOLVE_INVALID: current route state for App Server thread {native_thread_id} references an unavailable runtime"
+                )
+            })?;
+            (route.storage_root.clone(), runtime)
         };
-        let expected_runtime = expected_worker.runtime.as_ref().ok_or_else(|| {
+        let registered = runtime
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .lookup_binding_for(&binding.route_scope(), &binding.binding_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "ROUTE_RESOLVE_INVALID: current route state for App Server thread {native_thread_id} references a missing runtime binding"
+                )
+            })?;
+        if registered != binding {
+            return Err(format!(
+                "ROUTE_RESOLVE_INVALID: current route state for App Server thread {native_thread_id} conflicts with its runtime binding"
+            ));
+        }
+        let canonical_root = binding.project_scope.as_str().to_owned();
+        let route = RouteResolution {
+            app_scope_id: binding.app_scope_id,
+            project_scope: binding.project_scope,
+            canonical_root,
+            storage_root: storage_root.to_string_lossy().into_owned(),
+            agent_id: binding.agent_id,
+            binding_id: binding.binding_id,
+            endpoint_generation: binding.endpoint_generation,
+            native_thread_id: binding.native_thread_id.ok_or_else(|| {
+                "ROUTE_RESOLVE_INVALID: current route state has no native App Server thread"
+                    .to_owned()
+            })?,
+        };
+        route
+            .validate()
+            .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?;
+        Ok(route)
+    }
+
+    fn commit_current_thread_route(
+        &self,
+        runtime: &Arc<Server>,
+        context: &ProjectContext,
+        worker_id: &str,
+    ) -> Result<(), String> {
+        let route_scope = RouteScope {
+            app_scope_id: context.app_scope_id.clone(),
+            project_scope_id: context.project_scope.clone(),
+        };
+        let binding_id = BindingId::new(sanitize_identifier(&format!("binding-{worker_id}")))
+            .map_err(|error| format!("ROUTE_TRANSITION_INVALID: {error}"))?;
+        let binding = runtime
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .lookup_binding_for(&route_scope, &binding_id)
+            .filter(|binding| binding.agent_id.as_str() == worker_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "ROUTE_TRANSITION_INVALID: successful registration for {worker_id} has no matching runtime binding"
+                )
+            })?;
+        let native_thread_id = binding.native_thread_id.as_ref().ok_or_else(|| {
             format!(
-                "ROUTE_RESOLVE_NOT_FOUND: global Collab identity {} has no runtime binding",
-                expected_worker.worker_id
+                "ROUTE_TRANSITION_INVALID: successful registration for {worker_id} has no native App Server thread"
             )
         })?;
-        let mut matches = Vec::new();
-        for runtime in self.runtimes() {
-            let state = runtime.state.lock().unwrap();
-            let Some(worker) = state.workers.get(&expected_worker.worker_id) else {
-                continue;
-            };
-            if worker.token != expected_worker.token {
-                continue;
-            }
-            for project in state.global.projects.values() {
-                for binding in project.runtime_bindings.values() {
-                    if binding.native_thread_id.as_ref() == Some(&native_thread_id)
-                        && expected_worker
-                            .project_scope
-                            .as_ref()
-                            .is_none_or(|scope| scope == &binding.project_scope)
-                        && binding.agent_id.as_str() == expected_worker.worker_id
-                        && binding.binding_id == expected_runtime.binding_id
-                        && binding.endpoint_generation == expected_runtime.endpoint_generation
-                        && binding.app_scope_id == expected_runtime.appserver_id
-                    {
-                        matches.push((
-                            runtime.root.clone(),
-                            runtime.storage_root.clone(),
-                            binding.clone(),
-                        ));
-                    }
-                }
-            }
+        if self
+            .host
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .lookup_current_thread_route(native_thread_id)
+            == Some(&binding)
+        {
+            return Ok(());
         }
-        match matches.len() {
-            0 => Err(format!(
-                "ROUTE_RESOLVE_NOT_FOUND: no registered Collab route is bound to App Server thread {native_thread_id}"
-            )),
-            1 => {
-                let (_canonical_root, storage_root, binding) = matches.pop().unwrap();
-                let canonical_root = binding.project_scope.as_str().to_owned();
-                let route = RouteResolution {
-                    app_scope_id: binding.app_scope_id,
-                    project_scope: binding.project_scope,
-                    canonical_root,
-                    storage_root: storage_root.to_string_lossy().into_owned(),
-                    agent_id: binding.agent_id,
-                    binding_id: binding.binding_id,
-                    endpoint_generation: binding.endpoint_generation,
-                    native_thread_id: binding.native_thread_id.ok_or_else(|| {
-                        "ROUTE_RESOLVE_INVALID: matched binding has no native App Server thread"
-                            .to_owned()
-                    })?,
-                };
-                route
-                    .validate()
-                    .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?;
-                Ok(route)
-            }
-            _ => {
-                let mut routes = matches
-                    .into_iter()
-                    .map(|(root, _storage_root, binding)| {
-                        format!(
-                            "{} ({}, {})",
-                            root.display(),
-                            binding.app_scope_id,
-                            binding.binding_id
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                routes.sort();
-                Err(format!(
-                    "ROUTE_RESOLVE_AMBIGUOUS: App Server thread {native_thread_id} is bound to multiple routes: {}",
-                    routes.join(", ")
-                ))
-            }
+        self.host
+            .commit_checked(&[Event::GlobalCurrentThreadRouteSet { binding }])
+            .map(|_| ())
+            .map_err(|error| {
+                format!("ROUTE_TRANSITION_DURABILITY_FAILED: host journal commit failed: {error}")
+            })
+    }
+
+    fn finalize_registration(
+        &self,
+        runtime: Arc<Server>,
+        context: &ProjectContext,
+        worker_id: Option<&str>,
+        response: Resp,
+    ) -> (Arc<Server>, Resp) {
+        let Some(worker_id) = worker_id.filter(|_| response.ok) else {
+            return (runtime, response);
+        };
+        match self.commit_current_thread_route(&runtime, context, worker_id) {
+            Ok(()) => (runtime, response),
+            Err(error) => (runtime, Resp::err(error)),
         }
     }
 
@@ -2447,6 +2508,10 @@ impl ProjectRuntimeManager {
         }
         let key = Self::route_key(&context);
         let is_register = matches!(req, Req::Register { .. });
+        let register_worker_id = match &req {
+            Req::Register { worker_id, .. } => Some(worker_id.clone()),
+            _ => None,
+        };
         let _register_guard = is_register.then(|| self.register_gate.lock().unwrap());
         if matches!(req, Req::CrossProjectSend { .. }) {
             return self.dispatch_cross_project_send(&context, req);
@@ -2462,9 +2527,14 @@ impl ProjectRuntimeManager {
                 if let Err(error) = validate_request_context(&runtime, &req, Some(&context)) {
                     Resp::err(error)
                 } else {
-                    dispatch_with_route_context(&runtime, req, Some(context))
+                    dispatch_with_route_context(&runtime, req, Some(context.clone()))
                 };
-            return (runtime, response);
+            return self.finalize_registration(
+                runtime,
+                &context,
+                register_worker_id.as_deref(),
+                response,
+            );
         }
 
         let pending_route = self
@@ -2482,9 +2552,14 @@ impl ProjectRuntimeManager {
                 if let Err(error) = validate_request_context(&runtime, &req, Some(&context)) {
                     Resp::err(error)
                 } else {
-                    dispatch_with_route_context(&runtime, req, Some(context))
+                    dispatch_with_route_context(&runtime, req, Some(context.clone()))
                 };
-            return (runtime, response);
+            return self.finalize_registration(
+                runtime,
+                &context,
+                register_worker_id.as_deref(),
+                response,
+            );
         }
 
         // The first route for the daemon's resident project keeps the
@@ -2508,7 +2583,12 @@ impl ProjectRuntimeManager {
             } else if !response.ok {
                 return (self.host.clone(), response);
             }
-            return (self.host.clone(), response);
+            return self.finalize_registration(
+                self.host.clone(),
+                &context,
+                register_worker_id.as_deref(),
+                response,
+            );
         }
 
         let Req::Register { cwd, .. } = &req else {
@@ -2546,7 +2626,7 @@ impl ProjectRuntimeManager {
         } else {
             dispatch_with_route_context(&runtime, req, Some(context.clone()))
         };
-        (runtime, response)
+        self.finalize_registration(runtime, &context, register_worker_id.as_deref(), response)
     }
 }
 
@@ -9944,6 +10024,17 @@ mod host_route_registry_tests {
             .global
             .bind_runtime(binding.clone())
             .unwrap();
+        server.commit(&[Event::GlobalCurrentThreadRouteSet {
+            binding: binding.clone(),
+        }]);
+        manager.install_runtime(
+            &(
+                binding.app_scope_id.as_str().to_owned(),
+                binding.project_scope.as_str().to_owned(),
+            ),
+            server.clone(),
+            None,
+        );
         register_known_project_with_app(&historical_server, &historical_root, "app-route");
         let historical_binding = RuntimeBinding::new(
             GlobalState::canonical_project_scope(&historical_root).unwrap(),
@@ -10025,7 +10116,7 @@ mod host_route_registry_tests {
     }
 
     #[test]
-    fn native_thread_route_resolution_fails_closed_for_zero_or_duplicate_matches() {
+    fn native_thread_route_resolution_ignores_history_and_fails_closed_for_invalid_state() {
         let (server, root, _) = test_server();
         let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
         let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
@@ -10067,6 +10158,17 @@ mod host_route_registry_tests {
             state.global.bind_runtime(duplicate).unwrap();
             state.global.bind_runtime(second).unwrap();
         }
+        server.commit(&[Event::GlobalCurrentThreadRouteSet {
+            binding: current.clone(),
+        }]);
+        manager.install_runtime(
+            &(
+                current.app_scope_id.as_str().to_owned(),
+                current.project_scope.as_str().to_owned(),
+            ),
+            server.clone(),
+            None,
+        );
         write_global_identity(
             &host_paths,
             "agent-current",
@@ -10114,17 +10216,31 @@ mod host_route_registry_tests {
                 native_thread_id: Some(NativeThreadId::new("thread-duplicate").unwrap()),
             },
         );
-        let ambiguous = manager
+        let resolved = manager
             .resolve_route_by_native_thread("thread-duplicate")
-            .unwrap_err();
-        assert!(
-            ambiguous.starts_with("ROUTE_RESOLVE_AMBIGUOUS"),
-            "{ambiguous}"
-        );
+            .unwrap();
+        assert_eq!(resolved, current);
         for invalid in ["", "thread\ninvalid"] {
             let error = manager.resolve_route_by_native_thread(invalid).unwrap_err();
             assert!(error.starts_with("ROUTE_RESOLVE_INVALID"), "{error}");
         }
+
+        let corrupt = RuntimeBinding::new(
+            current.project_scope.clone(),
+            current.app_scope_id.clone(),
+            AgentId::new("agent-corrupt").unwrap(),
+            RuntimeId::new("runtime-corrupt").unwrap(),
+            BindingId::new("binding-corrupt").unwrap(),
+            1,
+            Some(current.native_thread_id.clone()),
+        )
+        .unwrap();
+        server.commit(&[Event::GlobalCurrentThreadRouteSet { binding: corrupt }]);
+        let error = manager
+            .resolve_route_by_native_thread("thread-duplicate")
+            .unwrap_err();
+        assert!(error.starts_with("ROUTE_RESOLVE_INVALID"), "{error}");
+        assert!(error.contains("missing runtime binding"), "{error}");
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -10152,6 +10268,17 @@ mod host_route_registry_tests {
             .global
             .bind_runtime(binding.clone())
             .unwrap();
+        server.commit(&[Event::GlobalCurrentThreadRouteSet {
+            binding: binding.clone(),
+        }]);
+        manager.install_runtime(
+            &(
+                binding.app_scope_id.as_str().to_owned(),
+                binding.project_scope.as_str().to_owned(),
+            ),
+            server.clone(),
+            None,
+        );
         write_global_identity(
             &host_paths,
             "agent-wire-route",
@@ -10252,6 +10379,246 @@ mod host_route_registry_tests {
     }
 
     #[tokio::test]
+    async fn native_thread_route_resolution_uses_latest_cross_project_registration() {
+        let (server, root, host_journal) = test_server();
+        let project_a = root.with_file_name(format!(
+            "{}-current-a",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        let project_b = root.with_file_name(format!(
+            "{}-current-b",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        for project in [&project_a, &project_b] {
+            std::fs::create_dir_all(project.join(".agent-collab/server")).unwrap();
+        }
+        let project_a = project_a.canonicalize().unwrap();
+        let project_b = project_b.canonicalize().unwrap();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let shared_thread = "thread-cross-project-current";
+        let context_a = context_with_app(&project_a, "current-app-a");
+        let context_b = context_with_app(&project_b, "current-app-b");
+
+        let (_, first) = manager.dispatch_sync(
+            Some(context_a.clone()),
+            Req::Register {
+                worker_id: "current-worker-a".into(),
+                token: "token-current-a".into(),
+                cwd: project_a.display().to_string(),
+                candidates: test_candidates(shared_thread),
+            },
+        );
+        assert!(first.ok, "{first:?}");
+        let (_, second) = manager.dispatch_sync(
+            Some(context_b.clone()),
+            Req::Register {
+                worker_id: "current-worker-b".into(),
+                token: "token-current-b".into(),
+                cwd: project_b.display().to_string(),
+                candidates: test_candidates(shared_thread),
+            },
+        );
+        assert!(second.ok, "{second:?}");
+
+        let current = manager
+            .resolve_route_by_native_thread(shared_thread)
+            .unwrap();
+        assert_eq!(
+            current.project_scope.as_str(),
+            context_b.project_scope.as_str()
+        );
+        assert_eq!(current.app_scope_id.as_str(), "current-app-b");
+        assert_eq!(current.agent_id.as_str(), "current-worker-b");
+        assert_eq!(current.binding_id.as_str(), "binding-current-worker-b");
+
+        let (_, rejected) = manager.dispatch_sync(
+            Some(context_b.clone()),
+            Req::Register {
+                worker_id: "rejected-worker".into(),
+                token: "token-rejected-worker".into(),
+                cwd: project_a.display().to_string(),
+                candidates: test_candidates(shared_thread),
+            },
+        );
+        assert!(!rejected.ok, "{rejected:?}");
+        assert_eq!(
+            manager
+                .resolve_route_by_native_thread(shared_thread)
+                .unwrap(),
+            current
+        );
+
+        let host_state = server.state.lock().unwrap();
+        server.rewrite_journal_locked(&host_state).unwrap();
+        drop(host_state);
+        assert!(
+            !std::fs::read(&host_journal).unwrap().is_empty(),
+            "the host current transition must be durable in the host journal"
+        );
+        drop(manager);
+
+        let replayed_host = Arc::new(Server {
+            config: crate::config::Config::default(),
+            root: root.clone(),
+            storage_root: root.clone(),
+            journal_path: host_journal.clone(),
+            state: Mutex::new(replay(&root).unwrap()),
+            journal: Mutex::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&host_journal)
+                    .unwrap(),
+            ),
+            appserver_candidate_check: Arc::new(|candidate| Ok(verified_appserver(candidate))),
+            appserver_notification_sink: Arc::new(|_, _, _, _| {
+                Ok(serde_json::json!({"accepted": true}))
+            }),
+            appserver_thread_status: Arc::new(|_, thread_id| {
+                Ok(serde_json::json!({"thread": {"id": thread_id, "status": "idle"}}))
+            }),
+            appserver_thread_archive: Arc::new(|_, _| Ok(serde_json::json!({"archived": true}))),
+            mailbox_notify: Notify::new(),
+        });
+        let replayed_manager = ProjectRuntimeManager::new(replayed_host, &host_paths).unwrap();
+        assert_eq!(
+            replayed_manager
+                .resolve_route_by_native_thread(shared_thread)
+                .unwrap(),
+            current
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(project_a).unwrap();
+        std::fs::remove_dir_all(project_b).unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_thread_reregistration_retires_the_previous_current_route() {
+        let (server, root, _) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let app = crate::identity::CLI_APP_SERVER_ID;
+        let worker_id = "same-thread-worker";
+        let token = "token-same-thread-worker";
+        let context = context_with_app(&root, app);
+        let shared_thread = "thread-same-worker-old";
+
+        let (_, first) = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                cwd: root.display().to_string(),
+                candidates: test_candidates(shared_thread),
+            },
+        );
+        assert!(first.ok, "{first:?}");
+
+        let provisional = RuntimeIdentity::cli_adapter(worker_id).unwrap();
+        let (_, rebound) = manager.dispatch_sync(
+            Some(context_with_runtime(&root, app, &provisional)),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                cwd: root.display().to_string(),
+                candidates: test_candidates("thread-same-worker-new"),
+            },
+        );
+        assert!(rebound.ok, "{rebound:?}");
+
+        let old = manager
+            .resolve_route_by_native_thread(shared_thread)
+            .unwrap_err();
+        assert!(old.starts_with("ROUTE_RESOLVE_NOT_FOUND"), "{old}");
+        let current = manager
+            .resolve_route_by_native_thread("thread-same-worker-new")
+            .unwrap();
+        assert_eq!(current.agent_id.as_str(), worker_id);
+        assert_eq!(current.native_thread_id.as_str(), "thread-same-worker-new");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_current_route_commit_failure_is_explicit() {
+        let (server, root, host_journal) = test_server();
+        let host_paths = HostPaths::for_state_root(root.join("host-state")).unwrap();
+        let manager = ProjectRuntimeManager::new(server.clone(), &host_paths).unwrap();
+        let app = crate::identity::CLI_APP_SERVER_ID;
+        let context = context_with_app(&root, app);
+        let worker_id = "host-route-failure-worker";
+        let token = "token-host-route-failure-worker";
+
+        let (_, registered) = manager.dispatch_sync(
+            Some(context.clone()),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                cwd: root.display().to_string(),
+                candidates: test_candidates("thread-host-route-failure-old"),
+            },
+        );
+        assert!(registered.ok, "{registered:?}");
+        let binding = server
+            .state
+            .lock()
+            .unwrap()
+            .global
+            .lookup_current_thread_route(
+                &NativeThreadId::new("thread-host-route-failure-old").unwrap(),
+            )
+            .cloned()
+            .unwrap();
+        inject_current_thread_route_journal_fault();
+
+        let (_, response) = manager.dispatch_sync(
+            Some(context_with_runtime(
+                &root,
+                app,
+                &RuntimeIdentity {
+                    agent_id: binding.agent_id.clone(),
+                    runtime_id: binding.runtime_id.clone(),
+                    appserver_id: binding.app_scope_id.clone(),
+                    endpoint_generation: binding.endpoint_generation,
+                    binding_id: binding.binding_id.clone(),
+                    native_thread_id: binding.native_thread_id.clone(),
+                },
+            )),
+            Req::Register {
+                worker_id: worker_id.into(),
+                token: token.into(),
+                cwd: root.display().to_string(),
+                candidates: test_candidates("thread-host-route-failure-new"),
+            },
+        );
+        assert!(!response.ok, "{response:?}");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("ROUTE_TRANSITION_DURABILITY_FAILED:")),
+            "{response:?}"
+        );
+        assert!(!std::fs::read(&host_journal).unwrap().is_empty());
+        assert_eq!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .global
+                .lookup_current_thread_route(
+                    &NativeThreadId::new("thread-host-route-failure-old").unwrap()
+                )
+                .map(|binding| binding.native_thread_id.as_ref().unwrap().as_str()),
+            Some("thread-host-route-failure-old")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn manager_external_register_is_durable_and_replayed_in_its_runtime() {
         let (server, root, host_journal) = test_server();
         let external_root = root.with_file_name(format!(
@@ -10276,7 +10643,10 @@ mod host_route_registry_tests {
         assert!(!Arc::ptr_eq(&runtime, &server));
         assert_eq!(manager.runtimes().len(), 2);
         assert!(host_journal.as_path().exists());
-        assert!(std::fs::read(&host_journal).unwrap().is_empty());
+        assert!(
+            !std::fs::read(&host_journal).unwrap().is_empty(),
+            "external registration must persist its host current-thread transition"
+        );
         let route_journal = host_paths.state_root().join("routes.jsonl");
         let route_records = load_host_route_records(&route_journal).unwrap();
         assert_eq!(route_records.len(), 1);
@@ -10745,7 +11115,10 @@ mod host_route_registry_tests {
             .map(|record| (record.app_scope_id.clone(), record.project_scope.clone()))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(route_keys.len(), 3);
-        assert!(std::fs::read(&host_journal).unwrap().is_empty());
+        assert!(
+            !std::fs::read(&host_journal).unwrap().is_empty(),
+            "successful routed registrations must persist host current-thread transitions"
+        );
         assert!(std::fs::read(&app_a_runtime.journal_path)
             .unwrap()
             .windows(b"app-a-worker".len())
@@ -11146,7 +11519,10 @@ mod host_route_registry_tests {
             .any(|window| window == first_message_id.as_bytes()));
         let route_journal = host_paths.state_root().join("routes.jsonl");
         let route_journal_before_replay = std::fs::read(&route_journal).unwrap();
-        assert!(std::fs::read(&host_journal).unwrap().is_empty());
+        assert!(
+            !std::fs::read(&host_journal).unwrap().is_empty(),
+            "successful routed registrations must persist host current-thread transitions"
+        );
 
         drop(sender_runtime);
         drop(recipient_runtime);

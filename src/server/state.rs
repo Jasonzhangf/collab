@@ -531,6 +531,9 @@ pub enum Event {
     GlobalRuntimeBound {
         binding: super::global_state::RuntimeBinding,
     },
+    GlobalCurrentThreadRouteSet {
+        binding: super::global_state::RuntimeBinding,
+    },
     GlobalMigrationCommitEvidence {
         evidence: super::global_state::MigrationCommitEvidence,
     },
@@ -916,6 +919,13 @@ impl State {
                     binding: binding.clone(),
                 })?;
             }
+            Event::GlobalCurrentThreadRouteSet { binding } => {
+                let mut next = self.global.clone();
+                next.set_current_thread_route(binding.clone())
+                    .map_err(|error| format!("global reducer rejected event: {error}"))?;
+                next.set_counters(self.sequence, self.revision);
+                self.global = next;
+            }
             Event::GlobalMigrationCommitEvidence { evidence } => {
                 self.apply_global_event(&GlobalEvent::MigrationCommitEvidence {
                     evidence: evidence.clone(),
@@ -1097,6 +1107,13 @@ impl State {
                 });
             }
         }
+        events.extend(
+            self.global
+                .current_thread_routes
+                .values()
+                .cloned()
+                .map(|binding| Event::GlobalCurrentThreadRouteSet { binding }),
+        );
         let mut migration_commit_evidence: Vec<_> = self
             .global
             .migration_commit_evidence
