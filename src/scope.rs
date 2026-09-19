@@ -544,8 +544,7 @@ pub fn project_root() -> anyhow::Result<PathBuf> {
 /// Daemon start/stop and configuration commands own local lifecycle state.
 /// They must not follow `CODEX_THREAD_ID` to a different project route.
 pub fn lifecycle_project_root() -> anyhow::Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
-    inherited_cwd_if_initialized(cwd)
+    validate_project_root(std::env::current_dir()?)
 }
 
 /// Resolve the exact destination for `collab init`. Initialization binds to
@@ -1201,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_scope_requires_an_exact_local_baseline() {
+    fn lifecycle_scope_uses_the_exact_cwd_without_requiring_a_baseline() {
         let root = test_root("lifecycle-exact-cwd");
         let initialized = root.join("initialized");
         let uninitialized = root.join("uninitialized");
@@ -1209,15 +1208,12 @@ mod tests {
         std::fs::create_dir_all(&uninitialized).unwrap();
 
         assert_eq!(
-            inherited_cwd_if_initialized(initialized.clone()).unwrap(),
+            validate_project_root(initialized.clone()).unwrap(),
             initialized
         );
-        let error = inherited_cwd_if_initialized(uninitialized.clone()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("no .agent-collab found in inherited cwd"),
-            "{error}"
+        assert_eq!(
+            validate_project_root(uninitialized.clone()).unwrap(),
+            uninitialized
         );
 
         std::fs::remove_dir_all(root).ok();
