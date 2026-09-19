@@ -2,8 +2,9 @@
 //!
 //! This module speaks the native JSON-RPC surface exposed by Codex TUI and
 //! Desktop. It does not start an App Server, invent a namespace, or treat
-//! `thread/queue/add` acceptance as delivery. Every operation is bounded and
-//! preserves the exact native error on failure.
+//! queue acceptance as delivery. Explicit coordination uses `turn/start`,
+//! while background wakeups may use `thread/queue/add`. Every operation is
+//! bounded and preserves the exact native error on failure.
 
 use super::{AdapterCapabilities, AdapterError, EndpointKind, WakeMode};
 use crate::identity::NativeThreadId;
@@ -194,7 +195,7 @@ impl LiveAppServer {
         let mut client = Client::connect(&self.socket_path, self.timeout)?;
         client.initialize()?;
         client.call(
-            "thread/queue/add",
+            "turn/start",
             json!({
                 "threadId": thread_id.as_str(),
                 "input": [{"type": "text", "text": body}],
@@ -235,7 +236,7 @@ impl LiveAppServer {
             "namespace": self.namespace,
             "thread_id": self.thread_id.as_str(),
             "capabilities": self.capabilities.names(),
-            "accepted_semantics": "thread/queue/add accepted is not delivered, executed, replied, or read"
+            "accepted_semantics": "turn/start accepted the immediate notification; execution and reply are observed separately"
         })
     }
 }
@@ -311,8 +312,8 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
         });
     }
     // Item history is a diagnostic capability, not a registration or wake
-    // requirement. Some App Server builds expose thread/read and queue/add but
-    // return method-not-found for items/list; that must not block peer
+    // requirement. Some App Server builds expose thread/read and notification
+    // methods but return method-not-found for items/list; that must not block peer
     // registration. Snapshot calls still fail explicitly if the method is
     // unavailable.
     let _items_available = method_exists(
@@ -324,12 +325,23 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
             "sortDirection": "desc",
         }),
     )?;
-    let send_message = method_exists(
+    let immediate_notify = method_exists(
+        &mut client,
+        "turn/start",
+        json!({"threadId": "", "input": []}),
+    )?;
+    if !immediate_notify {
+        return Err(AdapterError::CapabilityUnavailable {
+            endpoint: EndpointKind::Tui,
+            operation: "turn/start",
+        });
+    }
+    let queue_wakeup = method_exists(
         &mut client,
         "thread/queue/add",
         json!({"threadId": "", "input": []}),
     )?;
-    if !send_message {
+    if !queue_wakeup {
         return Err(AdapterError::CapabilityUnavailable {
             endpoint: EndpointKind::Tui,
             operation: "thread/queue/add",
@@ -344,17 +356,65 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
             "session_status".into(),
             "read_thread".into(),
             "send_message_to_thread".into(),
+            "queue_wakeup".into(),
             "wait_reply".into(),
         ],
-        self_check: "initialize, thread/read identity, and thread/queue/add method probe passed"
-            .into(),
+        self_check:
+            "initialize, thread/read identity, turn/start, and thread/queue/add method probes passed"
+                .into(),
     })
 }
 
-/// Queue one notification through a server-selected App Server transport.
-/// A successful result means the native App Server accepted the queue write;
-/// it does not mean the target turn was executed, read, or answered.
-pub fn queue_add(
+/// Start or steer one immediate notification through a server-selected App
+/// Server transport. A successful result means the native App Server accepted
+/// the turn; execution and reply are observed separately.
+pub fn immediate_notify(
+    transport: &SelectedTransport,
+    body: &str,
+    client_user_message_id: &str,
+) -> Result<Value, AdapterError> {
+    if transport.kind != TransportKind::AppServer {
+        return Err(AdapterError::CapabilityUnavailable {
+            endpoint: EndpointKind::Tui,
+            operation: "turn/start",
+        });
+    }
+    let endpoint = transport
+        .endpoint
+        .as_deref()
+        .ok_or_else(|| AdapterError::InvalidBinding {
+            detail: "selected App Server transport has no endpoint".into(),
+        })?;
+    let thread_id = transport
+        .thread_id
+        .as_deref()
+        .ok_or_else(|| AdapterError::InvalidBinding {
+            detail: "selected App Server transport has no thread_id".into(),
+        })?;
+    let socket_path = endpoint_path(endpoint)?;
+    let thread_id = NativeThreadId::new(thread_id.to_owned()).map_err(|error| {
+        AdapterError::InvalidBinding {
+            detail: format!("selected App Server thread_id is invalid: {error}"),
+        }
+    })?;
+    let mut client = Client::connect(&socket_path, Duration::from_millis(DEFAULT_TIMEOUT_MS))?;
+    client.initialize()?;
+    let receipt = client.call(
+        "turn/start",
+        json!({
+            "threadId": thread_id.as_str(),
+            "input": [{"type": "text", "text": body}],
+            "clientUserMessageId": client_user_message_id,
+        }),
+    )?;
+    validate_immediate_receipt(&receipt)?;
+    Ok(receipt)
+}
+
+/// Queue one background wake through a server-selected App Server transport.
+/// This is reserved for wakeup/long-horizon paths; ordinary sendmessage must
+/// use `immediate_notify`.
+pub fn queue_wakeup(
     transport: &SelectedTransport,
     body: &str,
     client_user_message_id: &str,
@@ -503,6 +563,40 @@ fn endpoint_path(endpoint: &str) -> Result<PathBuf, AdapterError> {
         });
     }
     Ok(PathBuf::from(path))
+}
+
+fn validate_immediate_receipt(receipt: &Value) -> Result<(), AdapterError> {
+    let turn_id = receipt
+        .pointer("/turn/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AdapterError::Unknown {
+            operation: "turn/start",
+            detail: "response is missing turn.id".into(),
+        })?;
+    let status = receipt
+        .pointer("/turn/status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AdapterError::Unknown {
+            operation: "turn/start",
+            detail: "response is missing turn.status".into(),
+        })?;
+    if !matches!(
+        status,
+        "inProgress" | "completed" | "interrupted" | "failed"
+    ) {
+        return Err(AdapterError::Unknown {
+            operation: "turn/start",
+            detail: format!("response returned unsupported turn status {status}"),
+        });
+    }
+    if turn_id.chars().any(char::is_whitespace) {
+        return Err(AdapterError::Unknown {
+            operation: "turn/start",
+            detail: "response returned an invalid turn.id".into(),
+        });
+    }
+    Ok(())
 }
 
 fn method_exists(client: &mut Client, method: &str, params: Value) -> Result<bool, AdapterError> {
@@ -927,7 +1021,103 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| capability == "send_message_to_thread"));
+        assert!(selected
+            .capabilities
+            .iter()
+            .any(|capability| capability == "queue_wakeup"));
+        assert!(selected.self_check.contains("turn/start"));
         assert!(selected.self_check.contains("thread/queue/add"));
+    }
+
+    #[test]
+    fn candidate_rejects_appserver_without_queue_wakeup_method() {
+        let socket =
+            std::env::temp_dir().join(format!("collab-queue-probe-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                .unwrap();
+            loop {
+                let payload = read_client_frame(&mut stream);
+                let request: Value = serde_json::from_slice(&payload).unwrap();
+                let Some(id) = request.get("id").cloned() else {
+                    continue;
+                };
+                let method = request["method"].as_str().unwrap();
+                let response = match method {
+                    "initialize" => json!({"id": id, "result": {}}),
+                    "thread/read" => {
+                        json!({"id": id, "result": {"thread": {"id": "thread-1"}}})
+                    }
+                    "thread/items/list" => {
+                        json!({"id": id, "error": {"code": -32601, "message": "unsupported"}})
+                    }
+                    "turn/start" => {
+                        json!({"id": id, "error": {"code": -32600, "message": "invalid params"}})
+                    }
+                    "thread/queue/add" => {
+                        let response = json!({
+                            "id": id,
+                            "error": {"code": -32601, "message": "unsupported"}
+                        });
+                        stream
+                            .write_all(&encode_frame(0x1, &serde_json::to_vec(&response).unwrap()))
+                            .unwrap();
+                        break;
+                    }
+                    _ => unreachable!("{method}"),
+                };
+                stream
+                    .write_all(&encode_frame(0x1, &serde_json::to_vec(&response).unwrap()))
+                    .unwrap();
+            }
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        let candidate = AppServerCandidate {
+            endpoint: format!("unix://{}", socket.display()),
+            namespace: "codex_tui".into(),
+            thread_id: "thread-1".into(),
+        };
+        let error = verify_candidate(&candidate).unwrap_err();
+        assert!(matches!(
+            error,
+            AdapterError::CapabilityUnavailable {
+                operation: "thread/queue/add",
+                ..
+            }
+        ));
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
+    fn immediate_receipt_requires_turn_identity_and_protocol_status() {
+        validate_immediate_receipt(&json!({
+            "turn": {"id": "turn-1", "status": "inProgress"}
+        }))
+        .unwrap();
+
+        for malformed in [
+            json!({}),
+            json!({"turn": {"status": "inProgress"}}),
+            json!({"turn": {"id": "turn-1"}}),
+            json!({"turn": {"id": "turn-1", "status": "queued"}}),
+            json!({"turn": {"id": "bad turn", "status": "completed"}}),
+        ] {
+            assert!(
+                validate_immediate_receipt(&malformed).is_err(),
+                "{malformed}"
+            );
+        }
     }
 
     fn read_client_frame(stream: &mut UnixStream) -> Vec<u8> {

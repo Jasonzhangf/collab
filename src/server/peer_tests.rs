@@ -28,7 +28,7 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
             appserver_candidate_check: Arc::new(|candidate| {
                 Ok(test_appserver_transport(&candidate.thread_id))
             }),
-            appserver_notification_sink: Arc::new(|_, _, _| {
+            appserver_notification_sink: Arc::new(|_, _, _, _| {
                 Ok(serde_json::json!({"accepted": true}))
             }),
             appserver_thread_status: Arc::new(|_, thread_id| {

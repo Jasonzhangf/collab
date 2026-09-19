@@ -502,7 +502,7 @@ fn launch(
             .context("child registration receipt did not contain its runtime binding")?;
     crate::identity::persist_registration(&scope, &mut ident, runtime, transport.clone())
         .context("cannot persist child runtime binding")?;
-    crate::client::adapters::codex_app_server::queue_add(
+    crate::client::adapters::codex_app_server::immediate_notify(
         &transport,
         &prompt,
         &format!("collab-subagent-start-{}", record.id),
@@ -998,7 +998,7 @@ mod tests {
         let executable = directory.join("codex-fixture");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n case \"$1\" in\n --profile) shift; profile=$1;;\n --output-last-message) shift; output=$1;;\n esac\n shift\ndone\ncase \"$profile\" in\n good) printf OK > \"$output\";;\n env) if [ -z \"${TMUX+x}\" ] && [ -z \"${TMUX_PANE+x}\" ]; then printf OK > \"$output\"; else printf INHERITED > \"$output\"; fi;;\n wrong) printf NOT_OK > \"$output\";;\n fail) exit 3;;\n slow) exec sleep 2;;\nesac\n",
+            "#!/bin/sh\nprofile=\noutput=\nwhile [ $# -gt 0 ]; do\n case \"$1\" in\n --profile) shift; profile=$1;;\n --output-last-message) shift; output=$1;;\n esac\n shift\ndone\ncase \"$profile\" in\n good) printf OK > \"$output\";;\n env) if [ -z \"${TMUX+x}\" ] && [ -z \"${TMUX_PANE+x}\" ]; then printf OK > \"$output\"; else printf INHERITED > \"$output\"; fi;;\n wrong) printf NOT_OK > \"$output\";;\n fail) exit 3;;\n slow) exec sleep 2;;\nesac\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1027,7 +1027,7 @@ mod tests {
                 &settings,
                 &environment,
             );
-            assert_eq!(result.is_ok(), expected);
+            assert_eq!(result.is_ok(), expected, "profile={name} result={result:?}");
             if name == "slow" {
                 assert_eq!(result.unwrap_err().to_string(), "probe timed out");
             }

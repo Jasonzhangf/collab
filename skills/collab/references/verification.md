@@ -3,9 +3,10 @@
 Read this for Collab source changes, release, install, restart, or protocol
 verification—not ordinary command use.
 
-For a version bump, verify the current source version, release build version,
-installed binary versions, canonical command paths, and refreshed embedded
-Skill byte-for-byte. Refresh the Skill with the exact
+Every Cargo build automatically increments the ignored local build counter;
+there is no manual patch bump. Verify the semantic source baseline, release
+build version, installed binary versions, canonical command paths, and
+refreshed embedded Skill byte-for-byte. Refresh the Skill with the exact
 `$CARGO_HOME/bin/collab` binary, not a bare command that may resolve an older
 PATH entry. Remove only legacy copies whose binary identity proves they are
 matching Collab artifacts, then validate the new baseline only: do not migrate
@@ -29,8 +30,9 @@ Before review, prove the affected subset and every changed invariant:
 - all pending eligible messages coalesce after 60 seconds into one attempt;
 - failed wake and daemon restart never replay an attempted batch;
 - one ID/subject/original-body delivery preserves a reusable direct-message
-  lease and records one accepted delivery event; App Server proves the native
-  queue accepted the bounded preview;
+  lease and records one accepted delivery event; explicit `sendmessage` proves
+  native `turn/start` accepted the bounded preview, while daemon wakeup and
+  long-horizon notifications use `thread/queue/add`;
 - successful resource/deadline/async-result delivery consumes exactly one
   matching one-shot subscription;
 - release clears obsolete wait state and does not wake an unsubscribed Agent;
