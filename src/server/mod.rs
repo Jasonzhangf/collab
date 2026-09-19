@@ -3136,41 +3136,38 @@ fn attempt_scheduler_notification(
             }],
         );
     }
-    let (recipient, transport, delay, explicit) = {
+    let delivery = {
         let state = server.state.lock().unwrap();
-        let Some(seed) = state.msgs.get(message_id) else {
-            clear_scheduler_notification_claim(server, request_id);
-            return SchedulerNotificationAttempt::Rejected;
-        };
-        let recipient = seed.to.clone();
-        let Some(subscription) = state.notification_subscriptions.get(subscription_id) else {
-            clear_scheduler_notification_claim(server, request_id);
-            return SchedulerNotificationAttempt::Rejected;
-        };
-        if subscription.worker_id != recipient {
-            clear_scheduler_notification_claim(server, request_id);
-            return SchedulerNotificationAttempt::Rejected;
-        }
-        let delay = state
-            .delivery_modes
-            .get(message_id)
-            .filter(|mode| mode.as_str() == "explicit-notification")
-            .map(|_| 0)
-            .unwrap_or_else(|| server.config.notifications.delay_ms(&subscription.event));
-        let Some(transport) = state
-            .workers
-            .get(&recipient)
-            .and_then(selected_transport_for_worker)
-        else {
-            clear_scheduler_notification_claim(server, request_id);
-            return SchedulerNotificationAttempt::Rejected;
-        };
-        if !subscription_matches_transport(subscription, &transport) {
-            clear_scheduler_notification_claim(server, request_id);
-            return SchedulerNotificationAttempt::Rejected;
-        }
-        let explicit = is_explicit_notification(&state, seed);
-        (recipient, transport, delay, explicit)
+        state.msgs.get(message_id).and_then(|seed| {
+            let recipient = seed.to.clone();
+            let subscription = state.notification_subscriptions.get(subscription_id)?;
+            if subscription.worker_id != recipient {
+                return None;
+            }
+            let delay = state
+                .delivery_modes
+                .get(message_id)
+                .filter(|mode| mode.as_str() == "explicit-notification")
+                .map(|_| 0)
+                .unwrap_or_else(|| server.config.notifications.delay_ms(&subscription.event));
+            let transport = state
+                .workers
+                .get(&recipient)
+                .and_then(selected_transport_for_worker)?;
+            if !subscription_matches_transport(subscription, &transport) {
+                return None;
+            }
+            Some((
+                recipient,
+                transport,
+                delay,
+                is_explicit_notification(&state, seed),
+            ))
+        })
+    };
+    let Some((recipient, transport, delay, explicit)) = delivery else {
+        clear_scheduler_notification_claim(server, request_id);
+        return SchedulerNotificationAttempt::Rejected;
     };
     let notified = attempt_appserver_notification_with_retry(
         server,
@@ -5024,13 +5021,26 @@ fn scheduler_admission_failed_response(
 
 fn scheduler_dispatch_recover_pending(server: &Server, request_id: &str) -> Option<Resp> {
     let pending = {
-        let state = server.state.lock().unwrap();
-        let pending = state
+        let mut state = server.state.lock().unwrap();
+        let admission = state.scheduler_admissions.get(request_id)?.clone();
+        if admission.status == "notifying"
+            && now_ms().saturating_sub(admission.updated_ms) >= state::REQUEST_COOLDOWN_MS
+        {
+            server.commit_locked(
+                &mut state,
+                &[Event::SchedulerAdmissionStatus {
+                    request_id: request_id.into(),
+                    status: "pending".into(),
+                    error: admission.error.clone(),
+                    updated_ms: now_ms(),
+                }],
+            );
+        }
+        state
             .scheduler_admissions
             .get(request_id)
             .filter(|admission| admission.status == "pending")
-            .cloned()?;
-        pending
+            .cloned()?
     };
     let (admission, task, subscription) = {
         let mut state = server.state.lock().unwrap();
@@ -16131,6 +16141,128 @@ mod scheduler_admission_tests {
         assert_eq!(state.msgs.len(), 1);
         assert_eq!(
             state.scheduler_admissions["req-concurrent-notify-1"].status,
+            "succeeded"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_rejection_clears_claim_without_deadlock() {
+        let (server, root) = test_server();
+        register(&server, "peer", "%peer");
+        server.commit(&[Event::TaskCreated {
+            task: TaskRec {
+                id: "task-scheduler-req-rejection-deadlock".into(),
+                owner: "peer".into(),
+                created_by: "master".into(),
+                feature_id: None,
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                priority: "p1".into(),
+                status: "assigned".into(),
+                next_step: None,
+                wait: None,
+                created_ms: now_ms(),
+                updated_ms: now_ms(),
+            },
+        }]);
+        server.commit(&[Event::SchedulerAdmission {
+            admission: crate::server::state::SchedulerAdmissionRecord {
+                request_id: "req-rejection-deadlock".into(),
+                decision: "use-registered-peer".into(),
+                worker_id: "peer".into(),
+                managed_subagent_id: None,
+                message_id: "scheduler-req-rejection-deadlock".into(),
+                task_id: "task-scheduler-req-rejection-deadlock".into(),
+                status: "pending".into(),
+                error: None,
+                created_ms: now_ms(),
+                updated_ms: now_ms(),
+            },
+        }]);
+        let response = scheduler_dispatch_recover_pending(&server, "req-rejection-deadlock")
+            .expect("pending reservation must be recovered");
+        assert!(!response.ok, "{response:?}");
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.scheduler_admissions["req-rejection-deadlock"].status,
+            "pending"
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_notifying_claim_recovers_after_cooldown() {
+        let (mut server, root) = test_server();
+        register(&server, "master", "%master");
+        register(&server, "peer", "%peer");
+        server.config.notifications.enabled = true;
+        server.commit(&[Event::MasterAssigned {
+            worker_id: "master".into(),
+            assigned_by: "operator".into(),
+            approval: Some("scheduler test".into()),
+            assigned_ms: now_ms(),
+        }]);
+        let server = Arc::new(server);
+        let first = dispatch(
+            &server,
+            Req::Subagent {
+                worker_id: "master".into(),
+                token: "token-master".into(),
+                command: crate::subagent::Action::Dispatch {
+                    request_id: "req-stale-notifying".into(),
+                    subject: "Recover stale claim".into(),
+                    body: "Retry after cooldown".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p1".into(),
+                    next_step: None,
+                },
+                launch_env: Default::default(),
+            },
+        );
+        assert!(first.ok, "{first:?}");
+        {
+            let mut state = server.state.lock().unwrap();
+            let stale_ms = now_ms() - state::REQUEST_COOLDOWN_MS;
+            server.commit_locked(
+                &mut state,
+                &[Event::SchedulerAdmissionStatus {
+                    request_id: "req-stale-notifying".into(),
+                    status: "notifying".into(),
+                    error: None,
+                    updated_ms: stale_ms,
+                }],
+            );
+        }
+        let retry = dispatch(
+            &server,
+            Req::Subagent {
+                worker_id: "master".into(),
+                token: "token-master".into(),
+                command: crate::subagent::Action::Dispatch {
+                    request_id: "req-stale-notifying".into(),
+                    subject: "Recover stale claim".into(),
+                    body: "Retry after cooldown".into(),
+                    feature_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    base_commit: None,
+                    priority: "p1".into(),
+                    next_step: None,
+                },
+                launch_env: Default::default(),
+            },
+        );
+        assert!(retry.ok, "{retry:?}");
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.scheduler_admissions["req-stale-notifying"].status,
             "succeeded"
         );
         drop(state);
