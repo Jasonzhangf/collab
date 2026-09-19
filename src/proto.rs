@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{
-    validate_binding, AppServerId, BindingId, CommandId, DispatchId, MessageId, OperationId,
-    RuntimeIdentity, TurnId,
+    validate_binding, AgentId, AppServerId, BindingId, CommandId, DispatchId, MessageId,
+    NativeThreadId, OperationId, RuntimeIdentity, TurnId,
 };
 use crate::scope::{ProjectScopeId, RouteScope};
 
@@ -141,6 +141,51 @@ pub struct ProjectContext {
     pub project_scope: ProjectScopeId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_context: Option<RuntimeIdentity>,
+}
+
+/// The daemon-owned route selected by one native App Server thread.
+///
+/// This is the only production route selector for thread-backed commands.
+/// The daemon returns the route and binding identity; callers must not
+/// reconstruct them from cwd or `routes.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteResolution {
+    pub app_scope_id: AppServerId,
+    pub project_scope: ProjectScopeId,
+    pub canonical_root: String,
+    pub storage_root: String,
+    pub agent_id: AgentId,
+    pub binding_id: BindingId,
+    pub endpoint_generation: u64,
+    pub native_thread_id: NativeThreadId,
+}
+
+impl RouteResolution {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        crate::identity::validate_id_for_protocol(self.app_scope_id.as_str())?;
+        crate::identity::validate_id_for_protocol(self.project_scope.as_str())?;
+        crate::identity::validate_id_for_protocol(self.agent_id.as_str())?;
+        crate::identity::validate_id_for_protocol(self.binding_id.as_str())?;
+        crate::identity::validate_id_for_protocol(self.native_thread_id.as_str())?;
+        for (name, value) in [
+            ("canonical root", self.canonical_root.as_str()),
+            ("storage root", self.storage_root.as_str()),
+        ] {
+            if value.is_empty()
+                || value.chars().any(char::is_control)
+                || !std::path::Path::new(value).is_absolute()
+            {
+                anyhow::bail!("route resolution {name} must be an absolute path");
+            }
+        }
+        if self.project_scope.as_str() != self.canonical_root {
+            anyhow::bail!("route resolution project scope does not match canonical root");
+        }
+        if self.endpoint_generation == 0 {
+            anyhow::bail!("route resolution endpoint generation must be non-zero");
+        }
+        Ok(())
+    }
 }
 
 impl ProjectContext {
@@ -318,6 +363,12 @@ pub enum Req {
     Context {
         worker_id: String,
         token: String,
+    },
+    /// Resolve the unique registered project route for one native App Server
+    /// thread. This is a daemon-owned read-only lookup: callers must not
+    /// select a route by cwd or by reading routes.jsonl directly.
+    RouteResolve {
+        native_thread_id: String,
     },
     MsgStatus {
         msg_id: String,
@@ -594,6 +645,20 @@ mod tests {
         }
     }
 
+    fn registered_route() -> RouteResolution {
+        let root = env!("CARGO_MANIFEST_DIR");
+        RouteResolution {
+            app_scope_id: AppServerId::new("appserver-1").unwrap(),
+            project_scope: ProjectScopeId::new(root).unwrap(),
+            canonical_root: root.into(),
+            storage_root: root.into(),
+            agent_id: AgentId::new("agent-1").unwrap(),
+            binding_id: BindingId::new("binding-1").unwrap(),
+            endpoint_generation: 7,
+            native_thread_id: NativeThreadId::new("thread-1").unwrap(),
+        }
+    }
+
     fn registered_scope() -> RouteScope {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         RouteScope::for_registered_project(AppServerId::new("appserver-1").unwrap(), root).unwrap()
@@ -634,6 +699,38 @@ mod tests {
             serde_json::from_value::<CommandEnvelope>(encoded).unwrap(),
             command
         );
+    }
+
+    #[test]
+    fn route_resolution_round_trips_complete_typed_route() {
+        let route = registered_route();
+        let encoded = serde_json::to_value(&route).unwrap();
+        assert_eq!(encoded["app_scope_id"], "appserver-1");
+        assert_eq!(encoded["project_scope"], env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(encoded["canonical_root"], env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(encoded["storage_root"], env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(encoded["agent_id"], "agent-1");
+        assert_eq!(encoded["binding_id"], "binding-1");
+        assert_eq!(encoded["endpoint_generation"], 7);
+        assert_eq!(encoded["native_thread_id"], "thread-1");
+        let decoded: RouteResolution = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, route);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn route_resolution_rejects_malformed_identity_fields() {
+        let mut route = registered_route();
+        route.project_scope = ProjectScopeId::new("/other-project").unwrap();
+        assert!(route.validate().is_err());
+
+        let mut route = registered_route();
+        route.storage_root = "relative/storage".into();
+        assert!(route.validate().is_err());
+
+        let mut route = registered_route();
+        route.endpoint_generation = 0;
+        assert!(route.validate().is_err());
     }
 
     #[test]

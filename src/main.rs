@@ -68,6 +68,11 @@ enum Cmd {
         #[command(subcommand)]
         command: MasterCmd,
     },
+    /// Resolve the daemon-owned route for a native App Server thread
+    Route {
+        #[command(subcommand)]
+        command: RouteCmd,
+    },
     /// Hidden alias: previous collab root commands are collab master
     #[command(hide = true)]
     Root {
@@ -358,6 +363,15 @@ enum MasterCmd {
 }
 
 #[derive(Subcommand)]
+enum RouteCmd {
+    /// Resolve one thread without using the current cwd as a selector
+    Resolve {
+        #[arg(long = "native-thread-id")]
+        native_thread_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum WorkerCmd {
     /// Re-register the current App Server thread without changing task ownership
     Recover,
@@ -601,7 +615,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::SubagentExec { file } => subagent::exec_launch(&file),
         Cmd::Config => {
             crate::config::ensure_written()?;
-            out(&crate::config::load(&scope::project_root()?)?);
+            out(&crate::config::load(&scope::lifecycle_project_root()?)?);
             Ok(())
         }
         Cmd::Subagent { command } => {
@@ -680,12 +694,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Serve => {
-            let scope = Scope::resolve()?;
+            let scope = Scope {
+                root: scope::lifecycle_project_root()?,
+            };
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(server::run(scope))
         }
         Cmd::Up => {
-            let project_root = scope::project_root()?;
+            let project_root = scope::lifecycle_project_root()?;
             if !project_root.join(".agent-collab").is_dir() {
                 scope::init(&project_root)?;
             }
@@ -705,7 +721,9 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Down => {
-            let scope = Scope::resolve()?;
+            let scope = Scope {
+                root: scope::lifecycle_project_root()?,
+            };
             if client::alive(&scope.sock_path()) {
                 let _: serde_json::Value = client::call_with_context(
                     &scope.sock_path(),
@@ -831,11 +849,36 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             out(&v);
             Ok(())
         }
+        Cmd::Route {
+            command: RouteCmd::Resolve { native_thread_id },
+        } => {
+            let host_paths = scope::HostPaths::resolve()?;
+            let native_thread_id = native_thread_id
+                .or_else(|| std::env::var("CODEX_THREAD_ID").ok())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("route resolve requires --native-thread-id or CODEX_THREAD_ID")
+                })?;
+            let route = crate::client::resolve_route(&host_paths.socket_path(), &native_thread_id)?;
+            out(&json!({
+                "canonical_root": route.canonical_root,
+                "storage_root": route.storage_root,
+                "app_scope_id": route.app_scope_id,
+                "project_scope": route.project_scope,
+                "agent_id": route.agent_id,
+                "binding_id": route.binding_id,
+                "endpoint_generation": route.endpoint_generation,
+                "native_thread_id": route.native_thread_id,
+            }));
+            Ok(())
+        }
         Cmd::Root { command } | Cmd::Master { command } => {
             if matches!(command, MasterCmd::Status) {
-                let cwd = std::env::current_dir()?;
                 let host_paths = scope::HostPaths::resolve()?;
-                let route = scope::canonical_route_for_cwd(&host_paths, &cwd)?;
+                let thread_id = std::env::var("CODEX_THREAD_ID").map_err(|_| anyhow::anyhow!(
+                    "master status requires CODEX_THREAD_ID; use `collab route resolve` to inspect an explicit thread"
+                ))?;
+                let route = scope::route_for_native_thread(&host_paths, &thread_id)?;
                 let scope = Scope { root: route.root };
                 let v: serde_json::Value = client::call_with_context(
                     &scope.sock_path(),
@@ -1108,31 +1151,27 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Context { worker } => {
-            let cwd = std::env::current_dir()?;
             let host_paths = scope::HostPaths::resolve()?;
-            let local_scope = cwd
-                .join(".agent-collab")
-                .is_dir()
-                .then(|| Scope { root: cwd.clone() });
-            let identity_scope = Scope { root: cwd.clone() };
-            let Some(ident) = identity::load_existing(&identity_scope, worker)? else {
-                out(&unregistered_context(local_scope.as_ref(), None)?);
-                return Ok(());
+            let thread_id = std::env::var("CODEX_THREAD_ID").map_err(|_| {
+                anyhow::anyhow!(
+                    "context requires CODEX_THREAD_ID so the daemon can resolve the global binding"
+                )
+            })?;
+            let route = match scope::route_for_native_thread(&host_paths, &thread_id) {
+                Ok(route) => route,
+                Err(error) if error.to_string().starts_with("ROUTE_RESOLVE_NOT_FOUND:") => {
+                    out(&unregistered_context(None, None)?);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             };
-            let Some(runtime) = ident.runtime.as_ref() else {
-                out(&unregistered_context(local_scope.as_ref(), Some(&ident))?);
-                return Ok(());
-            };
-            let route =
-                scope::canonical_route_for_identity(&host_paths, &cwd, &runtime.appserver_id);
-            let scope = match route {
-                Ok(route) => Scope { root: route.root },
-                Err(error) => anyhow::bail!(
-                    "cannot resolve persisted Collab identity {} from cwd {}: {error}",
-                    ident.worker_id,
-                    cwd.display()
-                ),
-            };
+            let scope = Scope { root: route.root };
+            let ident = identity::load_existing(&scope, worker)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no persisted Collab identity for CODEX_THREAD_ID {}",
+                    thread_id
+                )
+            })?;
             if ident.transport.is_none() {
                 out(&unregistered_context(Some(&scope), Some(&ident))?);
                 return Ok(());

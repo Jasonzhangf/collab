@@ -2,7 +2,10 @@
   "lifecycle_id": "collab-v1-peer-low-intervention",
   "status": "active",
   "edges": [
-    {"from": "inherited-agent-environment", "to": "project-control-root", "caller": "main", "callee": "scope::project_root", "path": "src/main.rs"},
+    {"from": "inherited-agent-environment", "to": "project-control-root", "caller": "main", "callee": "scope::project_root_for_init", "path": "src/main.rs"},
+    {"from": "native-app-server-thread", "to": "thread-route-resolution", "caller": "main", "callee": "client::resolve_route", "path": "src/main.rs"},
+    {"from": "thread-route-resolution", "to": "runtime-binding", "caller": "dispatch_wire_routed", "callee": "resolve_route_by_native_thread", "path": "src/server/mod.rs"},
+    {"from": "thread-route-resolution", "to": "project-control-root", "caller": "main", "callee": "scope::route_for_native_thread", "path": "src/main.rs"},
     {"from": "peer-register", "to": "task-register", "caller": "dispatch", "callee": "handle_task_register_with_next", "path": "src/server/mod.rs"},
     {"from": "master-scheduler", "to": "task-assignment", "caller": "dispatch", "callee": "handle_scheduler_dispatch", "path": "src/server/mod.rs"},
     {"from": "task-assignment", "to": "task-accept", "caller": "dispatch", "callee": "handle_task_accept", "path": "src/server/mod.rs"},

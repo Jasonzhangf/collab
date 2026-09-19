@@ -2,7 +2,7 @@
 pub mod adapters;
 
 use crate::identity::RuntimeIdentity;
-use crate::proto::{ProjectContext, Req, RequestEnvelope, Resp};
+use crate::proto::{ProjectContext, Req, RequestEnvelope, Resp, RouteResolution};
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -89,6 +89,24 @@ pub fn record_event(sock: &Path, kind: &str, detail: Value) {
 /// event when the socket cannot be reached.
 pub fn call<T: DeserializeOwned>(sock: &Path, req: &Req) -> anyhow::Result<T> {
     call_with_context(sock, req, None)
+}
+
+pub fn resolve_route(sock: &Path, native_thread_id: &str) -> anyhow::Result<RouteResolution> {
+    let route: RouteResolution = call(
+        sock,
+        &Req::RouteResolve {
+            native_thread_id: native_thread_id.to_owned(),
+        },
+    )?;
+    route.validate()?;
+    if route.native_thread_id.as_str() != native_thread_id {
+        anyhow::bail!(
+            "ROUTE_RESOLVE_INVALID: daemon returned thread {} for requested thread {}",
+            route.native_thread_id,
+            native_thread_id
+        );
+    }
+    Ok(route)
 }
 
 /// Round-trip one request with an explicit registered project context.  The
@@ -584,8 +602,8 @@ mod tests {
     impl TempServerDir {
         fn new(test: &str) -> Self {
             let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("collab-client-{test}-{}-{id}", std::process::id()));
+            let path =
+                PathBuf::from("/tmp").join(format!("collab-c-{test}-{}-{id}", std::process::id()));
             fs::create_dir(&path).expect("create client fixture directory");
             Self(path)
         }
@@ -737,6 +755,68 @@ mod tests {
             fixture.socket().exists(),
             "client must not delete stale socket"
         );
+    }
+
+    #[test]
+    fn resolve_route_rejects_thread_mismatch() {
+        let fixture = TempServerDir::new("route-thread-mismatch");
+        let listener = UnixListener::bind(fixture.socket()).expect("bind route response");
+        let responder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept route request");
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .expect("read route request");
+            assert!(line.contains("\"native_thread_id\":\"thread-requested\""));
+            let root = env!("CARGO_MANIFEST_DIR");
+            let response = json!({
+                "ok": true,
+                "app_scope_id": "appserver-1",
+                "project_scope": root,
+                "canonical_root": root,
+                "storage_root": root,
+                "agent_id": "agent-1",
+                "binding_id": "binding-1",
+                "endpoint_generation": 7,
+                "native_thread_id": "thread-other"
+            });
+            stream
+                .write_all(format!("{response}\n").as_bytes())
+                .expect("write route response");
+        });
+
+        let error = resolve_route(&fixture.socket(), "thread-requested").unwrap_err();
+        assert!(
+            error.to_string().contains("ROUTE_RESOLVE_INVALID"),
+            "{error}"
+        );
+        responder.join().expect("route responder");
+    }
+
+    #[test]
+    fn resolve_route_rejects_partial_typed_route() {
+        let fixture = TempServerDir::new("route-partial");
+        let listener = UnixListener::bind(fixture.socket()).expect("bind route response");
+        let responder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept route request");
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .expect("read route request");
+            stream
+                .write_all(
+                    br#"{"ok":true,"canonical_root":"/tmp/project","app_scope_id":"appserver-1","native_thread_id":"thread-1"}
+"#,
+                )
+                .expect("write partial route response");
+        });
+
+        let error = resolve_route(&fixture.socket(), "thread-1").unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected response shape"),
+            "{error}"
+        );
+        responder.join().expect("route responder");
     }
 
     #[test]
