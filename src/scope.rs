@@ -524,17 +524,6 @@ fn validate_project_root(root: PathBuf) -> anyhow::Result<PathBuf> {
     Ok(root)
 }
 
-/// The launching environment owns project scope. Every peer, including a
-/// Codex App Server thread, is bound to the exact process cwd. No caller may
-/// select a path and no ancestor is searched.
-fn inherited_cwd_if_initialized(cwd: PathBuf) -> anyhow::Result<PathBuf> {
-    if cwd.join(".agent-collab").is_dir() {
-        validate_project_root(cwd)
-    } else {
-        anyhow::bail!("no .agent-collab found in inherited cwd {}", cwd.display())
-    }
-}
-
 pub fn project_root() -> anyhow::Result<PathBuf> {
     Ok(Scope::resolve()?.root)
 }
