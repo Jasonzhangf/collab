@@ -494,22 +494,14 @@ fn identities_by_native_thread_at(
         .collect())
 }
 
-/// Return the one global identity currently bound to a native App Server
-/// thread.  Multiple persisted identities for one thread are ambiguous and
-/// must fail closed rather than letting route selection choose a winner.
-pub(crate) fn identity_for_native_thread(
+/// Return every global identity currently bound to a native App Server
+/// thread. The caller decides how to fail closed on zero or multiple matches.
+pub(crate) fn identities_for_native_thread(
     state_root: &Path,
     native_thread_id: &str,
-) -> anyhow::Result<Option<Identity>> {
+) -> anyhow::Result<Vec<Identity>> {
     let host_paths = HostPaths::for_state_root(state_root)?;
-    let mut matches = identities_by_native_thread_at(&host_paths, native_thread_id)?;
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(matches.pop()),
-        count => anyhow::bail!(
-            "multiple persisted Collab identities are bound to App Server thread {native_thread_id}: {count}"
-        ),
-    }
+    identities_by_native_thread_at(&host_paths, native_thread_id)
 }
 
 /// Load or create one Codex thread identity.

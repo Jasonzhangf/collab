@@ -1820,17 +1820,25 @@ impl ProjectRuntimeManager {
     ) -> Result<RouteResolution, String> {
         let native_thread_id = NativeThreadId::new(native_thread_id.to_owned())
             .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?;
-        let expected_worker = crate::identity::identity_for_native_thread(
+        let mut expected_workers = crate::identity::identities_for_native_thread(
             &self.host_state_root,
             native_thread_id.as_str(),
         )
-        .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?
-        .ok_or_else(|| {
-            format!(
-                "ROUTE_RESOLVE_NOT_FOUND: no global Collab identity is bound to App Server thread {}",
-                native_thread_id
-            )
-        })?;
+        .map_err(|error| format!("ROUTE_RESOLVE_INVALID: {error}"))?;
+        let expected_worker = match expected_workers.len() {
+            0 => {
+                return Err(format!(
+                    "ROUTE_RESOLVE_NOT_FOUND: no global Collab identity is bound to App Server thread {}",
+                    native_thread_id
+                ));
+            }
+            1 => expected_workers.pop().unwrap(),
+            count => {
+                return Err(format!(
+                    "ROUTE_RESOLVE_AMBIGUOUS: App Server thread {native_thread_id} is bound to multiple global Collab identities: {count}"
+                ));
+            }
+        };
         let expected_runtime = expected_worker.runtime.as_ref().ok_or_else(|| {
             format!(
                 "ROUTE_RESOLVE_NOT_FOUND: global Collab identity {} has no runtime binding",
@@ -8960,7 +8968,7 @@ mod host_route_registry_tests {
         host_paths: &HostPaths,
         worker_id: &str,
         token: &str,
-        project_scope: &crate::scope::ProjectScopeId,
+        project_scope: Option<&crate::scope::ProjectScopeId>,
         runtime: &RuntimeIdentity,
     ) {
         let path = host_paths
@@ -8969,17 +8977,15 @@ mod host_route_registry_tests {
             .join(worker_id)
             .join("identity.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            path,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "worker_id": worker_id,
-                "token": token,
-                "project_scope": project_scope,
-                "runtime": runtime,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let mut identity = serde_json::json!({
+            "worker_id": worker_id,
+            "token": token,
+            "runtime": runtime,
+        });
+        if let Some(project_scope) = project_scope {
+            identity["project_scope"] = serde_json::json!(project_scope);
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&identity).unwrap()).unwrap();
     }
 
     fn runtime_for_registered(
@@ -9553,13 +9559,7 @@ mod host_route_registry_tests {
             binding_id: binding.binding_id.clone(),
             native_thread_id: binding.native_thread_id.clone(),
         };
-        write_global_identity(
-            &host_paths,
-            "agent-route",
-            "token-route",
-            &binding.project_scope,
-            &runtime,
-        );
+        write_global_identity(&host_paths, "agent-route", "token-route", None, &runtime);
         server.commit(&[Event::Registered {
             worker: WorkerRec {
                 id: "agent-route".into(),
@@ -9640,7 +9640,7 @@ mod host_route_registry_tests {
             &host_paths,
             "agent-current",
             "token-current",
-            &current.project_scope,
+            Some(&current.project_scope),
             &RuntimeIdentity {
                 agent_id: current.agent_id.clone(),
                 runtime_id: current.runtime_id.clone(),
@@ -9669,6 +9669,27 @@ mod host_route_registry_tests {
             .unwrap();
         assert_eq!(current.agent_id.as_str(), "agent-current");
         assert_eq!(current.binding_id.as_str(), "binding-current");
+        write_global_identity(
+            &host_paths,
+            "agent-other",
+            "token-other",
+            None,
+            &RuntimeIdentity {
+                agent_id: AgentId::new("agent-other").unwrap(),
+                runtime_id: RuntimeId::new("runtime-other").unwrap(),
+                appserver_id: AppServerId::new("app-route").unwrap(),
+                endpoint_generation: 1,
+                binding_id: BindingId::new("binding-other").unwrap(),
+                native_thread_id: Some(NativeThreadId::new("thread-duplicate").unwrap()),
+            },
+        );
+        let ambiguous = manager
+            .resolve_route_by_native_thread("thread-duplicate")
+            .unwrap_err();
+        assert!(
+            ambiguous.starts_with("ROUTE_RESOLVE_AMBIGUOUS"),
+            "{ambiguous}"
+        );
         for invalid in ["", "thread\ninvalid"] {
             let error = manager.resolve_route_by_native_thread(invalid).unwrap_err();
             assert!(error.starts_with("ROUTE_RESOLVE_INVALID"), "{error}");
@@ -9704,7 +9725,7 @@ mod host_route_registry_tests {
             &host_paths,
             "agent-wire-route",
             "token-wire-route",
-            &binding.project_scope,
+            Some(&binding.project_scope),
             &RuntimeIdentity {
                 agent_id: binding.agent_id.clone(),
                 runtime_id: binding.runtime_id.clone(),

@@ -613,18 +613,25 @@ protocol.
 ### Thread-backed route resolution
 
 When `CODEX_THREAD_ID` is present, the daemon is the sole route selector. The
-CLI sends the native App Server thread ID through the context-free
-`RouteResolve` request and uses the daemon's typed `RuntimeBinding` result.
+CLI sends only the native App Server thread ID through the context-free
+`RouteResolve` request. The daemon first finds the one global identity for that
+thread, then matches that identity's current runtime binding; the global
+identity's current binding is the route selector. Historical routes are not
+candidates, even when they contain the same thread, binding ID, or generation.
+`routes.jsonl` is only the host route admission/storage index, never a selector
+or a fallback.
+
 `collab route resolve` exposes this read-only lookup; it defaults to
 `CODEX_THREAD_ID` and accepts `--native-thread-id <id>` for diagnostics.
-
 Thread-backed `collab context`, `collab master status`, and normal scoped
 commands must not use the current cwd or read `routes.jsonl` to guess a route.
 The daemon returns exactly one route, `ROUTE_RESOLVE_NOT_FOUND` for zero
-matches, and `ROUTE_RESOLVE_AMBIGUOUS` for multiple matches. An invalid or
-malformed thread ID is `ROUTE_RESOLVE_INVALID`. The resolver is read-only and
-returns no token; identity/token loading remains a separate authentication
-step after the route is selected.
+matches, and `ROUTE_RESOLVE_AMBIGUOUS` when multiple current global identities
+are bound to the thread or the selected identity's binding still maps to
+multiple routes. An invalid or malformed thread ID is
+`ROUTE_RESOLVE_INVALID`. The resolver is read-only and returns no token;
+identity/token loading remains a separate authentication step after the route
+is selected.
 
 ## Subscribe to a future event
 
