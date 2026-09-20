@@ -402,6 +402,41 @@ pub fn verify_candidate(candidate: &AppServerCandidate) -> Result<SelectedTransp
     })
 }
 
+/// Verify a transport already persisted for a registered App Server worker.
+///
+/// Unlike candidate admission, this does not probe notification capabilities.
+/// It only proves that the persisted thread still exists, still has the same
+/// identity, and is loaded after one canonical resume when necessary.
+pub fn probe_persisted_transport(transport: &SelectedTransport) -> Result<(), AdapterError> {
+    let thread_id = transport
+        .thread_id
+        .as_deref()
+        .ok_or_else(|| AdapterError::InvalidBinding {
+            detail: "persisted App Server transport has no thread_id".into(),
+        })?;
+    let thread_id = NativeThreadId::new(thread_id.to_owned()).map_err(|error| {
+        AdapterError::InvalidBinding {
+            detail: format!("persisted App Server thread_id is invalid: {error}"),
+        }
+    })?;
+    let mut client = transport_client(transport)?;
+    let status = persisted_thread_status(&mut client, thread_id.as_str())?;
+    if status != "notLoaded" {
+        return Ok(());
+    }
+    let resume_error = client
+        .call("thread/resume", json!({"threadId": thread_id.as_str()}))
+        .err();
+    match persisted_thread_status(&mut client, thread_id.as_str()) {
+        Ok(status) if status != "notLoaded" => Ok(()),
+        Ok(_) => Err(AdapterError::Unknown {
+            operation: "thread/resume",
+            detail: "persisted thread remained notLoaded after canonical thread/resume".into(),
+        }),
+        Err(error) => Err(resume_error.unwrap_or(error)),
+    }
+}
+
 /// Start or steer one immediate notification through a server-selected App
 /// Server transport. A successful result means the native App Server accepted
 /// the turn; execution and reply are observed separately.
@@ -649,6 +684,15 @@ fn thread_status(client: &mut Client, thread_id: &str) -> Result<String, Adapter
             operation: "thread/read",
             detail: "response is missing thread.status.type".into(),
         })
+}
+
+fn persisted_thread_status(client: &mut Client, thread_id: &str) -> Result<String, AdapterError> {
+    thread_status(client, thread_id).map_err(|error| match error {
+        AdapterError::Unknown { detail, .. } if detail.contains("thread not found") => {
+            AdapterError::RouteUnavailable { detail }
+        }
+        error => error,
+    })
 }
 
 fn active_turn_id(client: &mut Client, thread_id: &str) -> Result<Option<String>, AdapterError> {
@@ -1371,6 +1415,189 @@ mod tests {
         assert!(error.to_string().contains("ADAPTER_ROUTE_UNAVAILABLE"));
         server.join().unwrap();
         std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
+    fn persisted_probe_accepts_loaded_matching_thread() {
+        let socket = temp_socket("persisted-loaded");
+        let Some(listener) = bind_test_socket(&socket) else {
+            return;
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handshake(&mut stream);
+            initialize(&mut stream);
+            let read = next_request(&mut stream);
+            assert_eq!(read["method"], "thread/read");
+            respond(
+                &mut stream,
+                json!({
+                    "id": read["id"],
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "idle"}
+                        }
+                    }
+                }),
+            );
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        probe_persisted_transport(&selected_transport(&socket)).unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
+    fn persisted_probe_resumes_not_loaded_once_then_requires_loaded_read() {
+        let socket = temp_socket("persisted-resume");
+        let Some(listener) = bind_test_socket(&socket) else {
+            return;
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handshake(&mut stream);
+            initialize(&mut stream);
+            let read = next_request(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": read["id"],
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "notLoaded"}
+                        }
+                    }
+                }),
+            );
+            let resume = next_request(&mut stream);
+            assert_eq!(resume["method"], "thread/resume");
+            respond(
+                &mut stream,
+                json!({
+                    "id": resume["id"],
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "idle"}
+                        }
+                    }
+                }),
+            );
+            let read = next_request(&mut stream);
+            assert_eq!(read["method"], "thread/read");
+            respond(
+                &mut stream,
+                json!({
+                    "id": read["id"],
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "idle"}
+                        }
+                    }
+                }),
+            );
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        probe_persisted_transport(&selected_transport(&socket)).unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
+    fn persisted_probe_fails_closed_for_bad_identity_status_or_resume() {
+        let cases = [
+            (
+                "mismatch",
+                json!({
+                    "result": {
+                        "thread": {"id": "other-thread", "status": {"type": "idle"}}
+                    }
+                }),
+                None,
+                "thread identity mismatch",
+            ),
+            (
+                "missing-status",
+                json!({"result": {"thread": {"id": "thread-1"}}}),
+                None,
+                "missing thread.status.type",
+            ),
+            (
+                "not-found",
+                json!({"error": {"code": -32602, "message": "thread not found"}}),
+                None,
+                "ADAPTER_ROUTE_UNAVAILABLE",
+            ),
+            (
+                "read-failure",
+                json!({"error": {"code": -32603, "message": "thread-store read failed"}}),
+                None,
+                "thread-store read failed",
+            ),
+            (
+                "resume-still-not-loaded",
+                json!({
+                    "result": {
+                        "thread": {"id": "thread-1", "status": {"type": "notLoaded"}}
+                    }
+                }),
+                Some(json!({
+                    "result": {
+                        "thread": {"id": "thread-1", "status": {"type": "notLoaded"}}
+                    }
+                })),
+                "remained notLoaded",
+            ),
+        ];
+
+        for (label, first_response, resume_response, expected) in cases {
+            let socket = temp_socket(label);
+            let Some(listener) = bind_test_socket(&socket) else {
+                return;
+            };
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                handshake(&mut stream);
+                initialize(&mut stream);
+                let read = next_request(&mut stream);
+                let mut first = first_response;
+                first["id"] = read["id"].clone();
+                respond(&mut stream, first);
+                if let Some(mut resume_response) = resume_response {
+                    let resume = next_request(&mut stream);
+                    assert_eq!(resume["method"], "thread/resume");
+                    resume_response["id"] = resume["id"].clone();
+                    respond(&mut stream, resume_response);
+                    let read = next_request(&mut stream);
+                    respond(
+                        &mut stream,
+                        json!({
+                            "id": read["id"],
+                            "result": {
+                                "thread": {
+                                    "id": "thread-1",
+                                    "status": {"type": "notLoaded"}
+                                }
+                            }
+                        }),
+                    );
+                }
+                stream.shutdown(Shutdown::Both).ok();
+            });
+
+            let error = probe_persisted_transport(&selected_transport(&socket)).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{label}: expected {expected:?}, got {error}"
+            );
+            server.join().unwrap();
+            std::fs::remove_file(socket).ok();
+        }
     }
 
     #[test]

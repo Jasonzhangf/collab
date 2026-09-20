@@ -25,9 +25,12 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
-            appserver_candidate_check: Arc::new(|candidate| {
-                Ok(test_appserver_transport(&candidate.thread_id))
-            }),
+            appserver_candidate_check: Arc::new(
+                (|candidate: &crate::proto::AppServerCandidate| {
+                    Ok(test_appserver_transport(&candidate.thread_id))
+                })
+                .into(),
+            ),
             appserver_notification_sink: Arc::new(|_, _, _, _| {
                 Ok(serde_json::json!({"accepted": true}))
             }),
@@ -2684,16 +2687,19 @@ fn dead_master_transport_is_not_claimable_and_allows_approved_self_promote() {
         )
         .ok
     );
-    server.appserver_candidate_check = Arc::new(|candidate| {
-        if candidate.thread_id == "thread-b" {
-            Ok(test_appserver_transport("thread-b"))
-        } else {
-            Err(crate::client::adapters::AdapterError::RouteUnavailable {
-                detail: "thread is not live".into(),
+    server.appserver_candidate_check = Arc::new(
+        (|candidate: &crate::proto::AppServerCandidate| {
+            if candidate.thread_id == "thread-b" {
+                Ok(test_appserver_transport("thread-b"))
+            } else {
+                Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                    detail: "thread is not live".into(),
+                }
+                .to_string())
             }
-            .to_string())
-        }
-    });
+        })
+        .into(),
+    );
     let status = super::handle_master_status(&server);
     assert!(status.data["master"].is_null(), "{status:?}");
     assert_eq!(status.data["recorded_unusable"]["worker_id"], "peer-a");
@@ -2803,7 +2809,7 @@ fn register_appserver(server: &mut Server, id: &str, thread_id: &str) -> Resp {
             })
         }
     };
-    server.appserver_candidate_check = Arc::new(checked);
+    server.appserver_candidate_check = Arc::new(checked.into());
     handle_register_with_app_scope(
         server,
         id.into(),
@@ -2836,12 +2842,15 @@ fn init_registration_result_exposes_persisted_runtime_identity() {
 fn master_promotion_requires_live_transport() {
     let (mut server, root) = test_server();
     register(&server, "peer-a", "thread-a");
-    server.appserver_candidate_check = Arc::new(|_| {
-        Err(crate::client::adapters::AdapterError::RouteUnavailable {
-            detail: "thread is not live".into(),
-        }
-        .to_string())
-    });
+    server.appserver_candidate_check = Arc::new(
+        (|_: &crate::proto::AppServerCandidate| {
+            Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                detail: "thread is not live".into(),
+            }
+            .to_string())
+        })
+        .into(),
+    );
     let denied = super::handle_master_promote(
         &server,
         "peer-a".into(),
@@ -2851,6 +2860,98 @@ fn master_promotion_requires_live_transport() {
     assert!(!denied.ok);
     assert!(denied.error.unwrap().contains("live registered transport"));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_promotion_uses_persisted_probe_after_active_writer_conflict() {
+    let (mut server, root) = test_server();
+    let registered = register_appserver(&mut server, "peer-persisted", "thread-persisted");
+    assert!(registered.ok, "{registered:?}");
+    let candidate_check_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let candidate_check_called_for_server = candidate_check_called.clone();
+    let persisted_probe_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let persisted_probe_called_for_server = persisted_probe_called.clone();
+    server.appserver_candidate_check = Arc::new(AppServerCandidateCheck {
+        verify: Arc::new(move |_: &crate::proto::AppServerCandidate| {
+            candidate_check_called_for_server.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(
+                "ADAPTER_UNKNOWN: rpc unknown: thread thread-persisted already has an active writer"
+                    .into(),
+            )
+        }),
+        persisted_probe: Arc::new(move |_| {
+            persisted_probe_called_for_server.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }),
+    });
+
+    let promoted = super::handle_master_promote(
+        &server,
+        "peer-persisted".into(),
+        "token-peer-persisted".into(),
+        "user approved peer-persisted as appserver master".into(),
+    );
+    assert!(promoted.ok, "{}", promoted.error.unwrap_or_default());
+    assert!(
+        !candidate_check_called.load(std::sync::atomic::Ordering::Relaxed),
+        "persisted same-owner transport must not use candidate admission probing"
+    );
+    assert!(
+        persisted_probe_called.load(std::sync::atomic::Ordering::Relaxed),
+        "persisted same-owner transport must use the persisted probe"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn master_promotion_fails_closed_when_persisted_probe_rejects() {
+    for (label, probe_error) in [
+        (
+            "id-mismatch",
+            "ADAPTER_UNKNOWN: thread/read unknown: thread identity mismatch: expected thread-persisted, observed thread-other",
+        ),
+        (
+            "unavailable",
+            "ADAPTER_ROUTE_UNAVAILABLE: persisted thread is missing",
+        ),
+        ("timeout", "ADAPTER_TIMEOUT: thread/read timed out"),
+        (
+            "read-failure",
+            "ADAPTER_UNKNOWN: thread/read unknown: response is missing thread.status.type",
+        ),
+        (
+            "resume-still-not-loaded",
+            "ADAPTER_UNKNOWN: thread/resume unknown: persisted thread remained notLoaded after canonical thread/resume",
+        ),
+    ] {
+        let (mut server, root) = test_server();
+        let registered = register_appserver(&mut server, "peer-persisted", "thread-persisted");
+        assert!(registered.ok, "{label}: {registered:?}");
+        let probe_error = probe_error.to_string();
+        server.appserver_candidate_check = Arc::new(AppServerCandidateCheck {
+            verify: Arc::new(|_: &crate::proto::AppServerCandidate| {
+                panic!("persisted same-owner transport must not use candidate admission probing")
+            }),
+            persisted_probe: Arc::new(move |_| Err(probe_error.clone())),
+        });
+
+        let promoted = super::handle_master_promote(
+            &server,
+            "peer-persisted".into(),
+            "token-peer-persisted".into(),
+            "user approved peer-persisted as appserver master".into(),
+        );
+        assert!(!promoted.ok, "{label}: {promoted:?}");
+        assert!(
+            promoted
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("requires a live registered transport")
+                    || error.contains("identity is unknown")),
+            "{label}: {promoted:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -3616,13 +3717,16 @@ fn orphan_force_close_defers_when_owner_appserver_probe_is_unknown() {
     register(&server, "owner", "thread-owner");
     register(&server, "peer", "thread-peer");
     assert!(create_task(&server, "owner", "working", "feature").ok);
-    server.appserver_candidate_check = Arc::new(|candidate| {
-        if candidate.thread_id == "thread-owner" {
-            Err("owner route probe unknown".into())
-        } else {
-            Ok(test_appserver_transport(&candidate.thread_id))
-        }
-    });
+    server.appserver_candidate_check = Arc::new(
+        (|candidate: &crate::proto::AppServerCandidate| {
+            if candidate.thread_id == "thread-owner" {
+                Err("owner route probe unknown".into())
+            } else {
+                Ok(test_appserver_transport(&candidate.thread_id))
+            }
+        })
+        .into(),
+    );
     let resp = handle_task_close(
         &server,
         "peer".into(),
@@ -3687,16 +3791,19 @@ fn registered_peer_force_closes_orphaned_owner_with_no_live_master() {
     register(&server, "owner", "thread-owner");
     register(&server, "peer", "thread-peer");
     assert!(create_task(&server, "owner", "orphan", "feature").ok);
-    server.appserver_candidate_check = Arc::new(|candidate| {
-        if candidate.thread_id == "thread-owner" {
-            Err(crate::client::adapters::AdapterError::RouteUnavailable {
-                detail: "owner route lost".into(),
+    server.appserver_candidate_check = Arc::new(
+        (|candidate: &crate::proto::AppServerCandidate| {
+            if candidate.thread_id == "thread-owner" {
+                Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                    detail: "owner route lost".into(),
+                }
+                .to_string())
+            } else {
+                Ok(test_appserver_transport(&candidate.thread_id))
             }
-            .to_string())
-        } else {
-            Ok(test_appserver_transport(&candidate.thread_id))
-        }
-    });
+        })
+        .into(),
+    );
     let resp = handle_task_close(
         &server,
         "peer".into(),
@@ -3722,16 +3829,19 @@ fn repeated_orphan_force_close_is_idempotent_after_journal_replay() {
     register(&server, "owner", "thread-owner");
     register(&server, "peer", "thread-peer");
     assert!(create_task(&server, "owner", "orphan", "feature").ok);
-    server.appserver_candidate_check = Arc::new(|candidate| {
-        if candidate.thread_id == "thread-owner" {
-            Err(crate::client::adapters::AdapterError::RouteUnavailable {
-                detail: "owner route lost".into(),
+    server.appserver_candidate_check = Arc::new(
+        (|candidate: &crate::proto::AppServerCandidate| {
+            if candidate.thread_id == "thread-owner" {
+                Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                    detail: "owner route lost".into(),
+                }
+                .to_string())
+            } else {
+                Ok(test_appserver_transport(&candidate.thread_id))
             }
-            .to_string())
-        } else {
-            Ok(test_appserver_transport(&candidate.thread_id))
-        }
-    });
+        })
+        .into(),
+    );
     let reason = "owner route lost; replay closes the same orphan";
     let first = handle_task_close(
         &server,
@@ -6350,12 +6460,15 @@ fn worker_status_query_reports_unverified_appserver_as_lost() {
         register_appserver(&mut server, "lost-appserver", "thread-lost-appserver").ok,
         "appserver registration failed"
     );
-    server.appserver_candidate_check = Arc::new(|_| {
-        Err(crate::client::adapters::AdapterError::RouteUnavailable {
-            detail: "test appserver verification failure".into(),
-        }
-        .to_string())
-    });
+    server.appserver_candidate_check = Arc::new(
+        (|_: &crate::proto::AppServerCandidate| {
+            Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                detail: "test appserver verification failure".into(),
+            }
+            .to_string())
+        })
+        .into(),
+    );
     let resp = dispatch(&Arc::new(server), Req::WorkerStatus { worker_id: None });
     assert!(resp.ok);
     let workers = resp.data["workers"].as_array().unwrap();
@@ -6765,16 +6878,19 @@ fn worker_unresponsive_notifies_live_master_with_snapshot_advice() {
     let (mut server, root) = test_server();
     register(&server, "master-worker", "thread-master");
     register(&server, "stuck-worker", "thread-stuck");
-    server.appserver_candidate_check = Arc::new(|candidate| {
-        if candidate.thread_id == "thread-stuck" {
-            Err(crate::client::adapters::AdapterError::RouteUnavailable {
-                detail: "stuck worker route is not live".into(),
+    server.appserver_candidate_check = Arc::new(
+        (|candidate: &crate::proto::AppServerCandidate| {
+            if candidate.thread_id == "thread-stuck" {
+                Err(crate::client::adapters::AdapterError::RouteUnavailable {
+                    detail: "stuck worker route is not live".into(),
+                }
+                .to_string())
+            } else {
+                Ok(test_appserver_transport(&candidate.thread_id))
             }
-            .to_string())
-        } else {
-            Ok(test_appserver_transport(&candidate.thread_id))
-        }
-    });
+        })
+        .into(),
+    );
     let server_arc = std::sync::Arc::new(server);
     let promote_resp = dispatch(
         &server_arc,
