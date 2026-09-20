@@ -429,12 +429,29 @@ pub fn probe_persisted_transport(transport: &SelectedTransport) -> Result<(), Ad
         .err();
     match persisted_thread_status(&mut client, thread_id.as_str()) {
         Ok(status) if status != "notLoaded" => Ok(()),
-        Ok(_) => Err(AdapterError::Unknown {
+        Ok(_)
+            if resume_error.as_ref().is_some_and(|error| {
+                is_matching_active_writer_conflict(error, thread_id.as_str())
+            }) =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(resume_error.unwrap_or(AdapterError::Unknown {
             operation: "thread/resume",
             detail: "persisted thread remained notLoaded after canonical thread/resume".into(),
-        }),
+        })),
         Err(error) => Err(resume_error.unwrap_or(error)),
     }
+}
+
+fn is_matching_active_writer_conflict(error: &AdapterError, thread_id: &str) -> bool {
+    matches!(
+        error,
+        AdapterError::Unknown {
+            operation: "rpc",
+            detail,
+        } if detail == &format!("rpc unknown: thread {thread_id} already has an active writer")
+    )
 }
 
 /// Start or steer one immediate notification through a server-selected App
@@ -1509,6 +1526,126 @@ mod tests {
     }
 
     #[test]
+    fn persisted_probe_accepts_matching_active_writer_conflict() {
+        let socket = temp_socket("persisted-active-writer");
+        let Some(listener) = bind_test_socket(&socket) else {
+            return;
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handshake(&mut stream);
+            initialize(&mut stream);
+            let read = next_request(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": read["id"],
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "notLoaded"}
+                        }
+                    }
+                }),
+            );
+            let resume = next_request(&mut stream);
+            assert_eq!(resume["method"], "thread/resume");
+            assert_eq!(resume["params"]["threadId"], "thread-1");
+            respond(
+                &mut stream,
+                json!({
+                    "id": resume["id"],
+                    "error": {
+                        "code": -32000,
+                        "message": "rpc unknown: thread thread-1 already has an active writer"
+                    }
+                }),
+            );
+            let read = next_request(&mut stream);
+            assert_eq!(read["method"], "thread/read");
+            respond(
+                &mut stream,
+                json!({
+                    "id": read["id"],
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "notLoaded"}
+                        }
+                    }
+                }),
+            );
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        probe_persisted_transport(&selected_transport(&socket)).unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
+    fn persisted_probe_rejects_active_writer_for_another_thread() {
+        let socket = temp_socket("persisted-other-active-writer");
+        let Some(listener) = bind_test_socket(&socket) else {
+            return;
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handshake(&mut stream);
+            initialize(&mut stream);
+            let read = next_request(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": read["id"],
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "notLoaded"}
+                        }
+                    }
+                }),
+            );
+            let resume = next_request(&mut stream);
+            assert_eq!(resume["method"], "thread/resume");
+            respond(
+                &mut stream,
+                json!({
+                    "id": resume["id"],
+                    "error": {
+                        "code": -32000,
+                        "message": "rpc unknown: thread thread-2 already has an active writer"
+                    }
+                }),
+            );
+            let read = next_request(&mut stream);
+            respond(
+                &mut stream,
+                json!({
+                    "id": read["id"],
+                    "result": {
+                        "thread": {
+                            "id": "thread-1",
+                            "status": {"type": "notLoaded"}
+                        }
+                    }
+                }),
+            );
+            stream.shutdown(Shutdown::Both).ok();
+        });
+
+        let error = probe_persisted_transport(&selected_transport(&socket)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("thread thread-2 already has an active writer"),
+            "{error}"
+        );
+        server.join().unwrap();
+        std::fs::remove_file(socket).ok();
+    }
+
+    #[test]
     fn persisted_probe_fails_closed_for_bad_identity_status_or_resume() {
         let cases = [
             (
@@ -1552,6 +1689,21 @@ mod tests {
                     }
                 })),
                 "remained notLoaded",
+            ),
+            (
+                "resume-other-error",
+                json!({
+                    "result": {
+                        "thread": {"id": "thread-1", "status": {"type": "notLoaded"}}
+                    }
+                }),
+                Some(json!({
+                    "error": {
+                        "code": -32000,
+                        "message": "thread-store resume failed"
+                    }
+                })),
+                "thread-store resume failed",
             ),
         ];
 
