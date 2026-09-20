@@ -416,7 +416,7 @@ fn register(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::V
         None => RuntimeIdentity::cli_adapter(&ident.worker_id)?,
     };
     let cwd = scope.root.display().to_string();
-    let response: serde_json::Value = client::call_with_runtime_identity_at_root(
+    let response: serde_json::Value = client::call_with_runtime_identity_at_root_daemon(
         &scope.sock_path(),
         &Req::Register {
             worker_id: ident.worker_id.clone(),
@@ -1016,7 +1016,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Worker { cmd } => {
-            let scope = Scope::resolve()?;
+            let scope = match cmd {
+                WorkerCmd::Recover => scope::resolve_for_recovery()?,
+                _ => Scope::resolve()?,
+            };
             match cmd {
                 WorkerCmd::Recover => {
                     let mut ident = identity::load_or_create(&scope, None, None)?;

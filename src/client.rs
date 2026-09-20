@@ -239,6 +239,19 @@ fn call_with_runtime_identity_at_root_selected_endpoint<T: DeserializeOwned>(
     call_with_context(sock, req, envelope.project_context)
 }
 
+/// Submit registration and identity-recovery requests directly to the daemon.
+/// These control-plane operations must be able to repair a missing App Server
+/// route before ordinary adapter routing is available.
+pub fn call_with_runtime_identity_at_root_daemon<T: DeserializeOwned>(
+    sock: &Path,
+    req: &Req,
+    root: &Path,
+    identity: &RuntimeIdentity,
+) -> anyhow::Result<T> {
+    let project_context = ProjectContext::for_registered_route(root, identity)?;
+    call_with_context(sock, req, Some(project_context))
+}
+
 pub fn daemon_locked(server_dir: &Path) -> bool {
     matches!(lock_availability(server_dir), LockAvailability::Held)
 }
