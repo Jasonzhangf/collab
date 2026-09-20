@@ -145,8 +145,68 @@ const MAX_WORKTREE_PATH_BYTES: usize = 80;
 /// otherwise an old binary could append concurrently under the new socket.
 const LEGACY_HOST_DAEMON_LOCK_PATH: &str = "/tmp/collab-host.lock";
 
-type AppServerCandidateCheck =
+type AppServerCandidateVerify =
     dyn Fn(&crate::proto::AppServerCandidate) -> Result<SelectedTransport, String> + Send + Sync;
+
+pub(crate) struct AppServerCandidateCheck {
+    verify: Arc<AppServerCandidateVerify>,
+    persisted_probe: Arc<dyn Fn(&SelectedTransport) -> Result<(), String> + Send + Sync>,
+}
+
+impl AppServerCandidateCheck {
+    fn new(
+        verify: Arc<AppServerCandidateVerify>,
+        persisted_probe: Arc<dyn Fn(&SelectedTransport) -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        Self {
+            verify,
+            persisted_probe,
+        }
+    }
+
+    fn verify(
+        &self,
+        candidate: &crate::proto::AppServerCandidate,
+    ) -> Result<SelectedTransport, String> {
+        (self.verify)(candidate)
+    }
+
+    fn appserver_persisted_probe(&self, transport: &SelectedTransport) -> Result<(), String> {
+        (self.persisted_probe)(transport)
+    }
+}
+
+impl<F> From<F> for AppServerCandidateCheck
+where
+    F: Fn(&crate::proto::AppServerCandidate) -> Result<SelectedTransport, String>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn from(verify: F) -> Self {
+        let verify = Arc::new(verify);
+        let persisted_verify = Arc::clone(&verify);
+        Self::new(
+            verify,
+            Arc::new(move |transport| {
+                let candidate = crate::proto::AppServerCandidate {
+                    endpoint: transport.endpoint.clone().ok_or_else(|| {
+                        "persisted App Server transport has no endpoint".to_string()
+                    })?,
+                    namespace: transport.namespace.clone().ok_or_else(|| {
+                        "persisted App Server transport has no namespace".to_string()
+                    })?,
+                    thread_id: transport.thread_id.clone().ok_or_else(|| {
+                        "persisted App Server transport has no thread_id".to_string()
+                    })?,
+                };
+                persisted_verify(&candidate).map(|_| ())
+            }),
+        )
+    }
+}
+
+type AppServerCandidateCheckHandle = AppServerCandidateCheck;
 type AppServerNotificationSink =
     dyn Fn(&SelectedTransport, &str, &str, bool) -> Result<serde_json::Value, String> + Send + Sync;
 type AppServerThreadStatus =
@@ -154,10 +214,16 @@ type AppServerThreadStatus =
 type AppServerThreadArchive =
     dyn Fn(&SelectedTransport, &str) -> Result<serde_json::Value, String> + Send + Sync;
 
-fn default_appserver_candidate_check() -> Arc<AppServerCandidateCheck> {
-    Arc::new(|candidate| {
-        crate::client::adapters::verify_candidate(candidate).map_err(|error| error.to_string())
-    })
+fn default_appserver_candidate_check() -> Arc<AppServerCandidateCheckHandle> {
+    Arc::new(AppServerCandidateCheck::new(
+        Arc::new(|candidate| {
+            crate::client::adapters::verify_candidate(candidate).map_err(|error| error.to_string())
+        }),
+        Arc::new(|transport| {
+            crate::client::adapters::probe_persisted_transport(transport)
+                .map_err(|error| error.to_string())
+        }),
+    ))
 }
 
 pub(crate) fn default_appserver_notification_sink() -> Arc<AppServerNotificationSink> {
@@ -447,7 +513,7 @@ pub struct Server {
     pub journal_path: PathBuf,
     pub state: Mutex<State>,
     pub journal: Mutex<std::fs::File>,
-    pub appserver_candidate_check: Arc<AppServerCandidateCheck>,
+    pub appserver_candidate_check: Arc<AppServerCandidateCheckHandle>,
     pub appserver_notification_sink: Arc<AppServerNotificationSink>,
     pub appserver_thread_status: Arc<AppServerThreadStatus>,
     pub appserver_thread_archive: Arc<AppServerThreadArchive>,
@@ -1466,7 +1532,7 @@ fn validate_transport_candidates(
         }
     }
     drop(state);
-    match (server.appserver_candidate_check)(candidate) {
+    match server.appserver_candidate_check.verify(candidate) {
         Ok(transport) => Ok(transport),
         Err(error) => {
             append_log(
@@ -3349,16 +3415,19 @@ mod notification_batch_tests {
                 journal_path: root.join(".agent-collab/server/journal.jsonl"),
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
-                appserver_candidate_check: Arc::new(|candidate| {
-                    Ok(SelectedTransport {
-                        kind: TransportKind::AppServer,
-                        endpoint: Some(candidate.endpoint.clone()),
-                        namespace: Some(candidate.namespace.clone()),
-                        thread_id: Some(candidate.thread_id.clone()),
-                        capabilities: vec!["send_message_to_thread".into()],
-                        self_check: "test appserver".into(),
+                appserver_candidate_check: Arc::new(
+                    (|candidate: &crate::proto::AppServerCandidate| {
+                        Ok(SelectedTransport {
+                            kind: TransportKind::AppServer,
+                            endpoint: Some(candidate.endpoint.clone()),
+                            namespace: Some(candidate.namespace.clone()),
+                            thread_id: Some(candidate.thread_id.clone()),
+                            capabilities: vec!["send_message_to_thread".into()],
+                            self_check: "test appserver".into(),
+                        })
                     })
-                }),
+                    .into(),
+                ),
                 appserver_notification_sink: Arc::new(|_, _, _, _| {
                     Ok(serde_json::json!({"accepted": true}))
                 }),
@@ -4681,6 +4750,18 @@ fn worker_identity_presence(server: &Server, worker: &WorkerRec) -> IdentityPres
     let Some(transport) = selected_transport_for_worker(worker) else {
         return IdentityPresence::Missing;
     };
+    if is_persisted_appserver_transport(worker, &transport) {
+        return match server
+            .appserver_candidate_check
+            .appserver_persisted_probe(&transport)
+        {
+            Ok(()) => IdentityPresence::Present,
+            Err(error) if error.starts_with("ADAPTER_ROUTE_UNAVAILABLE:") => {
+                IdentityPresence::Missing
+            }
+            Err(_) => IdentityPresence::Unknown,
+        };
+    }
     let (Some(endpoint), Some(namespace), Some(thread_id)) =
         (transport.endpoint, transport.namespace, transport.thread_id)
     else {
@@ -4691,7 +4772,7 @@ fn worker_identity_presence(server: &Server, worker: &WorkerRec) -> IdentityPres
         namespace,
         thread_id,
     };
-    match (server.appserver_candidate_check)(&candidate) {
+    match server.appserver_candidate_check.verify(&candidate) {
         Ok(_) => IdentityPresence::Present,
         Err(error) => {
             // A positively unavailable route is a dead transport.  Timeouts,
@@ -4704,6 +4785,14 @@ fn worker_identity_presence(server: &Server, worker: &WorkerRec) -> IdentityPres
             }
         }
     }
+}
+
+fn is_persisted_appserver_transport(worker: &WorkerRec, transport: &SelectedTransport) -> bool {
+    worker.transport.as_ref() == Some(transport)
+        && transport.kind == TransportKind::AppServer
+        && transport.endpoint.is_some()
+        && transport.namespace.is_some()
+        && transport.thread_id.is_some()
 }
 
 fn appserver_agent_view(
@@ -9403,7 +9492,9 @@ mod host_route_registry_tests {
             journal_path: journal_path.clone(),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
-            appserver_candidate_check: Arc::new(|candidate| Ok(verified_appserver(candidate))),
+            appserver_candidate_check: Arc::new(
+                (|candidate: &AppServerCandidate| Ok(verified_appserver(candidate))).into(),
+            ),
             appserver_notification_sink: Arc::new(|_, _, _, _| {
                 Ok(serde_json::json!({"accepted": true}))
             }),
@@ -9421,7 +9512,7 @@ mod host_route_registry_tests {
         check: impl Fn(&AppServerCandidate) -> Result<SelectedTransport, String> + Send + Sync + 'static,
     ) {
         let server = Arc::get_mut(server).expect("unique test server");
-        server.appserver_candidate_check = Arc::new(check);
+        server.appserver_candidate_check = Arc::new(check.into());
     }
 
     fn with_appserver_notification_sink(
@@ -10471,7 +10562,9 @@ mod host_route_registry_tests {
                     .open(&host_journal)
                     .unwrap(),
             ),
-            appserver_candidate_check: Arc::new(|candidate| Ok(verified_appserver(candidate))),
+            appserver_candidate_check: Arc::new(
+                (|candidate: &AppServerCandidate| Ok(verified_appserver(candidate))).into(),
+            ),
             appserver_notification_sink: Arc::new(|_, _, _, _| {
                 Ok(serde_json::json!({"accepted": true}))
             }),
@@ -14787,16 +14880,19 @@ mod reducer_binding_tests {
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
-            appserver_candidate_check: Arc::new(|candidate| {
-                Ok(SelectedTransport {
-                    kind: TransportKind::AppServer,
-                    endpoint: Some(candidate.endpoint.clone()),
-                    namespace: Some(candidate.namespace.clone()),
-                    thread_id: Some(candidate.thread_id.clone()),
-                    capabilities: vec!["send_message_to_thread".into()],
-                    self_check: "test appserver".into(),
+            appserver_candidate_check: Arc::new(
+                (|candidate: &crate::proto::AppServerCandidate| {
+                    Ok(SelectedTransport {
+                        kind: TransportKind::AppServer,
+                        endpoint: Some(candidate.endpoint.clone()),
+                        namespace: Some(candidate.namespace.clone()),
+                        thread_id: Some(candidate.thread_id.clone()),
+                        capabilities: vec!["send_message_to_thread".into()],
+                        self_check: "test appserver".into(),
+                    })
                 })
-            }),
+                .into(),
+            ),
             appserver_notification_sink: Arc::new(|_, _, _, _| {
                 Ok(serde_json::json!({"accepted": true}))
             }),
@@ -14897,9 +14993,12 @@ mod reducer_binding_tests {
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
             state: Mutex::new(State::default()),
             journal: Mutex::new(journal),
-            appserver_candidate_check: Arc::new(|candidate| {
-                Ok(peer_tests::test_appserver_transport(&candidate.thread_id))
-            }),
+            appserver_candidate_check: Arc::new(
+                (|candidate: &crate::proto::AppServerCandidate| {
+                    Ok(peer_tests::test_appserver_transport(&candidate.thread_id))
+                })
+                .into(),
+            ),
             appserver_notification_sink: default_appserver_notification_sink(),
             appserver_thread_status: default_appserver_thread_status(),
             appserver_thread_archive: default_appserver_thread_archive(),

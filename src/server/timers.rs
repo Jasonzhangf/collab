@@ -399,16 +399,19 @@ mod tests {
                 journal_path: root.join(".agent-collab/server/journal.jsonl"),
                 state: Mutex::new(State::default()),
                 journal: Mutex::new(journal),
-                appserver_candidate_check: Arc::new(|candidate| {
-                    Ok(SelectedTransport {
-                        kind: crate::proto::TransportKind::AppServer,
-                        endpoint: Some(candidate.endpoint.clone()),
-                        namespace: Some(candidate.namespace.clone()),
-                        thread_id: Some(candidate.thread_id.clone()),
-                        capabilities: vec!["send_message_to_thread".into()],
-                        self_check: "test appserver".into(),
+                appserver_candidate_check: Arc::new(
+                    (|candidate: &crate::proto::AppServerCandidate| {
+                        Ok(SelectedTransport {
+                            kind: crate::proto::TransportKind::AppServer,
+                            endpoint: Some(candidate.endpoint.clone()),
+                            namespace: Some(candidate.namespace.clone()),
+                            thread_id: Some(candidate.thread_id.clone()),
+                            capabilities: vec!["send_message_to_thread".into()],
+                            self_check: "test appserver".into(),
+                        })
                     })
-                }),
+                    .into(),
+                ),
                 appserver_notification_sink: Arc::new(|_, _, _, _| {
                     Ok(serde_json::json!({"accepted": true}))
                 }),
