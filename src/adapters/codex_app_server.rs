@@ -450,7 +450,8 @@ fn is_matching_active_writer_conflict(error: &AdapterError, thread_id: &str) -> 
         AdapterError::Unknown {
             operation: "rpc",
             detail,
-        } if detail == &format!("rpc unknown: thread {thread_id} already has an active writer")
+        } if detail
+            == &format!("thread-store conflict: thread {thread_id} already has an active writer")
     )
 }
 
@@ -1557,7 +1558,7 @@ mod tests {
                     "id": resume["id"],
                     "error": {
                         "code": -32000,
-                        "message": "rpc unknown: thread thread-1 already has an active writer"
+                        "message": "thread-store conflict: thread thread-1 already has an active writer"
                     }
                 }),
             );
@@ -1614,7 +1615,7 @@ mod tests {
                     "id": resume["id"],
                     "error": {
                         "code": -32000,
-                        "message": "rpc unknown: thread thread-2 already has an active writer"
+                        "message": "thread-store conflict: thread thread-2 already has an active writer"
                     }
                 }),
             );
