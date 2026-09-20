@@ -415,6 +415,24 @@ fn register(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::V
         }
         None => RuntimeIdentity::cli_adapter(&ident.worker_id)?,
     };
+    register_with_runtime(scope, ident, context_runtime)
+}
+
+/// Bootstrap recovery with the only runtime identity accepted before the
+/// daemon has restored this worker's registered route.
+fn register_recovery(scope: &Scope, ident: &mut Identity) -> anyhow::Result<serde_json::Value> {
+    register_with_runtime(
+        scope,
+        ident,
+        RuntimeIdentity::cli_adapter(&ident.worker_id)?,
+    )
+}
+
+fn register_with_runtime(
+    scope: &Scope,
+    ident: &mut Identity,
+    context_runtime: RuntimeIdentity,
+) -> anyhow::Result<serde_json::Value> {
     let cwd = scope.root.display().to_string();
     let response: serde_json::Value = client::call_with_runtime_identity_at_root_daemon(
         &scope.sock_path(),
@@ -1023,7 +1041,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             match cmd {
                 WorkerCmd::Recover => {
                     let mut ident = identity::load_or_create(&scope, None, None)?;
-                    let _ = register(&scope, &mut ident)?;
+                    let _ = register_recovery(&scope, &mut ident)?;
                     out(&json!({
                         "recovered": true,
                         "worker_id": ident.worker_id,
