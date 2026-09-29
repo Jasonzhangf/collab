@@ -118,7 +118,7 @@ mod tests {
             .unwrap();
         (
             Server {
-                config: crate::config::Config::default(),
+                config: crate::server::peer_tests::test_config_for_root(&root),
                 root: root.clone(),
                 storage_root: root.clone(),
                 journal_path: root.join(".agent-collab/server/journal.jsonl"),

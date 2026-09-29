@@ -6,6 +6,17 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+pub(crate) fn test_config_for_root(root: &Path) -> crate::config::Config {
+    let external = crate::config::test_worktree_root_for(root);
+    crate::config::Config {
+        worktree: crate::config::Worktree {
+            root: Some(external),
+            ..Default::default()
+        },
+        ..crate::config::Config::default()
+    }
+}
+
 pub(crate) fn test_server() -> (Server, PathBuf) {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -19,7 +30,7 @@ pub(crate) fn test_server() -> (Server, PathBuf) {
         .unwrap();
     (
         Server {
-            config: crate::config::Config::default(),
+            config: test_config_for_root(&root),
             root: root.clone(),
             storage_root: root.clone(),
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
@@ -1522,7 +1533,7 @@ fn replayed_command_is_idempotent_and_operation_conflict_fails_closed() {
             .open(root.join(".agent-collab/server/journal.jsonl"))
             .unwrap();
         Server {
-            config: crate::config::Config::default(),
+            config: test_config_for_root(&root),
             root: root.clone(),
             storage_root: root.clone(),
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
@@ -4739,17 +4750,26 @@ fn worktree_path_budget_accepts_short_slug_and_rejects_escape() {
         now_ms()
     ));
     std::fs::create_dir_all(root.join("playground")).unwrap();
-    assert!(validate_worktree_path(&root, "./playground/ar03-0828").is_ok());
-    assert!(validate_worktree_path(
-        &root,
-        "./playground/v3-direct-sse-terminal-observability-20260827-long-run-id"
-    )
-    .is_err());
-    assert!(validate_worktree_path(&root, "./playground/../outside").is_err());
+    let external = root.parent().unwrap().join("external");
+    std::fs::create_dir_all(&external).unwrap();
+    let config = crate::config::Config {
+        worktree: crate::config::Worktree {
+            root: Some(external.clone()),
+            ..Default::default()
+        },
+        ..crate::config::Config::default()
+    };
+    let legacy = String::from("./playground/ar03-0828");
+    assert!(validate_new_worktree_path(&root, &config, &legacy).is_err());
+    let external_worktree = external.join("ar03-0828").display().to_string();
+    std::fs::create_dir_all(external.join("ar03-0828")).unwrap();
+    assert!(validate_new_worktree_path(&root, &config, &external_worktree).is_ok());
+    assert!(validate_worktree_path(&root, &config, "/too-long").is_err());
+    assert!(validate_worktree_path(&root, &config, "./playground/../outside").is_err());
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("/tmp", root.join("playground/link")).unwrap();
-        assert!(validate_worktree_path(&root, "./playground/link/escape").is_err());
+        assert!(validate_worktree_path(&root, &config, "./playground/link/escape").is_err());
     }
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -5934,7 +5954,9 @@ fn context_is_read_only_and_does_not_consume_notifications() {
     let (server, root) = test_server();
     register(&server, "peer", "%peer");
     register(&server, "peer-two", "%peer-two");
-    std::fs::create_dir_all(root.join("playground")).unwrap();
+    let external = server.config.worktree.root.clone().unwrap();
+    std::fs::create_dir_all(external.join("peer-task")).unwrap();
+    std::fs::create_dir_all(external.join("other-task")).unwrap();
     assert!(
         handle_task_register(
             &server,
@@ -5943,7 +5965,7 @@ fn context_is_read_only_and_does_not_consume_notifications() {
             "task".into(),
             None,
             Some("feature".into()),
-            Some("./playground/peer-task".into()),
+            Some(external.join("peer-task").display().to_string()),
             Some("peer-branch".into()),
             Some("peer-base".into()),
             default_priority(),
@@ -5958,7 +5980,7 @@ fn context_is_read_only_and_does_not_consume_notifications() {
             "other-task".into(),
             None,
             Some("other-feature".into()),
-            Some("./playground/other-task".into()),
+            Some(external.join("other-task").display().to_string()),
             Some("other-branch".into()),
             Some("other-base".into()),
             default_priority(),
@@ -6218,12 +6240,23 @@ fn cleanup_rejects_unmerged_then_removes_only_merged_clean_worktree() {
             .success()
     );
 
-    let refused = close_task_resources(&root, Some("playground/wt"), Some("feature"));
+    let refused = close_task_resources(
+        &root,
+        &crate::config::Config::default(),
+        Some("playground/wt"),
+        Some("feature"),
+    );
     assert!(refused.unwrap_err().contains("not merged"));
     assert!(playground.join("wt").is_dir());
 
     assert!(git(&["merge", "-q", "feature"]).status.success());
-    assert!(close_task_resources(&root, Some("playground/wt"), Some("feature")).is_ok());
+    assert!(close_task_resources(
+        &root,
+        &crate::config::Config::default(),
+        Some("playground/wt"),
+        Some("feature")
+    )
+    .is_ok());
     assert!(!playground.join("wt").exists());
     assert!(!git(&["rev-parse", "--verify", "feature"]).status.success());
     std::fs::remove_dir_all(root).ok();

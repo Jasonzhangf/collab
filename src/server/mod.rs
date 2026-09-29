@@ -140,6 +140,105 @@ const TASK_STATUSES: [&str; 12] = [
     "cancelled",
 ];
 const MAX_WORKTREE_PATH_BYTES: usize = 80;
+
+/// Canonical external playground root required for new task worktrees.
+/// Configured via `~/.appsdk/config.toml` `[worktree] root`, or
+/// `$COLLAB_WORKTREE_ROOT`, defaulting to `$HOME/playground`.
+///
+/// The legacy project-root `playground/` layout remains readable for already
+/// registered tasks so existing worktrees can still be audited and closed;
+/// new registrations must use the configured external root.
+
+fn configured_worktree_root(config: &crate::config::Config) -> Result<PathBuf, String> {
+    config
+        .worktree
+        .resolve()
+        .map_err(|error| format!("worktree root is unavailable: {error}"))
+}
+
+fn canonical_worktree_target(root: &Path, raw: &str) -> Result<PathBuf, String> {
+    let raw_trim = raw.trim();
+    if raw_trim.is_empty() {
+        return Err("worktree path must be non-empty".into());
+    }
+    let path = Path::new(raw_trim);
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("worktree path may not contain '..'".into());
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("project root cannot be canonicalized: {error}"))?;
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let relative = raw_trim.strip_prefix("./").unwrap_or(raw_trim);
+        canonical_root.join(relative)
+    };
+    let existing = {
+        let mut probe = candidate.as_path();
+        while !probe.exists() {
+            probe = probe
+                .parent()
+                .ok_or_else(|| "worktree path has no existing parent".to_string())?;
+        }
+        probe
+    };
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|error| format!("worktree path cannot be canonicalized: {error}"))?;
+    let suffix = candidate
+        .strip_prefix(existing)
+        .map_err(|_| "worktree path cannot be resolved under its parent".to_string())?;
+    Ok(canonical_existing.join(suffix))
+}
+
+fn canonical_worktree_roots(
+    root: &Path,
+    config: &crate::config::Config,
+) -> Result<Vec<PathBuf>, String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("project root cannot be canonicalized: {error}"))?;
+    let mut roots = vec![configured_worktree_root(config)?];
+    // Legacy project-root playground remains closable so already-registered
+    // tasks under the old layout do not become uncloseable after migration.
+    roots.push(canonical_root.join("playground"));
+    Ok(roots)
+}
+
+fn configured_external_worktree_root(
+    root: &Path,
+    config: &crate::config::Config,
+) -> Result<PathBuf, String> {
+    let configured = configured_worktree_root(config)?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("project root cannot be canonicalized: {error}"))?;
+    let legacy_root = canonical_root.join("playground");
+    let mut existing = configured.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| "configured worktree root has no existing parent".to_string())?;
+    }
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|error| format!("configured worktree root cannot be canonicalized: {error}"))?;
+    let suffix = configured
+        .strip_prefix(existing)
+        .map_err(|_| "configured worktree root cannot be resolved".to_string())?;
+    let configured = canonical_existing.join(suffix);
+    if configured == legacy_root {
+        return Err(
+            "configured worktree root must be an external directory, not the project-root ./playground directory"
+                .into(),
+        );
+    }
+    Ok(configured)
+}
 /// Lock used by releases before the host-scoped state directory existed.
 /// A new daemon must fence this writer before it replays the project journal;
 /// otherwise an old binary could append concurrently under the new socket.
@@ -411,49 +510,25 @@ impl std::fmt::Display for NotificationDeliveryError {
 
 impl std::error::Error for NotificationDeliveryError {}
 
-fn validate_worktree_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
-    if raw.trim().is_empty() {
-        return Err("worktree path must be non-empty".into());
-    }
-    let path = Path::new(raw);
-    if path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err("worktree path may not contain '..'".into());
-    }
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        let relative = raw.strip_prefix("./").unwrap_or(raw);
-        root.join(relative)
-    };
+fn validate_worktree_path(
+    root: &Path,
+    config: &crate::config::Config,
+    raw: &str,
+) -> Result<PathBuf, String> {
+    let canonical_candidate = canonical_worktree_target(root, raw)?;
     let canonical_root = root
         .canonicalize()
         .map_err(|error| format!("project root cannot be canonicalized: {error}"))?;
-    let canonical_playground = canonical_root.join("playground");
-    let mut existing = candidate.as_path();
-    while !existing.exists() {
-        existing = existing
-            .parent()
-            .ok_or_else(|| "worktree path has no existing parent".to_string())?;
+    let legacy_root = canonical_root.join("playground");
+    let external_root = configured_external_worktree_root(root, config)?;
+    let accepted = canonical_candidate.starts_with(&external_root)
+        || canonical_candidate.starts_with(&legacy_root);
+    if !accepted {
+        return Err(
+            "worktree path must be under the configured worktree root (<root>/<project-key>/<slug>); legacy project-root ./playground is accepted only for already-registered cleanup".into(),
+        );
     }
-    let canonical_existing = existing
-        .canonicalize()
-        .map_err(|error| format!("worktree path cannot be canonicalized: {error}"))?;
-    let suffix = candidate
-        .strip_prefix(existing)
-        .map_err(|_| "worktree path cannot be resolved under project root".to_string())?;
-    let canonical_candidate = canonical_existing.join(suffix);
-    if !canonical_candidate.starts_with(&canonical_playground) {
-        return Err("worktree path must be inside ./playground".into());
-    }
-    if raw.as_bytes().len() > MAX_WORKTREE_PATH_BYTES {
-        return Err(format!(
-            "worktree path exceeds {} bytes; use a short slug under ./playground",
-            MAX_WORKTREE_PATH_BYTES
-        ));
-    }
+    let path = Path::new(raw.trim());
     let leaf = path
         .file_name()
         .and_then(|v| v.to_str())
@@ -467,6 +542,25 @@ fn validate_worktree_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
         return Err("worktree basename must be a short slug (ASCII letters, digits, '.', '-' or '_'; max 32 chars)".into());
     }
     Ok(canonical_candidate)
+}
+
+fn validate_new_worktree_path(
+    root: &Path,
+    config: &crate::config::Config,
+    raw: &str,
+) -> Result<PathBuf, String> {
+    let canonical = validate_worktree_path(root, config, raw)?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("project root cannot be canonicalized: {error}"))?;
+    let legacy_root = canonical_root.join("playground");
+    let external_root = configured_external_worktree_root(root, config)?;
+    if canonical.starts_with(legacy_root) && !canonical.starts_with(external_root) {
+        return Err(
+            "new worktree registrations must use the configured external worktree root".into(),
+        );
+    }
+    Ok(canonical)
 }
 
 fn task_claim_held(status: &str) -> bool {
@@ -3409,7 +3503,7 @@ mod notification_batch_tests {
             .unwrap();
         (
             Arc::new(Server {
-                config: crate::config::Config::default(),
+                config: crate::server::peer_tests::test_config_for_root(&root),
                 root: root.clone(),
                 storage_root: root.clone(),
                 journal_path: root.join(".agent-collab/server/journal.jsonl"),
@@ -5455,7 +5549,7 @@ pub(crate) fn handle_scheduler_dispatch(
         ));
     }
     if let Some(path) = &worktree_path {
-        let canonical = match validate_worktree_path(&server.root, path) {
+        let canonical = match validate_new_worktree_path(&server.root, &server.config, path) {
             Ok(path) => path,
             Err(error) => return Resp::err(error),
         };
@@ -6453,7 +6547,7 @@ fn handle_task_register_with_next(
     }
     let task_owner = worker_id.clone();
     if let Some(path) = &worktree_path {
-        let canonical = match validate_worktree_path(&server.root, path) {
+        let canonical = match validate_new_worktree_path(&server.root, &server.config, path) {
             Ok(path) => path,
             Err(error) => return Resp::err(error),
         };
@@ -6548,10 +6642,11 @@ fn handle_task_relocate(
     if worker.token != token {
         return Resp::err("token mismatch: identity does not own this worker_id");
     }
-    let canonical_worktree = match validate_worktree_path(&server.root, &worktree_path) {
-        Ok(path) => path,
-        Err(error) => return Resp::err(error),
-    };
+    let canonical_worktree =
+        match validate_new_worktree_path(&server.root, &server.config, &worktree_path) {
+            Ok(path) => path,
+            Err(error) => return Resp::err(error),
+        };
     let worktree_path = canonical_worktree.display().to_string();
     let Some(mut task) = st.tasks.get(&task_id).cloned() else {
         return Resp::err(format!("task {} not found", task_id));
@@ -6785,6 +6880,7 @@ fn stale_worker_views(
 
 fn close_task_resources(
     root: &Path,
+    config: &crate::config::Config,
     worktree_path: Option<&str>,
     branch: Option<&str>,
 ) -> Result<(), String> {
@@ -6801,16 +6897,19 @@ fn close_task_resources(
         }
     }
     if let Some(relative) = worktree_path {
-        let worktree = root.join(relative);
-        let allowed_root = root
-            .canonicalize()
-            .unwrap_or_else(|_| root.to_path_buf())
-            .join("playground");
+        let worktree = canonical_worktree_target(root, relative)?;
+        let allowed_roots = canonical_worktree_roots(root, config)?;
         let canonical_worktree = worktree
             .canonicalize()
             .map_err(|e| format!("declared worktree {} is missing: {e}", relative))?;
-        if !canonical_worktree.starts_with(allowed_root) {
-            return Err(format!("refusing cleanup outside playground: {}", relative));
+        if !allowed_roots
+            .iter()
+            .any(|allowed_root| canonical_worktree.starts_with(allowed_root))
+        {
+            return Err(format!(
+                "refusing cleanup outside approved worktree roots: {}",
+                relative
+            ));
         }
         let dirty = Command::new("git")
             .arg("-C")
@@ -7306,6 +7405,7 @@ fn handle_task_close(
     if !receipt_reusable {
         if let Err(e) = close_task_resources(
             &server.root,
+            &server.config,
             task.worktree_path.as_deref(),
             task.branch.as_deref(),
         ) {
@@ -9486,7 +9586,7 @@ mod host_route_registry_tests {
             .open(&journal_path)
             .unwrap();
         let server = Arc::new(Server {
-            config: crate::config::Config::default(),
+            config: crate::server::peer_tests::test_config_for_root(&root),
             root: root.clone(),
             storage_root: root.clone(),
             journal_path: journal_path.clone(),
@@ -10550,7 +10650,7 @@ mod host_route_registry_tests {
         drop(manager);
 
         let replayed_host = Arc::new(Server {
-            config: crate::config::Config::default(),
+            config: crate::server::peer_tests::test_config_for_root(&root),
             root: root.clone(),
             storage_root: root.clone(),
             journal_path: host_journal.clone(),
@@ -14874,7 +14974,7 @@ mod reducer_binding_tests {
             .open(server_dir.join("journal.jsonl"))
             .unwrap();
         let server = Server {
-            config: crate::config::Config::default(),
+            config: crate::server::peer_tests::test_config_for_root(&root),
             root: root.clone(),
             storage_root: root.clone(),
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
@@ -14987,7 +15087,7 @@ mod reducer_binding_tests {
             .open(server_dir.join("journal.jsonl"))
             .unwrap();
         let server = Server {
-            config: crate::config::Config::default(),
+            config: crate::server::peer_tests::test_config_for_root(&root),
             root: root.clone(),
             storage_root: root.clone(),
             journal_path: root.join(".agent-collab/server/journal.jsonl"),
@@ -15005,7 +15105,9 @@ mod reducer_binding_tests {
             mailbox_notify: tokio::sync::Notify::new(),
         };
         peer_tests::register(&server, "worker", "thread-worker");
-        let worktree = "playground/task-1".to_string();
+        let worktree = server.config.worktree.root.clone().unwrap().join("task-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let worktree = worktree.display().to_string();
         let registered = handle_task_register(
             &server,
             "worker".into(),
@@ -15019,13 +15121,7 @@ mod reducer_binding_tests {
             "p2".into(),
         );
         assert!(registered.ok, "{registered:?}");
-        let canonical_worktree = server
-            .root
-            .canonicalize()
-            .unwrap()
-            .join("playground/task-1")
-            .to_string_lossy()
-            .into_owned();
+        let canonical_worktree = server.config.worktree.root.clone().unwrap().join("task-1");
         {
             let state = server.state.lock().unwrap();
             assert_eq!(

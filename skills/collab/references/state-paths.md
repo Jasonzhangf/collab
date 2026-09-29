@@ -110,7 +110,7 @@ unless the operator explicitly chooses the owner's migration or reset route.
 Run `collab context`. If it says unregistered, run the idempotent
 `appsdk init .` (or `collab init` for a standalone project), then run
 `collab context` again. Registration must run from the canonical project main
-tree, not a `playground/` worktree. `collab context` itself is read-only and
+tree, not a configured worktree root. `collab context` itself is read-only and
 must remain safe in a worktree: it resolves the canonical route from global
 state and never creates a route or identity.
 

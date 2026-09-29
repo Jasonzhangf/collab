@@ -57,6 +57,26 @@ copies, restart the global daemon, or touch `~/.collab/`, project-local
 daemon may keep running the old binary until an explicitly authorized
 maintenance window.
 
+## Task worktree root
+
+New task worktrees must live under a configured external root, not inside the
+project checkout. The root is resolved in this order:
+
+1. `[worktree] root` in `~/.appsdk/config.toml` (the existing `[worktree] base`
+   key is accepted as a legacy alias).
+2. `$COLLAB_WORKTREE_ROOT`.
+3. `$HOME/playground` when nothing is configured.
+
+The layout must be `{project-key}/{task-slug}`, so a registration looks like:
+
+```text
+--worktree <resolved-root>/<project-key>/<short-slug>
+```
+
+The legacy project-root `./playground/` layout remains readable for already
+registered tasks so they can still be audited and closed, but new
+registrations and relocations must use the configured external root.
+
 ## Start and identity
 
 ```sh
@@ -118,7 +138,7 @@ collab subagent dispatch --request-id <id> --subject <topic> <body>
 ```sh
 collab task register <id> \
   --feature <feature-id> \
-  --worktree ./playground/<short-slug> \
+  --worktree <worktree-root>/<project-key>/<short-slug> \
   --branch codex/<branch> \
   --base-commit <sha> \
   --priority p2 \
@@ -127,7 +147,7 @@ collab task register <id> \
 collab task update <id> --status verifying --next "run gates"
 collab task update <id> --status reviewed --next "record delivery"
 collab task deliver <id> --evidence "commit=<sha>; gates=pass" \
-  --worktree ./playground/<short-slug>
+  --worktree <worktree-root>/<project-key>/<short-slug>
 collab task review <id> --accept --evidence "review gates=pass"
 collab task integrated <id> --commit <main-sha> --evidence "main gates=pass"
 collab task close <id>
@@ -147,7 +167,9 @@ and cannot manufacture review or integration evidence.
 Delivery is a local durable milestone. It sends no peer message. Every task
 with a declared worktree carries a cleanup obligation. Close fails before
 mutation unless the task is merged, its declared worktree is clean and inside
-`./playground/`, and its branch is merged into current main. Close removes the
+the configured worktree root (legacy project-root `./playground/` worktrees
+remain closable for already registered tasks), and its branch is merged into
+current main. Close removes the
 exact worktree/branch, verifies absence, persists a durable cleanup receipt,
 and only then marks the task closed. A terminal task with a missing receipt or
 an existing declared worktree fails audit; cancellation cannot bypass cleanup.

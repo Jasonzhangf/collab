@@ -241,7 +241,7 @@ enum TaskCmd {
         #[arg(long)]
         goal: Option<String>,
     },
-    /// Relocate the caller's task to a short playground worktree
+    /// Relocate the caller's task to a clean configured worktree
     Relocate {
         id: String,
         #[arg(long)]
@@ -588,11 +588,23 @@ fn unregistered_context(
         Some(scope) => scope.root.clone(),
         None => canonical_cwd.clone(),
     };
-    let looks_like_worktree = canonical_cwd.ancestors().any(|ancestor| {
-        ancestor
-            .file_name()
-            .is_some_and(|name| name == "playground")
-    });
+    let worktree_root = crate::config::load(&project_root)
+        .ok()
+        .and_then(|config| config.worktree.resolve().ok())
+        .unwrap_or_else(|| std::env::temp_dir());
+    let looks_like_worktree = if canonical_cwd.starts_with(&worktree_root) {
+        true
+    } else if let Some(scope) = scope {
+        let canonical_scope =
+            std::fs::canonicalize(&scope.root).unwrap_or_else(|_| scope.root.clone());
+        canonical_cwd.starts_with(canonical_scope.join("playground"))
+    } else {
+        canonical_cwd.ancestors().any(|ancestor| {
+            ancestor
+                .file_name()
+                .is_some_and(|name| name == "playground")
+        })
+    };
     let next_action = if looks_like_worktree {
         "return to the canonical project main checkout and run `appsdk init .`"
     } else {
@@ -721,13 +733,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Init => {
             let project_root = scope::project_root_for_init()?;
-            if project_root.ancestors().skip(1).any(|ancestor| {
-                ancestor
-                    .file_name()
-                    .is_some_and(|name| name == "playground")
-            }) {
+            let canonical_project = std::fs::canonicalize(&project_root)?;
+            let external_root = crate::config::load(&canonical_project)?
+                .worktree
+                .resolve()?;
+            if canonical_project.starts_with(&external_root) {
                 anyhow::bail!(
-                    "collab init must run from the project main tree, not a ./playground worktree"
+                    "collab init must run from the canonical project main tree, not a configured worktree root: {}",
+                    external_root.display()
                 );
             }
             let _base = scope::init(&project_root)?;

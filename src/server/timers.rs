@@ -393,7 +393,7 @@ mod tests {
             .unwrap();
         (
             Arc::new(Server {
-                config: crate::config::Config::default(),
+                config: crate::server::peer_tests::test_config_for_root(&root),
                 root: root.clone(),
                 storage_root: root.clone(),
                 journal_path: root.join(".agent-collab/server/journal.jsonl"),
@@ -751,7 +751,7 @@ mod tests {
             .open(root.join(".agent-collab/server/journal.jsonl"))
             .unwrap();
         let restarted = Server {
-            config: crate::config::Config::default(),
+            config: crate::server::peer_tests::test_config_for_root(&root),
             root: root.clone(),
             storage_root: root.clone(),
             journal_path: root.join(".agent-collab/server/journal.jsonl"),

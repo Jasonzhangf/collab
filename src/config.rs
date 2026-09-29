@@ -14,6 +14,7 @@ pub struct Config {
     pub timers: Timers,
     pub subagent: Subagent,
     pub retention: Retention,
+    pub worktree: Worktree,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -23,9 +24,76 @@ impl Default for Config {
             timers: Timers::default(),
             subagent: Subagent::default(),
             retention: Retention::default(),
+            worktree: Worktree::default(),
         }
     }
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Worktree {
+    /// Absolute root for owned task worktrees, e.g. `/Volumes/Intel/playground`.
+    /// Falls back to `$COLLAB_WORKTREE_ROOT`, then `$HOME/playground`.
+    pub root: Option<PathBuf>,
+    /// Legacy alias accepted from existing AppSDK/Collab config.
+    #[serde(alias = "base")]
+    pub(crate) base: Option<PathBuf>,
+    /// Optional layout hint; only `project-key/task-slug` is currently supported.
+    #[serde(default)]
+    pub(crate) layout: Option<String>,
+}
+impl Default for Worktree {
+    fn default() -> Self {
+        Self {
+            root: None,
+            base: None,
+            layout: None,
+        }
+    }
+}
+
+impl Worktree {
+    pub fn resolve(&self) -> Result<PathBuf> {
+        if let Some(layout) = self.layout.as_deref() {
+            if layout != "{project-key}/{task-slug}" && layout != "<project-key>/<task-slug>" {
+                anyhow::bail!(
+                    "unsupported [worktree] layout `{layout}`; use {{project-key}}/{{task-slug}}"
+                );
+            }
+        }
+        if let Some(root) = self
+            .root
+            .as_ref()
+            .or(self.base.as_ref())
+            .filter(|root| root.is_absolute())
+        {
+            return Ok(root.clone());
+        }
+        if let Some(root) = std::env::var_os("COLLAB_WORKTREE_ROOT")
+            .map(PathBuf::from)
+            .filter(|root| root.is_absolute())
+        {
+            return Ok(root);
+        }
+        let home = std::env::var_os("HOME").context("HOME unavailable")?;
+        Ok(PathBuf::from(home).join("playground"))
+    }
+}
+
+/// Test-only root selection mirroring the config resolution the runtime uses:
+/// an absolute root is taken as-is; tests resolve it against the canonical
+/// project parent so fixtures do not depend on a host-specific mount.
+#[cfg(test)]
+pub(crate) fn test_worktree_root_for(root: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let external = canonical
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .join("external");
+    std::fs::create_dir_all(&external).unwrap_or_default();
+    external
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Keepalive {
@@ -625,5 +693,41 @@ projects = [
             parsed["projects"][0]["subagent"]["runtime"].as_str(),
             Some("codex")
         );
+    }
+
+    #[test]
+    fn worktree_config_accepts_root_env_base_and_legacy_layout() {
+        let dir = std::env::temp_dir().join(format!(
+            "collab-worktree-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        let root = dir.join("playground");
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(
+            Worktree {
+                root: Some(root.clone()),
+                ..Default::default()
+            }
+            .resolve()
+            .unwrap(),
+            root
+        );
+
+        let env_root = dir.join("env");
+        std::env::set_var("COLLAB_WORKTREE_ROOT", &env_root);
+        assert_eq!(Worktree::default().resolve().unwrap(), env_root);
+        std::env::remove_var("COLLAB_WORKTREE_ROOT");
+
+        let config: Config = toml::from_str(&format!(
+            "[worktree]\nbase = \"{}\"\nlayout = \"{{project-key}}/{{task-slug}}\"\n",
+            root.display()
+        ))
+        .unwrap();
+        assert_eq!(config.worktree.resolve().unwrap(), root);
     }
 }
